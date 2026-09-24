@@ -88,7 +88,7 @@
     "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
     "bytes": 33762
   },
-  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "baseline_reference_commit": "88cf569e885019ffe637192efcbda4aaf2c32f1c",
   "mlx_swift_lm_revision": "859f4d97e0d1ae9cce0883b044f764283841edfb",
   "target": {
     "upstream_model_id": "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
