@@ -1,0 +1,3 @@
+# This measured prompt is immutable: changing a byte invalidates its committed
+# token IDs, SHA-256, and benchmark receipts.
+benchmarks/qwen36-a3b/contexts/python-coding-context-32768.txt whitespace=-blank-at-eol

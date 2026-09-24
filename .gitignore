@@ -1,0 +1,102 @@
+# The benchd measurement binary and its manifest, resolved by
+# tools/fetch-benchd.sh from the bench repository's dist channel. A FETCHED
+# ARTIFACT, never repository content: the channel publishes
+# benchd.manifest.json beside the binary, the bytes are verified against that
+# manifest on every resolve, and the resolved pair is installed here. Committing
+# them would add a 2 MB blob to the history that carries no authority the
+# channel manifest does not already carry.
+/benchd-bin/
+
+# Build artifacts
+*.so
+build/
+dist/
+.build/
+.build-worker/
+.build-ci/
+# CI tees `swift build` here for tools/ci-swift-warning-gate.sh to read.
+swift-build.log
+# CI tees tools/test-submission-security.sh here so the non-vacuity floor can be
+# re-checked against its printed trailer from outside the suite file.
+submission-security.log
+.tools/
+.mlxfast-cache/
+.mlxfast-private/
+.cache/
+
+# Reference weights are large and downloaded by setup.sh
+reference_weights/*
+!reference_weights/.gitkeep
+
+# Participant transformed weights are gitignored by default; opt in if needed
+#
+# NO .gitkeep HERE, unlike reference_weights/ above. The transform publishes
+# weights/ by ATOMIC DIRECTORY REPLACEMENT -- it fills a sibling staging
+# directory and then replaceItemAt()s the whole thing into place
+# (Sources/MLXFastTransform/Transform.swift) -- so nothing checked in UNDER
+# weights/ can survive the documented `mlxfast-swift transform --output weights`
+# step. A tracked weights/.gitkeep therefore came back as a deletion in
+# `git status` after every documented setup, which is a dirty tree no
+# participant can clean without re-adding a file the next transform deletes
+# again. reference_weights/ keeps its .gitkeep because it is filled file by
+# file by a downloader that never replaces the directory.
+#
+# The directory does not need to pre-exist: the transform creates it, and
+# weights/ is not a benchmark.json editablePaths entry, so the submission
+# archiver never looks for it on disk. The harness's tolerance of a stray
+# .gitkeep inside weights/ (ignoredRelativePaths in the runtime benchmark and
+# TransformVerification) is unaffected and stays correct for anyone who puts
+# one back by hand.
+weights/*
+
+# The speculative head directory. This track's MTP head is EMBEDDED in the
+# pinned target checkpoint (language_model.mtp.*), so nothing stages a head
+# weight file here and no submission carries one. mtp-head/ is not an
+# editablePaths entry; only its DECLARATION, mtp-head.manifest.json, is. The
+# ignore stays so a hand-staged experiment cannot be committed into the tree by
+# a stray `git add -A`.
+mtp-head/
+
+# Local results log
+results.tsv
+m5_artifacts/
+
+# Benchmark contract outputs
+score.json
+score.json.tmp
+# Every local run also writes a checksum sidecar and an integrity record, and
+# --local-iterate writes its own score/integrity names (benchmark.sh:112,:190).
+# Leaving them untracked-but-not-ignored made the tree permanently dirty, so a
+# `git add -A` swept repo-root artifacts into a submission diff -- which
+# enforce-modifiable-surface.sh then rejects as outside editablePaths.
+score.json.sha256
+score.local-*.json
+score.local-*.json.sha256
+score*.baseline.json
+benchmark-integrity.json
+benchmark-integrity.local-*.json
+correctness_golden.json
+correctness_golden*.json
+local_correctness_golden.json
+private_prompts.json
+private_prompts*.json
+gpqa_reference_cases.json
+gpqa_reference_cases*.json
+# Goldens, captures and prompts live in R2, never in git. tools/fetch-goldens.sh
+# --public writes the public captures here.
+correctness_prompts/
+
+# IDE
+.vscode/
+.idea/
+.serena/
+*.swp
+*.swo
+.DS_Store
+
+# Local-only working docs (not part of the benchmark)
+local-docs/
+__pycache__/
+
+# Operator-local environment: endpoints and credentials belong here, never in the repo
+.env

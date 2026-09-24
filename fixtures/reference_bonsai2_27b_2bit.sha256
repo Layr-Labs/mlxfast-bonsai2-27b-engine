@@ -1,0 +1,33 @@
+# SHA256 manifest for prism-ml/Ternary-Bonsai-2-27B-mlx-2bit.
+# Revision: 3f926b415992eaa2ae9dd7b573706494d6bbf787
+#
+# The target checkpoint for track bonsai2-27b-mlx-v1. Written by
+# tools/new-track.sh from the published tree. LFS-backed entries use the
+# LFS object's own sha256 (lfs.oid).
+#
+# .gitattributes, LICENSE and image files are DELIBERATELY NOT pinned: none
+# is engine-loaded, and setup.sh derives what it downloads from this file.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 19
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   8608721032
+#
+# Format: <sha256> <byte_count> <relative_path>
+de0e0c48fb6f691a31e74f338e3ccf93f9ecdfe2866ab769c4bf8b79a7636a30 411 NOTICE.txt
+486bf73b40dab072792cb2e48961a3698d4ca599f1355f3e628e4c64d8aa4cce 969 PACK-RUNTIME.md
+187aca6e2e8d01daa77e6faf64189ba015a5616f1627fdf2f4f2392d592bf5da 22732 README.md
+c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 8952 chat_template.jinja
+238de7c512cc56a733421e3fd011d88f8260739e3d00e32c5d65b7943cc9f837 58145 config.json
+e9c78caf0915d7db3a368930d3f1c02d0c5ef3a5e6a98dffad4fb7677d7042bc 2855 files.json
+cddd0dbd24dbf13229f872b4100c5a0bfe5186eeb09e171b2fc2bac701e98034 85 generation_config.json
+7132a3ec364f0bdac1f08f905f24f0ad2f14245060f592637a0396826d3b5fe6 297903 hadamard.json
+130de5925082c168b7866b2e91b52e44abbafc99017e3ca352b77b5b55a269ed 8595477990 model.safetensors
+27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516 390 preprocessor_config.json
+41ec215fe19fa8ad59527fca6594a782d1b7f23b69948ef063311c768217788e 86 reload-validation.json
+5279718d7671bd799e866f53099e82b0260117fec811f83011ba47a0abc7943e 5621 runtime/artifact.py
+7f7fd67637a7d9363eab8ebf7db59771830b690330ffef772379a0169ddb9608 2572 runtime/codec.py
+358bc104a02ea598f1e6cde8e7eeed169b9ec34f69f3543b47b390706446a1e0 115 runtime/requirements.txt
+30ad3905775040a8167360a009168b9ede1436cb02dc43e9e743432482eafbbf 10674 runtime/runtime.py
+624e78d1fc7a0ddbaa637121ee823209c525b8e89f35fbc68d6d2f3f3fcfd87d 4221 runtime/vision_artifact.py
+b36f33d09bd3de3e19de3fd2cf493a69ec0a5e24acf648b0c9fba120d9357554 63 tokenizer-validation.json
+0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 12809320 tokenizer.json
+b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27 17928 tokenizer_config.json

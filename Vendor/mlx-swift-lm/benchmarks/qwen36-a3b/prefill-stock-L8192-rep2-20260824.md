@@ -1,0 +1,36 @@
+# BenchCBv2RealModel report
+
+| | |
+|---|---|
+| Model | ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
+| Label | qwen36-a3b-prefill-stock-L8192-rep2 |
+| Profile | stock |
+| Prefill construction | chunk=512, soloStripe=off |
+| Chip | Apple M5 Max |
+| RAM | 128 GB |
+| OS | Version 26.5.2 (Build 25F84) |
+| Host at start | load avg (1m) 1.1 / 18 cores; no darkbloom process |
+| Invocation | `.build/arm64-apple-macosx/release/BenchCBv2 --model ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1 --prompt-lengths 8192 --profile stock --label qwen36-a3b-prefill-stock-L8192-rep2 --out benchmarks/qwen36-a3b/prefill-stock-L8192-rep2-20260824.md` |
+| Prompt lengths | 8192 |
+| Paged nominalMaxSeqLen | 8193 |
+| mlx-swift-lm (build) | ab73a82-dirty |
+| Date | 2026-08-25T03:06:24Z |
+
+model class: Qwen35MoEModel; layers: 10
+- optimization model: layer18(requested=false, effective=false, interval=n/a); weightedUnsort(requested=false, effective=false); safeR1GeometryEligible=false; safeR1(requested=false, effective=false, aot=true, nax=true)
+- optimization-run-json: {"model":{"layer18Effective":false,"layer18Requested":false,"safeR1GeometryEligible":false,"weightedUnsortEffective":false,"weightedUnsortRequested":false},"safeR1AOTAvailable":true,"safeR1Effective":false,"safeR1NAXAvailable":true,"safeR1Requested":false}
+vocabSize=248320
+
+## Performance (maxTokens 1)
+
+| engine | B | prompts (tok) | decode TPS/req | agg TPS | TTFT p50 (ms) | ITL p50 (ms) |
+|---|---|---|---|---|---|---|
+| v2 | 1 | 8192 | 0.0 | 0.3 | 3087 | 0.0 |
+
+- optimization provenance [perf/v2/B1]: layer18(requested=false, effective=false, interval=n/a); weightedUnsort(requested=false, effective=false); safeR1GeometryEligible=false; layer18ExpectedMinimumSubmissions=0, layer18Submissions=0, layer18Engaged=false; weightedCalls=0, weightedEngaged=false; safeR1(requested=false, effective=false, armed=true, aot=true, nax=true, exactGeometryExpected=false, attempts=0, hits=0, fallbacks=0, fallbackNAX=0, fallbackOuterRoute=0, fallbackQuantization=0, fallbackTopology=0, fallbackAssignmentCount=0, fallbackGeometry=0, fallbackMetallibUnavailable=0)
+- optimization-cell-json [perf/v2/B1]: {"aggregateTPS":0.3239650197205398,"batch":1,"decodeTPSPerRequest":0,"engine":"v2","itlP50Ms":0,"optimizationProvenance":{"layer18Engaged":false,"layer18ExpectedMinimumSubmissions":0,"layer18IntermediateSubmissions":0,"model":{"layer18Effective":false,"layer18Requested":false,"safeR1GeometryEligible":false,"weightedUnsortEffective":false,"weightedUnsortRequested":false},"safeR1":{"aotAvailable":true,"armed":true,"attempts":0,"effective":false,"exactGeometryExpected":false,"fallbackAssignmentCount":0,"fallbackGeometry":0,"fallbackMetallibUnavailable":0,"fallbackNAX":0,"fallbackOuterRoute":0,"fallbackQuantization":0,"fallbackTopology":0,"fallbacks":0,"hits":0,"naxAvailable":true,"requested":false},"weightedUnsortEffectiveCalls":0,"weightedUnsortEngaged":false},"perRequest":["    req 0: prompt=8192 tokens=1 ttft=3087ms decodeTPS=0.0 finish=length"],"promptMix":[8192],"ttftP50Ms":3086.7480039596558}
+
+Per-request detail:
+    [mem after v2 B=1] gpuActive=18.17 GiB gpuPeak=19.46 GiB
+  v2 B=1:
+    req 0: prompt=8192 tokens=1 ttft=3087ms decodeTPS=0.0 finish=length

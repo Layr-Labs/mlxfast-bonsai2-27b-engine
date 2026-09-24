@@ -1,0 +1,451 @@
+{
+  "schema_version": 1,
+  "track_id": "bonsai2-27b-mlx-v1",
+  "track_name": "bonsai2-27b-mlx-v1 -- composite cohort speedup",
+  "official_scoring_enabled": true,
+  "official_pairs": 3,
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial",
+    "mtp",
+    "dflash"
+  ],
+  "benchmark_name": "mlxfast-bonsai2-27b",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.02,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "vocab_size": 248320,
+  "num_hidden_layers": 64,
+  "seed_tokens": 512,
+  "golden_model_type": "prism_hadamard_qwen35",
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "live_golden": "pool-1",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-2.golden.json",
+      "sha256": "7754e6d877dce75b6605a3026bda94d1211b32da796834d98b3e28b5617f47ba",
+      "bytes": 34450
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-3.golden.json",
+      "sha256": "934f0a52d125e2ca14e96fcbc68ae9239e6327d78932bb69ae31dafdddd798e5",
+      "bytes": 34027
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-4.golden.json",
+      "sha256": "38320c56e624a994ba39cf0243408dd81bf5019bcb4532dd553b1da855533e90",
+      "bytes": 34034
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-5.golden.json",
+      "sha256": "6f4a1b1739648a424ee83f6e611c3f27cae4ccaae208cae8ad08d907f0b337ed",
+      "bytes": 34148
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-6.golden.json",
+      "sha256": "02dbd81873b5c09748b63b9fea38663bae4b4079d826feb4eacd74cdeb21fc45",
+      "bytes": 33434
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-7.golden.json",
+      "sha256": "86a09fac9b34317df5ccefddab25d8a843b2e749ecaa15d4bb0703cd4d7fe217",
+      "bytes": 33992
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-8.golden.json",
+      "sha256": "7fc2248c70d8438793308255dbce61fff9819b054f878467ca1b9a0737a8bfeb",
+      "bytes": 34395
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+    "bytes": 33762
+  },
+  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "mlx_swift_lm_revision": "859f4d97e0d1ae9cce0883b044f764283841edfb",
+  "target": {
+    "upstream_model_id": "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+    "upstream_revision": "3f926b415992eaa2ae9dd7b573706494d6bbf787",
+    "model_type": "prism_hadamard_qwen35",
+    "base_model_type": "qwen3_5",
+    "text_model_type": "qwen3_5_text",
+    "schema_version": 2,
+    "num_hidden_layers": 64,
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144,
+    "full_attention_interval": 4,
+    "layer_type_counts": {
+      "full_attention": 16,
+      "linear_attention": 48
+    },
+    "full_attention_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51,
+      55,
+      59,
+      63
+    ],
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "attention_bias": false,
+    "attn_output_gate": true,
+    "output_gate_type": "swish",
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10000000,
+    "mrope_interleaved": true,
+    "mrope_section": [
+      11,
+      11,
+      10
+    ],
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "gdn_activation_layout": "grouped",
+    "mamba_ssm_dtype": "float32",
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "tie_word_embeddings": false,
+    "bos_token_id": 248044,
+    "eos_token_ids": [
+      248044
+    ],
+    "mtp_num_hidden_layers": 0,
+    "components": {
+      "mtp": false,
+      "text": true,
+      "vision": true
+    },
+    "tensor_namespace": "mlx-vlm-qwen3_5",
+    "raw_checkpoint_tensor_count": 2390,
+    "raw_checkpoint_shard_count": 1,
+    "raw_checkpoint_total_size_bytes": 8595477990,
+    "language_model_tensor_count": 2057,
+    "vision_tower_tensor_count": 333,
+    "vision_tower_loaded": false,
+    "lm_head_tensor_count": 4,
+    "manifest_path": "fixtures/reference_bonsai2_27b_2bit.sha256",
+    "config_fixture_path": "fixtures/bonsai2_27b_config.json",
+    "tensor_inventory_path": "fixtures/bonsai2_27b_tensor_inventory.json",
+    "quantization": {
+      "mode": "affine",
+      "group_size": 128,
+      "bits": 2,
+      "scale_dtype": "float16",
+      "bias_dtype": "float16",
+      "mixed_precision": false
+    },
+    "hadamard": {
+      "manifest_path_in_checkpoint": "hadamard.json",
+      "transform": "normalized-sylvester-walsh-hadamard",
+      "axis": "input-last-dimension",
+      "sign_mode": "explicit",
+      "block_size": 1024,
+      "packed_module_count": 402,
+      "sign_vector_count": 402,
+      "sign_dtype": "float32",
+      "embedding_module": "model.embed_tokens",
+      "arithmetic_dtype": "float32"
+    },
+    "upstream_base_model": "Qwen/Qwen3.8-27B",
+    "upstream_base_model_relation": "quantized"
+  },
+  "mtp_head": {
+    "role": "spec_decode_mtp_head",
+    "source": "separate_pinned_export",
+    "upstream_model_id": "EigenLabs/Qwen3.8-27B-MTP-4bit",
+    "upstream_revision": "329261c5e0b3f9c233485e682cb3b67b88c20a55",
+    "model_type": "qwen3_5_mtp",
+    "manifest_path": "fixtures/reference_bonsai2_27b_mtp_head_4bit.sha256",
+    "declaration_path": "mtp-head.manifest.json",
+    "tensor_prefix": "",
+    "tensor_count": 31,
+    "tensor_bytes": 238930944,
+    "num_hidden_layers": 1,
+    "block_size": 3,
+    "hybrid": false,
+    "layer_types": [
+      "full_attention"
+    ],
+    "rope_theta": 10000000,
+    "use_dedicated_embeddings": false,
+    "shares_target_embed_tokens": true,
+    "shares_target_lm_head": true,
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4,
+      "scale_dtype": "bfloat16",
+      "bias_dtype": "bfloat16"
+    },
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "dflash_drafter": {
+    "role": "spec_decode_dflash_drafter",
+    "source": "separate_pinned_export",
+    "upstream_model_id": "z-lab/Qwen3.8-27B-DFlash2",
+    "upstream_revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+    "model_type": "qwen3",
+    "architecture": "DFlash2DraftModel",
+    "manifest_path": "fixtures/reference_bonsai2_27b_dflash2_drafter.sha256",
+    "declaration_path": "mtp-head.manifest.json",
+    "config_fixture_path": "fixtures/bonsai2_27b_dflash2_drafter_config.json",
+    "tensor_inventory_path": "fixtures/bonsai2_27b_dflash2_drafter_inventory.json",
+    "tensor_prefix": "",
+    "tensor_count": 81,
+    "tensor_bytes": 3848808960,
+    "max_declared_bytes": 4294967296,
+    "num_hidden_layers": 5,
+    "block_size": 8,
+    "hybrid": false,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention"
+    ],
+    "sliding_window": 2048,
+    "is_causal": false,
+    "rope_theta": 10000000,
+    "dtype": "bfloat16",
+    "use_dedicated_embeddings": false,
+    "shares_target_embed_tokens": true,
+    "shares_target_lm_head": true,
+    "target_layer_ids": [
+      5,
+      19,
+      33,
+      47,
+      61
+    ],
+    "num_target_layers": 64,
+    "mask_token_id": 248070,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ]
+  },
+  "protocol": {
+    "mtp_envelope_constants_from_darkbloom": {
+      "max_draft_tokens": 7,
+      "max_speculative_batch": 1,
+      "verification_mode": "rectangular_exact"
+    },
+    "dflash_envelope_constants": {
+      "max_draft_tokens": 16,
+      "max_speculative_batch": 1,
+      "verification_mode": "rectangular_exact"
+    }
+  },
+  "scoring_semantics": {
+    "formula": "composite = prefill_gain^0.25 * decode_gain^0.75"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "license_name": "apache-2.0",
+    "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/blob/3f926b415992eaa2ae9dd7b573706494d6bbf787/LICENSE",
+    "verified_repositories": [
+      "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+      "EigenLabs/Qwen3.8-27B-MTP-4bit"
+    ]
+  },
+  "live_golden_speculative": {
+    "mtp1": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp2": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp3": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp4": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp5": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp6": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "mtp7": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash1": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash2": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash3": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash4": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash5": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash6": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash7": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash8": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash9": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash10": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash11": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash12": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash13": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash14": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash15": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    },
+    "dflash16": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/pool-1.golden.json",
+      "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
+      "bytes": 33762
+    }
+  },
+  "public_captures": {
+    "local_iterate": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json",
+      "sha256": "cc5952f782f6ddba1ff46abf173c3372704579d82d4d6a5a2c45d90cde42be9e",
+      "bytes": 10663
+    },
+    "local_submit": {
+      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json",
+      "sha256": "c1c42007bfd0989543c4b4d664483749bd3c278ec998915b80a294bd505122fd",
+      "bytes": 21007
+    }
+  }
+}

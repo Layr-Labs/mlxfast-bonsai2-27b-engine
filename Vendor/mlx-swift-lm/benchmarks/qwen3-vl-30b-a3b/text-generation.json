@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "case": "text",
+  "model": "lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit",
+  "model_revision": "61c11f42d7bc01e00f5ea7f2e667c0a216f48397",
+  "base_revision": "f562840f045590fb51be9ebb5e890141d51684c2",
+  "prompt": "Reply with exactly: Swift MoE ready",
+  "prompt_sha256": "f239d411e612bf466eeda32f84f1afe95278c31885fd270cac4fa9edad6ab21b",
+  "generation": {
+    "temperature": 0,
+    "max_tokens": 8
+  },
+  "swift": {
+    "command": "DARKBLOOM_BF16_WEIGHTS=0 Qwen3VLPortCheck <snapshot-path> both 8 /tmp/qwen3vl-red.png",
+    "tokens": [55336, 6050, 36, 5527, 151645],
+    "text": "Swift MoE ready<|im_end|>",
+    "prompt_tokens": 16,
+    "generation_tokens": 5,
+    "prefill_seconds": 2.2747199535369873,
+    "generation_seconds": 0.38325297832489014
+  },
+  "python": {
+    "command": "uv run --with mlx-vlm --with jinja2 python /tmp/qwen3vl_reference.py <snapshot-path> /tmp/qwen3vl-red.png 8",
+    "mlx_vlm_version": "0.6.16",
+    "transformers_version": "5.15.1",
+    "tokens": [55336, 6050, 36, 5527, 151645],
+    "text": "Swift MoE ready<|im_end|>",
+    "prompt_tokens": 16,
+    "generation_tokens": 5,
+    "prompt_tokens_per_second": 27.912299555165063,
+    "generation_tokens_per_second": 138.06751766474827,
+    "peak_memory_gb": 18.303730224,
+    "finish_reason": "stop"
+  },
+  "output_token_parity": "exact"
+}

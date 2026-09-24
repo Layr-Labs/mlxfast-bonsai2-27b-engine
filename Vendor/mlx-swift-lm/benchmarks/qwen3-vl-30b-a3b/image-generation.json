@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "case": "image",
+  "model": "lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit",
+  "model_revision": "61c11f42d7bc01e00f5ea7f2e667c0a216f48397",
+  "base_revision": "f562840f045590fb51be9ebb5e890141d51684c2",
+  "prompt": "What color is this image? Reply with just the color name.",
+  "prompt_sha256": "20360c1032777ab5fac2f7d6a338d1983d7ad904f4c0066277bc5d1235377b8d",
+  "image": {
+    "description": "100x100 RGBA red PNG",
+    "sha256": "2df3a4b2c1198a2e96087274ba526738fb3fbec3c3780dfbdcc535e2820428c4"
+  },
+  "generation": {
+    "temperature": 0,
+    "max_tokens": 8
+  },
+  "swift": {
+    "command": "DARKBLOOM_BF16_WEIGHTS=0 Qwen3VLPortCheck <snapshot-path> both 8 /tmp/qwen3vl-red.png",
+    "tokens": [2518, 151645],
+    "text": " red<|im_end|>",
+    "text_prompt_tokens": 32,
+    "generation_tokens": 2,
+    "prefill_seconds": 3.207831025123596,
+    "generation_seconds": 0.09606993198394775
+  },
+  "python": {
+    "command": "uv run --with mlx-vlm --with jinja2 python /tmp/qwen3vl_reference.py <snapshot-path> /tmp/qwen3vl-red.png 8",
+    "mlx_vlm_version": "0.6.16",
+    "transformers_version": "5.15.1",
+    "tokens": [2518, 151645],
+    "text": " red<|im_end|>",
+    "text_and_visual_prompt_tokens": 87,
+    "generation_tokens": 2,
+    "prompt_tokens_per_second": 67.64593440408842,
+    "generation_tokens_per_second": 179.19273137012573,
+    "peak_memory_gb": 18.544916281,
+    "finish_reason": "stop"
+  },
+  "reference_adjustment": "mlx-vlm 0.6.16 vision blocks were set to tanh GELU and its mergers to exact GELU to match the checkpoint and original Hugging Face implementation",
+  "prompt_count_note": "Swift reports 32 textual prompt tokens; Python includes 55 visual tokens and reports 87 total prompt tokens",
+  "output_token_parity": "exact"
+}

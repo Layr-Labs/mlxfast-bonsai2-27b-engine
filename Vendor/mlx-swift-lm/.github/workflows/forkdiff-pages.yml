@@ -1,0 +1,99 @@
+name: Deploy Fork Diff
+
+# Renders `fork.yaml` with protolambda/forkdiff and publishes the result as the
+# repository's GitHub Pages site — the same setup ethereum-optimism/op-geth
+# uses for its go-ethereum fork diff. Runs the analysis gate first, so a page
+# that lies about the fork is never published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Render and deploy
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # forkdiff diffs against base.hash, deep in history
+
+      - name: Fetch upstream main
+        run: |
+          git fetch --no-tags --quiet https://github.com/ml-explore/mlx-swift-lm.git \
+            main:refs/remotes/upstream/main
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Refuse to publish a stale analysis
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build forkdiff
+        run: |
+          mkdir -p tmp/pages
+          go run github.com/protolambda/forkdiff@v0.1.1 \
+            -repo . -fork fork.yaml -out tmp/pages/index.html
+          touch tmp/pages/.nojekyll
+
+      - name: Is GitHub Pages enabled?
+        # Pages must be switched on once by a repo admin (Settings → Pages →
+        # Source: "GitHub Actions"). The workflow token cannot do that itself
+        # (`configure-pages` enablement needs an admin PAT), so until then the
+        # page is built and kept as an artifact but not deployed — a notice,
+        # not a red run.
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/pages" --silent 2>/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}; built the page but skipped the deploy. Enable it once under Settings → Pages (Source: GitHub Actions) and re-run this workflow."
+          fi
+
+      - name: Keep the rendered page as an artifact
+        if: steps.pages.outputs.enabled != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: forkdiff-page
+          path: tmp/pages/index.html
+          retention-days: 30
+
+      - name: Setup Pages
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Upload artifact
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: tmp/pages
+
+      - name: Deploy to GitHub Pages
+        if: steps.pages.outputs.enabled == 'true'
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

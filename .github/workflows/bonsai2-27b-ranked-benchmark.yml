@@ -1,0 +1,51 @@
+# bonsai2-27b-mlx-v1 RANKED BENCHMARK -- STUB, NOT PROVISIONED.
+#
+# The REAL ranked pipeline for this track is .github/workflows/benchmark.yml,
+# and that is what benchmark.json's runner.workflow names. This file is kept
+# only as the fail-closed landing pad for a dispatch aimed at a per-track
+# ranked workflow name. It measures nothing and scores nothing.
+#
+# Deliberately absent, and each one is a separate piece of work:
+#   - secrets of any kind (no R2 credentials, no HF token, no signing key)
+#   - R2 / hidden-golden download and sha256 + byte pin verification
+#   - self-hosted runner labels (`runs-on` here is the hosted ubuntu image ON
+#     PURPOSE, so a mis-dispatch cannot land on the fleet)
+#   - the single-leg measurement dispatch, the cool gate, the seal and the
+#     upload of benchmark-results-<run_id>/score.json
+#
+# There is no `push`, `pull_request` or `schedule` trigger: workflow_dispatch
+# only, so nothing runs by accident.
+
+name: Ternary Bonsai 2 27B ranked benchmark (NOT PROVISIONED)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refuse:
+    name: fail closed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to run
+        run: |
+          echo "::error title=Not the ranked pipeline::this workflow measures nothing"
+          cat >&2 <<'EOF2'
+          This workflow is a stub. Nothing was measured and nothing was scored.
+
+          The ranked pipeline for bonsai2-27b-mlx-v1 is
+          .github/workflows/benchmark.yml, which benchmark.json names in
+          runner.workflow. Dispatch that one.
+
+          That pipeline is itself not runnable yet. Still to land:
+            1. the track goldens, recorded on the track's box, published in
+               R2 and pinned in fixtures/bonsai2_27b_mlx_v1_track.json. The
+               timed_prompt_pool[] is empty today and scoring is not armed.
+            2. a self-hosted runner advertising the
+               [self-hosted, macOS, bonsai2-27b-mlx-v1] label set.
+
+          Refusing with exit 1.
+          EOF2
+          exit 1
