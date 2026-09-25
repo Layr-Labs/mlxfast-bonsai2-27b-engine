@@ -1008,8 +1008,14 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // Visit adjacent M tiles of each N tile so prompt-width calls reuse the
+  // packed weight tile while it remains in cache. For a fixed NAX grid this
+  // remaps each (M,N) tile exactly once; tid.z remains the batch index.
+  const int m_tiles = (M + BM - 1) / BM;
+  const int n_tiles = (N + BN - 1) / BN;
+  const int tile_id = int(tid.y) * n_tiles + int(tid.x);
+  const int y_row = (tile_id % m_tiles) * BM;
+  const int y_col = (tile_id / m_tiles) * BN;
 
   auto wl = (const device uint8_t*)w;
 
