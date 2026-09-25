@@ -52,6 +52,25 @@ public struct SignedBlockHadamard {
             .reshaped(x.shape).asType(x.dtype)
     }
 
+    /// `self(silu(gate) * up)` with the SwiGLU product formed in FP32 inside
+    /// the one-pass rotation's read: `((g * sigmoid(g)) * u) * signs`, the
+    /// same FP32 products in the same order as the compiled chains it
+    /// replaces (`Qwen35FusedElementwise.swigluSigned` / `gatedNormTail`
+    /// followed by the sign multiply). FP16 or FP32 operands, widened exactly
+    /// on read. Nil when the kernel does not apply.
+    public func rotatedSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard SignedHadamardKernel.appliesSwiGLU(
+            blockSize: blockSize, width: width, gate: gate, up: up)
+        else { return nil }
+        return SignedHadamardKernel.swiGLU(gate, up, signs: signs, width: width)
+    }
+
+    /// Build the one-pass kernel variants for this width at load, so no timed forward
+    /// pays a Metal library build for them.
+    public func warmFusedKernels() {
+        SignedHadamardKernel.warm(blockSize: blockSize, width: width, signs: signs)
+    }
+
     /// The sign vector as an array, for a caller that folds the sign flip into
     /// an elementwise op it already runs on the activation. Read only.
     public var signVector: MLXArray { signs }
@@ -323,6 +342,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             weight: weight, bias: bias, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
         freeze()
+        transform.warmFusedKernels()
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -446,6 +466,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func forwardPreSigned(_ signed: MLXArray, widenOutput: Bool = true) -> MLXArray {
         precondition(gdnLayout == nil, "pre-signed forward needs an ungrouped layout")
         let rotated = transform.applyPreSigned(signed)
+        if !widenOutput, let routed = matrixRegimeForward(rotated, widenOutput: false) {
+            return routed
+        }
+        return applyRotated(rotated)
+    }
+
+    /// `self(silu(gate) * up)` with the SwiGLU product and the signs formed in
+    /// the one-pass rotation (`SignedBlockHadamard.rotatedSwiGLU`), then the
+    /// same route `forwardPreSigned` takes. Nil when the kernel does not apply
+    /// (the caller keeps its composed path).
+    public func forwardAfterSwiGLU(gate: MLXArray, up: MLXArray, widenOutput: Bool = true)
+        -> MLXArray?
+    {
+        guard gdnLayout == nil, let rotated = transform.rotatedSwiGLU(gate: gate, up: up)
+        else { return nil }
         if !widenOutput, let routed = matrixRegimeForward(rotated, widenOutput: false) {
             return routed
         }
@@ -614,6 +649,77 @@ public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantize
     return packed
 }
 
+// MARK: - Signs folded into the producer
+
+extension HadamardQuantizedLinear {
+    /// The signs `rotate` applies, when nothing precedes them (no GDN layout
+    /// permutation). A producer may then apply them itself and call
+    /// `forwardPreSigned`.
+    public var presignVector: MLXArray? { gdnLayout == nil ? transform.signVector : nil }
+}
+
+/// The common signs of projections that share one input transform, or nil.
+public func sharedHadamardSigns(_ projections: [Linear]) -> MLXArray? {
+    guard let siblings = sharedHadamardSiblings(projections),
+        let signs = siblings.first?.presignVector
+    else { return nil }
+    return signs
+}
+
+/// `sharedHadamardProjections` for an FP32 input that already carries the
+/// shared signs (`y == x * sharedHadamardSigns(projections)`, exact: the
+/// signs are +-1). The Hadamard stage reads the same array `rotate(x)` would
+/// have formed, and the rotated activation takes the same route: the fused
+/// sibling stack when it applies, otherwise each projection's
+/// `applyRotated`. Nil when the projections do not share a transform.
+public func sharedHadamardProjectionsPresigned(
+    _ y: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let siblings = sharedHadamardSiblings(projections), let first = siblings.first,
+        first.presignVector != nil, y.dtype == .float32
+    else { return nil }
+    let rotated = first.transform.applyPreSigned(y)
+    if let fused = first.fusedSiblingsForward(
+        rotated, siblings: siblings, widenOutput: widenOutput)
+    {
+        return fused
+    }
+    return siblings.map { $0.applyRotated(rotated) }
+}
+
+/// A normalization weight with a consumer's Hadamard signs folded in.
+///
+/// `rms_norm.metal` writes `w[i] * T(x[i] * inv)`. Multiplying `w` by +-1
+/// first is exact, so `rmsNorm(x, w * s) == rmsNorm(x, w) * s` bit for bit and
+/// the separate sign multiply disappears. The fold is an input-independent
+/// derived constant; the loaded weight is not modified. Deliberately neither
+/// an MLXArray nor a Module, so reflecting the owner does not add the folded
+/// constant to the parameter tree. Use only on paths that are never
+/// compile-traced.
+public final class SignFoldedWeight: @unchecked Sendable {
+    private struct Entry {
+        let weight: MLXArray
+        let signs: MLXArray
+        let folded: MLXArray
+    }
+
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    public init() {}
+
+    public func callAsFunction(_ weight: MLXArray, signs: MLXArray) -> MLXArray {
+        lock.withLock { () -> MLXArray in
+            if let cached = self.entry, cached.weight === weight, cached.signs === signs {
+                return cached.folded
+            }
+            let folded = (weight * signs).asType(weight.dtype)
+            self.entry = Entry(weight: weight, signs: signs, folded: folded)
+            return folded
+        }
+    }
+}
+
 /// Packed folded embeddings with an inverse transform after lookup.
 ///
 /// `asLinear` applies the forward transform, allowing the same packed weights
@@ -642,6 +748,7 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         self.transform = transform
         super.init(weight: weight)
         freeze()
+        transform.warmFusedKernels()
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -658,3 +765,182 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             groupSize: groupSize, bits: bits)
     }
 }
+
+// MARK: - One-pass signed Hadamard kernels
+
+/// The signed block Walsh-Hadamard transform in ONE pass for FP32 output,
+/// with the SwiGLU product formed in its read. Carried from ercument f8565a2
+/// (its MODE 1 kernel; its plain, layout-permutation and sigmoid-gate
+/// variants are not used here).
+///
+/// The composed path is the compiled SwiGLU chain, the element-wise
+/// `x * signs` (or both in one compiled kernel), followed by MLX's `hadamard_n<float, 1024, 16, 4>`
+/// (`kernels/hadamard.h`, launched by `hadamard.cpp` with m = 1, n2 = 1024,
+/// max_radix 16, read_width 4, scale 1/sqrt(1024) = 0.03125 exactly). These
+/// kernels are that kernel line for line -- same 64-thread grid per block,
+/// same read/write index `j * 4 * 64 + i * 4 + r`, same two radix-16 steps
+/// with `j = ((i - k) << 4) + k`, same final radix-4 step with
+/// `j = ((index - k) << 2) + k`, same barriers, `radix_func` verbatim, same
+/// `buf * scale` write -- with the element-wise producer moved into the
+/// read. Multiplying by +-1 is exact, the butterflies are only adds and
+/// subtracts, and every custom kernel, compiled kernel and the JIT Hadamard
+/// library build in MLX's default safe math mode, so the output is
+/// bit-identical to the composed path.
+enum SignedHadamardKernel {
+    static func appliesSwiGLU(blockSize: Int, width: Int, gate: MLXArray, up: MLXArray)
+        -> Bool
+    {
+        blockSize == 1024 && width % 1024 == 0 && gate.size > 0
+            && (gate.dtype == .float32 || gate.dtype == .float16)
+            && up.dtype == gate.dtype && gate.shape == up.shape
+            && gate.ndim > 0 && gate.dim(-1) == width
+    }
+
+    static func swiGLU(_ gate: MLXArray, _ up: MLXArray, signs: MLXArray, width: Int)
+        -> MLXArray
+    {
+        swiGLUKernel(
+            [gate, up, signs],
+            template: [("WIDTH", width)],
+            grid: (64, gate.size / 1024, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [gate.shape],
+            outputDTypes: [.float32])[0]
+    }
+
+    /// Each (kernel, WIDTH, operand dtype) is its own Metal library
+    /// (`metal_kernel.cpp` names it by template hash and input dtypes), so
+    /// warming is keyed on the width: the variant for FP16 (MLP down: gate/up
+    /// stay FP16 on the matrix route) and FP32 (GDN out) operands.
+    static func warm(blockSize: Int, width: Int, signs: MLXArray) {
+        guard blockSize == 1024, width % 1024 == 0, warmed.claim(width) else { return }
+        var outputs = [MLXArray]()
+        for dtype in [DType.float16, .float32] {
+            let a = MLXArray.zeros([1, width], dtype: dtype)
+            outputs.append(swiGLU(a, a, signs: signs, width: width))
+        }
+        eval(outputs)
+    }
+
+    private static let warmed = WarmedWidths()
+
+    /// Operands may be strided views (the split halves of a fused sibling
+    /// product): each row is located with `elem_to_loc`, and when the last
+    /// axis is the unit-stride width axis the row is read directly.
+    private static let swiGLUKernel = MLXFast.metalKernel(
+        name: "bonsai_swiglu_signed_hadamard_1024",
+        inputNames: ["a", "b", "signs"],
+        outputNames: ["out"],
+        source: bonsaiSwiGLUHadamard1024Source,
+        header: bonsaiHadamard1024Header,
+        ensureRowContiguous: false)
+}
+
+private final class WarmedWidths: @unchecked Sendable {
+    private let lock = NSLock()
+    private var widths = Set<Int>()
+
+    func claim(_ width: Int) -> Bool {
+        lock.withLock { widths.insert(width).inserted }
+    }
+}
+
+/// `radix_func` of `kernels/hadamard.h` verbatim, and MLX's `Sigmoid`
+/// functor (`kernels/unary_ops.h`) verbatim for float.
+private let bonsaiHadamard1024Header = """
+    #define BONSAI_UNROLL _Pragma("clang loop unroll(full)")
+
+    template <short R>
+    METAL_FUNC void bonsai_hadamard_radix(thread float* x) {
+      constexpr short logR = __builtin_ctz(R);
+      short h = 1;
+      BONSAI_UNROLL for (short s = 0; s < logR; s++) {
+        BONSAI_UNROLL for (short i = 0; i < R / 2; i++) {
+          short k = i & (h - 1);
+          short j = ((i - k) << 1) + k;
+          float a = x[j];
+          float b = x[j + h];
+          x[j] = a + b;
+          x[j + h] = a - b;
+        }
+        h <<= 1;
+      }
+    }
+
+    METAL_FUNC float bonsai_sigmoid(float x) {
+      auto y = 1 / (1 + metal::exp(metal::abs(x)));
+      return (x < 0) ? y : 1 - y;
+    }
+
+    """
+
+/// hadamard_n<float, N = 1024, max_radix = 16, read_width = 4> reading
+/// `((a * sigmoid(a)) * b) * signs` in FP32.
+private let bonsaiSwiGLUHadamard1024Source = """
+    constexpr short NT = 64;
+    constexpr uint BLOCKS = WIDTH / 1024;
+    short i = short(thread_position_in_grid.x);
+    uint blk = thread_position_in_grid.y;
+    uint row = blk / BLOCKS;
+    uint row_base = row * WIDTH;
+    uint col0 = (blk % BLOCKS) * 1024;
+    const bool a_rows = a_strides[a_ndim - 1] == 1 && a_shape[a_ndim - 1] == WIDTH;
+    const bool b_rows = b_strides[b_ndim - 1] == 1 && b_shape[b_ndim - 1] == WIDTH;
+    const int64_t a_row =
+        a_rows ? elem_to_loc(int64_t(row_base), a_shape, a_strides, a_ndim) : 0;
+    const int64_t b_row =
+        b_rows ? elem_to_loc(int64_t(row_base), b_shape, b_strides, b_ndim) : 0;
+
+    threadgroup float buf[1024];
+
+    BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+      short index = j * 4 * NT + i * 4;
+      BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+        uint p = col0 + index + r;
+        int64_t e = int64_t(row_base) + p;
+        float av = float(a[a_rows ? a_row + p : elem_to_loc(e, a_shape, a_strides, a_ndim)]);
+        float bv = float(b[b_rows ? b_row + p : elem_to_loc(e, b_shape, b_strides, b_ndim)]);
+        float t = av * bonsai_sigmoid(av);
+        float v = t * bv;
+        buf[index + r] = v * signs[p];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float v[16];
+    short h = 1;
+    BONSAI_UNROLL for (short s = 0; s < 2; s++) {
+      short k = i & (h - 1);
+      short j = ((i - k) << 4) + k;
+      BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+        v[r] = buf[j + h * r];
+      }
+      bonsai_hadamard_radix<16>(v);
+      BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+        buf[j + h * r] = v[r];
+      }
+      h <<= 4;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    BONSAI_UNROLL for (short t = 0; t < 4; t++) {
+      short index = i + t * NT;
+      short k = index & (h - 1);
+      short j = ((index - k) << 2) + k;
+      BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+        v[r] = buf[j + h * r];
+      }
+      bonsai_hadamard_radix<4>(v);
+      BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+        buf[j + h * r] = v[r];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+      short index = j * 4 * NT + i * 4;
+      BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+        out[row_base + col0 + index + r] = buf[index + r] * 0.03125f;
+      }
+    }
+    """
