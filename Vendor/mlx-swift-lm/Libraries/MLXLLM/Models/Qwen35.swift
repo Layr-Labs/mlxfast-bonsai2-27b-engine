@@ -224,6 +224,83 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
+/// one kernel each. Every function here is pure elementwise arithmetic in the
+/// same order as the ops it replaces; fusion changes the dispatch count, not
+/// the operands or their precision. Shapeless, so one trace serves every
+/// window width.
+enum Qwen35FusedElementwise {
+    /// `silu(gate) * up` in FP32, times the down projection's Hadamard signs.
+    static let swigluSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { gate, up, signs in
+            (silu(gate.asType(.float32)) * up.asType(.float32)) * signs
+        }
+
+    /// `[g, beta]` of the gated delta rule: `exp(-exp(A_log) * softplus(a + dt_bias))`
+    /// and `sigmoid(b)`, both FP32, exactly as `gatedDeltaUpdate` forms them.
+    static let gatedDeltaGates: @Sendable ([MLXArray]) -> [MLXArray] =
+        compile(shapeless: true) { inputs in
+            let a = inputs[0]
+            let b = inputs[1]
+            let aLog = inputs[2]
+            let dtBias = inputs[3]
+            let g = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+            let beta = sigmoid(b).asType(.float32)
+            return [g, beta]
+        }
+
+    /// The gated norm's tail: `silu(gate) * normed`, in FP32.
+    static let gatedNormTail: @Sendable (MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { normed, gate in
+            silu(gate.asType(.float32)) * normed.asType(.float32)
+        }
+}
+
+/// Input-independent constants a GDN layer derives from its geometry, held
+/// outside the parameter tree (a plain class, so Module reflection sees
+/// `.other`).
+private final class Qwen35GDNDerived {
+    private let lock = NSLock()
+    private var qScale: MLXArray?
+    private var kScale: MLXArray?
+
+    /// Per-dimension weights for the q and k norms that carry the head-scale
+    /// factors: `rmsNorm(x, weight: w)` computes `w * (x * inv)` and a
+    /// separate scalar multiply computes `(x * inv) * s`; with `w` filled with
+    /// `s` the two are the same product, so the multiply dispatch disappears.
+    func normScales(headKDim: Int, dtype: DType) -> (q: MLXArray, k: MLXArray) {
+        lock.withLock {
+            if let qScale, let kScale, qScale.dtype == dtype {
+                return (qScale, kScale)
+            }
+            let invScale = pow(Float(headKDim), -0.5)
+            let q = MLXArray(Array(repeating: pow(invScale, 2), count: headKDim)).asType(dtype)
+            let k = MLXArray(Array(repeating: invScale, count: headKDim)).asType(dtype)
+            qScale = q
+            kScale = k
+            return (q, k)
+        }
+    }
+}
+
+/// The gated delta recurrence with its gates formed by one fused kernel and
+/// the state kept in FP32, matching `gatedDeltaUpdate` op for op.
+func qwen35GatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+) -> (MLXArray, MLXArray) {
+    let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
+    let B = q.dim(0)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var ssm = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if ssm.dtype != .float32 {
+        ssm = ssm.asType(.float32)
+    }
+    return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -252,6 +329,25 @@ final class Qwen35GatedDeltaNet: Module {
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
+
+    /// Derived norm weights; a plain box, never a parameter.
+    private let derived = Qwen35GDNDerived()
+
+    /// The gated output norm with its `silu(gate) * x` tail fused into one
+    /// kernel; the same FP32 arithmetic as `norm(out, gate:)`.
+    private func gatedNorm(_ out: MLXArray, gate: MLXArray) -> MLXArray {
+        let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+        return Qwen35FusedElementwise.gatedNormTail(normed, gate).asType(out.dtype)
+    }
+
+    /// `out_proj` on the normed output. When the projection is packed on the
+    /// matrix route the FP16 product is left for the residual add to widen.
+    private func projectOut(_ x: MLXArray) -> MLXArray {
+        if let packed = outProj as? HadamardQuantizedLinear {
+            return packed.forwardUnwidened(x)
+        }
+        return outProj(x)
+    }
 
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
@@ -580,15 +676,11 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
+        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = qwen35GatedDelta(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -714,7 +806,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = gatedDeltaUpdate(
+        let boundarySsm = qwen35GatedDelta(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -729,8 +821,9 @@ final class Qwen35GatedDeltaNet: Module {
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
             0...]
-        let boundaryConv = boundaryConvView + MLXArray.zeros(
-            boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        // A contiguous copy detaches the three retained rows from the whole
+        // window's conv input, as the zero-add did, in one dispatch.
+        let boundaryConv = contiguous(boundaryConvView)
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
@@ -896,8 +989,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
-        return outProj(normedOut.reshaped(B, S, -1))
+        let normedOut = gatedNorm(out, gate: z)
+        return projectOut(normedOut.reshaped(B, S, -1))
     }
 
     /// CBv2 MTP rectangular verify path. Widths one and two retain the
@@ -973,17 +1066,13 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
+        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = gatedDeltaUpdate(
+            let recurrence = qwen35GatedDelta(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1118,12 +1207,12 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(outProj, projectionInput)
         }
-        return outProj(projectionInput)
+        return projectOut(projectionInput)
     }
 }
 
@@ -1270,9 +1359,14 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
         let projectionInput = sigmoidMultiply(output, gate)
-        return exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+        if exactTargetVerify {
+            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+        }
+        if let packed = oProj as? HadamardQuantizedLinear {
+            // The residual add widens the FP16 product itself.
+            return packed.forwardUnwidened(projectionInput)
+        }
+        return oProj(projectionInput)
     }
 }
 
@@ -1496,7 +1590,19 @@ extension Qwen3NextMLP {
     }
 
     /// `callAsFunction` with gate and up sharing one packed input transform.
+    ///
+    /// On a packed down projection the tail is one fused kernel: the gate and
+    /// up products stay FP16, `silu(gate) * up` is formed in FP32 together with
+    /// the down projection's Hadamard signs, and the down product is left for
+    /// the residual add to widen. Same arithmetic, four fewer dispatches.
     func qwen35Forward(_ x: MLXArray) -> MLXArray {
+        if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
+        {
+            let signed = Qwen35FusedElementwise.swigluSigned(
+                shared[0], shared[1], down.transform.signVector)
+            return down.forwardPreSigned(signed, widenOutput: false)
+        }
         guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
             return self(x)
         }
@@ -2103,6 +2209,43 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     }
 }
 
+/// The prompt forward of a speculative leg. The engine keeps one row of the
+/// prompt's logits (`narrowPrefillOutput`) but needs every trusted hidden row
+/// for the drafter, so this projects the vocabulary at the last position only
+/// and returns the full pre-norm hidden. The serial prefill path above already
+/// does the same narrowing; without this seam the speculative leg paid a
+/// `[B, 512, 248320]` head projection it then discarded. Final RMSNorm is
+/// row-independent, so norm-after-slice equals slice-after-norm for the
+/// surviving row; the trunk, every K/V write, every recurrent stage and the
+/// DFlash 2 tap are the same as in `cbv2ForwardWithHidden`.
+extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+        switch requirement {
+        case .evaluationOnly:
+            // A small handle whose graph depends on the whole trunk.
+            return (last[0..., 0..., 0 ..< 1], hidden)
+        case .lastPositionLogits:
+            let normalized = model.norm(last)
+            let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
+        }
+    }
+}
+
 extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
     /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
     /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
@@ -2403,6 +2546,18 @@ extension Qwen35Model: CBv2RecurrentMTPForwardable {
         languageModel.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
     }
 }
 
