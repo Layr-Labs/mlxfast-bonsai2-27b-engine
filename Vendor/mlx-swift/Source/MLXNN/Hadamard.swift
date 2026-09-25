@@ -336,7 +336,7 @@ enum FewRowPackedMatmul {
     static let rowBlocks = 4
     static let simdgroups = 2
     static let unroll = 2
-    static let occupancy = 2048
+    static let occupancy = 1024
 
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_FEW_ROW_VERIFY"]?
