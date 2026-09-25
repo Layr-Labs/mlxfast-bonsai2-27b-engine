@@ -1122,21 +1122,30 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            let bOut: MLXArray
+            let aOut: MLXArray
+            if let baShared = sharedHadamardProjections(inputs, [inProjB, inProjA]) {
+                bOut = baShared[0]
+                aOut = baShared[1]
+            } else {
+                bOut = inProjB(inputs)
+                aOut = inProjA(inputs)
+            }
             // Packed qkv and z read the same activation through the same
-            // transform; rotate it once. b and a stay full precision.
+            // transform; rotate it once.
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
                 return (
                     shared[0],
                     shared[1].reshaped(B, S, numVHeads, headVDim),
-                    inProjB(inputs),
-                    inProjA(inputs)
+                    bOut,
+                    aOut
                 )
             }
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
+                bOut,
+                aOut
             )
         }
         let outFused = fusedInProj(inputs)
@@ -2026,6 +2035,15 @@ final class Qwen35MRoPE {
                     ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
                     : rotated
             }
+            if queries.ndim == 4 && keys.ndim == 4
+                && queries.dim(0) == keys.dim(0) && queries.dim(2) == keys.dim(2)
+                && queries.dim(3) == keys.dim(3) && queries.dtype == keys.dtype
+            {
+                let qHeads = queries.dim(1)
+                let stacked = concatenated([queries, keys], axis: 1)
+                let rotated = applyDefault(stacked)
+                return (rotated[0..., ..<qHeads, 0..., 0...], rotated[0..., qHeads..., 0..., 0...])
+            }
             return (applyDefault(queries), applyDefault(keys))
         }
 
@@ -2488,6 +2506,10 @@ public class Qwen35TextModelInner: Module {
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            if (captureRecurrentWindow || inputs.dim(1) > 32) &&
+                (modelLayerIndex == 15 || modelLayerIndex == 31 || modelLayerIndex == 47) {
+                asyncEval(hiddenStates)
             }
         }
         if tapLayerIds == nil {
