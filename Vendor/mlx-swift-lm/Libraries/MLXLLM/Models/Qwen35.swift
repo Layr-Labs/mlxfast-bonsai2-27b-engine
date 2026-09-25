@@ -2169,7 +2169,24 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
-        lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
+        // Large packed vocabulary heads switch from qmv to qmm at 13 rows.
+        // Pad a short draft block within the same matrix tile, then discard
+        // the independent extra rows. No padded row enters target verification
+        // or either decoder's cache; the published packed weights stay intact.
+        if let head = lmHead as? HadamardQuantizedLinear,
+            head.bits == 2, head.groupSize == 128,
+            vocabularySize > 4096,
+            hidden.ndim == 3, hidden.dim(0) == 1,
+            hidden.dim(1) >= 8, hidden.dim(1) < 13
+        {
+            let rows = hidden.dim(1)
+            let padded = concatenated([
+                hidden,
+                MLXArray.zeros([1, 13 - rows, hidden.dim(2)], dtype: hidden.dtype),
+            ], axis: 1)
+            return head(padded)[0..., 0 ..< rows, 0...]
+        }
+        return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
 }
 
