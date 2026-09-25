@@ -329,10 +329,10 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
 /// A packed affine matmul for the few rows of a speculative verify. Each lane
 /// turns two weight codes into halves straight inside a simdgroup matrix
 /// fragment, and every fragment is multiplied against all of the rows, so
-/// sixteen rows cost about what eight do. Scales and offsets apply once per
+/// twenty-four rows cost about what eight do. Scales and offsets apply once per
 /// group to the partial sums, the offset through each group's activation sum.
 enum FewRowPackedMatmul {
-    static let rows = 4 ... 16
+    static let rows = 4 ... 24
     static let rowBlocks = 4
     static let simdgroups = 2
     static let unroll = 2
@@ -364,7 +364,7 @@ enum FewRowPackedMatmul {
         let offsets = MLXArray.zeros(biases.shape, dtype: biases.dtype)
         var outputs = [MLXArray]()
         for dtype in [DType.float32, .bfloat16, .float16] {
-            for m in [8, 16] {
+            for m in [8, 16, 24] {
                 if let y = apply(
                     MLXArray.zeros([m, k], dtype: dtype), weights, scales: groups,
                     biases: offsets, groupSize: groupSize, bits: bits)
