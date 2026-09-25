@@ -126,7 +126,7 @@ METAL_FUNC void gemm_loop_finalize(
 #define QMM_M16_DBG_NOMMA 0
 #endif
 #ifndef QMM_M16_PF
-#define QMM_M16_PF 1
+#define QMM_M16_PF 2
 #endif
 
 template <typename U>
