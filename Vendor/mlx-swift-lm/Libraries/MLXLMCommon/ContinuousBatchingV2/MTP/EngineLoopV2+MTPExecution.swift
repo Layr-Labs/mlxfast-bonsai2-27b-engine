@@ -704,6 +704,35 @@ extension EngineLoopV2 {
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
+
+        // SPECULATIVE FULL-ACCEPTANCE PROPOSAL. The acceptance readback below
+        // drains the round's graph while the GPU sits idle; this stages the
+        // NEXT round's block proposal inside the same graph, on the window's
+        // last target token (a device array, before any host knows it) and
+        // cloned drafter caches. When the round confirms every column,
+        // finalization installs the staged proposal bit-for-bit (same anchor
+        // value, same committed rows, same deterministic kernels) and the
+        // next round skips its drafter forward; any other outcome discards
+        // it having cost only window time the GPU was idle for anyway. See
+        // `CBv2MTPSpeculativeBlockDrafter`.
+        if batch == 1, k >= 1,
+            let specDrafter = mtp.blockDrafter as? any CBv2MTPSpeculativeBlockDrafter,
+            let blockContext = target.blockContext,
+            let requestState = rowMetadata.first?.assistantState,
+            let carry = verifyRows.first?.carry,
+            blockContext.dim(1) == 1 + k
+        {
+            let anchor = target.scores[0, k].reshaped([1])
+            if specDrafter.speculativeFullAcceptPropose(
+                anchor: anchor,
+                fullWindowHidden: blockContext,
+                depth: k,
+                kvOffsetBase: carry.kvOffset,
+                requestState: requestState) != nil
+            {
+                asyncEval(specDrafter.stagedEvaluationTargets(requestState))
+            }
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)

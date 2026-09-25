@@ -452,6 +452,77 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int)
 }
 
+/// A block drafter's speculative full-acceptance proposal, built and submitted
+/// INSIDE the producing round's graph so the drafter forward fills the GPU
+/// window the acceptance readback would otherwise leave idle.
+///
+/// The proposal assumes the round confirms EVERY column: its anchor is the
+/// window's last target token (a device array, read before any host knows
+/// it) and its context is the pending rows plus the whole tapped window. On
+/// that outcome it is bit-for-bit the proposal the next round's
+/// `proposeBlock` would make — the same anchor value, the same committed
+/// rows, the same deterministic kernels over cloned caches — so finalization
+/// can install it and skip that forward entirely. Any other outcome discards
+/// it; the speculative forward ran while the GPU was idle anyway, so a miss
+/// costs no wall-clock time and never touches the request's own caches.
+public protocol CBv2MTPSpeculativeBlockDrafter: CBv2MTPBlockDrafter {
+    /// Build and submit the speculative proposal for `depth` on cloned state,
+    /// or return nil without side effects when the drafter cannot (wrong
+    /// shape, empty context, a window wider than its cache, ...). The caller
+    /// supplies the window's last target token as a `[1]` int32 device array
+    /// and the whole tapped window hidden `[1, 1 + depth, taps * hidden]`.
+    func speculativeFullAcceptPropose(
+        anchor: MLXArray,
+        fullWindowHidden: MLXArray,
+        depth: Int,
+        kvOffsetBase: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> MLXArray?
+
+    /// The speculative proposal staged on this request state, if one is live.
+    func stagedSpeculativeBlock(
+        _ requestState: any CBv2MTPRequestState
+    ) -> CBv2MTPSpeculativeBlock?
+
+    /// The lazy roots the staged proposal must be submitted with (its tokens
+    /// and its cloned caches), so the GPU runs them before the round's
+    /// acceptance readback drains. Empty when nothing is staged.
+    func stagedEvaluationTargets(
+        _ requestState: any CBv2MTPRequestState
+    ) -> [MLXArray]
+
+    /// Install the staged proposal as the request's own state (cloned caches
+    /// become the caches, the context is absorbed) when the round confirmed
+    /// every column at exactly the assumed offset. Returns the staged tokens
+    /// for reuse, or nil (and discards) on any mismatch.
+    func commitSpeculativeBlock(
+        confirmed: Int, kvOffset: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> MLXArray?
+
+    /// Drop any staged proposal without touching the request's own state.
+    func discardSpeculativeBlock(_ requestState: any CBv2MTPRequestState)
+}
+
+/// The engine-visible face of a staged speculative proposal. Opaque beyond
+/// the checks finalization needs before committing it.
+public struct CBv2MTPSpeculativeBlock {
+    /// `[1, depth]` int32 draft ids, lazy and already submitted with the
+    /// round graph.
+    public let tokens: MLXArray
+    /// The committed KV length the window started from; a commit requires
+    /// `kvOffset - confirmed == kvOffsetBase`.
+    public let kvOffsetBase: Int
+    /// The depth proposed; a commit requires `confirmed == 1 + depth`.
+    public let depth: Int
+
+    public init(tokens: MLXArray, kvOffsetBase: Int, depth: Int) {
+        self.tokens = tokens
+        self.kvOffsetBase = kvOffsetBase
+        self.depth = depth
+    }
+}
+
 extension CBv2MTPBlockDrafter {
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block

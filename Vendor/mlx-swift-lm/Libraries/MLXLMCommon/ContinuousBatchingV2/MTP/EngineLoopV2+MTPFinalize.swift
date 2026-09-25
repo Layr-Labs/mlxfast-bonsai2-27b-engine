@@ -275,6 +275,13 @@ extension EngineLoopV2 {
             // decides every token. Only a fixed-depth block leg with a full
             // next round ahead takes this path, so the next round's depth is
             // the depth proposed here.
+            //
+            // A staged SPECULATIVE FULL-ACCEPTANCE proposal, submitted with
+            // the just-drained round's graph, is tried FIRST: on a
+            // full confirmation it is bit-for-bit the proposal below (the
+            // same anchor value, the same committed rows, the same kernels
+            // over cloned caches) and installs directly, saving the forward
+            // entirely; any other outcome discards it and falls through.
             var earlyBlock: CBv2MTPEarlyBlockProposal?
             if finishReason == nil, confirmed > 0, let block = mtp.blockDrafter,
                 let state = metadata.assistantState,
@@ -283,14 +290,31 @@ extension EngineLoopV2 {
             {
                 let anchor = kept[confirmed - 1]
                 let kvOffset = rec.numComputedTokens
-                if let tokens = try? block.proposeBlock(
-                    anchor: anchor, depth: k, requestState: state)
+                var installed: MLXArray?
+                if let specDrafter = block as? any CBv2MTPSpeculativeBlockDrafter {
+                    installed = specDrafter.commitSpeculativeBlock(
+                        confirmed: confirmed, kvOffset: kvOffset, depth: k,
+                        requestState: state)
+                    if installed == nil {
+                        specDrafter.discardSpeculativeBlock(state)
+                    }
+                }
+                if let tokens = installed ?? (try? block.proposeBlock(
+                    anchor: anchor, depth: k, requestState: state))
                 {
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     asyncEval([tokens] + block.evaluationTargets(for: state))
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 }
+            } else if let specDrafter = mtp.blockDrafter
+                as? any CBv2MTPSpeculativeBlockDrafter,
+                let state = metadata.assistantState
+            {
+                // The early block itself is not taken (finished, truncated or
+                // adaptive depth); whatever speculation was staged cannot be
+                // used and must not linger on the state.
+                specDrafter.discardSpeculativeBlock(state)
             }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {

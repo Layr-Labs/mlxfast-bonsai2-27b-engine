@@ -1406,17 +1406,39 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         blockSize: Int
     ) throws -> MLXArray {
+        try propose(
+            anchor: MLXArray(anchor.map { Int32($0) }),
+            targetHidden: targetHidden,
+            cache: cache,
+            blockSize: blockSize)
+    }
+
+    /// The same proposal with a DEVICE anchor: the block's first column and
+    /// the candidate walk's anchor row are gathered from `anchor` (`[B]`
+    /// int32) instead of a host array, so a speculative caller can propose
+    /// with a token the GPU has just produced before any host readback. Same
+    /// inputs, same kernels, same draft as the host-anchor call.
+    public func propose(
+        anchor: MLXArray,
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        blockSize: Int
+    ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
-        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
-        let rows = anchor.flatMap { [Int32($0)] + masks }
-        let block = MLXArray(rows, [anchor.count, blockSize])
+        let ids = anchor.asType(.int32).reshaped([-1])
+        let maskRow = MLXArray(
+            Array(repeating: Int32(config.maskTokenId), count: blockSize - 1),
+            [1, blockSize - 1])
+        let maskColumns = concatenated(
+            Array(repeating: maskRow, count: ids.dim(0)), axis: 0)
+        let block = concatenated([ids.reshaped([-1, 1]), maskColumns], axis: 1)
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: MLXArray(anchor.map { Int32($0) }))
+            anchor: ids)
     }
 
     // MARK: Loading

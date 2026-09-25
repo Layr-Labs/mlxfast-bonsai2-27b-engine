@@ -45,7 +45,7 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 }
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
-public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Sendable {
+public final class Qwen35DFlash2Assistant: CBv2MTPSpeculativeBlockDrafter, @unchecked Sendable {
 
     public let drafter: DFlash2DraftModel
     private let target: Qwen35TextModel
@@ -204,6 +204,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var isReleased = false
+        /// The staged speculative full-acceptance proposal, if one is live.
+        /// See `Qwen35DFlash2Assistant.speculativeFullAcceptPropose`.
+        var staged: StagedSpeculation?
 
         init(caches: [any KVCache]) { self.caches = caches }
 
@@ -364,5 +367,144 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
         state(requestState).roots.removeAll(keepingCapacity: true)
+    }
+
+    // MARK: - Speculative full-acceptance proposal
+
+    /// One staged speculation: the next block's proposal, computed during the
+    /// producing round's graph on CLONED caches. Valid only if that round
+    /// confirms every window column.
+    struct StagedSpeculation {
+        let tokens: MLXArray
+        /// The cloned cache lineage, holding the sandboxed history INCLUDING
+        /// the assumed full window.
+        let caches: [any KVCache]
+        /// `observedRows` to install on commit (base + the full window).
+        let observedRows: Int
+        let kvOffsetBase: Int
+        let depth: Int
+        let cacheSeeded: Bool
+        /// Lazy roots the engine must submit with the round graph.
+        var evalTargets: [MLXArray] {
+            [tokens] + caches.flatMap { $0.innerState() }
+        }
+    }
+
+    /// Kill switch for the speculative full-acceptance proposal (default on).
+    static let speculativeFullAcceptEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_BONSAI_SPEC_FULL_ACCEPT"
+        ]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    public func speculativeFullAcceptPropose(
+        anchor: MLXArray,
+        fullWindowHidden: MLXArray,
+        depth: Int,
+        kvOffsetBase: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> MLXArray? {
+        let state = self.state(requestState)
+        guard Self.speculativeFullAcceptEnabled, depth >= 1,
+            fullWindowHidden.dim(0) == 1, anchor.size == 1
+        else { return nil }
+        let window = fullWindowHidden.dim(1)
+        guard window == 1 + depth else { return nil }
+        // The speculation consumes pending PLUS the whole window. The normal
+        // path's `finalizeRound` append must retain every one of those rows,
+        // or the normal context would be a trimmed subset of this one and the
+        // two proposals would diverge. Stage only when nothing can trim.
+        if let limit = contextRowLimit, state.pendingRows + window > limit {
+            return nil
+        }
+        let sandbox = state.staged
+        if sandbox != nil { return nil }
+        // The normal path's next `proposeBlock` runs AFTER this round's
+        // `finalizeRound` appends the confirmed window to `pending`. At this
+        // round's BUILD the previous proposal has already absorbed everything
+        // `pending` held, so the context here is the window alone whenever
+        // `pending` is empty, and the retained rows plus the window when it
+        // is not — the same rows, in the same order, the normal propose will
+        // consume.
+        let windowContext = fullWindowHidden.asType(drafter.dtype)
+        let context: MLXArray
+        if state.pending.isEmpty {
+            context = windowContext
+        } else if state.pending.count == 1 {
+            context = concatenated([state.pending[0], windowContext], axis: 1)
+        } else {
+            context = concatenated(
+                [concatenated(state.pending, axis: 1), windowContext], axis: 1)
+        }
+        // The sandbox runs on CLONED caches: MLX arrays are functional
+        // values, so the clone shares the current history nodes and the
+        // sandbox's own updates build new nodes the request never sees.
+        let caches = state.caches.map { $0.copy() }
+        if !state.cacheSeeded {
+            for cache in caches {
+                guard let base = cache as? BaseKVCache else { continue }
+                base.offset = state.firstPendingPosition
+            }
+        }
+        guard
+            let tokens = try? drafter.propose(
+                anchor: anchor, targetHidden: context, cache: caches,
+                blockSize: depth + 1)
+        else { return nil }
+        state.staged = StagedSpeculation(
+            tokens: tokens,
+            caches: caches,
+            observedRows: state.observedRows + window,
+            kvOffsetBase: kvOffsetBase,
+            depth: depth,
+            cacheSeeded: true)
+        return tokens
+    }
+
+    public func stagedSpeculativeBlock(
+        _ requestState: any CBv2MTPRequestState
+    ) -> CBv2MTPSpeculativeBlock? {
+        guard let staged = state(requestState).staged else { return nil }
+        return CBv2MTPSpeculativeBlock(
+            tokens: staged.tokens,
+            kvOffsetBase: staged.kvOffsetBase,
+            depth: staged.depth)
+    }
+
+    public func stagedEvaluationTargets(
+        _ requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        state(requestState).staged?.evalTargets ?? []
+    }
+
+    public func commitSpeculativeBlock(
+        confirmed: Int, kvOffset: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> MLXArray? {
+        let state = self.state(requestState)
+        guard let staged = state.staged else { return nil }
+        state.staged = nil
+        // The speculation assumed this round confirms every column from a
+        // known offset; anything else leaves the request's own state — which
+        // the round never touched — exactly as the normal path expects it.
+        guard confirmed == 1 + depth, staged.depth == depth,
+            kvOffset - confirmed == staged.kvOffsetBase
+        else { return nil }
+        // Install the sandbox lineage. The window the sandbox absorbed is the
+        // full confirmation `finalizeRound` just appended to `pending`, so
+        // absorbing here reproduces the normal path's post-propose state:
+        // same rows, same cache content, same offset, empty pending.
+        state.caches = staged.caches
+        state.cacheSeeded = staged.cacheSeeded
+        state.absorbPending()
+        state.observedRows = staged.observedRows
+        state.roots.append(staged.tokens)
+        return staged.tokens
+    }
+
+    public func discardSpeculativeBlock(_ requestState: any CBv2MTPRequestState) {
+        state(requestState).staged = nil
     }
 }
