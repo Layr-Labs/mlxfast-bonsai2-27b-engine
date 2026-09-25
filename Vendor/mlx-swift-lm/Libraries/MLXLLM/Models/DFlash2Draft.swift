@@ -331,6 +331,11 @@ public final class DFlash2TapSlot {
     /// order the drafter's `fc` expects them. Nil turns the tap off.
     public var layerIds: [Int]?
 
+    /// The dtype the tower fuses tapped rows into, set once at `bind` from
+    /// the drafter's own dtype. Nil keeps the legacy wide path: the tower
+    /// fuses in the trunk dtype and the crossing casts downstream.
+    public var fusedDType: DType?
+
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
@@ -357,9 +362,18 @@ public protocol DFlash2TapTarget: DFlash2Target {
 
     /// How many layers the tower has, so the ids can be checked before a run.
     var dFlash2LayerCount: Int { get }
+
+    /// Aim the tower's tap fusion at the drafter's dtype. The default is a
+    /// no-op, which keeps the legacy path: the tower fuses in the trunk
+    /// dtype and every crossing below casts exactly once.
+    func setDFlash2TapFusedDType(_ dtype: DType?)
 }
 
 extension DFlash2TapTarget {
+    /// Legacy tap targets ignore the fused dtype: the tower keeps fusing in
+    /// the trunk dtype and every crossing below casts exactly once.
+    public func setDFlash2TapFusedDType(_ dtype: DType?) {}
+
     /// Check the ids against this target and turn the tap on.
     ///
     /// A bad id is a refusal, not a clamp: a drafter reading the wrong layers
@@ -1201,6 +1215,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let rope: RoPELayer
     private var target: (any DFlash2Target)?
 
+    /// Fused logits epilogue (H4): output multiplier + final softcap baked as
+    /// one compiled elementwise kernel over `[B, k, vocab]`, replacing 2-3
+    /// separate passes. Constants come from the init config, which never
+    /// changes, so the graph cannot go stale.
+    private let fusedLogitsEpilogue: @Sendable (MLXArray) -> MLXArray
+
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
     /// the target into the drafter — the embedded block and the fused target
@@ -1223,6 +1243,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             traditional: false,
             scalingConfig: nil,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
+        let outputMultiplier = config.dflash.outputMultiplier
+        let softcap = config.dflash.finalLogitSoftcapping
+        self.fusedLogitsEpilogue = compile(shapeless: true) { (logits: MLXArray) -> MLXArray in
+            var out = logits
+            if outputMultiplier != 1 {
+                out = out * outputMultiplier
+            }
+            if let softcap = softcap, softcap > 0 {
+                out = tanh(out / softcap) * softcap
+            }
+            return out
+        }
         super.init()
     }
 
@@ -1236,6 +1268,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         guard target.dFlash2HiddenSize == config.hiddenSize else {
             throw DFlash2Error.hiddenSizeMismatch(
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
+        }
+        // Aim the tower's tap fusion at this drafter's dtype so tapped rows
+        // arrive already fused in BF16 and every crossing below is a
+        // same-dtype no-op. Tap targets without the hook keep the legacy
+        // wide path via the default no-op above.
+        if let tapTarget = target as? any DFlash2TapTarget {
+            tapTarget.setDFlash2TapFusedDType(dtype)
         }
         self.target = target
     }
@@ -1314,7 +1353,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        // The tap fuses to this dtype upstream, so on the fused path this
+        // crossing is a same-dtype no-op and the round's single cast already
+        // happened narrow, per tap shard; otherwise one cast here, as before.
+        let fusedTarget =
+            targetHidden.dtype == dtype ? targetHidden : targetHidden.asType(dtype)
+        let context = hiddenNorm(fc(fusedTarget))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
@@ -1328,14 +1372,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        var logits = target.logitsForDFlash2Hidden(hidden)
-        if config.dflash.outputMultiplier != 1 {
-            logits = logits * config.dflash.outputMultiplier
+        let logits = target.logitsForDFlash2Hidden(hidden)
+        if config.dflash.outputMultiplier == 1,
+            (config.dflash.finalLogitSoftcapping ?? 0) <= 0
+        {
+            return logits
         }
-        if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
-            logits = tanh(logits / cap) * cap
-        }
-        return logits
+        return fusedLogitsEpilogue(logits)
     }
 
     // MARK: Proposing
