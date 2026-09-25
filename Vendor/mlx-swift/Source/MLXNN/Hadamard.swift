@@ -1,5 +1,6 @@
 // Adapted from PrismML-Eng/mlx-swift 6d3a84de28225d1f5bc0a56f5c781596997242f9 (MIT).
 // Preserve the published Bonsai pack's FP32 transform / original output dtype contract.
+import Cmlx
 import Foundation
 @_spi(QuantizedConstantCache) import MLX
 
@@ -226,6 +227,48 @@ private final class HadamardMatrixRouteOperands {
     }
 }
 
+/// Small zero-pad operands reused across packed projections with the same
+/// matrix-route shape. They are constant graph nodes, not model parameters.
+/// Do not retain or reuse them during compile/grad/vmap tracing: a traced
+/// activation needs the original per-call construction of its graph.
+private final class HadamardMatrixZeroPads: @unchecked Sendable {
+    private struct Entry {
+        let rows: Int
+        let width: Int
+        let dtype: DType
+        let stream: StreamOrDevice
+        let zeros: MLXArray
+    }
+
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+    private let capacity = 48
+
+    func pad(rows: Int, width: Int, dtype: DType, input: MLXArray) -> MLXArray {
+        let stream = StreamOrDevice.default
+        var identity: UInt = 0
+        var canCache = false
+        guard _mlx_array_constant_cache_identity(&identity, &canCache, input.ctx) == 0,
+            canCache
+        else {
+            return MLXArray.zeros([rows, width], dtype: dtype, stream: stream)
+        }
+        return lock.withLock {
+            if let cached = entries.first(where: {
+                $0.rows == rows && $0.width == width && $0.dtype == dtype
+                    && $0.stream == stream
+            }) {
+                return cached.zeros
+            }
+            let zeros = MLXArray.zeros([rows, width], dtype: dtype, stream: stream)
+            if entries.count == capacity { entries.removeFirst() }
+            entries.append(Entry(
+                rows: rows, width: width, dtype: dtype, stream: stream, zeros: zeros))
+            return zeros
+        }
+    }
+}
+
 /// Several packed projections that read one rotated activation, stacked along
 /// their output axis into one packed operand: the rows of `weight`, `scales`
 /// and `biases` are the siblings' rows in order, byte for byte. One matmul
@@ -373,6 +416,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// The core's vector-versus-matrix threshold for this pack's shapes on the
     /// M5 generation: fewer rows than this take the scalar vector kernel.
     private static let matrixRegimeMinimumRows = 13
+    private static let zeroPads = HadamardMatrixZeroPads()
     /// A projection at least this wide is a vocabulary head. Its products are
     /// logits that an argmax reads directly, so it keeps the FP32 read (TF32
     /// tensor products, FP32 logits) and the cached widened constants; only
@@ -504,7 +548,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         }
         if paddedRows > rows {
             input = concatenated(
-                [input, MLXArray.zeros([paddedRows - rows, k], dtype: inputDType)], axis: 0)
+                [input, zeroPads.pad(
+                    rows: paddedRows - rows, width: k, dtype: inputDType, input: x)], axis: 0)
         }
 
         var output = quantizedMM(
