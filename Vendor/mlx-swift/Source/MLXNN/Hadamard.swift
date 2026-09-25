@@ -1,7 +1,7 @@
 // Adapted from PrismML-Eng/mlx-swift 6d3a84de28225d1f5bc0a56f5c781596997242f9 (MIT).
 // Preserve the published Bonsai pack's FP32 transform / original output dtype contract.
 import Foundation
-import MLX
+@_spi(QuantizedConstantCache) import MLX
 
 /// Invalid transform metadata or incompatible packed weights.
 public enum HadamardError: Error {
@@ -178,6 +178,71 @@ public struct HadamardGDNLayout {
     }
 }
 
+
+/// Input-independent operands for the matrix-regime route of a packed
+/// projection: the same packed weight viewed with a leading expert axis of
+/// one, its FP32-widened constants in that view, and the zero expert index.
+/// A plain class, never a Module or an MLXArray, so reflecting the owning
+/// layer cannot add any of these to the parameter tree. Nothing here depends
+/// on a request; it is keyed on the layer's own frozen constants.
+private final class HadamardMatrixRouteOperands {
+    private let lock = NSLock()
+    private var weightSource: MLXArray?
+    private var weight3: MLXArray?
+    private var scalesSource: MLXArray?
+    private var scales3: MLXArray?
+    private var biasesSource: MLXArray?
+    private var biases3: MLXArray?
+    private var expertIndex: MLXArray?
+    let scaleCache = ConstantArrayCastCache()
+    let offsetCache = ConstantArrayCastCache()
+
+    func clear() {
+        lock.withLock {
+            weightSource = nil
+            weight3 = nil
+            scalesSource = nil
+            scales3 = nil
+            biasesSource = nil
+            biases3 = nil
+        }
+        scaleCache.clear()
+        offsetCache.clear()
+    }
+
+    /// The gather operands: `weight` as `[1, N, packedK]`, `scales` and
+    /// `biases` as `[1, N, groups]`, and a single `uint32` zero index. The
+    /// reshapes are views of arrays that already exist; they are rebuilt only
+    /// when the source array object changes.
+    func gatherOperands(weight: MLXArray, scales: MLXArray, biases: MLXArray?)
+        -> (weight: MLXArray, scales: MLXArray, biases: MLXArray?, index: MLXArray)
+    {
+        lock.withLock {
+            if weightSource !== weight || weight3 == nil {
+                weight3 = weight.reshaped([1] + weight.shape)
+                weightSource = weight
+            }
+            if scalesSource !== scales || scales3 == nil {
+                scales3 = scales.reshaped([1] + scales.shape)
+                scalesSource = scales
+            }
+            if let biases {
+                if biasesSource !== biases || biases3 == nil {
+                    biases3 = biases.reshaped([1] + biases.shape)
+                    biasesSource = biases
+                }
+            } else {
+                biases3 = nil
+                biasesSource = nil
+            }
+            if expertIndex == nil {
+                expertIndex = MLXArray([UInt32(0)])
+            }
+            return (weight3!, scales3!, biases3, expertIndex!)
+        }
+    }
+}
+
 /// Affine packed linear weights with a signed Hadamard input transform.
 ///
 /// Pass weights already folded and packed in MLX format. The initializer does
@@ -240,10 +305,116 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The packed matmul on an input already passed through `rotate`.
     public func applyRotated(_ rotated: MLXArray) -> MLXArray {
+        if let routed = matrixRegimeForward(rotated) {
+            return routed
+        }
         if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
             return constantCachedForward(rotated, allowFloat16: true)
         }
         return super.callAsFunction(rotated)
+    }
+
+    // MARK: - Matrix-regime route
+
+    /// On unless explicitly disabled. See `matrixRegimeForward`.
+    private static let matrixRouteEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_BONSAI_MATRIX_ROUTE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The core's vector-versus-matrix threshold for this pack's shapes on the
+    /// M5 generation: fewer rows than this take the scalar vector kernel.
+    private static let matrixRegimeMinimumRows = 13
+    /// Widest input this route handles. A seed prefill is far wider and keeps
+    /// the core's own dispatch.
+    private static let matrixRegimeMaximumRows = 64
+    /// The core splits K whenever the 32x32 tile count is at most this.
+    private static let splitKTileCeiling = 256
+
+    private let matrixRoute = HadamardMatrixRouteOperands()
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        matrixRoute.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    /// The packed matmul for a few-row input, routed onto the M5 matrix
+    /// kernels for every projection of the tower.
+    ///
+    /// The core dispatch (`QuantizedMatmul::eval_gpu`) sends fewer than 13
+    /// rows to the scalar `qmv_wide` kernel, which pays a device load and an
+    /// FMA per weight per row, and sends 13 or more rows either to the tensor
+    /// `qmm_t_nax` kernel or, for a projection whose 32x32 tile count is 256 or
+    /// fewer (k, v, o, z, out and down on this pack), to the FP32 split-K
+    /// `qmm_t_splitk` kernel plus a reduction. Both scalar paths are ALU-bound
+    /// at a verify width; the weight read is not the cost.
+    ///
+    /// This route keeps the same weights, the same FP32 activations and the
+    /// same widened FP32 constants, and only changes which kernel sees them:
+    ///
+    /// - rows below the threshold are zero-padded up to it, so the core takes
+    ///   the matrix path (the padded rows are dropped from the result);
+    /// - a projection the core would split-K instead goes through the gather
+    ///   form of the same operator with one expert and the zero index, whose
+    ///   dispatch has no split-K branch and reaches `gather_qmm_t_nax` directly.
+    ///
+    /// The tensor kernels round the FP32 input the way the core already does
+    /// for every projection at the seed prefill and for the wide projections
+    /// of a verify, so the change is priced by the token gate, not by a new
+    /// precision. Returns nil when the route does not apply.
+    private func matrixRegimeForward(_ x: MLXArray) -> MLXArray? {
+        guard Self.matrixRouteEnabled, mode == .affine, bits == 2, bias == nil,
+            x.dtype == .float32, x.ndim >= 2
+        else { return nil }
+        let k = x.dim(-1)
+        let rows = x.size / k
+        guard rows >= 2, rows <= Self.matrixRegimeMaximumRows else { return nil }
+        let n = weight.dim(0)
+        guard k % 64 == 0, n % 64 == 0, k % groupSize == 0 else { return nil }
+
+        let widenedScales =
+            matrixRoute.scaleCache.cachedCast(scales, to: .float32, allowFloat16: true)
+            ?? scales
+        let widenedBiases: MLXArray? = biases.map { offsets in
+            matrixRoute.offsetCache.cachedCast(offsets, to: .float32, allowFloat16: true)
+                ?? offsets
+        }
+
+        let paddedRows = max(rows, Self.matrixRegimeMinimumRows)
+        var input = x.reshaped(rows, k)
+        if paddedRows > rows {
+            input = concatenated(
+                [input, MLXArray.zeros([paddedRows - rows, k], dtype: x.dtype)], axis: 0)
+        }
+
+        let nTiles = (n + 31) / 32
+        let mTiles = (paddedRows + 31) / 32
+        var output: MLXArray
+        if nTiles * mTiles > Self.splitKTileCeiling {
+            output = quantizedMM(
+                input, weight, scales: widenedScales, biases: widenedBiases,
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+        } else {
+            let operands = matrixRoute.gatherOperands(
+                weight: weight, scales: widenedScales, biases: widenedBiases)
+            output = gatherQuantizedMM(
+                input.reshaped(1, paddedRows, k), operands.weight,
+                scales: operands.scales, biases: operands.biases,
+                rhsIndices: operands.index,
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode
+            ).reshaped(paddedRows, n)
+        }
+        if paddedRows > rows {
+            output = output[0 ..< rows]
+        }
+        return output.reshaped(Array(x.shape.dropLast()) + [n])
     }
 
     /// True when `rotate` is the same function on both layers, so one rotated
