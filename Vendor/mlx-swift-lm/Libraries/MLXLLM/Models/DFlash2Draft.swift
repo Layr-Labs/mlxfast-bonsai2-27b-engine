@@ -425,6 +425,41 @@ public enum DFlash2SlidingMask {
     }
 }
 
+/// The sliding mask of ONE block forward, built once and handed to every layer
+/// that asks for the same geometry.
+///
+/// Every layer of a forward sees the same context rows and the same block, so
+/// its mask inputs are equal and the mask is the same array. Building it per
+/// layer re-ran the same comparison graph once per layer. The memo is keyed on
+/// every input of ``DFlash2SlidingMask/make(contextLength:blockLength:slidingWindow:isCausal:)``,
+/// so a layer whose inputs differ still gets its own mask. It lives for one
+/// forward only and is a plain class, off the module tree (see
+/// ``DFlash2TapSlot``).
+final class DFlash2SlidingMaskMemo {
+    private var key: [Int]?
+    private var cached: MLXArray?
+
+    func mask(
+        contextLength: Int,
+        blockLength: Int,
+        slidingWindow: Int,
+        isCausal: Bool
+    ) -> MLXArray {
+        let requested = [contextLength, blockLength, slidingWindow, isCausal ? 1 : 0]
+        if let cached, key == requested {
+            return cached
+        }
+        let made = DFlash2SlidingMask.make(
+            contextLength: contextLength,
+            blockLength: blockLength,
+            slidingWindow: slidingWindow,
+            isCausal: isCausal)
+        key = requested
+        cached = made
+        return made
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -467,7 +502,8 @@ private final class DFlash2Attention: Module {
     ///   - x: the block, `[B, blockLength, hidden]`.
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -518,7 +554,7 @@ private final class DFlash2Attention: Module {
 
         var mask: MLXArray?
         if let slidingWindow {
-            mask = DFlash2SlidingMask.make(
+            mask = masks.mask(
                 contextLength: cachedLength,
                 blockLength: L,
                 slidingWindow: slidingWindow,
@@ -594,10 +630,58 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         return output.reshaped(hidden.shape)
     }
 
-    /// The first tap. Returns the convolved input and the dynamic taps the
-    /// matching ``finish(_:dynamic:)`` needs.
+    /// ``convolve(hidden:dynamic:base:groupSize:)`` for tap `tap` as ONE
+    /// kernel (`dflash2GroupedConvKernel`), plus `residual` when given, or
+    /// nil when the inputs do not qualify (the caller keeps the op chain).
+    ///
+    /// The op chain issues ten element-wise launches per call (four products
+    /// and sums per offset, and a two-input concatenate for the shifted
+    /// block); the kernel computes the same element in one. Each element
+    /// takes the chain's operations in the chain's order on the same
+    /// `T`-typed values — `out = 0 + k*v`, `+ d*v`, then offset 1 — with
+    /// every product and sum rounded to `T` as the separate launches round
+    /// it, and contraction off. The residual sum is the layer's own
+    /// `x + conv`. Bit-identical to the chain it replaces.
+    private func fusedConvolve(
+        _ hidden: MLXArray, projection: MLXArray, tap: Int, residual: MLXArray?
+    ) -> MLXArray? {
+        guard dflash2FusedConvEnabled, hidden.ndim == 3 else { return nil }
+        let batch = hidden.dim(0)
+        let length = hidden.dim(1)
+        let hiddenSize = hidden.dim(2)
+        let dtype = hidden.dtype
+        guard [DType.bfloat16, .float16, .float32].contains(dtype),
+            batch > 0, length > 0, hiddenSize == groups * groupSize,
+            hiddenSize % 256 == 0,
+            projection.shape == [batch, length, 2 * kernelSize * groups],
+            projection.dtype == dtype,
+            baseKernel.shape == [2, kernelSize, hiddenSize], baseKernel.dtype == dtype,
+            residual.map({ $0.shape == hidden.shape && $0.dtype == dtype }) ?? true
+        else { return nil }
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("KS", kernelSize), ("GS", groupSize), ("TAP", tap),
+        ]
+        let grid = (hiddenSize, length, batch)
+        if let residual {
+            return dflash2GroupedConvResidualKernel(
+                [hidden, projection, baseKernel, residual],
+                template: template, grid: grid, threadGroup: (256, 1, 1),
+                outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
+        }
+        return dflash2GroupedConvKernel(
+            [hidden, projection, baseKernel],
+            template: template, grid: grid, threadGroup: (256, 1, 1),
+            outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
+    }
+
+    /// The first tap. Returns the convolved input and the dynamic-tap
+    /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let dynamic = kernelProjection(hidden)
+        let projection = kernelProjection(hidden)
+        if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
+            return (fused, projection)
+        }
+        let dynamic = projection
             .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
         return (
             Self.convolve(
@@ -605,16 +689,102 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                 dynamic: dynamic[0..., 0..., 0, 0..., 0...],
                 base: baseKernel[0],
                 groupSize: groupSize),
-            dynamic[0..., 0..., 1, 0..., 0...]
+            projection
         )
     }
 
-    /// The second tap, over the sub-layer's output.
-    func finish(_ hidden: MLXArray, dynamic: MLXArray) -> MLXArray {
-        Self.convolve(
-            hidden: hidden, dynamic: dynamic, base: baseKernel[1], groupSize: groupSize)
+    /// The second tap, over the sub-layer's output, added to the layer's
+    /// residual stream: `residual + conv(hidden)`.
+    func finish(_ hidden: MLXArray, projection: MLXArray, residual: MLXArray) -> MLXArray {
+        if let fused = fusedConvolve(
+            hidden, projection: projection, tap: 1, residual: residual)
+        {
+            return fused
+        }
+        let dynamic = projection
+            .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
+        return residual
+            + Self.convolve(
+                hidden: hidden, dynamic: dynamic[0..., 0..., 1, 0..., 0...],
+                base: baseKernel[1], groupSize: groupSize)
     }
 }
+
+/// Kill switch for the one-launch grouped convolution (default on).
+private let dflash2FusedConvEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_FUSED_CONV"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One element of `DFlash2GroupedDynamicCausalConv.convolve` for tap `TAP`.
+///
+/// `h` is the block `[B, L, H]`, `dyn` the kernel projection `[B, L, 2*KS*G]`
+/// (viewed `[B, L, 2, KS, G]`), `base` the base kernel `[2, KS, H]`. The
+/// operations and their order are the op chain's: `out` starts at zero; for
+/// each offset `o` the shifted value `v` (zero before the block start) is
+/// multiplied by the base tap and added, then multiplied by the dynamic tap
+/// and added. Every intermediate is a `T`, as each separate launch stores it.
+private let dflash2GroupedConvHeader = """
+    template <typename T, int KS, int GS, int TAP>
+    inline T dflash2_grouped_conv(
+        const device T* h, const device T* dyn, const device T* base,
+        uint b, uint l, uint c, uint L, uint H) {
+    #pragma clang fp contract(off)
+      const uint G = H / GS;
+      const uint g = c / GS;
+      const size_t row = size_t(b) * L + l;
+      T out = static_cast<T>(0.0f);
+      for (int o = 0; o < KS; ++o) {
+        const T v = (l >= uint(o)) ? h[(row - o) * H + c] : static_cast<T>(0.0f);
+        const T kb = base[(size_t(TAP) * KS + o) * H + c];
+        const T kv = kb * v;
+        out = out + kv;
+        const T d = dyn[row * (2 * KS * G) + (size_t(TAP) * KS + o) * G + g];
+        const T dv = d * v;
+        out = out + dv;
+      }
+      return out;
+    }
+    """
+
+private let dflash2GroupedConvSource = """
+    const uint c = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint H = threads_per_grid.x;
+    const uint L = threads_per_grid.y;
+    out[(size_t(b) * L + l) * H + c] =
+        dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    """
+
+private let dflash2GroupedConvResidualSource = """
+    #pragma clang fp contract(off)
+    const uint c = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint H = threads_per_grid.x;
+    const uint L = threads_per_grid.y;
+    const size_t i = (size_t(b) * L + l) * H + c;
+    const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    out[i] = res[i] + conv;
+    """
+
+private let dflash2GroupedConvKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_conv",
+    inputNames: ["h", "dyn", "base"],
+    outputNames: ["out"],
+    source: dflash2GroupedConvSource,
+    header: dflash2GroupedConvHeader,
+    ensureRowContiguous: true)
+
+private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_conv_residual",
+    inputNames: ["h", "dyn", "base", "res"],
+    outputNames: ["out"],
+    source: dflash2GroupedConvResidualSource,
+    header: dflash2GroupedConvHeader,
+    ensureRowContiguous: true)
 
 // MARK: - The decoder layer
 
@@ -663,15 +833,17 @@ private final class DFlash2DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        let attended = x
-            + attentionConv.finish(
-                selfAttn(attentionInput, context: context, rope: rope, cache: cache),
-                dynamic: attentionTaps)
+        let attended = attentionConv.finish(
+            selfAttn(
+                attentionInput, context: context, rope: rope, cache: cache,
+                masks: masks),
+            projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+        return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
     }
 }
 
@@ -867,8 +1039,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
 
+        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
-            h = layer(h, context: context, rope: rope, cache: cache[index])
+            h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
