@@ -222,6 +222,14 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+/// `DARKBLOOM_QWEN35_VERIFY_SLICES=0` (or false/no/off) submits the verify
+/// forward as one graph, as before.
+let qwen35VerifySubmitInSlices: Bool = {
+    let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -2442,6 +2450,13 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    /// Layers per verify submission slice (see `cbv2Forward`). Four slices
+    /// of sixteen: building one slice on the host must beat the drafter's
+    /// GPU time so the first slice is ready when the GPU frees, and each
+    /// later slice builds far faster than the GPU runs the one before it.
+    /// Four submissions clear both with margin at the fewest extra calls.
+    static let verifySubmitLayers = 16
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2488,6 +2503,21 @@ public class Qwen35TextModelInner: Module {
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            // VERIFY SUBMITS IN SLICES. The drafter's block was submitted
+            // before this graph was built, so the GPU would otherwise idle
+            // from the drafter's last kernel until the host finished building
+            // all 64 layers. Submitting every `verifySubmitLayers` layers
+            // lets the GPU run the front of the tower while the host builds
+            // the rest. The same kernels run on the same inputs in the same
+            // order; only command-buffer boundaries move, so every value is
+            // bit-identical. Verify only: prefill and plain decode are
+            // untouched.
+            if captureRecurrentWindow, qwen35VerifySubmitInSlices,
+                (modelLayerIndex + 1) % Qwen35TextModelInner.verifySubmitLayers == 0,
+                modelLayerIndex + 1 < layers.count
+            {
+                asyncEval([hiddenStates])
             }
         }
         if tapLayerIds == nil {
