@@ -76,7 +76,8 @@ public final class LogitsPipelineV2 {
     public static let greedyEpsilon: Float = 1e-5
 
     public struct Output {
-        /// Fully transformed logits [B, vocab] (float32), ready for
+        /// Fully transformed logits [B, vocab] (float32, or input dtype on
+        /// the all-greedy no-op fast path), ready for
         /// greedy argmax or Gumbel-max sampling. Masked tokens are -inf.
         public let sampling: MLXArray
         /// log_softmax of the RAW logits [B, vocab], present only when at
@@ -283,8 +284,16 @@ public final class LogitsPipelineV2 {
             "logits rows (\(logits.dim(0))) != configured rows (\(rowCount)) — call setRows")
 
         // Work in float32 for numerically stable softmax/cumsum (vLLM does
-        // the same). f16→f32 is exact, so greedy argmax is unaffected.
-        var x = logits.asType(.float32)
+        // the same). f16→f32 is exact, so greedy argmax is unaffected — and
+        // on the all-greedy fast path (no bias/penalties/temperature/
+        // top-k-p-min-p/logprobs/hard-mask, consumer is SamplerV2 single
+        // argmax) the upcast is skipped entirely: argmax is invariant
+        // under the exact order-preserving f16→f32 cast.
+        let skipF32Upcast =
+            allGreedy && !anyBias && !anyRepetition && !anyFrequencyPresence
+            && !anyTemperature && !anyTopKPMinP && !wantsLogprobs
+            && hardMask == nil
+        var x = skipF32Upcast ? logits : logits.asType(.float32)
 
         // (0) Raw logprobs BEFORE any transform. (The counter is a telemetry
         // side effect only; the transform pipeline itself stays pure.)

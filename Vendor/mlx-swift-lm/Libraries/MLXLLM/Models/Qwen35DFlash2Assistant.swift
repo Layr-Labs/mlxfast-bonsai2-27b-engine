@@ -238,16 +238,28 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     }
 
     /// THE DTYPE CROSSING. The Bonsai trunk promotes activations to FP32 after
-    /// its FP32 norms; the drafter is BF16. The cast happens HERE rather than
-    /// at the drafter's `fc` input: it is the same one cast per context row,
-    /// and it additionally DETACHES the row from the whole prefill chunk it
-    /// was sliced out of, so a 2047-row window retains 2047 rows and not the
-    /// prompt. `DFlash2DraftModel.hiddenStates` casts again and that stays a
-    /// no-op for an already-BF16 tensor.
+    /// its FP32 norms; the drafter is BF16. The cast happens ONCE in
+    /// `proposeBlock`, over the fused context, rather than once per committed
+    /// chunk here: each per-chunk cast would otherwise execute as its own
+    /// elementwise pass at the draft round's eval fence, on top of the
+    /// full-context cast `DFlash2DraftModel.hiddenStates` already performs.
+    /// The single post-fusion cast additionally DETACHES the fused rows from
+    /// the whole prefill chunks they were sliced out of, so a 2047-row window
+    /// retains 2047 rows and not the prompt. Slice-then-cast casts the same
+    /// elements as cast-then-slice, so the values the drafter sees are
+    /// unchanged.
+    ///
+    /// Fallback: `BONSAI_DFLASH2_EAGER_CAST=1` restores the legacy per-chunk
+    /// cast in `append`; `proposeBlock` then sees rows already in the
+    /// drafter's dtype and its own cast is a guarded no-op.
+    private static let eagerPerChunkCast: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_DFLASH2_EAGER_CAST"] == "1"
+
     private func append(_ hidden: MLXArray, to requestState: any CBv2MTPRequestState) {
         let state = self.state(requestState)
         guard hidden.dim(1) > 0 else { return }
-        state.append(hidden.asType(drafter.dtype), limit: contextRowLimit)
+        let rows = Self.eagerPerChunkCast ? hidden.asType(drafter.dtype) : hidden
+        state.append(rows, limit: contextRowLimit)
     }
 
     // MARK: - Proposing
@@ -257,9 +269,16 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     ) throws -> MLXArray {
         let state = self.state(requestState)
         guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
-        let context =
+        let fused =
             state.pending.count == 1
             ? state.pending[0] : concatenated(state.pending, axis: 1)
+        // The round's single dtype crossing (see `append`): one guarded cast
+        // over the fused context instead of one cast per committed chunk plus
+        // the full-context cast `hiddenStates` performs. The dtype reads are
+        // shape metadata, not a host sync, and the fresh BF16 buffer detaches
+        // the retained window from the prefill chunks.
+        let context =
+            fused.dtype == drafter.dtype ? fused : fused.asType(drafter.dtype)
         if !state.cacheSeeded {
             // The cache must sit where the retained context actually starts.
             // This is the reference's `cache.offset = prompt.size - rows`: a

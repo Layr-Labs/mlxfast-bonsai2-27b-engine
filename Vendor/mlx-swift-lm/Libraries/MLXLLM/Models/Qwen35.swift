@@ -254,6 +254,22 @@ enum Qwen35FusedElementwise {
         compile(shapeless: true) { normed, gate in
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
+
+    /// `sigmoid(gate) * x` in FP32, times the o projection's Hadamard signs:
+    /// `sigmoidMultiply` with the input transform's sign pass folded in.
+    /// Feeds `forwardPreSigned`.
+    static let sigmoidGateSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { x, gate, signs in
+            (x.asType(.float32) * sigmoid(gate.asType(.float32))) * signs
+        }
+
+    /// `gatedNormTail` with the out projection's Hadamard signs folded in.
+    /// Feeds `forwardPreSigned`; call on the flattened `(B, S, -1)` tail
+    /// so the signs cover the final dimension.
+    static let gatedNormTailSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { normed, gate, signs in
+            (silu(gate.asType(.float32)) * normed.asType(.float32)) * signs
+        }
 }
 
 /// Input-independent constants a GDN layer derives from its geometry, held
@@ -324,6 +340,14 @@ final class Qwen35GatedDeltaNet: Module {
     private var fusedInputSourceSignature: [MLXArray]?
     private var fusedInputPermanentlyIneligible = false
 
+    // Dense b+a fusion: one `hiddenSize -> 2 * numVHeads` matmul replaces the
+    // two `hiddenSize -> numVHeads` input projections. Same inference-only
+    // cache discipline as `fusedInProj`; the quad quantized path (when
+    // eligible) already covers b+a and takes precedence in `projectInputs`.
+    private var fusedBAProj: Linear?
+    private var fusedBASourceSignature: [MLXArray]?
+    private var fusedBAPermanentlyIneligible = false
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -347,6 +371,20 @@ final class Qwen35GatedDeltaNet: Module {
             return packed.forwardUnwidened(x)
         }
         return outProj(x)
+    }
+
+    /// `gatedNorm` + `projectOut` with the out projection's signs folded
+    /// into the tail kernel, via `forwardPreSigned(widenOutput: false)`.
+    /// Falls back when the projection is unpacked or has a GDN layout.
+    private func gatedNormProjectOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        if let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil {
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            let signed = Qwen35FusedElementwise.gatedNormTailSigned(
+                normed.reshaped(B, S, -1), gate.reshaped(B, S, -1),
+                packed.transform.signVector)
+            return packed.forwardPreSigned(signed, widenOutput: false)
+        }
+        return projectOut(gatedNorm(out, gate: gate).reshaped(B, S, -1))
     }
 
     init(_ args: Qwen35TextConfiguration) {
@@ -382,6 +420,8 @@ final class Qwen35GatedDeltaNet: Module {
         _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         self.fusedInProj = nil
         self.fusedInputSourceSignature = nil
+        self.fusedBAProj = nil
+        self.fusedBASourceSignature = nil
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -431,6 +471,9 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            fusedBAProj = nil
+            fusedBASourceSignature = nil
+            fusedBAPermanentlyIneligible = false
         }
         return result
     }
@@ -443,6 +486,9 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            fusedBAProj = nil
+            fusedBASourceSignature = nil
+            fusedBAPermanentlyIneligible = false
         }
     }
 
@@ -587,12 +633,122 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
+    var hasFusedBAProjection: Bool { fusedBAProj != nil }
+
+    /// The dense b/a pair, exactly when one fused matmul reproduces both:
+    /// plain `Linear` (no quantized or Hadamard subclass), no bias, matching
+    /// `[numVHeads, hiddenSize]` geometry and dtype, and no trainable b/a
+    /// parameters. Anything else falls back to two matmuls. Type, bias, and
+    /// geometry mismatches are permanent (only a module replacement can lift
+    /// them, and that clears the flag); trainable parameters are transient.
+    private func exactFrozenDenseBAProjections() -> (b: Linear, a: Linear)? {
+        // Reject ineligible module types before traversing the
+        // trainable-parameter tree on hot decode forwards.
+        guard ObjectIdentifier(type(of: inProjB)) == ObjectIdentifier(Linear.self),
+            ObjectIdentifier(type(of: inProjA)) == ObjectIdentifier(Linear.self),
+            inProjB.bias == nil, inProjA.bias == nil,
+            inProjB.weight.ndim == 2, inProjA.weight.ndim == 2,
+            inProjB.weight.shape == [numVHeads, hiddenSize],
+            inProjA.weight.shape == [numVHeads, hiddenSize],
+            inProjB.weight.dtype == inProjA.weight.dtype
+        else {
+            fusedBAPermanentlyIneligible = true
+            return nil
+        }
+        let prefixes = ["in_proj_b.", "in_proj_a."]
+        guard !trainableParameters().flattened().contains(where: { key, _ in
+            prefixes.contains(where: key.hasPrefix)
+        }) else { return nil }
+        return (inProjB, inProjA)
+    }
+
+    /// Lazily fuse the dense `in_proj_b` + `in_proj_a` weights into one
+    /// `hiddenSize -> 2 * numVHeads` Linear, mirroring
+    /// `prepareFusedInputProjection`. The named modules stay addressable as
+    /// frozen slice views (`b = rows [0 ..< numVHeads]`,
+    /// `a = rows [numVHeads ..< 2 * numVHeads]`) into the one fused
+    /// allocation, so checkpoint and adapter paths are unchanged.
+    @discardableResult
+    func prepareFusedBA() -> Bool {
+        if fusedBAPermanentlyIneligible { return false }
+        if let fusedBASourceSignature {
+            guard let projections = exactFrozenDenseBAProjections(),
+                sourceSignatureMatches(
+                    [projections.b.weight, projections.a.weight],
+                    fusedBASourceSignature)
+            else {
+                fusedBAProj = nil
+                self.fusedBASourceSignature = nil
+                return false
+            }
+            return fusedBAProj != nil
+        }
+        guard let projections = exactFrozenDenseBAProjections() else { return false }
+        let fusedWeight = concatenated(
+            [projections.b.weight, projections.a.weight], axis: 0)
+        eval(fusedWeight)
+
+        let fused = Linear(weight: fusedWeight, bias: nil)
+        fused.freeze()
+
+        func sourceView(_ rows: Range<Int>) -> Linear {
+            let view = Linear(weight: fusedWeight[rows], bias: nil)
+            view.freeze()
+            return view
+        }
+        // Preserve checkpoint/adaptor-facing module names as views into the
+        // one fused physical allocation. A later module replacement invalidates
+        // `fusedBAProj` through updateModule before the next forward.
+        try! update(
+            modules: ModuleChildren(values: [
+                "in_proj_b": .value(sourceView(0 ..< numVHeads)),
+                "in_proj_a": .value(sourceView(numVHeads ..< (2 * numVHeads))),
+            ]), verify: [])
+        // updateModule invalidates on source replacement; assign only after
+        // the stable named views have been installed.
+        fusedBAProj = fused
+        guard let current = exactFrozenDenseBAProjections() else {
+            fusedBAProj = nil
+            return false
+        }
+        fusedBASourceSignature = [current.b.weight, current.a.weight]
+        return true
+    }
+
+    /// One fused matmul for b+a, sliced as `b = [0 ..< numVHeads]` and
+    /// `a = [numVHeads ..< 2 * numVHeads]`. Nil forces the two-matmul
+    /// fallback in `projectInputs`.
+    private func projectFusedBA(_ inputs: MLXArray) -> (MLXArray, MLXArray)? {
+        guard prepareFusedBA(), let fusedBA = fusedBAProj else { return nil }
+        let out = fusedBA(inputs)
+        return (
+            out[0..., 0..., 0 ..< numVHeads],
+            out[0..., 0..., numVHeads ..< (2 * numVHeads)]
+        )
+    }
+
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
-            // Packed qkv and z read the same activation through the same
-            // transform; rotate it once. b and a stay full precision.
+            // Dense b+a share one matmul when fused; qkv/z keep their own
+            // (possibly packed) path. b and a stay full precision.
+            if let fusedBA = projectFusedBA(inputs) {
+                if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+                    return (
+                        shared[0],
+                        shared[1].reshaped(B, S, numVHeads, headVDim),
+                        fusedBA.0,
+                        fusedBA.1
+                    )
+                }
+                return (
+                    inProjQKV(inputs),
+                    inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
+                    fusedBA.0,
+                    fusedBA.1
+                )
+            }
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
                 return (
                     shared[0],
@@ -989,8 +1145,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = gatedNorm(out, gate: z)
-        return projectOut(normedOut.reshaped(B, S, -1))
+        return gatedNormProjectOut(out, gate: z, B: B, S: S)
     }
 
     /// CBv2 MTP rectangular verify path. Widths one and two retain the
@@ -1207,12 +1362,11 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = gatedNorm(out, gate: z)
-        let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(outProj, projectionInput)
+            let normedOut = gatedNorm(out, gate: z)
+            return qwen35A3BExactW4G64Projection(outProj, normedOut.reshaped(B, S, -1))
         }
-        return projectOut(projectionInput)
+        return gatedNormProjectOut(out, gate: z, B: B, S: S)
     }
 }
 
@@ -1277,6 +1431,18 @@ final class Qwen35Attention: Module {
         return (qProj(x), kProj(x), vProj(x))
     }
 
+    /// `sigmoidMultiply` + `oProj` with the o projection's signs folded
+    /// into the gate kernel, via `forwardPreSigned(widenOutput: false)`.
+    /// Falls back when the projection is unpacked or has a GDN layout.
+    private func projectO(_ output: MLXArray, gate: MLXArray) -> MLXArray {
+        if let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil {
+            let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                output, gate, packed.transform.signVector)
+            return packed.forwardPreSigned(signed, widenOutput: false)
+        }
+        return oProj(sigmoidMultiply(output, gate))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -1309,7 +1475,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return projectO(output, gate: gate)
     }
 
     func cbv2Forward(
@@ -1358,15 +1524,10 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
         }
-        if let packed = oProj as? HadamardQuantizedLinear {
-            // The residual add widens the FP16 product itself.
-            return packed.forwardUnwidened(projectionInput)
-        }
-        return oProj(projectionInput)
+        return projectO(output, gate: gate)
     }
 }
 
