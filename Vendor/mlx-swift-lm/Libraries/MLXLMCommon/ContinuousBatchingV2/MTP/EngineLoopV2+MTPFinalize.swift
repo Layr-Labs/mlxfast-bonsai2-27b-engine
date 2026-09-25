@@ -15,6 +15,29 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
+    static let submitsCommittedRecurrentStateEarly: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
+
+    /// Start the committed recurrent state on the GPU now.
+    ///
+    /// A partially accepted verify commits each recurrent layer by replaying
+    /// the accepted prefix from the pre-verify state. That replay is built
+    /// lazily here and would otherwise run inside the next round's target
+    /// verify, on the critical path. Submitting it now lets the GPU run it
+    /// while the host finishes this finalize and builds the next drafter
+    /// graph, a window in which the GPU is otherwise idle. The arrays and
+    /// their values are exactly the ones the next verify reads.
+    func submitCommittedRecurrentState(for id: CBv2RequestID) {
+        guard Self.submitsCommittedRecurrentStateEarly,
+            let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
+        else { return }
+        let arrays = snapshot.keys.sorted().flatMap { index in
+            [snapshot[index]!.conv, snapshot[index]!.ssm].compactMap { $0 }
+        }
+        if !arrays.isEmpty { asyncEval(arrays) }
+    }
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -308,6 +331,7 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
+                    submitCommittedRecurrentState(for: id)
                 } else {
                     precondition(
                         evaluations.count == 1 + k,
