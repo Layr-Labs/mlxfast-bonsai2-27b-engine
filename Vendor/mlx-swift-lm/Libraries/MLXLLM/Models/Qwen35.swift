@@ -2026,7 +2026,25 @@ final class Qwen35MRoPE {
                     ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
                     : rotated
             }
-            return (applyDefault(queries), applyDefault(keys))
+            // Q and K share batch, sequence, head dimension and dtype on the
+            // self-attention path. Rotate their head-stacked tensor once, then
+            // restore the original query/key head ranges. Keep the native
+            // two-call path as a conservative fallback for unusual callers.
+            guard queries.ndim == keys.ndim,
+                  queries.dim(0) == keys.dim(0),
+                  queries.dim(2) == keys.dim(2),
+                  queries.dim(3) == keys.dim(3),
+                  queries.dtype == keys.dtype
+            else {
+                return (applyDefault(queries), applyDefault(keys))
+            }
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotated = applyDefault(combined)
+            return (
+                rotated[0..., ..<queryHeads, 0..., 0...],
+                rotated[0..., queryHeads..., 0..., 0...]
+            )
         }
 
         let queryHeads = queries.dim(1)
