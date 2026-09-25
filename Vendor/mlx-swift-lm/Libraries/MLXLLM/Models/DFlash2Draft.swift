@@ -476,6 +476,7 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    private let kvStack = DFlash2KVStack()
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -496,6 +497,15 @@ private final class DFlash2Attention: Module {
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         super.init()
+    }
+
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        kvStack.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     /// - Parameters:
@@ -541,10 +551,19 @@ private final class DFlash2Attention: Module {
             // offset rotates every row where the two separate ropes did.
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
-            let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let keys: MLXArray
+            let values: MLXArray
+            if let (kRows, vRows) = kvStack.apply(rows, k: kProj, v: vProj) {
+                keys = rope(
+                    kNorm(kRows.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                    offset: cache.offset)
+                values = vRows.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            } else {
+                keys = rope(
+                    kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                    offset: cache.offset)
+                values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            }
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
@@ -853,6 +872,43 @@ private final class DFlash2GateUpStack {
         if weight == nil {
             weight = concatenated([gate.weight, up.weight], axis: 0)
             boundary = gate.weight.dim(0)
+        }
+        let y = matmul(x, weight!.T)
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
+
+/// The K and V projections' weights stacked along the output axis for the
+/// KV-concat path, where both read the same `[context; block]` rows: the same
+/// BF16 bytes as the two loaded weights, concatenated once on first use and
+/// held in a plain class (never a stored `MLXArray` on the module, so
+/// reflection cannot add it to the parameter tree). One matmul over the stack
+/// replaces the separate K and V matmuls, and the rows are read once instead
+/// of twice. `DARKBLOOM_DFLASH2_STACK_KV=0` keeps the two matmuls. The drafter
+/// only proposes tokens, so this changes no emitted token either way.
+private final class DFlash2KVStack {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_KV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private var weight: MLXArray?
+    private var boundary = 0
+
+    func clear() {
+        weight = nil
+        boundary = 0
+    }
+
+    /// `(k(rows), v(rows))` from one matmul, or nil when the stack does not apply.
+    func apply(_ x: MLXArray, k: Linear, v: Linear) -> (MLXArray, MLXArray)? {
+        guard Self.enabled, k.bias == nil, v.bias == nil,
+            k.weight.dtype == v.weight.dtype, k.weight.dim(1) == v.weight.dim(1),
+            k.weight.ndim == 2, v.weight.ndim == 2
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([k.weight, v.weight], axis: 0)
+            boundary = k.weight.dim(0)
         }
         let y = matmul(x, weight!.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])

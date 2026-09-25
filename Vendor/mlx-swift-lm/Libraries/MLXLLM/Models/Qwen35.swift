@@ -1174,12 +1174,22 @@ final class Qwen35GatedDeltaNet: Module {
     /// recurrent transaction, which costs gigabytes over a prefill. Copying
     /// the tail drops the parent. It moves bytes; it changes no bit, no
     /// precision and no recurrence, and it is skipped for single-token decode
-    /// and for every other checkpoint format.
+    /// and for every other checkpoint format. Narrow verify windows (S <= 16)
+    /// keep the view: the backing is at most 19 rows (the captured path's
+    /// replay tape retains it anyway), so no parent larger than the window
+    /// itself is carried, and one copy launch per layer per round is saved.
+    /// `DARKBLOOM_BONSAI_TAIL_VIEW=0` keeps the copy at every width.
+    private static let tailViewEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TAIL_VIEW"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
     private func retainedConvTail(
         of convInput: MLXArray, keeping nKeep: Int, chunkWidth: Int
     ) -> MLXArray {
         let tail = convInput[0..., (convInput.dim(1) - nKeep)...]
         guard chunkWidth > 1, inProjQKV is HadamardQuantizedLinear else { return tail }
+        if chunkWidth <= 16, Self.tailViewEnabled { return tail }
         return contiguous(tail)
     }
 
