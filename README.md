@@ -127,12 +127,11 @@ This command converts the downloaded checkpoint into the `weights/` tree that
 the engine loads.
 
 ```bash
-MLXFAST_ENGINE_BIN=.build/release/bench-worker \
-MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json \
-  ./benchmark.sh --local-iterate
+./benchmark.sh --local-iterate
 ```
 
-This command runs the local test against the public local-iterate capture.
+This command runs the local test against the shipped local-iterate capture,
+with the engine `./setup.sh` built at `.build/release/bench-worker`.
 
 Both speculative decoders are separate artifacts. `./setup.sh` stages them for
 you: it runs `./setup-mtp-head.sh` for the MTP head, then
@@ -140,9 +139,11 @@ you: it runs `./setup-mtp-head.sh` for the MTP head, then
 decoders are separate
 exports](#the-speculative-decoders-are-separate-exports).
 
-> **WARNING — set `MLXFAST_CORRECTNESS_GOLDEN_PATH` yourself.**
-> The local test has no default golden. It stops with an error when the
-> variable is empty.
+> **NOTE — the local modes need no environment variable.**
+> `--local-iterate` uses the short shipped capture and `--local-submit` the
+> long one. `MLXFAST_CORRECTNESS_GOLDEN_PATH` overrides that choice, and
+> `MLXFAST_ENGINE_BIN` overrides the engine binary. `--official` has no
+> default golden: it takes the organizer-provisioned hidden golden.
 
 > **WARNING — do not pass `--golden`, `--weights`, or `--score-path` to
 > `./benchmark.sh`.**
@@ -538,9 +539,9 @@ The gate is on because `./benchmark.sh` arms it. Driving the Swift CLI directly
 skips it and times a hot GPU. Use `./benchmark.sh`. See AGENTS.md, "The
 cool-down gate".
 
-The two public captures differ in length for this reason. Use the 256-token
-capture for `--local-iterate`. Use the 1024-token capture for
-`--local-submit`.
+The two public captures differ in length for this reason. `--local-iterate`
+uses the 256-token capture and `--local-submit` the 1024-token capture by
+default.
 
 > **NOTE — both local modes check correctness and speed.**
 > Neither local mode is a speed-only signal. Both apply the teacher-forced
