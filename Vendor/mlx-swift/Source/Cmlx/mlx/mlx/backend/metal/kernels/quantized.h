@@ -2216,7 +2216,14 @@ template <
 // cooperative-tensor copies follow steel/gemm/nax.h (BaseNAXFrag::get_coord /
 // mma) as used by qmm_t_nax. Products run at the tensor unit's FP32-input
 // precision (TF32-class, like qmm_t_nax), not the FP32 FMAs of the SIMD path.
-#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400) && \
+// A Metal 4 compiler does not imply NAX hardware. The host JIT opts in only
+// when the device supports the fragment layout and FP32 tensor math is enabled.
+// AOT callers without that capability decision retain the portable SIMD body.
+#ifndef MLX_QMM_SPLITK_NAX_ENABLED
+#define MLX_QMM_SPLITK_NAX_ENABLED 0
+#endif
+#if MLX_QMM_SPLITK_NAX_ENABLED && defined(__METAL_VERSION__) && \
+    (__METAL_VERSION__ >= 400) && \
     defined(__has_include)
 #if __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)
 #define MLX_QMM_SPLITK_NAX 1

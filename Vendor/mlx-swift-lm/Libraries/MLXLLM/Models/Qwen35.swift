@@ -256,6 +256,116 @@ enum Qwen35FusedElementwise {
         }
 }
 
+/// Paired FP32 q/k RMS normalization for the GDN's fixed 16x128 heads.
+/// The two native RMS calls have identical input geometry, so one threadgroup
+/// pass can reduce both vectors and write both results. The kernel is limited to
+/// this exact FP32 shape; all other dtypes and layouts use the native path.
+private enum Qwen35PairRMSNorm {
+    private static let kernel: MLXFast.MLXFastKernel? = {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        return MLXFast.metalKernel(
+            name: "qwen35_pair_rms_native128",
+            inputNames: ["q", "k", "qWeight", "kWeight", "eps", "axisSize"],
+            outputNames: ["qOut", "kOut"],
+            source: """
+                uint lane = thread_index_in_threadgroup;
+                uint row = threadgroup_position_in_grid.z;
+
+                uint B = uint(q_shape[0]);
+                uint S = uint(q_shape[1]);
+                uint H = uint(q_shape[2]);
+                uint batch = row / (S * H);
+                uint token = (row / H) - batch * S;
+                uint head = row - (batch * S + token) * H;
+
+                size_t qBase = size_t(batch) * size_t(q_strides[0])
+                    + size_t(token) * size_t(q_strides[1])
+                    + size_t(head) * size_t(q_strides[2]);
+                size_t kBase = size_t(batch) * size_t(k_strides[0])
+                    + size_t(token) * size_t(k_strides[1])
+                    + size_t(head) * size_t(k_strides[2]);
+
+                uint axis = uint(axisSize);
+                float qx[4];
+                float kx[4];
+                float qAcc = 0.0f;
+                float kAcc = 0.0f;
+                size_t laneOffset = size_t(lane) * 4;
+                for (uint i = 0; i < 4; ++i) {
+                    qx[i] = q[qBase + laneOffset + i];
+                    qAcc += qx[i] * qx[i];
+                    kx[i] = k[kBase + laneOffset + i];
+                    kAcc += kx[i] * kx[i];
+                }
+                qAcc = simd_sum(qAcc);
+                kAcc = simd_sum(kAcc);
+
+                threadgroup float qSums[32];
+                threadgroup float kSums[32];
+                threadgroup float qInvMean[1];
+                threadgroup float kInvMean[1];
+
+                if (simdgroup_index_in_threadgroup == 0) {
+                    qSums[thread_index_in_simdgroup] = 0.0f;
+                    kSums[thread_index_in_simdgroup] = 0.0f;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (thread_index_in_simdgroup == 0) {
+                    qSums[simdgroup_index_in_threadgroup] = qAcc;
+                    kSums[simdgroup_index_in_threadgroup] = kAcc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simdgroup_index_in_threadgroup == 0) {
+                    qAcc = simd_sum(qSums[thread_index_in_simdgroup]);
+                    kAcc = simd_sum(kSums[thread_index_in_simdgroup]);
+                    if (thread_index_in_simdgroup == 0) {
+                        qInvMean[0] = metal::precise::rsqrt(qAcc / axis + eps);
+                        kInvMean[0] = metal::precise::rsqrt(kAcc / axis + eps);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                size_t outputBase = size_t(row) * size_t(axis);
+                for (uint i = 0; i < 4; ++i) {
+                    qOut[outputBase + laneOffset + i] =
+                        qWeight[laneOffset + i] * static_cast<float>(qx[i] * qInvMean[0]);
+                    kOut[outputBase + laneOffset + i] =
+                        kWeight[laneOffset + i] * static_cast<float>(kx[i] * kInvMean[0]);
+                }
+            """,
+            ensureRowContiguous: false)
+        #else
+        return nil
+        #endif
+    }()
+
+    static func apply(
+        q: MLXArray, k: MLXArray,
+        qWeight: MLXArray, kWeight: MLXArray,
+        eps: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard let kernel,
+              q.dtype == .float32, k.dtype == .float32,
+              q.shape == k.shape,
+              q.ndim == 4,
+              q.dim(2) == 16, q.dim(3) == 128,
+              qWeight.shape == [128], kWeight.shape == [128],
+              qWeight.dtype == .float32, kWeight.dtype == .float32,
+              q.size <= Int(Int32.max), k.size <= Int(Int32.max)
+        else { return nil }
+        let B = q.dim(0)
+        let S = q.dim(1)
+        let heads = q.dim(2)
+        let outputs = kernel(
+            [q, k, qWeight, kWeight, MLXArray(eps), MLXArray(Int32(128))],
+            grid: (32, 1, B * S * heads),
+            threadGroup: (32, 1, 1),
+            outputShapes: [q.shape, k.shape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+}
+
 /// Input-independent constants a GDN layer derives from its geometry, held
 /// outside the parameter tree (a plain class, so Module reflection sees
 /// `.other`).
@@ -283,6 +393,94 @@ private final class Qwen35GDNDerived {
     }
 }
 
+/// The input sign vector of a packed Hadamard projection can be folded into
+/// the preceding RMSNorm's affine weight. Keep that derived tensor outside the
+/// Module parameter tree and reuse it for every decode row.
+private final class Qwen35SignedNormCache {
+    private let lock = NSLock()
+    private var source: MLXArray?
+    private var signSource: MLXArray?
+    private var folded: MLXArray?
+
+    func weight(_ weight: MLXArray, transform: SignedBlockHadamard) -> MLXArray {
+        let signs = transform.signVector
+        return lock.withLock {
+            if let source, let signSource, let folded,
+                source === weight, signSource === signs
+            {
+                return folded
+            }
+            let result = weight * signs.asType(weight.dtype)
+            eval(result)
+            source = weight
+            signSource = signs
+            folded = result
+            return result
+        }
+    }
+}
+
+/// Fold the same input signs into an ordinary (unquantized) projection's
+/// columns. This lets that projection consume the pre-signed RMS output
+/// without materializing an extra full-width unsigned activation.
+private final class Qwen35SignedLinearCache {
+    private let lock = NSLock()
+    private var source: MLXArray?
+    private var signSource: MLXArray?
+    private var folded: MLXArray?
+
+    func call(
+        _ layer: Linear, input: MLXArray, transform: SignedBlockHadamard
+    ) -> MLXArray? {
+        guard ObjectIdentifier(type(of: layer)) == ObjectIdentifier(Linear.self),
+            layer.bias == nil,
+            layer.weight.ndim == 2,
+            layer.weight.dim(1) == transform.width
+        else { return nil }
+        let signs = transform.signVector
+        let foldedWeight = lock.withLock {
+            if let source, let signSource, let folded,
+                source === layer.weight, signSource === signs
+            {
+                return folded
+            }
+            let result = layer.weight * signs.asType(layer.weight.dtype)
+            eval(result)
+            source = layer.weight
+            signSource = signs
+            folded = result
+            return result
+        }
+        return matmul(input, foldedWeight.T)
+    }
+}
+
+private let qwen35HadamardSignFoldingEnabled: Bool = {
+    let value = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_BONSAI_SIGN_FOLD"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
+private func qwen35HadamardSubfeatureEnabled(_ name: String) -> Bool {
+    let value = ProcessInfo.processInfo.environment[name]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}
+
+private let qwen35HadamardSignFoldingGDNEnabled =
+    qwen35HadamardSignFoldingEnabled
+    && qwen35HadamardSubfeatureEnabled("DARKBLOOM_BONSAI_SIGN_FOLD_GDN")
+private let qwen35HadamardSignFoldingGDNLinearEnabled =
+    qwen35HadamardSignFoldingGDNEnabled
+    && qwen35HadamardSubfeatureEnabled("DARKBLOOM_BONSAI_SIGN_FOLD_GDN_LINEAR")
+private let qwen35HadamardSignFoldingAttentionEnabled =
+    qwen35HadamardSignFoldingEnabled
+    && qwen35HadamardSubfeatureEnabled("DARKBLOOM_BONSAI_SIGN_FOLD_ATTENTION")
+private let qwen35HadamardSignFoldingMLPEnabled =
+    qwen35HadamardSignFoldingEnabled
+    && qwen35HadamardSubfeatureEnabled("DARKBLOOM_BONSAI_SIGN_FOLD_MLP")
+
 /// The gated delta recurrence with its gates formed by one fused kernel and
 /// the state kept in FP32, matching `gatedDeltaUpdate` op for op.
 func qwen35GatedDelta(
@@ -299,6 +497,185 @@ func qwen35GatedDelta(
         ssm = ssm.asType(.float32)
     }
     return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
+}
+
+/// State-only specialization of GatedDelta.swift in this MIT-licensed tree.
+/// Prefix replay needs the recurrent state but discards the query outputs.
+private enum GDNStateOnlyReplay {
+    // Read once so the original path remains available for direct A/B checks.
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_STATE_ONLY_REPLAY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        return MLXFast.metalKernel(
+            name: "qwen35_gated_delta_state_only",
+            inputNames: ["k", "v", "g", "beta", "state_in", "T"],
+            outputNames: ["state_out"],
+            source: """
+                auto n = thread_position_in_grid.z;
+                auto b_idx = n / Hv;
+                auto hv_idx = n % Hv;
+                auto hk_idx = hv_idx / (Hv / Hk);
+                constexpr int n_per_t = Dk / 32;
+
+                auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+                auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+                auto dk_idx = thread_position_in_threadgroup.x;
+                auto dv_idx = thread_position_in_grid.y;
+                auto g_ = g + b_idx * T * Hv;
+                auto beta_ = beta + b_idx * T * Hv;
+                auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+                auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+                float state[n_per_t];
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = static_cast<float>(i_state[s_idx]);
+                }
+
+                for (int t = 0; t < T; ++t) {
+                  float kv_mem = 0.0f;
+                  {
+                    // Match the current kernel's scope and arithmetic exactly.
+                    #pragma clang fp reassociate(off)
+                    #pragma clang fp contract(off)
+                    float kv_compensation = 0.0f;
+                    for (int i = 0; i < n_per_t; ++i) {
+                      auto s_idx = n_per_t * dk_idx + i;
+                      state[i] = state[i] * g_[hv_idx];
+                      auto product = state[i] * k_[s_idx];
+                      auto corrected = product - kv_compensation;
+                      auto next_sum = kv_mem + corrected;
+                      kv_compensation = (next_sum - kv_mem) - corrected;
+                      kv_mem = next_sum;
+                    }
+                  }
+                  kv_mem = simd_sum(kv_mem);
+                  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + k_[s_idx] * delta;
+                  }
+                  k_ += Hk * Dk;
+                  v_ += Hv * Dv;
+                  g_ += Hv;
+                  beta_ += Hv;
+                }
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  o_state[s_idx] = static_cast<StT>(state[i]);
+                }
+                """,
+            ensureRowContiguous: true)
+        #else
+        return nil
+        #endif
+    }()
+
+    /// Compile supported specializations during model construction. A serial
+    /// warm pass never reaches rejected-prefix replay, so it cannot warm this
+    /// kernel. Swift's static initialization performs this once per process.
+    static func warmIfSupported(
+        keyHeads: Int, valueHeads: Int, keyDimension: Int, valueDimension: Int
+    ) {
+        guard enabled,
+              keyHeads == 16, valueHeads == 48,
+              keyDimension == 128, valueDimension == 128,
+              StreamOrDevice.default == .gpu,
+              Device.defaultDevice() == .gpu,
+              kernel != nil
+        else { return }
+        _ = warmedSpecializations
+    }
+
+    private static let warmedSpecializations: Void = {
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            autoreleasepool {
+                // Independent dummy tensors: no checkpoint or request data.
+                // Evaluate one dtype at a time and retain only the pipelines.
+                let k = MLXArray.zeros([1, 1, 16, 128], dtype: dtype)
+                let v = MLXArray.zeros([1, 1, 48, 128], dtype: dtype)
+                let g = MLXArray.ones([1, 1, 48], dtype: .float32)
+                let beta = MLXArray.zeros([1, 1, 48], dtype: .float32)
+                let state = MLXArray.zeros([1, 48, 128, 128], dtype: .float32)
+                if let output = applyGated(q: k, k: k, v: v, g: g, beta: beta, state: state) {
+                    eval(output)
+                }
+            }
+        }
+    }()
+
+    // Keep the original gate expressions and conversions. Unsupported calls
+    // return nil so the caller constructs its existing recurrence unchanged.
+    static func apply(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        state: MLXArray?, mask: MLXArray? = nil
+    ) -> MLXArray? {
+        guard enabled, supports(q: q, k: k, v: v, state: state, mask: mask),
+              a.shape == [k.dim(0), k.dim(1), v.dim(2)],
+              b.shape == a.shape,
+              aLog.shape == [v.dim(2)], dtBias.shape == [v.dim(2)],
+              a.dtype == .float32, b.dtype == .float32,
+              aLog.dtype == .float32, dtBias.dtype == .float32
+        else { return nil }
+        let beta = sigmoid(b).asType(.float32)
+        let g = computeGatedDeltaG(aLog, a, dtBias)
+        let initial = state ?? MLXArray.zeros(
+            [k.dim(0), v.dim(2), v.dim(3), k.dim(3)], dtype: .float32)
+        return applyGated(q: q, k: k, v: v, g: g, beta: beta, state: initial)
+    }
+
+    private static func applyGated(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> MLXArray? {
+        guard supports(q: q, k: k, v: v, state: state, mask: nil),
+              g.shape == [k.dim(0), k.dim(1), v.dim(2)],
+              beta.shape == g.shape,
+              g.dtype == .float32, beta.dtype == .float32,
+              let kernel
+        else { return nil }
+        let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        return kernel(
+            [k, v, g, beta, state, MLXArray(T)],
+            template: [
+                ("InT", q.dtype), ("StT", state.dtype),
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ],
+            grid: (32, Dv, B * Hv), threadGroup: (32, 4, 1),
+            outputShapes: [state.shape], outputDTypes: [state.dtype]
+        )[0]
+    }
+
+    private static func supports(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        state: MLXArray?, mask: MLXArray?
+    ) -> Bool {
+        guard StreamOrDevice.default == .gpu,
+              Device.defaultDevice() == .gpu,
+              mask == nil,
+              q.ndim == 4, k.ndim == 4, v.ndim == 4,
+              q.shape == k.shape,
+              k.dim(0) > 0, k.dim(1) > 0,
+              k.dim(2) == 16, k.dim(3) == 128,
+              v.shape == [k.dim(0), k.dim(1), 48, 128],
+              q.dtype == k.dtype, k.dtype == v.dtype,
+              [DType.float32, .float16, .bfloat16].contains(k.dtype),
+              k.size <= Int(Int32.max), v.size <= Int(Int32.max)
+        else { return false }
+        if let state {
+            return state.shape == [k.dim(0), 48, 128, 128]
+                && state.dtype == .float32
+                && state.size <= Int(Int32.max)
+        }
+        return true
+    }
 }
 
 final class Qwen35GatedDeltaNet: Module {
@@ -332,6 +709,8 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// Derived norm weights; a plain box, never a parameter.
     private let derived = Qwen35GDNDerived()
+    private let signedB = Qwen35SignedLinearCache()
+    private let signedA = Qwen35SignedLinearCache()
 
     /// The gated output norm with its `silu(gate) * x` tail fused into one
     /// kernel; the same FP32 arithmetic as `norm(out, gate:)`.
@@ -391,6 +770,9 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
+        GDNStateOnlyReplay.warmIfSupported(
+            keyHeads: numKHeads, valueHeads: numVHeads,
+            keyDimension: headKDim, valueDimension: headVDim)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -587,9 +969,54 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
-    private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
+    /// The transform shared by the packed qkv and z input projections, when
+    /// this checkpoint uses the Hadamard input path.
+    func inputHadamardTransform() -> SignedBlockHadamard? {
+        guard qwen35HadamardSignFoldingGDNEnabled else { return nil }
+        guard let qkv = inProjQKV as? HadamardQuantizedLinear,
+            let z = inProjZ as? HadamardQuantizedLinear,
+            qkv.sharesInputTransform(with: z)
+        else { return nil }
+        return qkv.transform
+    }
+
+    private func projectInputs(
+        _ inputs: MLXArray, B: Int, S: Int, preSigned: Bool = false
+    ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
+        if preSigned {
+            guard let transform = inputHadamardTransform() else {
+                preconditionFailure("GDN input sign folding lost its transform")
+            }
+            guard let shared = sharedHadamardProjectionsPreSigned(
+                inputs, [inProjQKV, inProjZ])
+            else {
+                preconditionFailure("GDN input sign folding lost its packed projections")
+            }
+            let b: MLXArray
+            let a: MLXArray
+            if qwen35HadamardSignFoldingGDNLinearEnabled,
+                let signedB = signedB.call(inProjB, input: inputs, transform: transform),
+                let signedA = signedA.call(inProjA, input: inputs, transform: transform)
+            {
+                b = signedB
+                a = signedA
+            } else {
+                // b/a are the two ordinary FP32 projections and do not
+                // consume a Hadamard-signed activation. Recover the unsigned
+                // RMS output when their columns cannot be folded.
+                let unsigned = inputs * transform.signVector.asType(inputs.dtype)
+                b = inProjB(unsigned)
+                a = inProjA(unsigned)
+            }
+            return (
+                shared[0],
+                shared[1].reshaped(B, S, numVHeads, headVDim),
+                b,
+                a
+            )
+        }
         guard prepareFusedInputProjection(), let fusedInProj else {
             // Packed qkv and z read the same activation through the same
             // transform; rotate it once. b and a stay full precision.
@@ -677,8 +1104,10 @@ final class Qwen35GatedDeltaNet: Module {
 
         let dtype = q.dtype
         let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
-        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+        let pairNormed = Qwen35PairRMSNorm.apply(
+            q: q, k: k, qWeight: scales.q, kWeight: scales.k, eps: 1e-6)
+        let qNormed = pairNormed?.0 ?? MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+        let kNormed = pairNormed?.1 ?? MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
 
         let (out, newSsmState) = qwen35GatedDelta(
             q: qNormed,
@@ -806,16 +1235,18 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = qwen35GatedDelta(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
+        let q = tape.q[0..., rows, 0...]
+        let k = tape.k[0..., rows, 0...]
+        let v = tape.v[0..., rows, 0...]
+        let a = tape.a[0..., rows, 0...]
+        let b = tape.b[0..., rows, 0...]
+        let mask = tape.mask.map { $0[0..., rows] }
+        let boundarySsm = GDNStateOnlyReplay.apply(
+            q: q, k: k, v: v, a: a, b: b,
+            aLog: aLog, dtBias: dtBias, state: tape.ssmPre, mask: mask
+        ) ?? qwen35GatedDelta(
+            q: q, k: k, v: v, a: a, b: b,
+            aLog: aLog, dtBias: dtBias, state: tape.ssmPre, mask: mask
         ).1
         let boundaryConvView = tape.convInput[
             0...,
@@ -850,7 +1281,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        preSigned: Bool = false
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
@@ -862,7 +1294,8 @@ final class Qwen35GatedDeltaNet: Module {
         // before constructing this forward's transient rollback data.
         cache?.clearMTPTransientState()
 
-        var (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
+        var (qkv, z, b, a) = projectInputs(
+            inputs, B: B, S: S, preSigned: preSigned)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -947,13 +1380,15 @@ final class Qwen35GatedDeltaNet: Module {
     func cbv2Forward(
         _ inputs: MLXArray,
         modelLayerIndex: Int,
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        preSigned: Bool = false
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
-        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
+        let (qkv, z, b, a) = projectInputs(
+            inputs, B: B, S: S, preSigned: preSigned)
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
@@ -1002,7 +1437,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        preSigned: Bool = false
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -1022,7 +1458,8 @@ final class Qwen35GatedDeltaNet: Module {
             a = exact.3
         } else {
             // Preserve main's fused GDN projection construction and graph.
-            (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
+            (qkv, z, b, a) = projectInputs(
+                inputs, B: B, S: S, preSigned: preSigned)
         }
 
         var convRows: [MLXArray] = []
@@ -1067,8 +1504,10 @@ final class Qwen35GatedDeltaNet: Module {
 
         let dtype = q.dtype
         let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
-        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+        let pairNormed = Qwen35PairRMSNorm.apply(
+            q: q, k: k, qWeight: scales.q, kWeight: scales.k, eps: 1e-6)
+        let qNormed = pairNormed?.0 ?? MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+        let kNormed = pairNormed?.1 ?? MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
 
         let out: MLXArray
         if S >= 3 {
@@ -1270,7 +1709,28 @@ final class Qwen35Attention: Module {
 
     /// q, k and v read the same activation. On a packed Hadamard checkpoint
     /// they share one input transform, so it is computed once.
-    private func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    func inputHadamardTransform() -> SignedBlockHadamard? {
+        guard qwen35HadamardSignFoldingAttentionEnabled else { return nil }
+        guard let q = qProj as? HadamardQuantizedLinear,
+            let k = kProj as? HadamardQuantizedLinear,
+            let v = vProj as? HadamardQuantizedLinear,
+            q.sharesInputTransform(with: k),
+            q.sharesInputTransform(with: v)
+        else { return nil }
+        return q.transform
+    }
+
+    private func projectQKV(
+        _ x: MLXArray, preSigned: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        if preSigned {
+            guard let shared = sharedHadamardProjectionsPreSigned(
+                x, [qProj, kProj, vProj])
+            else {
+                preconditionFailure("attention input sign folding lost its packed projections")
+            }
+            return (shared[0], shared[1], shared[2])
+        }
         if let shared = sharedHadamardProjections(x, [qProj, kProj, vProj]) {
             return (shared[0], shared[1], shared[2])
         }
@@ -1278,12 +1738,14 @@ final class Qwen35Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        preSigned: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let (qProjOutput, kProjOutput, vProjOutput) = projectQKV(x)
+        let (qProjOutput, kProjOutput, vProjOutput) = projectQKV(
+            x, preSigned: preSigned)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
@@ -1315,7 +1777,8 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        preSigned: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1328,7 +1791,7 @@ final class Qwen35Attention: Module {
                 qwen35A3BExactW4G64Projection(vProj, x)
             )
         } else {
-            projected = projectQKV(x)
+            projected = projectQKV(x, preSigned: preSigned)
         }
         let qProjOutput = projected.0
         let kProjection = projected.1
@@ -1582,8 +2045,19 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen3NextMLP {
-    func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return qwen35Forward(x) }
+    func inputHadamardTransform() -> SignedBlockHadamard? {
+        guard qwen35HadamardSignFoldingMLPEnabled else { return nil }
+        guard let gate = gateProj as? HadamardQuantizedLinear,
+            let up = upProj as? HadamardQuantizedLinear,
+            gate.sharesInputTransform(with: up)
+        else { return nil }
+        return gate.transform
+    }
+
+    func qwen35TargetVerify(
+        _ x: MLXArray, exact: Bool, preSigned: Bool = false
+    ) -> MLXArray {
+        guard exact else { return qwen35Forward(x, preSigned: preSigned) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
@@ -1595,15 +2069,24 @@ extension Qwen3NextMLP {
     /// up products stay FP16, `silu(gate) * up` is formed in FP32 together with
     /// the down projection's Hadamard signs, and the down product is left for
     /// the residual add to widen. Same arithmetic, four fewer dispatches.
-    func qwen35Forward(_ x: MLXArray) -> MLXArray {
+    func qwen35Forward(_ x: MLXArray, preSigned: Bool = false) -> MLXArray {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
-            let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
+            let shared = preSigned
+                ? sharedHadamardProjectionsPreSigned(
+                    x, [gateProj, upProj], widenOutput: false)
+                : sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
         {
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
         }
-        guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
+        let shared = preSigned
+            ? sharedHadamardProjectionsPreSigned(x, [gateProj, upProj])
+            : sharedHadamardProjections(x, [gateProj, upProj])
+        guard let shared else {
+            if preSigned {
+                preconditionFailure("MLP input sign folding lost its packed projections")
+            }
             return self(x)
         }
         return downProj(silu(shared[0]) * shared[1])
@@ -1622,6 +2105,10 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    /// Folded layer-norm weights are inference-only derived tensors.
+    private let inputSignedNorm = Qwen35SignedNormCache()
+    private let postSignedNorm = Qwen35SignedNormCache()
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -1653,6 +2140,29 @@ final class Qwen35DecoderLayer: Module {
         super.init()
     }
 
+    private func normalizedForPackedInput(
+        _ x: MLXArray,
+        norm: RMSNorm,
+        transform: SignedBlockHadamard?,
+        cache: Qwen35SignedNormCache,
+        exactTargetVerify: Bool
+    ) -> (value: MLXArray, preSigned: Bool) {
+        guard qwen35HadamardSignFoldingEnabled,
+            !exactTargetVerify,
+            let transform,
+            transform.width == norm.weight.dim(0),
+            x.ndim > 0,
+            x.dim(-1) == transform.width
+        else {
+            return (norm(x), false)
+        }
+        let foldedWeight = cache.weight(norm.weight, transform: transform)
+        return (
+            MLXFast.rmsNorm(x, weight: foldedWeight, eps: norm.eps),
+            true
+        )
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -1663,18 +2173,35 @@ final class Qwen35DecoderLayer: Module {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
         // Passes nConfirmed through to the linear-attention sublayer.
+        let normalizedInput = normalizedForPackedInput(
+            x,
+            norm: inputLayerNorm,
+            transform: isLinear
+                ? linearAttn!.inputHadamardTransform()
+                : selfAttn!.inputHadamardTransform(),
+            cache: inputSignedNorm,
+            exactTargetVerify: false)
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
-                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                nConfirmed: nConfirmed)
+                normalizedInput.value, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed, preSigned: normalizedInput.preSigned)
         } else {
-            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(
+                normalizedInput.value, mask: attentionMask, cache: cache,
+                preSigned: normalizedInput.preSigned)
         }
 
         let h = x + r
         if let dense = mlp as? Qwen3NextMLP {
-            return h + dense.qwen35Forward(postAttentionLayerNorm(h))
+            let normalized = normalizedForPackedInput(
+                h,
+                norm: postAttentionLayerNorm,
+                transform: dense.inputHadamardTransform(),
+                cache: postSignedNorm,
+                exactTargetVerify: false)
+            return h + dense.qwen35Forward(
+                normalized.value, preSigned: normalized.preSigned)
         }
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
@@ -1688,36 +2215,53 @@ final class Qwen35DecoderLayer: Module {
         captureRecurrentWindow: Bool = false,
         exactTargetVerify: Bool = false
     ) -> MLXArray {
+        let normalizedInput = normalizedForPackedInput(
+            x,
+            norm: inputLayerNorm,
+            transform: isLinear
+                ? linearAttn!.inputHadamardTransform()
+                : selfAttn!.inputHadamardTransform(),
+            cache: inputSignedNorm,
+            exactTargetVerify: exactTargetVerify)
         let r: MLXArray
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                    normalizedInput.value, modelLayerIndex: modelLayerIndex,
                     recurrentState: recurrentState,
-                    exactTargetVerify: exactTargetVerify)
+                    exactTargetVerify: exactTargetVerify,
+                    preSigned: normalizedInput.preSigned)
             } else {
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    normalizedInput.value, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState,
+                    preSigned: normalizedInput.preSigned)
             }
         } else {
             guard let attentionCache else {
                 preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
             }
             r = selfAttn!.cbv2Forward(
-                inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+                normalizedInput.value, cache: attentionCache, positionIds: positionIds,
+                exactTargetVerify: exactTargetVerify,
+                preSigned: normalizedInput.preSigned)
         }
         let h = x + r
-        let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
-                normalized, exactTargetVerify: exactTargetVerify)
+                postAttentionLayerNorm(h), exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
+            let normalized = normalizedForPackedInput(
+                h,
+                norm: postAttentionLayerNorm,
+                transform: dense.inputHadamardTransform(),
+                cache: postSignedNorm,
+                exactTargetVerify: exactTargetVerify)
             feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+                normalized.value, exact: exactTargetVerify,
+                preSigned: normalized.preSigned)
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }

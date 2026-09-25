@@ -599,6 +599,31 @@ public func sharedHadamardProjections(
     return packed.map { $0.applyRotated(rotated) }
 }
 
+/// Applies packed projections to an activation whose Hadamard sign flip has
+/// already been folded into the preceding normalizer. This is the exact
+/// counterpart of `sharedHadamardProjections`: it skips the sign multiply and
+/// performs only the Walsh-Hadamard transform before the packed matmuls.
+public func sharedHadamardProjectionsPreSigned(
+    _ signed: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
+    var packed = [HadamardQuantizedLinear]()
+    packed.reserveCapacity(projections.count)
+    for projection in projections {
+        guard let layer = projection as? HadamardQuantizedLinear,
+            layer.sharesInputTransform(with: first)
+        else { return nil }
+        packed.append(layer)
+    }
+    let rotated = first.transform.applyPreSigned(signed)
+    if let fused = first.fusedSiblingsForward(
+        rotated, siblings: packed, widenOutput: widenOutput)
+    {
+        return fused
+    }
+    return packed.map { $0.applyRotated(rotated) }
+}
+
 /// The packed projections that share one transform, when every one of them is
 /// packed with that same transform and none has a GDN layout; nil otherwise.
 public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantizedLinear]? {

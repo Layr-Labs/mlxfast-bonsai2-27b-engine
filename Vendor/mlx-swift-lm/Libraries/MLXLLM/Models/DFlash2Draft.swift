@@ -849,6 +849,71 @@ private final class DFlash2DecoderLayer: Module {
 
 // MARK: - The candidate selector
 
+/// Exact top-k selection using stable sorts over vocabulary chunks, then their
+/// survivors. Kept in a value type so its shape-only offsets are not parameters.
+private struct DFlash2ChunkedTopK {
+    private static let chunkSize = 512
+
+    private let vocabularySize: Int
+    private let topK: Int
+    private let chunkCount: Int
+    private let survivorCount: Int
+    private let offsets: MLXArray
+
+    init?(vocabularySize: Int, topK: Int) {
+        guard topK == 16, vocabularySize > Self.chunkSize,
+            vocabularySize % Self.chunkSize == 0,
+            vocabularySize <= Int(UInt32.max)
+        else { return nil }
+        let chunks = vocabularySize / Self.chunkSize
+        self.vocabularySize = vocabularySize
+        self.topK = topK
+        self.chunkCount = chunks
+        self.survivorCount = chunks * topK
+        self.offsets = MLXArray(
+            (0 ..< chunks).map { UInt32($0 * Self.chunkSize) }, [1, chunks, 1])
+    }
+
+    /// Compile the shape-only Metal pipelines when the selector is constructed.
+    /// Sort specializes on dtype and tile width, not draft depth. Two rows also
+    /// cover the strided final gather and three-dimensional index addition;
+    /// one row uses separate UInt32 gather/add variants shared by all dtypes.
+    func warmUp() {
+        guard StreamOrDevice.default == .gpu else { return }
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            let synthetic = MLXArray.zeros([1, 2, vocabularySize], dtype: dtype)
+            if let candidates = select(synthetic) { eval(candidates) }
+        }
+        let singleRow = MLXArray.zeros([1, 1, vocabularySize], dtype: .float32)
+        if let candidates = select(singleRow) { eval(candidates) }
+        // Only MLX's compiled pipelines and allocator cache outlive these
+        // synthetic graphs; no logits, proposals, or model weights are retained.
+    }
+
+    func select(_ logits: MLXArray) -> MLXArray? {
+        // Metal argPartition is a stable full sort; CPU uses nth_element.
+        // Check the actual default stream, including task-local overrides.
+        guard StreamOrDevice.default == .gpu,
+            logits.ndim == 3, logits.dim(-1) == vocabularySize, logits.size > 0,
+            logits.dtype == .float16 || logits.dtype == .bfloat16 || logits.dtype == .float32
+        else { return nil }
+        let rows = logits.size / vocabularySize
+        let blocks = logits.reshaped([rows, chunkCount, Self.chunkSize])
+        let localOrder = argSort(blocks, axis: -1)[
+            0..., 0..., (Self.chunkSize - topK)...]
+        let values = takeAlong(blocks, localOrder, axis: -1)
+            .reshaped([rows, survivorCount])
+        let indices = (localOrder + offsets).reshaped([rows, survivorCount])
+
+        // Every discarded entry has at least topK entries above it in its
+        // chunk. Stable chunk order preserves global index order for tied
+        // scores, including NaNs, through the second stable sort.
+        let order = argSort(values, axis: -1)[0..., (survivorCount - topK)...]
+        return takeAlong(indices, order, axis: -1)
+            .reshaped([logits.dim(0), logits.dim(1), topK])
+    }
+}
+
 /// The low-rank edge-scored greedy path over the per-position candidate lists.
 ///
 /// The track is greedy, so only the temperature-0 path of the reference
@@ -856,6 +921,9 @@ private final class DFlash2DecoderLayer: Module {
 /// not here.
 final class DFlash2CandidateSelector: Module {
     let topK: Int
+    private let chunkedTopK: DFlash2ChunkedTopK?
+    private static let useChunkedTopK =
+        ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_CHUNKED_TOPK"] != "0"
 
     @ParameterInfo(key: "predecessor_codebook") var predecessorCodebook: MLXArray
     @ParameterInfo(key: "successor_codebook") var successorCodebook: MLXArray
@@ -863,6 +931,9 @@ final class DFlash2CandidateSelector: Module {
 
     init(_ config: DFlash2Configuration) {
         self.topK = config.dflash.selectorTopK
+        self.chunkedTopK = Self.useChunkedTopK
+            ? DFlash2ChunkedTopK(
+                vocabularySize: config.vocabularySize, topK: config.dflash.selectorTopK) : nil
         _predecessorCodebook.wrappedValue = MLXArray.zeros([
             config.vocabularySize, config.dflash.selectorRank,
         ])
@@ -872,6 +943,7 @@ final class DFlash2CandidateSelector: Module {
         _hiddenProjection.wrappedValue = Linear(
             config.hiddenSize, config.dflash.selectorRank, bias: false)
         super.init()
+        chunkedTopK?.warmUp()
     }
 
     /// The greedy path.
@@ -883,8 +955,13 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates: MLXArray
+        if let selected = chunkedTopK?.select(logits) {
+            candidates = selected
+        } else {
+            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
