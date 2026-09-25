@@ -1019,7 +1019,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   if constexpr (
       bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
       WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
+    if (M - y_row <= 16) {
       const uint cb = simd_gid >> 1;
       const uint ks = simd_gid & 1;
       threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
