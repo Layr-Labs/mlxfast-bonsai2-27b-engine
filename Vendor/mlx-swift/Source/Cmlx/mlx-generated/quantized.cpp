@@ -2391,6 +2391,40 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
     }
   }
 
+  // Few-row path: three disjoint partial arrays fit in the existing Xs/Ws.
+  // Keep the baseline pairwise addition order: (C0 + C1) + (C2 + C3).
+  if constexpr (kHalves == 1) {
+    constexpr int partial_size = 16 * SIMD_SIZE;
+    if (simd_gid != 0) {
+      threadgroup float* dst = simd_gid == 3 ? red1 :
+          red0 + (simd_gid - 1) * partial_size;
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          dst[(8 * h + i) * SIMD_SIZE + simd_lid] = C[h][i];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0) {
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const int idx = (8 * h + i) * SIMD_SIZE + simd_lid;
+          const U left = C[h][i] + red0[idx];
+          const U right = red0[partial_size + idx] + red1[idx];
+          const U acc = left + right;
+          const int v = fm + (i / 4) * 8;
+          const int r = row0 + 16 * h + fn + (i % 4);
+          if (v < rows && r < N) y[v * N + r] = static_cast<T>(acc);
+        }
+      }
+    }
+    return;
+  }
+
   // Sum the 4 simdgroups' partials (identical fragment layouts, so they line
   // up element by element): 1 -> 0 and 3 -> 2, then 2 -> 0.
   threadgroup float* red = (simd_gid & 2) ? red1 : red0;
@@ -2476,6 +2510,37 @@ template <
   threadgroup T Ws[BN * BK_padded];
 
   const int k_start = tid.z * k_partition_size;
+#ifdef MLX_QMM_M16_NAX
+  // Few-row tiles: the shared few-row core in quantized_utils.h over this
+  // threadgroup's 32 weight rows and K partition, the 4 simdgroups splitting
+  // the partition's groups; partials are summed through Xs / Ws.
+  if constexpr (bits == 2 && group_size == 128 && BM == 32 && BN == 32) {
+    static_assert(
+        16 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
+        "few-row reduction must fit in Xs / Ws");
+    const int rows16 = min(M - int(tid.y) * BM, BM);
+    if (rows16 <= 16 && false) {
+      qmm_m16_block<T, 4>(
+          w,
+          scales,
+          biases,
+          x + int(tid.y) * BM * static_cast<int64_t>(K),
+          y + tid.z * static_cast<int64_t>(split_k_partition_stride) +
+              int(tid.y) * BM * static_cast<int64_t>(N),
+          K,
+          N,
+          rows16,
+          int(tid.x) * BN,
+          k_start,
+          k_partition_size,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
+      return;
+    }
+  }
+#endif
   x += k_start;
 
   auto wl = (const device uint8_t*)w;
@@ -3518,8 +3583,6 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
     }
   }
 }
-
-///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
 

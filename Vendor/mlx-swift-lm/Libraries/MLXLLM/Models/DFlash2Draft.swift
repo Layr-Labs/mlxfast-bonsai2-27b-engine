@@ -823,10 +823,47 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 
 // MARK: - The decoder layer
 
+/// The gate and up projections' weights stacked along the output axis: the
+/// same BF16 bytes as the two loaded weights, concatenated once on first use
+/// and held in a plain class (never a stored `MLXArray` on the module, so
+/// reflection cannot add it to the parameter tree). One matmul over the
+/// stack replaces two over the same input, and the block's 16 rows fill one
+/// wider tensor tile instead of two. `DARKBLOOM_DFLASH2_STACK_GATEUP=0` keeps
+/// the two matmuls.
+private final class DFlash2GateUpStack {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_GATEUP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private var weight: MLXArray?
+    private var boundary = 0
+
+    func clear() {
+        weight = nil
+        boundary = 0
+    }
+
+    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
+    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
+        guard Self.enabled, gate.bias == nil, up.bias == nil,
+            gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
+            gate.weight.ndim == 2, up.weight.ndim == 2
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([gate.weight, up.weight], axis: 0)
+            boundary = gate.weight.dim(0)
+        }
+        let y = matmul(x, weight!.T)
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
+
 private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
+    private let gateUp = DFlash2GateUpStack()
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -835,8 +872,20 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        gateUp.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
+            return down(silu(g) * u)
+        }
+        return down(silu(gate(x)) * up(x))
     }
 }
 
