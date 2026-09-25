@@ -525,10 +525,27 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        var contextKeys: MLXArray
+        var contextValues: MLXArray
+        var blockKeys: MLXArray
+        var blockValues: MLXArray
+        if B == 1 && contextLength >= 2 && contextLength <= 16 {
+            // The context and block use the same K/V projections. For short
+            // context, one call avoids a second weight read for each matrix.
+            // Long context can select a slower matmul and round differently.
+            let projectedInput = concatenated([context, x], axis: 1)
+            let projectedKeys = kProj(projectedInput)
+            let projectedValues = vProj(projectedInput)
+            contextKeys = projectedKeys[0..., ..<contextLength, 0...]
+            blockKeys = projectedKeys[0..., contextLength..., 0...]
+            contextValues = projectedValues[0..., ..<contextLength, 0...]
+            blockValues = projectedValues[0..., contextLength..., 0...]
+        } else {
+            contextKeys = kProj(context)
+            contextValues = vProj(context)
+            blockKeys = kProj(x)
+            blockValues = vProj(x)
+        }
 
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
@@ -849,6 +866,211 @@ private final class DFlash2DecoderLayer: Module {
 
 // MARK: - The candidate selector
 
+/// MLX argPartition currently sorts the full 248,320-column row. For the
+/// drafter's top-16 use, retain 16 winners per 4,096-column block and merge
+/// only those winners. Equal BF16 values use the larger original index first;
+/// reversing the winners reproduces the stable ascending sort's final slice.
+private let dflash2Top16Header = """
+    inline bool dflash2_top16_better(float value, uint id, float best, uint best_id) {
+        return value > best || (value == best && id > best_id);
+    }
+    """
+
+private let dflash2Top16PartialKernel = MLXFast.metalKernel(
+    name: "dflash2_top16_partial",
+    inputNames: ["logits"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: """
+        constexpr uint K = 16;
+        constexpr uint BLOCK = 4096;
+        uint tid = thread_position_in_threadgroup.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint group = threadgroup_position_in_grid.x;
+        uint vocab = uint(logits_shape[2]);
+        uint blocks = (vocab + BLOCK - 1) / BLOCK;
+        uint row = group / blocks;
+        uint block = group % blocks;
+        uint base = block * BLOCK + tid * 16;
+        float local_values[16];
+        uint local_ids[16];
+        for (uint j = 0; j < 16; ++j) {
+            uint token = base + j;
+            local_ids[j] = token;
+            local_values[j] = token < vocab
+                ? float(logits[row * vocab + token]) : -INFINITY;
+        }
+        threadgroup float simd_values[8];
+        threadgroup uint simd_ids[8];
+        threadgroup uint chosen;
+        for (uint pick = 0; pick < K; ++pick) {
+            float best_value = -INFINITY;
+            uint best_id = 0;
+            for (uint j = 0; j < 16; ++j) {
+                if (dflash2_top16_better(
+                    local_values[j], local_ids[j], best_value, best_id)) {
+                    best_value = local_values[j];
+                    best_id = local_ids[j];
+                }
+            }
+            float simd_value = simd_max(best_value);
+            uint simd_id = simd_max(best_value == simd_value ? best_id : 0);
+            if (lane == 0) {
+                simd_values[simd_gid] = simd_value;
+                simd_ids[simd_gid] = simd_id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float winner_value = -INFINITY;
+                uint winner_id = 0;
+                for (uint g = 0; g < 8; ++g) {
+                    if (dflash2_top16_better(
+                        simd_values[g], simd_ids[g], winner_value, winner_id)) {
+                        winner_value = simd_values[g];
+                        winner_id = simd_ids[g];
+                    }
+                }
+                uint out_offset = (row * blocks + block) * K + pick;
+                partial_ids[out_offset] = winner_id;
+                partial_values[out_offset] = winner_value;
+                chosen = winner_id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < 16; ++j) {
+                if (local_ids[j] == chosen) local_values[j] = -INFINITY;
+            }
+        }
+        """,
+    header: dflash2Top16Header,
+    ensureRowContiguous: true)
+
+private let dflash2Top16FinalKernel = MLXFast.metalKernel(
+    name: "dflash2_top16_final",
+    inputNames: ["partial_ids", "partial_values"],
+    outputNames: ["selected_ids", "selected_values"],
+    source: """
+        constexpr uint K = 16;
+        uint tid = thread_position_in_threadgroup.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint row = threadgroup_position_in_grid.x;
+        uint count = uint(partial_ids_shape[1]) * K;
+        float local_values[4];
+        uint local_ids[4];
+        for (uint j = 0; j < 4; ++j) {
+            uint offset = tid + j * 256;
+            if (offset < count) {
+                local_values[j] = partial_values[row * count + offset];
+                local_ids[j] = partial_ids[row * count + offset];
+            } else {
+                local_values[j] = -INFINITY;
+                local_ids[j] = 0xffffffff;
+            }
+        }
+        threadgroup float simd_values[8];
+        threadgroup uint simd_ids[8];
+        threadgroup uint chosen;
+        for (uint pick = 0; pick < K; ++pick) {
+            float best_value = -INFINITY;
+            uint best_id = 0;
+            for (uint j = 0; j < 4; ++j) {
+                if (dflash2_top16_better(
+                    local_values[j], local_ids[j], best_value, best_id)) {
+                    best_value = local_values[j];
+                    best_id = local_ids[j];
+                }
+            }
+            float simd_value = simd_max(best_value);
+            uint simd_id = simd_max(best_value == simd_value ? best_id : 0);
+            if (lane == 0) {
+                simd_values[simd_gid] = simd_value;
+                simd_ids[simd_gid] = simd_id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float winner_value = -INFINITY;
+                uint winner_id = 0;
+                for (uint g = 0; g < 8; ++g) {
+                    if (dflash2_top16_better(
+                        simd_values[g], simd_ids[g], winner_value, winner_id)) {
+                        winner_value = simd_values[g];
+                        winner_id = simd_ids[g];
+                    }
+                }
+                uint out_offset = row * K + (K - 1 - pick);
+                selected_ids[out_offset] = winner_id;
+                using output_t = metal::remove_reference_t<decltype(selected_values[0])>;
+                selected_values[out_offset] = output_t(winner_value);
+                chosen = winner_id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < 4; ++j) {
+                if (local_ids[j] == chosen) local_values[j] = -INFINITY;
+            }
+        }
+        """,
+    header: dflash2Top16Header,
+    ensureRowContiguous: true)
+
+/// One threadgroup walks the greedy path (up to 16 positions). Each of its 16
+/// simdgroups owns one candidate and reproduces MLX's BF16 rank-256 row sum:
+/// four adjacent values per lane, two blocks, then a simdgroup reduction.
+private let dflash2GreedyPathKernel = MLXFast.metalKernel(
+    name: "dflash2_greedy_path_bf16",
+    inputNames: [
+        "candidates", "unary", "projected", "predecessor_book",
+        "successor_book", "anchor",
+    ],
+    outputNames: ["path"],
+    source: """
+        #pragma clang fp contract(off)
+        constexpr uint K = 16;
+        constexpr uint R = 256;
+        uint tid = thread_position_in_threadgroup.x;
+        uint candidate_lane = simdgroup_index_in_threadgroup;
+        uint rank_lane = thread_index_in_simdgroup;
+        uint length = uint(candidates_shape[1]);
+        threadgroup float scores[K];
+        threadgroup uint ids[K];
+        threadgroup uint previous;
+        if (tid == 0) previous = uint(anchor[0]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint position = 0; position < length; ++position) {
+            uint id = uint(candidates[position * K + candidate_lane]);
+            bfloat16_t partial = bfloat16_t(0.0f);
+            for (uint block = 0; block < 2; ++block) {
+                for (uint j = 0; j < 4; ++j) {
+                    uint r = block * 128 + rank_lane * 4 + j;
+                    float left = float(predecessor_book[previous * R + r]);
+                    float middle = float(projected[position * R + r]);
+                    float right = float(successor_book[id * R + r]);
+                    bfloat16_t first = bfloat16_t(left * middle);
+                    bfloat16_t second = bfloat16_t(float(first) * right);
+                    partial = bfloat16_t(float(second) + float(partial));
+                }
+            }
+            bfloat16_t edge = simd_sum(partial);
+            if (rank_lane == 0) {
+                float score = float(unary[position * K + candidate_lane]) + float(edge);
+                if constexpr (UNARY_BF16 == 1) score = float(bfloat16_t(score));
+                scores[candidate_lane] = score;
+                ids[candidate_lane] = id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint best = 0;
+                for (uint k = 1; k < K; ++k) {
+                    if (scores[k] > scores[best]) best = k;
+                }
+                previous = ids[best];
+                path[position] = int(previous);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """,
+    ensureRowContiguous: true)
+
 /// The low-rank edge-scored greedy path over the per-position candidate lists.
 ///
 /// The track is greedy, so only the temperature-0 path of the reference
@@ -883,10 +1105,17 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
-        let unary = takeAlong(logits, candidates, axis: -1)
+        let accelerated = top16CandidatesAndUnary(logits)
+        let candidates = accelerated?.0
+            ?? argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        let unary = accelerated?.1 ?? takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
+        if let fused = fusedGreedyPath(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor)
+        {
+            return fused
+        }
 
         var predecessor = anchor
         var path = [MLXArray]()
@@ -907,6 +1136,49 @@ final class DFlash2CandidateSelector: Module {
         // `argPartition` indexes in UInt32, so the path inherits that dtype.
         // Draft tokens are token ids, and the engine reads them as Int32.
         return stacked(path, axis: 1).asType(.int32)
+    }
+
+    private func top16CandidatesAndUnary(_ logits: MLXArray) -> (MLXArray, MLXArray)? {
+        let shape = logits.shape
+        guard topK == 16, shape.count == 3, shape[0] == 1,
+            shape[1] > 0, shape[1] <= 16, shape[2] == 248_320,
+            [.bfloat16, .float32].contains(logits.dtype)
+        else { return nil }
+        let length = shape[1]
+        let blocks = (shape[2] + 4095) / 4096
+        let partial = dflash2Top16PartialKernel(
+            [logits], grid: (length * blocks * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[length, blocks, 16], [length, blocks, 16]],
+            outputDTypes: [.uint32, .float32])
+        let selected = dflash2Top16FinalKernel(
+            partial, grid: (length * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, length, 16], [1, length, 16]],
+            outputDTypes: [.uint32, logits.dtype])
+        return (selected[0], selected[1])
+    }
+
+    private func fusedGreedyPath(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray
+    ) -> MLXArray? {
+        let length = candidates.dim(1)
+        guard topK == 16, length > 0,
+            candidates.shape == [1, length, 16], candidates.dtype == .uint32,
+            unary.shape == candidates.shape, [.bfloat16, .float32].contains(unary.dtype),
+            projected.shape == [1, length, 256], projected.dtype == .bfloat16,
+            predecessorCodebook.dim(1) == 256, predecessorCodebook.dtype == .bfloat16,
+            successorCodebook.shape == predecessorCodebook.shape,
+            successorCodebook.dtype == .bfloat16,
+            anchor.shape == [1], anchor.dtype == .int32
+        else { return nil }
+
+        return dflash2GreedyPathKernel(
+            [
+                candidates, unary, projected, predecessorCodebook,
+                successorCodebook, anchor,
+            ],
+            template: [("UNARY_BF16", unary.dtype == .bfloat16 ? 1 : 0)],
+            grid: (512, 1, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[1, length]], outputDTypes: [.int32])[0]
     }
 }
 
