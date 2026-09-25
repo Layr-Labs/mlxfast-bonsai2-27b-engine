@@ -888,6 +888,13 @@ final class DFlash2CandidateSelector: Module {
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
+        if let path = DFlash2GreedyWalk.select(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        {
+            return path
+        }
+
         var predecessor = anchor
         var path = [MLXArray]()
         path.reserveCapacity(hidden.dim(1))
@@ -908,6 +915,80 @@ final class DFlash2CandidateSelector: Module {
         // Draft tokens are token ids, and the engine reads them as Int32.
         return stacked(path, axis: 1).asType(.int32)
     }
+}
+
+/// The greedy candidate walk with every edge score computed up front.
+///
+/// Position 0 scores its candidates against the anchor; every later position
+/// scores its candidates against each candidate of the position before it, as
+/// one `[L-1, K, K]` table built from the same element-wise products and the
+/// same final-axis sum as the per-position loop. One small kernel then walks
+/// the table in order, so the selected path is the loop's path.
+enum DFlash2GreedyWalk {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_FUSED_WALK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func select(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray? {
+        guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
+            unary.dtype == .float32
+        else { return nil }
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        guard length >= 1, k >= 1, k <= 32 else { return nil }
+        let c = candidates[0]
+        let first =
+            (take(predecessorCodebook, anchor, axis: 0).expandedDimensions(axis: 1)
+                * projected[0..., 0, 0...].expandedDimensions(axis: 1)
+                * take(successorCodebook, c[0], axis: 0).expandedDimensions(axis: 0))
+            .sum(axis: -1)[0]
+        let later: MLXArray
+        if length > 1 {
+            let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            let next = take(successorCodebook, c[1...], axis: 0)
+            later =
+                ((previous * projected[0, 1..., 0...].expandedDimensions(axis: 1))
+                    .expandedDimensions(axis: 2)
+                    * next.expandedDimensions(axis: 1))
+                .sum(axis: -1)
+        } else {
+            later = MLXArray.zeros([1, k, k], dtype: first.dtype)
+        }
+        let path = kernel(
+            [unary[0], first, later, c],
+            template: [("L", length), ("K", k)],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+        return path.reshaped([1, length])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_greedy_walk",
+        inputNames: ["unary", "edge0", "edges", "cand"],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            int prev = -1;
+            for (uint i = 0; i < L; i++) {
+                float score = -INFINITY;
+                if (c < K) {
+                    float e = (i == 0) ? float(edge0[c])
+                                       : float(edges[((i - 1) * K + uint(prev)) * K + c]);
+                    score = unary[i * K + c] + e;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                prev = int(sel);
+                if (c == 0) path[i] = int(cand[i * K + sel]);
+            }
+            """)
 }
 
 // MARK: - The drafter
