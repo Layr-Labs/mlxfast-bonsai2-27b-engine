@@ -417,12 +417,16 @@ PYEOF
 fi
 
 # --- 7. the goldens ----------------------------------------------------------
-# THERE IS NOTHING TO DO HERE, and that is the design. A track's goldens are
-# recorded on ITS OWN BOX, published to R2 under correctness_prompts/<track id>/
-# and staged on the ranked box as MLXFAST_QWEN38_GOLDEN_DIR. They are never in
-# git, so a new track carries none of the source track's and there is no
-# directory to rename. The new track's contract pins its own keys once its
-# goldens are recorded.
+# A track's hidden goldens are recorded on ITS OWN BOX, published to R2 under
+# correctness_prompts/<track id>/ and staged on the ranked box as
+# MLXFAST_QWEN38_GOLDEN_DIR. They are never in git, so there is nothing to
+# rename. The source track's PUBLIC captures do ship in git, at the same path,
+# and they are the source track's: the new track records its own on its own
+# box. Drop them, so the stamped tree carries no other track's golden.
+if [[ -d "correctness_prompts/${OLD_TRACK_ID}" ]]; then
+  rm -rf "correctness_prompts/${OLD_TRACK_ID}"
+  note "removed correctness_prompts/${OLD_TRACK_ID}/ (the source track's public captures); record this track's own on its box and commit them at correctness_prompts/${TRACK_ID}/"
+fi
 
 # --- 8. the engine fork pin --------------------------------------------------
 # NOTHING TO STAMP HERE. Vendor/mlx-swift-lm is a VENDORED TREE of plain files,

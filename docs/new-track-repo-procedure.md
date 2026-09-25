@@ -56,10 +56,15 @@ logic lands:
   runtime configuration.
 - Identity = **sha256 + bytes**, never name/path/location. The gates-bound golden pin is the
   oracle-carrying file's hash; the oracle is mandatory on the timed path.
-- Uploaded to R2 under `correctness_prompts/{track_id}/`, append-only, per-instance
+- Hidden material (the pool tapes, the per-depth oracles, the live golden) is uploaded
+  to R2 under `correctness_prompts/{track_id}/`, append-only, per-instance
   authorization, operator-workstation credentials only, GET + sha + bytes round-trip
   verified after upload. The bucket is part of the endpoint, never part of the object
   key. `tools/fetch-goldens.sh` documents the convention and is the reader.
+- The two public captures for the local modes are recorded in the same session and
+  committed to the repository at `correctness_prompts/{track_id}/`. A participant's
+  local test needs no R2 access. `tools/golden-arming-patch.py` checks them against
+  the hidden bytes and prints a `ship:` line per capture naming that path.
 - Upload happens **once the track is stable and ready for testing** — after the engine port and
   measurement stack are proven on-box, before the first scored window.
   `official_scoring_enabled` flips true LAST, in its own PR, after one clean scored window.
@@ -103,10 +108,11 @@ What it changes:
   and the two new-track scripts keep the old names, because they record the source
   track. `tools/new-track.sh` holds that exemption list, and
   `tools/test-new-track.sh` holds the same list and proves it.
-- The goldens: nothing to do. A track's goldens are recorded on its own box,
-  published to R2 under `correctness_prompts/<track id>/` and staged on the
-  ranked box as `MLXFAST_QWEN38_GOLDEN_DIR`. They are never in git, so the new
-  track carries none of the source track's and there is no directory to rename.
+- The goldens: the hidden goldens are never in git, so there is nothing to rename.
+  The source track's public captures are in git, and the script removes
+  `correctness_prompts/<source track id>/`: they are the source track's. The new
+  track records its own on its own box and commits them at
+  `correctness_prompts/<new track id>/`.
 
 The script never commits. Review the diff, then commit.
 
