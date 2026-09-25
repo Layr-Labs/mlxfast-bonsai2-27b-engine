@@ -463,6 +463,14 @@ private final class DFlash2Attention: Module {
         super.init()
     }
 
+    /// On unless explicitly disabled. It selects how the context and block
+    /// rows are grouped into projection calls, never what a row computes.
+    private static let jointKeyValueRows: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_JOINT_KV"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// - Parameters:
     ///   - x: the block, `[B, blockLength, hidden]`.
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
@@ -489,25 +497,47 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
-
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
-        contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        blockKeys = kNorm(blockKeys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-        blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         queries = rope(queries, offset: blockOffset)
-        contextKeys = rope(contextKeys, offset: cache.offset)
-        blockKeys = rope(blockKeys, offset: blockOffset)
+
+        let contextKeys: MLXArray
+        let contextValues: MLXArray
+        let blockKeys: MLXArray
+        let blockValues: MLXArray
+        if Self.jointKeyValueRows, contextLength > 0, context.dtype == x.dtype {
+            // The context rows and the block rows are one unbroken run of
+            // positions starting at `cache.offset`, and both go through the
+            // same `k_proj`, `v_proj`, key norm and rotation. One pass over the
+            // joined rows reads each projection weight once per forward
+            // instead of twice; the key norm and the rotation are per row, so
+            // splitting the result afterwards gives each side its own rows.
+            let rows = concatenated([context, x], axis: 1)
+            let total = contextLength + L
+            let jointKeys = rope(
+                kNorm(kProj(rows).reshaped(B, total, kvHeads, -1)).transposed(0, 2, 1, 3),
+                offset: cache.offset)
+            let jointValues = vProj(rows).reshaped(B, total, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            contextKeys = jointKeys[0..., 0..., ..<contextLength, 0...]
+            contextValues = jointValues[0..., 0..., ..<contextLength, 0...]
+            blockKeys = jointKeys[0..., 0..., contextLength..., 0...]
+            blockValues = jointValues[0..., 0..., contextLength..., 0...]
+        } else {
+            contextKeys = rope(
+                kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+                    .transposed(0, 2, 1, 3),
+                offset: cache.offset)
+            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            blockKeys = rope(
+                kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3),
+                offset: blockOffset)
+            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        }
 
         // Only the CONTEXT keys and values enter the cache. The block's own keys
         // and values are concatenated for this forward and then dropped.
