@@ -501,6 +501,18 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return applyRotated(rotated)
     }
 
+    /// The packed matmul on an activation a caller's own kernel already
+    /// rotated with this layer's transform (its layout, signs and block
+    /// transform, the values `rotate` computes), optionally leaving the
+    /// matrix route's FP16 product unwidened: `forwardPreSigned` minus its
+    /// rotation.
+    public func forwardRotated(_ rotated: MLXArray, widenOutput: Bool = true) -> MLXArray {
+        if !widenOutput, let routed = matrixRegimeForward(rotated, widenOutput: false) {
+            return routed
+        }
+        return applyRotated(rotated)
+    }
+
     /// The representation the route handles: the pack's 2-bit affine layout
     /// with FP16 constants, no linear bias, and a 64-aligned output width.
     private static func routeApplies(to layer: HadamardQuantizedLinear) -> Bool {

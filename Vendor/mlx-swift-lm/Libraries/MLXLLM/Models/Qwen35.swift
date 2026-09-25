@@ -868,6 +868,15 @@ final class Qwen35GatedDeltaNet: Module {
     /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
     /// the rotation reads the same values either way.
     private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        if let packed = outProj as? HadamardQuantizedLinear,
+            let rotated = Qwen35GatedHadamard.gatedRMSNorm(
+                out, gate: gate, weight: norm.weight, eps: norm.eps,
+                transform: packed.transform, layout: packed.gdnLayout)
+        {
+            // The norm, the gate, the value layout, the signs and the block
+            // transform in one kernel; the residual add widens the product.
+            return packed.forwardRotated(rotated.reshaped(B, S, -1), widenOutput: false)
+        }
         if Qwen35FusedElementwise.foldsHadamardSigns,
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
@@ -1972,6 +1981,14 @@ final class Qwen35Attention: Module {
             return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, attendedGate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
+            if packed.gdnLayout == nil,
+                let rotated = Qwen35GatedHadamard.sigmoidGate(
+                    output, gate: attendedGate, transform: packed.transform)
+            {
+                // The output gate, the signs and the block transform in one
+                // kernel; the residual add widens the FP16 product itself.
+                return packed.forwardRotated(rotated, widenOutput: false)
+            }
             // The output gate and the projection's Hadamard signs share one
             // kernel; the residual add widens the FP16 product itself.
             if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
@@ -2216,9 +2233,7 @@ extension Qwen3NextMLP {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
             let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
         {
-            let signed = Qwen35FusedElementwise.swigluSigned(
-                shared[0], shared[1], down.transform.signVector)
-            return down.forwardPreSigned(signed, widenOutput: false)
+            return swigluDown(down, gate: shared[0], up: shared[1])
         }
         guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
             return self(x)
@@ -2246,8 +2261,24 @@ extension Qwen3NextMLP {
             let shared = sharedHadamardProjectionsPreSigned(
                 signedInput, siblings, widenOutput: false)
         else { return nil }
+        return swigluDown(down, gate: shared[0], up: shared[1])
+    }
+
+    /// `down` applied to `silu(gate) * up`. One kernel forms the SwiGLU
+    /// product, the down projection's Hadamard signs and its block transform
+    /// (`Qwen35GatedHadamard.swiGLU`); where that does not apply, the
+    /// compiled signed SwiGLU feeds `forwardPreSigned`. The same rotated
+    /// values either way; the residual add widens the product.
+    fileprivate func swigluDown(
+        _ down: HadamardQuantizedLinear, gate: MLXArray, up: MLXArray
+    ) -> MLXArray {
+        if let rotated = Qwen35GatedHadamard.swiGLU(
+            gate: gate, up: up, transform: down.transform)
+        {
+            return down.forwardRotated(rotated, widenOutput: false)
+        }
         let signed = Qwen35FusedElementwise.swigluSigned(
-            shared[0], shared[1], down.transform.signVector)
+            gate, up, down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
     }
 }
@@ -2989,6 +3020,303 @@ enum Qwen35FusedHadamard {
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [x.shape], outputDTypes: [outputDType])[0]
         }
+    }
+}
+
+/// The elementwise op that feeds a packed projection, run inside that
+/// projection's signed rotation: the SwiGLU product before `down_proj`, the
+/// attention output gate before `o_proj`, and the GDN output's per-head
+/// RMSNorm and `silu(z)` gate before `out_proj`.
+///
+/// Each kernel forms the op's FP32 value exactly as the chain it replaces
+/// does (MLX's `Sigmoid` verbatim, the same products in the same order; the
+/// norm as `rms_single_row` runs a 128-wide head: 32 lanes of four ordered
+/// squares, `simd_sum`, `precise::rsqrt(sum / 128 + eps)`, `w * (x * inv)`),
+/// multiplies in the projection's +-1 signs (exact), then runs the butterfly,
+/// staging and final scale of `bonsai_signed_hadamard_1024` unchanged. The
+/// rotated activation is the chain's, bit for bit; the op's own dispatches,
+/// its FP32 store and the rotation's reload of it are gone. Operands are read
+/// through their strides (the SwiGLU halves and the GDN gate are column
+/// slices of a stacked projection), so nothing is copied to feed a kernel.
+/// `DARKBLOOM_BONSAI_GATED_ROTATE=0` keeps the separate ops.
+enum Qwen35GatedHadamard {
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GATED_ROTATE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let floatTypes: [DType] = [.float32, .float16, .bfloat16]
+
+    private static let header = """
+        // Thread-local Hadamard butterfly for 2^R values, as in
+        // mlx/backend/metal/kernels/hadamard.h (radix_func).
+        template <short R>
+        inline void qwen35_gh_radix(thread float* x) {
+          constexpr short logR = __builtin_ctz(R);
+          short h = 1;
+          #pragma clang loop unroll(full)
+          for (short s = 0; s < logR; s++) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < R / 2; i++) {
+              short k = i & (h - 1);
+              short j = ((i - k) << 1) + k;
+              float a = x[j];
+              float b = x[j + h];
+              x[j] = a + b;
+              x[j + h] = a - b;
+            }
+            h <<= 1;
+          }
+        }
+
+        // MLX `Sigmoid` (unary_ops.h), verbatim, at float.
+        inline float qwen35_gh_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        """
+
+    // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
+    // 1024-wide block of a W-wide row, BPR blocks per row.
+    private static let prologue = """
+        constexpr short N = 1024;
+        constexpr short NT = 64;
+        const uint blk = threadgroup_position_in_grid.x;
+        const short i = short(thread_position_in_threadgroup.x);
+        const uint row = blk / uint(BPR);
+        const uint bcol = (blk % uint(BPR)) * uint(N);
+        const size_t rowbase = size_t(row) * size_t(W);
+        threadgroup float buf[N];
+
+        """
+
+    // `bonsai_signed_hadamard_1024` from its first barrier on, verbatim.
+    private static let transformAndStore = """
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float xv[16];
+        short h = 1;
+        #pragma clang loop unroll(full)
+        for (short s = 0; s < 2; s++) {
+          short k = i & (h - 1);
+          short j = ((i - k) << 4) + k;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 16; r++) {
+            xv[r] = buf[j + h * r];
+          }
+          qwen35_gh_radix<16>(xv);
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 16; r++) {
+            buf[j + h * r] = xv[r];
+          }
+          h <<= 4;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < 4; t++) {
+          short index = i + t * NT;
+          short k = index & (h - 1);
+          short j = ((index - k) << 2) + k;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            xv[r] = buf[j + h * r];
+          }
+          qwen35_gh_radix<4>(xv);
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            buf[j + h * r] = xv[r];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          const short index = j * 4 * NT + i * 4;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            out[rowbase + bcol + uint(index + r)] = buf[index + r] * 0.03125f;
+          }
+        }
+        """
+
+    // MODE 1: (a * sigmoid(a)) * b, the compiled `silu(a) * b`.
+    // MODE 2: a * sigmoid(b). Both operands are read through their strides.
+    private static let gatedSource = prologue + """
+        const int64_t a_row = elem_to_loc<int64_t>(int64_t(rowbase), a_shape, a_strides, a_ndim);
+        const int64_t b_row = elem_to_loc<int64_t>(int64_t(rowbase), b_shape, b_strides, b_ndim);
+        const int64_t a_col = a_strides[a_ndim - 1];
+        const int64_t b_col = b_strides[b_ndim - 1];
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          const short index = j * 4 * NT + i * 4;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const uint col = bcol + uint(index + r);
+            const float av = float(a[a_row + int64_t(col) * a_col]);
+            const float bv = float(b[b_row + int64_t(col) * b_col]);
+            float v;
+            if (MODE == 1) {
+              const float t = av * qwen35_gh_sigmoid(av);
+              v = t * bv;
+            } else {
+              v = av * qwen35_gh_sigmoid(bv);
+            }
+            buf[index + r] = v * signs[col];
+          }
+        }
+
+        """ + transformAndStore
+
+    // Per GD-wide head: the inverse RMS as `rms_single_row` forms it (lane l
+    // squares and sums elements 4l..4l+3 in order, then `simd_sum`), then
+    // `silu(z) * (w * (x * inv))` at every output column, read at the source
+    // column of the GDN value layout (GR repeats of GKH key heads).
+    private static let normSource = prologue + """
+        constexpr uint HPB = uint(N) / uint(GD);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int64_t x_row = elem_to_loc<int64_t>(int64_t(rowbase), inp_shape, inp_strides, inp_ndim);
+        const int64_t x_head = inp_strides[inp_ndim - 2];
+        const int64_t x_dim = inp_strides[inp_ndim - 1];
+        const int64_t z_row = elem_to_loc<int64_t>(int64_t(rowbase), gate_shape, gate_strides, gate_ndim);
+        const int64_t z_head = gate_strides[gate_ndim - 2];
+        const int64_t z_dim = gate_strides[gate_ndim - 1];
+        threadgroup float inv_rms[HPB];
+        for (uint hh = sg; hh < HPB; hh += 2) {
+          const uint hr = (bcol + hh * uint(GD)) / uint(GD);
+          const uint sh = (GR > 1) ? (hr % uint(GR)) * uint(GKH) + hr / uint(GR) : hr;
+          float acc = 0;
+          float tx[4];
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            tx[r] = inp[x_row + int64_t(sh) * x_head + int64_t(lane * 4 + uint(r)) * x_dim];
+            acc += tx[r] * tx[r];
+          }
+          acc = simd_sum(acc);
+          if (lane == 0) {
+            inv_rms[hh] = metal::precise::rsqrt(acc / GD + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          const short index = j * 4 * NT + i * 4;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const uint col = bcol + uint(index + r);
+            const uint d = col % uint(GD);
+            const uint hr = col / uint(GD);
+            const uint sh = (GR > 1) ? (hr % uint(GR)) * uint(GKH) + hr / uint(GR) : hr;
+            const float xs = inp[x_row + int64_t(sh) * x_head + int64_t(d) * x_dim];
+            const float xn = float(wt[int64_t(d) * wt_strides[0]])
+                * (xs * inv_rms[uint(index + r) / uint(GD)]);
+            const float zv = float(gate[z_row + int64_t(sh) * z_head + int64_t(d) * z_dim]);
+            const float gz = zv * qwen35_gh_sigmoid(zv);
+            buf[index + r] = (gz * xn) * signs[col];
+          }
+        }
+
+        """ + transformAndStore
+
+    private static let gatedKernel = MLXFast.metalKernel(
+        name: "qwen35_gated_signed_hadamard_1024",
+        inputNames: ["a", "b", "signs"],
+        outputNames: ["out"],
+        source: gatedSource,
+        header: header,
+        ensureRowContiguous: false)
+
+    private static let normKernel = MLXFast.metalKernel(
+        name: "qwen35_gated_rmsnorm_hadamard_1024",
+        inputNames: ["inp", "gate", "wt", "signs", "eps"],
+        outputNames: ["out"],
+        source: normSource,
+        header: header,
+        ensureRowContiguous: false)
+
+    /// A 1024-block transform spanning the activation's last axis, FP32 signs.
+    private static func covers(_ transform: SignedBlockHadamard, width: Int) -> Bool {
+        enabled && transform.blockSize == 1024 && transform.width == width
+            && width % 1024 == 0 && transform.signVector.dtype == .float32
+    }
+
+    private static func gated(
+        _ a: MLXArray, _ b: MLXArray, transform: SignedBlockHadamard, mode: Int
+    ) -> MLXArray {
+        let width = a.dim(-1)
+        let rows = a.size / width
+        let blocksPerRow = width / 1024
+        // The operand dtypes key the compiled library: its signature is
+        // written for the dtypes of the first call.
+        let template: [(String, any KernelTemplateArg)] = [
+            ("AT", a.dtype), ("BT", b.dtype), ("W", width), ("BPR", blocksPerRow),
+            ("MODE", mode),
+        ]
+        return gatedKernel(
+            [a, b, transform.signVector], template: template,
+            grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [a.shape], outputDTypes: [.float32])[0]
+    }
+
+    /// `applyPreSigned((silu(gate) * up) * signs)`: the down projection's
+    /// rotated input, for gate and up in FP32, FP16 or BF16 (each widened
+    /// exactly, as the compiled chain's `asType(.float32)` does).
+    static func swiGLU(gate: MLXArray, up: MLXArray, transform: SignedBlockHadamard)
+        -> MLXArray?
+    {
+        guard gate.ndim >= 1, gate.size > 0, gate.shape == up.shape,
+            floatTypes.contains(gate.dtype), floatTypes.contains(up.dtype),
+            covers(transform, width: gate.dim(-1))
+        else { return nil }
+        return gated(gate, up, transform: transform, mode: 1)
+    }
+
+    /// `applyPreSigned((x * sigmoid(gate)) * signs)` for FP32 `x` and `gate`
+    /// (the chain forms the sigmoid in the gate's own dtype, so only FP32).
+    static func sigmoidGate(_ x: MLXArray, gate: MLXArray, transform: SignedBlockHadamard)
+        -> MLXArray?
+    {
+        guard x.ndim >= 1, x.size > 0, x.shape == gate.shape,
+            x.dtype == .float32, gate.dtype == .float32,
+            covers(transform, width: x.dim(-1))
+        else { return nil }
+        return gated(x, gate, transform: transform, mode: 2)
+    }
+
+    /// The GDN output projection's rotated input: `rmsNorm(x, weight, eps)`
+    /// over each 128-wide head of an FP32 `x`, times `silu(z)`, gathered
+    /// through `layout`, signed and transformed. Returned with the heads
+    /// flattened into the last axis.
+    static func gatedRMSNorm(
+        _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float,
+        transform: SignedBlockHadamard, layout: HadamardGDNLayout?
+    ) -> MLXArray? {
+        guard x.ndim >= 2, x.size > 0, x.dtype == .float32, x.shape == z.shape,
+            floatTypes.contains(z.dtype), floatTypes.contains(weight.dtype),
+            x.dim(-1) == 128, weight.ndim == 1, weight.dim(0) == 128
+        else { return nil }
+        let heads = x.dim(-2)
+        let width = heads * 128
+        guard covers(transform, width: width) else { return nil }
+        var repeats = 1
+        var keyHeads = heads
+        if let layout {
+            guard layout.width == width, layout.valueHeads == heads,
+                heads % layout.keyHeads == 0
+            else { return nil }
+            repeats = heads / layout.keyHeads
+            keyHeads = layout.keyHeads
+        }
+        let rows = x.size / width
+        let blocksPerRow = width / 1024
+        let template: [(String, any KernelTemplateArg)] = [
+            ("ZT", z.dtype), ("WT", weight.dtype), ("W", width), ("BPR", blocksPerRow),
+            ("GR", repeats), ("GKH", keyHeads), ("GD", 128),
+        ]
+        return normKernel(
+            [x, z, weight, transform.signVector, MLXArray(eps)], template: template,
+            grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [Array(x.shape.dropLast(2)) + [width]],
+            outputDTypes: [.float32])[0]
     }
 }
 
