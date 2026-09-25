@@ -2,6 +2,7 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -14,6 +15,10 @@ extension EngineLoopV2 {
     /// production traffic (mass typically ≥0.99 at K=256) shortlisted while
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
+
+    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's event.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
 
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
@@ -84,6 +89,17 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        if Self.pollsAcceptancePacket {
+            // Poll the packet instead of sleeping on its completion event: the
+            // step thread wakes the instant the verify finishes and stays on a
+            // clocked-up core for the finalize and the next graph build, which
+            // are on the GPU's critical path. The read below then returns at
+            // once. `BONSAI_POLL_PACKET=0` restores the sleeping wait.
+            var available = false
+            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
+                !available
+            {}
+        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)

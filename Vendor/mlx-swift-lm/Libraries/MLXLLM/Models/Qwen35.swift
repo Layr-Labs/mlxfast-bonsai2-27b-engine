@@ -345,7 +345,84 @@ func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
     aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
 ) -> (MLXArray, MLXArray) {
-    let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
+    qwen35GatedDelta(
+        q: q, k: k, v: v, gates: Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias]),
+        state: state, mask: mask)
+}
+
+/// `BONSAI_GDN_REUSE=0` makes the accepted-prefix replay recompute g and beta.
+let qwen35ReplayReusesGates: Bool = {
+    let value = ProcessInfo.processInfo.environment["BONSAI_GDN_REUSE"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
+/// `BONSAI_CONV_TAILS=0` keeps the verify's conv tails as slices of the
+/// concatenated conv input.
+let qwen35ConvTailsFromSource: Bool = {
+    let value = ProcessInfo.processInfo.environment["BONSAI_CONV_TAILS"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
+/// An input rotation computed ahead of a projection by the previous layer
+/// boundary's fused residual-norm-rotation kernel, handed to the projection
+/// that consumes it. A plain class outside the parameter tree, so Module
+/// reflection sees `.other`; taken at most once.
+final class Qwen35PendingRotation {
+    private var value: MLXArray?
+    func set(_ rotated: MLXArray) { value = rotated }
+    func take() -> MLXArray? {
+        defer { value = nil }
+        return value
+    }
+}
+
+/// The residual stream between decoder layers: either materialized, or
+/// `h + y` with the add deferred into the next layer's input-norm kernel.
+enum Qwen35ResidualStream {
+    case value(MLXArray)
+    case pending(MLXArray, MLXArray)
+
+    func materialized() -> MLXArray {
+        switch self {
+        case .value(let v): return v
+        case .pending(let h, let y): return h + y
+        }
+    }
+}
+
+/// The dtype a boundary kernel writes its rotation in for `siblings`: the
+/// dtype their fused packed route reads an FP32 activation in (the kernel's
+/// `static_cast` is the same rounding the fused transform's output cast
+/// performs), FP32 otherwise. `BONSAI_ROTATION_FP16=0` keeps FP32.
+func qwen35RotationDType(rows: Int, _ siblings: [HadamardQuantizedLinear]) -> DType {
+    guard qwen35WritesRoutedRotation,
+        HadamardQuantizedLinear.routedInputDType(rows: rows, siblings: siblings) == .float16
+    else { return .float32 }
+    return .float16
+}
+
+let qwen35WritesRoutedRotation: Bool = {
+    let value = ProcessInfo.processInfo.environment["BONSAI_ROTATION_FP16"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
+/// `BONSAI_FUSED_BOUNDARY=0` keeps the residual add between layers.
+let qwen35DefersLayerResidual: Bool = {
+    let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_BOUNDARY"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
+/// The recurrence on precomputed `[g, beta]`. Both are element-wise in the
+/// time axis, so a row slice of a window's gates is exactly the gates of the
+/// sliced rows.
+func qwen35GatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, gates: [MLXArray],
+    state: MLXArray?, mask: MLXArray?
+) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
@@ -854,6 +931,15 @@ final class Qwen35GatedDeltaNet: Module {
         return Qwen35FusedElementwise.gatedNormTail(normed, gate).asType(out.dtype)
     }
 
+    /// `projectOut(gatedNorm(out, gate:).reshaped(B, S, -1))` with the norm, the
+    /// gate tail, the value layout, the signs and the rotation in one kernel
+    /// (the same FP32 arithmetic). Nil when the fused path does not apply.
+    private func projectGatedNormFused(_ out: MLXArray, gate: MLXArray) -> MLXArray? {
+        guard let packed = outProj as? HadamardQuantizedLinear else { return nil }
+        return packed.applyAfterGatedRMSNorm(
+            out, gate: gate, weight: norm.weight, eps: norm.eps, widenOutput: false)
+    }
+
     /// `out_proj` on the normed output. When the projection is packed on the
     /// matrix route the FP16 product is left for the residual add to widen.
     private func projectOut(_ x: MLXArray) -> MLXArray {
@@ -868,6 +954,11 @@ final class Qwen35GatedDeltaNet: Module {
     /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
     /// the rotation reads the same values either way.
     private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        // The per-head norm, the gated tail, the signs and the rotation in
+        // one kernel (the same values as the path below).
+        if let fused = projectGatedNormFused(out, gate: gate) {
+            return fused
+        }
         if Qwen35FusedElementwise.foldsHadamardSigns,
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
@@ -1123,10 +1214,35 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
+    /// The input rotation of `[inProjQKV, inProjZ]`, when the layer boundary
+    /// already formed it.
+    let pendingRotation = Qwen35PendingRotation()
+
+    /// The transform the layer boundary may rotate this layer's input with.
+    var inputRotationSiblings: [HadamardQuantizedLinear]? {
+        sharedHadamardSiblings([inProjQKV, inProjZ])
+    }
+
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
+        let prerotated = pendingRotation.take()
         guard prepareFusedInputProjection(), let fusedInProj else {
+            // The boundary kernel already rotated the input: the same rotated
+            // values the shared projection below would form.
+            if let prerotated,
+                let shared = sharedHadamardProjections(rotated: prerotated, [inProjQKV, inProjZ])
+            {
+                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA) {
+                    return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
+                }
+                return (
+                    shared[0],
+                    shared[1].reshaped(B, S, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
             // Packed qkv and z read the same activation through the same
             // transform; rotate it once. b and a stay full precision.
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
@@ -1357,23 +1473,52 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        gates: [MLXArray]? = nil,
+        convSource: (state: MLXArray, qkv: MLXArray)? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = qwen35GatedDelta(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
-        ).1
+        let boundarySsm: MLXArray
+        if let gates, tape.mask == nil {
+            // The verify window's own g and beta, sliced to the accepted rows,
+            // instead of recomputing them from the tape's a and b.
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                gates: gates.map { $0[0..., rows, 0...] },
+                state: tape.ssmPre,
+                mask: nil
+            ).1
+        } else {
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] }
+            ).1
+        }
+        if let convSource {
+            // Rows [c, c + nKeep) of [convState; qkv], read from the two
+            // sources: the same values as slicing the concatenated input.
+            let nKeep = tape.convStateRows
+            let c = committedRows
+            let tail =
+                c >= nKeep
+                ? convSource.qkv[0..., (c - nKeep) ..< c, 0...]
+                : concatenated(
+                    [convSource.state[0..., c ..< nKeep, 0...], convSource.qkv[0..., 0 ..< c, 0...]],
+                    axis: 1)
+            return CBv2RecurrentLayerState(conv: tail, ssm: boundarySsm)
+        }
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -1494,6 +1639,11 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
+        // The per-head norm, the gated tail, the signs and the rotation in one
+        // kernel; the residual add widens the FP16 product exactly.
+        if let fused = projectGatedNormFused(out, gate: z) {
+            return fused
+        }
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
@@ -1675,9 +1825,19 @@ final class Qwen35GatedDeltaNet: Module {
             out = recurrence.0
             let finalSsmState = recurrence.1
 
+            // With S >= nKeep every committable tail is read from convState and
+            // qkv directly, so the concatenated input is never evaluated.
+            let tailsFromSource = qwen35ConvTailsFromSource && S >= nKeep
+            let replayGates: [MLXArray]? =
+                qwen35ReplayReusesGates ? pre.map { [$0.g, $0.beta] } : nil
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
-                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
+                let finalConv =
+                    tailsFromSource
+                    ? qkv[rowRange, (S - nKeep) ..< S, 0...]
+                    : convInput[rowRange, S ..< (S + nKeep), 0...]
+                let convSource: (state: MLXArray, qkv: MLXArray)? =
+                    tailsFromSource ? (convState[rowRange], qkv[rowRange]) : nil
                 let finalSSM = finalSsmState[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
@@ -1696,8 +1856,11 @@ final class Qwen35GatedDeltaNet: Module {
                 // already-accounted committed generation when it existed before
                 // this verify. `v` retains the whole conv output backing.
                 let convOutBacking = convOutBackingAll[rowRange]
+                // The tails alias qkv (and the pre-verify conv state, already
+                // charged) instead of the concatenated input.
+                let convBacking = convSource?.qkv ?? tape.convInput
                 var roots = [
-                    tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
+                    convBacking, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
@@ -1727,7 +1890,7 @@ final class Qwen35GatedDeltaNet: Module {
                 }
                 let materializedBytes = checkedByteCount(roots + [finalSSM])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
-                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                let fullAcceptanceRetainedBytes = checkedByteCount([convBacking])
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -1739,8 +1902,12 @@ final class Qwen35GatedDeltaNet: Module {
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
                         strictReplayRetainedRoots: strictReplayRoots,
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
-                        fullAcceptanceRetainedRoots: [tape.convInput],
+                        fullAcceptanceRetainedRoots: [convBacking],
                         fullAcceptance: {
+                            if convSource != nil {
+                                // Already a tail of qkv alone; nothing to detach.
+                                return CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
+                            }
                             let detachedConv = finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
@@ -1748,7 +1915,9 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                                tape: tape, committedRows: keepPositions,
+                                gates: replayGates.map { $0.map { $0[rowRange] } },
+                                convSource: convSource)
                         })
                 } catch {
                     preconditionFailure(
@@ -1857,9 +2026,23 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    /// The input rotation of `[qProj, kProj, vProj]`, when the layer boundary
+    /// already formed it.
+    let pendingRotation = Qwen35PendingRotation()
+
+    /// The transform the layer boundary may rotate this layer's input with.
+    var inputRotationSiblings: [HadamardQuantizedLinear]? {
+        sharedHadamardSiblings([qProj, kProj, vProj])
+    }
+
     /// q, k and v read the same activation. On a packed Hadamard checkpoint
     /// they share one input transform, so it is computed once.
     private func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let prerotated = pendingRotation.take(),
+            let shared = sharedHadamardProjections(rotated: prerotated, [qProj, kProj, vProj])
+        {
+            return (shared[0], shared[1], shared[2])
+        }
         if let shared = sharedHadamardProjections(x, [qProj, kProj, vProj]) {
             return (shared[0], shared[1], shared[2])
         }
@@ -1898,6 +2081,13 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
+        // output * sigmoid(gate), the signs and the rotation in one kernel;
+        // the residual add widens the FP16 product exactly.
+        if let packed = oProj as? HadamardQuantizedLinear,
+            let y = packed.applyAfterSigmoidGate(output, gate: gate, widenOutput: false)
+        {
+            return y
+        }
         return oProj(sigmoidMultiply(output, gate))
     }
 
@@ -1972,6 +2162,13 @@ final class Qwen35Attention: Module {
             return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, attendedGate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
+            // output * sigmoid(gate), the signs and the rotation in one
+            // kernel; the residual add widens the FP16 product as before.
+            if let y = packed.applyAfterSigmoidGate(
+                output, gate: attendedGate, widenOutput: false)
+            {
+                return y
+            }
             // The output gate and the projection's Hadamard signs share one
             // kernel; the residual add widens the FP16 product itself.
             if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
@@ -2212,10 +2409,40 @@ extension Qwen3NextMLP {
     /// up products stay FP16, `silu(gate) * up` is formed in FP32 together with
     /// the down projection's Hadamard signs, and the down product is left for
     /// the residual add to widen. Same arithmetic, four fewer dispatches.
+    /// `h = x + r` and `qwen35Forward(norm(h))` with the residual add, the
+    /// RMSNorm and the gate/up input rotation in one kernel. Returns `(h, y)`,
+    /// bit-identical to the composed path; nil when the fused kernel does not
+    /// apply, and the caller then runs the composed path.
+    func qwen35ForwardAfterResidual(_ x: MLXArray, _ r: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray)?
+    {
+        guard ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let fused = siblings[0].transform.addRMSNormRotated(
+                x, r, weight: norm.weight, eps: norm.eps, writeNormed: false,
+                rotatedDType: qwen35RotationDType(rows: x.size / max(1, x.dim(-1)), siblings)),
+            let shared = sharedHadamardProjections(
+                rotated: fused.rotated, [gateProj, upProj], widenOutput: false)
+        else { return nil }
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return (fused.sum, y)
+        }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return (fused.sum, down.forwardPreSigned(signed, widenOutput: false))
+    }
+
     func qwen35Forward(_ x: MLXArray) -> MLXArray {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
             let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
         {
+            // silu(gate) * up, the down projection's signs and its transform in
+            // one kernel; the same products in the same order as the compiled
+            // chain plus `forwardPreSigned`.
+            if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+                return y
+            }
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
@@ -2246,6 +2473,9 @@ extension Qwen3NextMLP {
             let shared = sharedHadamardProjectionsPreSigned(
                 signedInput, siblings, widenOutput: false)
         else { return nil }
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return y
+        }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
@@ -2336,6 +2566,11 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
+        if let dense = mlp as? Qwen3NextMLP,
+            let (h, y) = dense.qwen35ForwardAfterResidual(x, r, norm: postAttentionLayerNorm)
+        {
+            return h + y
+        }
         let h = x + r
         if let dense = mlp as? Qwen3NextMLP {
             return h + dense.qwen35Forward(postAttentionLayerNorm(h))
@@ -2397,6 +2632,11 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: exactTargetVerify)
         }
+        if !exactTargetVerify, let dense = mlp as? Qwen3NextMLP,
+            let (h, y) = dense.qwen35ForwardAfterResidual(x, r, norm: postAttentionLayerNorm)
+        {
+            return h + y
+        }
         let h = x + r
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
@@ -2416,6 +2656,139 @@ final class Qwen35DecoderLayer: Module {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
         return h + feedForward
+    }
+}
+
+extension Qwen35DecoderLayer {
+    /// `callAsFunction` on a residual stream whose previous add may still be
+    /// pending; see `cbv2ForwardStream`.
+    func callAsFunctionStream(
+        _ input: Qwen35ResidualStream,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int = 0
+    ) -> Qwen35ResidualStream {
+        guard qwen35DefersLayerResidual, let dense = mlp as? Qwen3NextMLP else {
+            return .value(
+                self(
+                    input.materialized(), attentionMask: attentionMask, ssmMask: ssmMask,
+                    cache: cache, nConfirmed: nConfirmed))
+        }
+        let (x, normed, box) = boundaryInput(input)
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(
+                normed, mask: ssmMask, cache: cache as? MambaCache, nConfirmed: nConfirmed)
+        } else {
+            r = selfAttn!(normed, mask: attentionMask, cache: cache)
+        }
+        // A rotation the projection did not take must not leak into a later call.
+        _ = box?.take()
+        if let (h, y) = dense.qwen35ForwardAfterResidual(x, r, norm: postAttentionLayerNorm) {
+            return .pending(h, y)
+        }
+        let h = x + r
+        return .value(h + dense.qwen35Forward(postAttentionLayerNorm(h)))
+    }
+
+    /// This layer's input `x`, `inputLayerNorm(x)` and the box its input
+    /// projections take a boundary rotation from. A pending `h + y` is added,
+    /// normalized and rotated for those projections by one kernel
+    /// (`addRMSNormRotated`: the same values as `x = h + y`,
+    /// `inputLayerNorm(x)` and the projections' own rotation).
+    private func boundaryInput(_ input: Qwen35ResidualStream)
+        -> (MLXArray, MLXArray, Qwen35PendingRotation?)
+    {
+        let box: Qwen35PendingRotation? =
+            isLinear ? linearAttn?.pendingRotation : selfAttn?.pendingRotation
+        switch input {
+        case .pending(let h, let y):
+            let siblings = isLinear ? linearAttn?.inputRotationSiblings : selfAttn?.inputRotationSiblings
+            if let box, let siblings, let transform = siblings.first?.transform,
+                ObjectIdentifier(type(of: inputLayerNorm)) == ObjectIdentifier(RMSNorm.self),
+                let fused = transform.addRMSNormRotated(
+                    h, y, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
+                    writeNormed: true,
+                    rotatedDType: qwen35RotationDType(rows: h.size / max(1, h.dim(-1)), siblings)),
+                let normed = fused.normed
+            {
+                box.set(fused.rotated)
+                return (fused.sum, normed, box)
+            }
+            let x = h + y
+            return (x, inputLayerNorm(x), box)
+        case .value(let v):
+            return (v, inputLayerNorm(v), box)
+        }
+    }
+
+    /// `cbv2Forward` on a residual stream whose previous add may still be
+    /// pending (see `boundaryInput`); this layer's MLP boundary leaves its
+    /// `h + y` pending for the next layer in turn. Returns this layer's
+    /// materialized input (the previous layer's output) and its output stream.
+    func cbv2ForwardStream(
+        _ input: Qwen35ResidualStream,
+        modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray? = nil,
+        captureRecurrentWindow: Bool = false,
+        exactTargetVerify: Bool = false,
+        lastRowOnly: Bool = false
+    ) -> (input: MLXArray, output: Qwen35ResidualStream) {
+        guard qwen35DefersLayerResidual, !exactTargetVerify, !lastRowOnly,
+            let dense = mlp as? Qwen3NextMLP
+        else {
+            let x = input.materialized()
+            return (
+                x,
+                .value(
+                    cbv2Forward(
+                        x, modelLayerIndex: modelLayerIndex, attentionCache: attentionCache,
+                        recurrentState: recurrentState, positionIds: positionIds,
+                        captureRecurrentWindow: captureRecurrentWindow,
+                        exactTargetVerify: exactTargetVerify, lastRowOnly: lastRowOnly))
+            )
+        }
+        let (x, normed, box) = boundaryInput(input)
+        let r: MLXArray
+        if isLinear {
+            precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
+            if captureRecurrentWindow {
+                r = linearAttn!.cbv2ForwardCaptured(
+                    normed, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState,
+                    exactTargetVerify: exactTargetVerify)
+            } else {
+                r = linearAttn!.cbv2Forward(
+                    normed, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState)
+            }
+        } else {
+            guard let attentionCache else {
+                preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
+            }
+            r = selfAttn!.cbv2Forward(
+                normed, cache: attentionCache, positionIds: positionIds,
+                exactTargetVerify: exactTargetVerify)
+        }
+        // A rotation the projection did not take must not leak into a later call.
+        _ = box?.take()
+        if let (h, y) = dense.qwen35ForwardAfterResidual(x, r, norm: postAttentionLayerNorm) {
+            return (x, .pending(h, y))
+        }
+        let h = x + r
+        let feedForward: MLXArray
+        if let folded = dense.qwen35ForwardSignedNorm(
+            h, norm: postAttentionLayerNorm, gain: signedGain)
+        {
+            feedForward = folded
+        } else {
+            feedForward = dense.qwen35TargetVerify(
+                postAttentionLayerNorm(h), exact: exactTargetVerify)
+        }
+        return (x, .value(h + feedForward))
     }
 }
 
@@ -2489,15 +2862,17 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        var stream = Qwen35ResidualStream.value(hiddenStates)
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask,
+            stream = layer.callAsFunctionStream(
+                stream, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
         }
+        hiddenStates = stream.materialized()
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
@@ -2596,6 +2971,7 @@ public class Qwen35TextModelInner: Module {
         let tapLayerIds = dFlash2Tap.layerIds
         var tapped = [MLXArray?](
             repeating: nil, count: tapLayerIds?.count ?? 0)
+        var stream = Qwen35ResidualStream.value(hiddenStates)
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -2609,8 +2985,8 @@ public class Qwen35TextModelInner: Module {
                     "Qwen35 CBv2 attention cache mapped to the wrong model layer")
                 attentionIndex += 1
             }
-            hiddenStates = layer.cbv2Forward(
-                hiddenStates,
+            let (layerInput, output) = layer.cbv2ForwardStream(
+                stream,
                 modelLayerIndex: modelLayerIndex,
                 attentionCache: attentionCache,
                 recurrentState: recurrentState,
@@ -2618,12 +2994,20 @@ public class Qwen35TextModelInner: Module {
                 captureRecurrentWindow: captureRecurrentWindow,
                 exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
                 lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex)
-            // `hiddenStates` here IS the OUTPUT hidden state of this layer,
-            // which is what the reference taps (`_LayerHook` wraps the layer and
-            // keeps what it returned).
-            if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
-                tapped[slot] = hiddenStates
+            // The reference taps the OUTPUT hidden state of a layer
+            // (`_LayerHook` wraps the layer and keeps what it returned). With
+            // the residual add deferred, that is the next layer's
+            // materialized input.
+            if modelLayerIndex > 0, let tapLayerIds,
+                let slot = tapLayerIds.firstIndex(of: modelLayerIndex - 1)
+            {
+                tapped[slot] = layerInput
             }
+            stream = output
+        }
+        hiddenStates = stream.materialized()
+        if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: layers.count - 1) {
+            tapped[slot] = hiddenStates
         }
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
