@@ -776,6 +776,47 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return MLX.split(wide, indices: Array(fused.boundaries.dropLast()), axis: -1)
     }
 
+    /// One routed matmul for siblings whose activation already carries the
+    /// shared signs in FP32, over their packed rows stacked along the output
+    /// axis, split back into one result per sibling.
+    ///
+    /// The caller applies the single sign pass (`x.asType(.float32) *
+    /// signVector`); this applies the one Hadamard and the one matmul, so the
+    /// whole stack costs one sign multiply, one transform and one dispatch
+    /// set. Bit-identical to `fusedSiblingsForward(first.rotate(x), ...)` on
+    /// the same FP32 input: the signs are the same ±1 vector, and the
+    /// Hadamard and the routed matmul see the same FP32 values.
+    ///
+    /// The FP32 signed input also keeps the fused route eligible whatever
+    /// dtype the layer input has: `rotate` narrows back to the input dtype,
+    /// which would fail the route's FP32 read. Returns nil under the same
+    /// route conditions as `fusedSiblingsForward` (a caller then applies each
+    /// sibling's `forwardPreSigned` to the signed activation as before).
+    /// Not for a layer with a GDN layout.
+    fileprivate func fusedSiblingsForwardPreSigned(
+        _ signed: MLXArray, siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
+    ) -> [MLXArray]? {
+        guard Self.siblingFusionEnabled, siblings.count >= 2,
+            signed.dtype == .float32, signed.ndim >= 2
+        else { return nil }
+        let k = signed.dim(-1)
+        guard signed.size / k >= 2, k % 64 == 0 else { return nil }
+        guard let first = siblings.first else { return nil }
+        for sibling in siblings {
+            guard sibling.sharesInputTransform(with: first),
+                Self.routeApplies(to: sibling), sibling.groupSize == groupSize,
+                sibling.weight.dim(1) == weight.dim(1), k % sibling.groupSize == 0
+            else { return nil }
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        let rotated = first.transform.applyPreSigned(signed)
+        let wide = Self.matrixRoutedMatmul(
+            rotated, weight: fused.weight, scales: fused.scales, biases: fused.biases,
+            groupSize: groupSize, bits: bits, mode: mode, operands: fused.operands,
+            widenOutput: widenOutput)
+        return MLX.split(wide, indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
     /// True when `rotate` is the same function on both layers, so one rotated
     /// activation can feed both packed matmuls with bit-identical results.
     public func sharesInputTransform(with other: HadamardQuantizedLinear) -> Bool {
@@ -873,6 +914,40 @@ public func sharedHadamardProjectionsPreSigned(
         return fused
     }
     return siblings.map { $0.applyRotated(rotated) }
+}
+
+/// Applies each packed Hadamard projection to an activation that already
+/// carries their shared signs in FP32 (`x.asType(.float32) * signVector`),
+/// rotating it once. Every projection reads the identical rotated array it
+/// would have computed itself, so outputs are bit-identical to calling each
+/// one. Returns nil when any projection is not packed or uses a different
+/// transform (a caller then keeps its unpacked/GDN-layout fallback).
+public func sharedHadamardProjectionsPreSigned(
+    _ signed: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
+    var packed = [HadamardQuantizedLinear]()
+    packed.reserveCapacity(projections.count)
+    for projection in projections {
+        guard let layer = projection as? HadamardQuantizedLinear,
+            layer.sharesInputTransform(with: first)
+        else { return nil }
+        packed.append(layer)
+    }
+    if let fused = first.fusedSiblingsForwardPreSigned(
+        signed, siblings: packed, widenOutput: widenOutput)
+    {
+        return fused
+    }
+    // S=1 fallback: one shared rotation, then one matmul per sibling.
+    // Bit-identical to each sibling's `forwardPreSigned`: that is
+    // `applyRotated(transform.applyPreSigned(signed))`, and the siblings
+    // share one identical transform, so the hoisted rotation is the array
+    // each sibling would have formed itself. (All callers of this overload
+    // use the default `widenOutput: true`, under which the two spellings
+    // agree exactly; at S=1 the matrix route never applies in either.)
+    let rotated = first.transform.applyPreSigned(signed)
+    return packed.map { $0.applyRotated(rotated) }
 }
 
 /// Packed folded embeddings with an inverse transform after lookup.
