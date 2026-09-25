@@ -254,6 +254,28 @@ enum Qwen35FusedElementwise {
         compile(shapeless: true) { normed, gate in
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
+
+    /// On unless explicitly disabled: a packed projection whose input comes
+    /// out of a norm or an elementwise op receives that input with its
+    /// Hadamard signs already applied, and its rotation skips the multiply.
+    static let foldsHadamardSigns: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FOLD_SIGNS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `gatedNormTail` times the output projection's Hadamard signs.
+    static let gatedNormTailSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { normed, gate, signs in
+            (silu(gate.asType(.float32)) * normed.asType(.float32)) * signs
+        }
+
+    /// The attention output gate `x * sigmoid(gate)` times the output
+    /// projection's Hadamard signs, returned in the gate product's dtype.
+    static let sigmoidGateSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { x, gate, signs in
+            ((x * sigmoid(gate)) * signs).asType(x.dtype)
+        }
 }
 
 /// Input-independent constants a GDN layer derives from its geometry, held
@@ -283,6 +305,40 @@ private final class Qwen35GDNDerived {
     }
 }
 
+/// A norm gain with its consumer's Hadamard signs folded in, derived once from
+/// the loaded gain and held outside the parameter tree (a plain class, so
+/// Module reflection sees `.other`). The norm writes `w * y` per element; with
+/// `w * s` it writes `(w * s) * y`, which is `(w * y) * s` exactly: the signs
+/// are ±1, and negating a factor negates a rounded product without changing
+/// its magnitude.
+fileprivate final class Qwen35SignedGain {
+    private let lock = NSLock()
+    private var source: MLXArray?
+    private var signs: MLXArray?
+    private var folded: MLXArray?
+
+    func gain(_ source: MLXArray, signs: MLXArray) -> MLXArray {
+        lock.withLock {
+            if let folded, self.source === source, self.signs === signs {
+                return folded
+            }
+            let value = (source * signs).asType(source.dtype)
+            self.source = source
+            self.signs = signs
+            self.folded = value
+            return value
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            source = nil
+            signs = nil
+            folded = nil
+        }
+    }
+}
+
 /// The gated delta recurrence with its gates formed by one fused kernel and
 /// the state kept in FP32, matching `gatedDeltaUpdate` op for op.
 func qwen35GatedDelta(
@@ -299,6 +355,10 @@ func qwen35GatedDelta(
     if ssm.dtype != .float32 {
         ssm = ssm.asType(.float32)
     }
+    if mask == nil, !stateOnly, Qwen35GDNPrefillKernel.applies(q: q, v: v) {
+        return Qwen35GDNPrefillKernel.run(
+            q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm)
+    }
     if mask == nil, let result = Qwen35GatedDeltaRows.run(
         q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, stateOnly: stateOnly)
     {
@@ -307,6 +367,250 @@ func qwen35GatedDelta(
     return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
 }
 
+/// Wide-window (prefill) variant of the unmasked gated-delta kernel.
+///
+/// Same recurrence, same operands and the same per-element arithmetic as
+/// `gatedDeltaKernel`: each lane keeps the same `Dk / 32` contiguous state
+/// entries, the Kahan-compensated `kv_mem` partial runs in the same order under
+/// the same fp pragmas, and every cross-lane total is the same XOR butterfly
+/// over lane offsets 1, 2, 4, 8, 16 that `simd_sum` performs. What changes is
+/// the layout: one simdgroup carries four `Dv` rows of a head (four
+/// independent chains sharing each step's q/k/g/beta loads), and the four
+/// rows' butterflies are interleaved (the first two levels exchange two and
+/// one values instead of four, a transposed reduction) so a step issues 13
+/// shuffles instead of 40. Pairwise sums are identical, so the outputs are
+/// bit-identical; this is checked once per process on this device against
+/// the stock kernel (random operands, both outputs compared bit for bit), and
+/// the stock kernel is used if the check fails. Only windows of at least
+/// `minimumT` rows use it; `MLXFAST_GDN_PREFILL_KERNEL=0` disables it.
+enum Qwen35GDNPrefillKernel {
+    static let minimumT = 64
+    private static let rows = 4
+
+    static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_GDN_PREFILL_KERNEL"] != "0"
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "qwen35_gated_delta_rows4",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: """
+            constexpr int R = 4;
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // q, k: [B, T, Hk, Dk]; v, y: [B, T, Hv, Dv]; g, beta: [B, T, Hv]
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv0 = thread_position_in_grid.y * R;
+            const uint lane = thread_index_in_simdgroup;
+            const bool b0 = (lane & 1) != 0;
+            const bool b1 = (lane & 2) != 0;
+
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv0) * Dk;
+            auto o_state = state_out + (n * Dv + dv0) * Dk;
+
+            float state[R][n_per_t];
+            for (int r = 0; r < R; ++r)
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[r][i] = static_cast<float>(i_state[r * Dk + s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              float kk[n_per_t];
+              float qq[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                kk[i] = static_cast<float>(k_[s_idx]);
+                qq[i] = static_cast<float>(q_[s_idx]);
+              }
+              float gg = g_[hv_idx];
+              float bb = beta_[hv_idx];
+              float kv_mem[R];
+              {
+                // Preserve Kahan summation under Metal's default fast math.
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                for (int r = 0; r < R; ++r) {
+                  float acc = 0.0f;
+                  float kv_compensation = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    state[r][i] = state[r][i] * gg;
+                    auto product = state[r][i] * kk[i];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = acc + corrected;
+                    kv_compensation = (next_sum - acc) - corrected;
+                    acc = next_sum;
+                  }
+                  kv_mem[r] = acc;
+                }
+              }
+
+              // Transposed butterfly: after offsets 1 and 2 lane (b0, b1)
+              // holds row 2*b0 + b1; offsets 4, 8, 16 finish that row.
+              float km[R];
+              {
+                float p0 = (b0 ? kv_mem[2] : kv_mem[0]) + simd_shuffle_xor(b0 ? kv_mem[0] : kv_mem[2], 1);
+                float p1 = (b0 ? kv_mem[3] : kv_mem[1]) + simd_shuffle_xor(b0 ? kv_mem[1] : kv_mem[3], 1);
+                float x = (b1 ? p1 : p0) + simd_shuffle_xor(b1 ? p0 : p1, 2);
+                x = x + simd_shuffle_xor(x, 4);
+                x = x + simd_shuffle_xor(x, 8);
+                x = x + simd_shuffle_xor(x, 16);
+                // Every lane needs all four totals.
+                float x2 = simd_shuffle_xor(x, 2);
+                float lo = b1 ? x2 : x;   // row 2*b0
+                float hi = b1 ? x : x2;   // row 2*b0 + 1
+                float lo1 = simd_shuffle_xor(lo, 1);
+                float hi1 = simd_shuffle_xor(hi, 1);
+                km[0] = b0 ? lo1 : lo;
+                km[1] = b0 ? hi1 : hi;
+                km[2] = b0 ? lo : lo1;
+                km[3] = b0 ? hi : hi1;
+              }
+
+              float outp[R];
+              for (int r = 0; r < R; ++r) {
+                auto delta = (static_cast<float>(v_[dv0 + r]) - km[r]) * bb;
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[r][i] = state[r][i] + kk[i] * delta;
+                  out += state[r][i] * qq[i];
+                }
+                outp[r] = out;
+              }
+              {
+                float p0 = (b0 ? outp[2] : outp[0]) + simd_shuffle_xor(b0 ? outp[0] : outp[2], 1);
+                float p1 = (b0 ? outp[3] : outp[1]) + simd_shuffle_xor(b0 ? outp[1] : outp[3], 1);
+                float x = (b1 ? p1 : p0) + simd_shuffle_xor(b1 ? p0 : p1, 2);
+                x = x + simd_shuffle_xor(x, 4);
+                x = x + simd_shuffle_xor(x, 8);
+                x = x + simd_shuffle_xor(x, 16);
+                if (lane < R) {
+                  y[dv0 + (b0 ? 2 : 0) + (b1 ? 1 : 0)] = static_cast<InT>(x);
+                }
+              }
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int r = 0; r < R; ++r)
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[r * Dk + s_idx] = static_cast<StT>(state[r][i]);
+            }
+            """
+    )
+
+    static func applies(q: MLXArray, v: MLXArray) -> Bool {
+        guard enabled, q.dim(1) >= minimumT, q.dim(3) % 32 == 0, v.dim(3) % rows == 0
+        else { return false }
+        return verified(q: q, v: v)
+    }
+
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let outputs = kernel(
+            [q, k, v, g, beta, state, MLXArray(T)],
+            template: [
+                ("InT", q.dtype),
+                ("StT", state.dtype),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (32, Dv / rows, B * Hv),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [q.dtype, state.dtype]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, dtype: String
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    /// One-time, per-geometry device check: both kernels on the same random
+    /// operands must agree bit for bit in `y` and in the final state.
+    /// Verdict lookup only: the check itself runs at model construction
+    /// (`prepare`), never inside a forward. A geometry or activation dtype
+    /// that was not prepared uses the stock kernel.
+    private static func verified(q: MLXArray, v: MLXArray) -> Bool {
+        let geometry = Geometry(
+            hk: q.dim(2), dk: q.dim(3), hv: v.dim(2), dv: v.dim(3), dtype: "\(q.dtype)")
+        return lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Compile both kernels and run the bit-identity check for one head
+    /// geometry, once per process, at model construction (before any timed
+    /// forward). The window length is a runtime argument of both kernels, not
+    /// a template parameter, so one pipeline serves every prefill width.
+    /// Activations reach the recurrence in FP32 on the packed checkpoint;
+    /// BF16 and FP16 are prepared too so no width or dtype compiles lazily.
+    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard enabled, dk % 32 == 0, dv % rows == 0, hv % hk == 0 else { return }
+        lock.withLock {
+            for dtype in [DType.float32, .bfloat16, .float16] {
+                let geometry = Geometry(hk: hk, dk: dk, hv: hv, dv: dv, dtype: "\(dtype)")
+                if verdicts[geometry] != nil { continue }
+                let verdict = selfCheck(geometry, dtype: dtype)
+                verdicts[geometry] = verdict
+                if !verdict {
+                    FileHandle.standardError.write(
+                        "qwen35: GDN prefill kernel disagrees with the stock kernel on this device (\(dtype)); using the stock kernel\n"
+                            .data(using: .utf8)!)
+                }
+            }
+        }
+    }
+
+    private static func selfCheck(_ geo: Geometry, dtype: DType) -> Bool {
+        let T = minimumT
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6d6c_7866), into: 9)
+        // Wide magnitude spread so the pairwise sums actually differ by order.
+        func spread(_ shape: [Int], _ i: Int) -> MLXArray {
+            MLXRandom.normal(shape, key: keys[i])
+                * exp(MLXRandom.normal(shape, key: keys[i + 3]))
+        }
+        let q = (spread([1, T, geo.hk, geo.dk], 0) * 0.1).asType(dtype)
+        let k = (spread([1, T, geo.hk, geo.dk], 1) * 0.1).asType(dtype)
+        let v = spread([1, T, geo.hv, geo.dv], 2).asType(dtype)
+        let g = MLXRandom.uniform(0.5 ..< 1.0, [1, T, geo.hv], key: keys[6])
+        let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, geo.hv], key: keys[7])
+        let state = MLXRandom.normal([1, geo.hv, geo.dv, geo.dk], key: keys[8])
+        let (yRef, sRef) = gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        let (yNew, sNew) = run(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        let bits: DType = dtype.size == 2 ? .uint16 : .uint32
+        let same = all(yRef.view(dtype: bits) .== yNew.view(dtype: bits))
+            .&& all(sRef.view(dtype: .uint32) .== sNew.view(dtype: .uint32))
+        return same.item(Bool.self)
+    }
 /// The gated-delta recurrence of `gatedDeltaKernel`, four value rows per
 /// simdgroup. Each lane keeps the stock kernel's elements (`4 * lane + i`,
 /// ascending `i`) of four adjacent rows, so the q/k/g/beta loads, the address
@@ -880,6 +1184,24 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(x)
     }
 
+    /// `projectOut(gatedNorm(out, gate:))` with `out_proj`'s Hadamard signs
+    /// multiplied in by the gated tail's kernel, so the packed projection's
+    /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
+    /// the rotation reads the same values either way.
+    private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        if Qwen35FusedElementwise.foldsHadamardSigns,
+            let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+            packed.transform.width == numVHeads * headVDim
+        {
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
+            let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
+                .asType(out.dtype)
+            return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+        }
+        return projectOut(gatedNorm(out, gate: gate).reshaped(B, S, -1))
+    }
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -922,6 +1244,9 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
+
+        Qwen35GDNPrefillKernel.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -1125,6 +1450,18 @@ final class Qwen35GatedDeltaNet: Module {
             // Packed qkv and z read the same activation through the same
             // transform; rotate it once. b and a stay full precision.
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+                // b and a read the same activation through the same transform
+                // too: rotate it once for both (linson007's queued 4d60780a).
+                // Each still gets the identical rotated array it would have
+                // built itself; nil falls back to the separate calls.
+                if let ba = sharedHadamardProjections(inputs, [inProjB, inProjA]) {
+                    return (
+                        shared[0],
+                        shared[1].reshaped(B, S, numVHeads, headVDim),
+                        ba[0],
+                        ba[1]
+                    )
+                }
                 return (
                     shared[0],
                     shared[1].reshaped(B, S, numVHeads, headVDim),
@@ -1541,8 +1878,7 @@ final class Qwen35GatedDeltaNet: Module {
         if let fused = projectGatedNormFused(out, gate: z) {
             return fused
         }
-        let normedOut = gatedNorm(out, gate: z)
-        return projectOut(normedOut.reshaped(B, S, -1))
+        return projectGatedOut(out, gate: z, B: B, S: S)
     }
 
     /// CBv2 MTP rectangular verify path. Widths one and two retain the
@@ -1771,12 +2107,11 @@ final class Qwen35GatedDeltaNet: Module {
         if !exactTargetVerify, let fused = projectGatedNormFused(out, gate: z) {
             return fused
         }
-        let normedOut = gatedNorm(out, gate: z)
-        let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(outProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(
+                outProj, gatedNorm(out, gate: z).reshaped(B, S, -1))
         }
-        return projectOut(projectionInput)
+        return projectGatedOut(out, gate: z, B: B, S: S)
     }
 }
 
@@ -1929,15 +2264,22 @@ final class Qwen35Attention: Module {
             // residual add widens the product as before.
             return y
         }
-        let projectionInput = sigmoidMultiply(output, gate)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
-            // The residual add widens the FP16 product itself.
-            return packed.forwardUnwidened(projectionInput)
+            // The output gate and the projection's Hadamard signs share one
+            // kernel; the residual add widens the FP16 product itself.
+            if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
+                output.dtype == gate.dtype
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    output, gate, packed.transform.signVector)
+                return packed.forwardPreSigned(signed, widenOutput: false)
+            }
+            return packed.forwardUnwidened(sigmoidMultiply(output, gate))
         }
-        return oProj(projectionInput)
+        return oProj(sigmoidMultiply(output, gate))
     }
 }
 
@@ -2185,6 +2527,34 @@ extension Qwen3NextMLP {
         }
         return downProj(silu(shared[0]) * shared[1])
     }
+
+    /// `qwen35Forward(norm(h))` with gate and up's Hadamard signs folded into
+    /// the norm's gain, so their shared rotation skips its sign multiply. The
+    /// signed gain yields the plain norm's output times the signs exactly (see
+    /// `Qwen35SignedGain`). Nil when the fold does not apply.
+    fileprivate func qwen35ForwardSignedNorm(
+        _ h: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+    ) -> MLXArray? {
+        guard Qwen35FusedElementwise.foldsHadamardSigns,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let transform = siblings.first?.transform,
+            norm.weight.ndim == 1, norm.weight.dim(0) == transform.width
+        else { return nil }
+        let signedInput = MLXFast.rmsNorm(
+            h, weight: gain.gain(norm.weight, signs: transform.signVector), eps: norm.eps)
+        guard
+            let shared = sharedHadamardProjectionsPreSigned(
+                signedInput, siblings, widenOutput: false)
+        else { return nil }
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return y
+        }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return down.forwardPreSigned(signed, widenOutput: false)
+    }
 }
 
 // MARK: - Decoder Layer
@@ -2199,6 +2569,28 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    /// The post-attention gain with the MLP's gate/up signs folded in.
+    private let signedGain = Qwen35SignedGain()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -2287,14 +2679,20 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: exactTargetVerify)
         }
         let h = x + r
-        let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
-                normalized, exactTargetVerify: exactTargetVerify)
+                postAttentionLayerNorm(h), exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            if !exactTargetVerify,
+                let folded = dense.qwen35ForwardSignedNorm(
+                    h, norm: postAttentionLayerNorm, gain: signedGain)
+            {
+                feedForward = folded
+            } else {
+                feedForward = dense.qwen35TargetVerify(
+                    postAttentionLayerNorm(h), exact: exactTargetVerify)
+            }
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
@@ -2718,24 +3116,19 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
         let rows = hidden.dim(1)
-        if rows > Qwen35TextModel.promptProjectionMinimumRows {
-            // A prompt-sized forward is only ever read at its last row (the
-            // teacher-forced stepper and every engine prefill caller slice
-            // `[..., -1, ...]`), so project that row alone instead of all L
-            // rows through the 248320-wide head. RMSNorm is row-local, so
-            // norm-after-slice equals slice-after-norm for the surviving
-            // row; the returned shape `[B, 1, vocab]` slices identically.
-            // Verify windows (at most 17 rows) keep every row.
-            let last = model.norm(hidden[0..., (rows - 1)..., 0...])
-            return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
-        }
-        let normalized = model.norm(hidden)
+        let output = Self.narrowPromptRows && rows > 32
+            ? hidden[0..., (rows - 1)..., 0...] : hidden
+        let normalized = model.norm(output)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 
-    /// Forwards wider than this are prompt chunks, never speculative verify
-    /// windows (DFlash 2 verifies at most 17 rows, the MTP head at most 8).
-    static let promptProjectionMinimumRows = 32
+    /// Prompt-width forwards through this seam are read at their final
+    /// position only.
+    static let narrowPromptRows: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_LAST_ROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
