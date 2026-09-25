@@ -38,6 +38,13 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// True when both transforms compute the same function. Transforms decoded
+    /// for one width share one sign buffer, so the common case is O(1).
+    public func isIdentical(to other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width
+            && (signs === other.signs || signValues == other.signValues)
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -223,12 +230,46 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        applyRotated(rotate(x))
+    }
+
+    /// The input transform alone: GDN layout, signs, Hadamard, dtype restore.
+    public func rotate(_ x: MLXArray) -> MLXArray {
+        transform(gdnLayout.map { $0(x) } ?? x)
+    }
+
+    /// The packed matmul on an input already passed through `rotate`.
+    public func applyRotated(_ rotated: MLXArray) -> MLXArray {
         if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
             return constantCachedForward(rotated, allowFloat16: true)
         }
         return super.callAsFunction(rotated)
     }
+
+    /// True when `rotate` is the same function on both layers, so one rotated
+    /// activation can feed both packed matmuls with bit-identical results.
+    public func sharesInputTransform(with other: HadamardQuantizedLinear) -> Bool {
+        gdnLayout == nil && other.gdnLayout == nil
+            && transform.isIdentical(to: other.transform)
+    }
+}
+
+/// Applies each packed Hadamard projection to the same activation, rotating it
+/// once. Every projection reads the identical rotated array it would have
+/// computed itself, so outputs are bit-identical to calling each one. Returns
+/// nil when any projection is not packed or uses a different transform.
+public func sharedHadamardProjections(_ x: MLXArray, _ projections: [Linear]) -> [MLXArray]? {
+    guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
+    var packed = [HadamardQuantizedLinear]()
+    packed.reserveCapacity(projections.count)
+    for projection in projections {
+        guard let layer = projection as? HadamardQuantizedLinear,
+            layer.sharesInputTransform(with: first)
+        else { return nil }
+        packed.append(layer)
+    }
+    let rotated = first.rotate(x)
+    return packed.map { $0.applyRotated(rotated) }
 }
 
 /// Packed folded embeddings with an inverse transform after lookup.

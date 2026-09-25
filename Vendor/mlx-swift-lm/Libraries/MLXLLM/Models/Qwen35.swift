@@ -495,6 +495,16 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            // Packed qkv and z read the same activation through the same
+            // transform; rotate it once. b and a stay full precision.
+            if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+                return (
+                    shared[0],
+                    shared[1].reshaped(B, S, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
@@ -1169,19 +1179,28 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    /// q, k and v read the same activation. On a packed Hadamard checkpoint
+    /// they share one input transform, so it is computed once.
+    private func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let shared = sharedHadamardProjections(x, [qProj, kProj, vProj]) {
+            return (shared[0], shared[1], shared[2])
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let (qProjOutput, kProjOutput, vProjOutput) = projectQKV(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = kProjOutput
+        var values = vProjOutput
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -1212,17 +1231,24 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+        let projected: (MLXArray, MLXArray, MLXArray)
+        if exactTargetVerify {
+            projected = (
+                qwen35A3BExactW4G64Projection(qProj, x),
+                qwen35A3BExactW4G64Projection(kProj, x),
+                qwen35A3BExactW4G64Projection(vProj, x)
+            )
+        } else {
+            projected = projectQKV(x)
+        }
+        let qProjOutput = projected.0
+        let kProjection = projected.1
+        let vProjection = projected.2
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
-        let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1463,10 +1489,18 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return self(x) }
+        guard exact else { return qwen35Forward(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
+    }
+
+    /// `callAsFunction` with gate and up sharing one packed input transform.
+    func qwen35Forward(_ x: MLXArray) -> MLXArray {
+        guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
+            return self(x)
+        }
+        return downProj(silu(shared[0]) * shared[1])
     }
 }
 
@@ -1533,6 +1567,9 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
+        if let dense = mlp as? Qwen3NextMLP {
+            return h + dense.qwen35Forward(postAttentionLayerNorm(h))
+        }
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
