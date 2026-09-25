@@ -425,6 +425,31 @@ public enum DFlash2SlidingMask {
     }
 }
 
+/// Reuse a geometry-only mask within one forward; never retain it across requests.
+private struct DFlash2SlidingMaskScope {
+    private struct Key: Hashable {
+        let contextLength: Int
+        let blockLength: Int
+        let slidingWindow: Int
+        let isCausal: Bool
+    }
+    private var masks = [Key: MLXArray]()
+
+    mutating func mask(
+        contextLength: Int, blockLength: Int, slidingWindow: Int, isCausal: Bool
+    ) -> MLXArray {
+        let key = Key(
+            contextLength: contextLength, blockLength: blockLength,
+            slidingWindow: slidingWindow, isCausal: isCausal)
+        if let mask = masks[key] { return mask }
+        let mask = DFlash2SlidingMask.make(
+            contextLength: contextLength, blockLength: blockLength,
+            slidingWindow: slidingWindow, isCausal: isCausal)
+        masks[key] = mask
+        return mask
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -467,7 +492,8 @@ private final class DFlash2Attention: Module {
     ///   - x: the block, `[B, blockLength, hidden]`.
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        maskScope: inout DFlash2SlidingMaskScope
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -518,7 +544,7 @@ private final class DFlash2Attention: Module {
 
         var mask: MLXArray?
         if let slidingWindow {
-            mask = DFlash2SlidingMask.make(
+            mask = maskScope.mask(
                 contextLength: cachedLength,
                 blockLength: L,
                 slidingWindow: slidingWindow,
@@ -663,12 +689,15 @@ private final class DFlash2DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        maskScope: inout DFlash2SlidingMaskScope
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
         let attended = x
             + attentionConv.finish(
-                selfAttn(attentionInput, context: context, rope: rope, cache: cache),
+                selfAttn(
+                    attentionInput, context: context, rope: rope, cache: cache,
+                    maskScope: &maskScope),
                 dynamic: attentionTaps)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
@@ -866,9 +895,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        var maskScope = DFlash2SlidingMaskScope()
 
         for (index, layer) in layers.enumerated() {
-            h = layer(h, context: context, rope: rope, cache: cache[index])
+            h = layer(
+                h, context: context, rope: rope, cache: cache[index],
+                maskScope: &maskScope)
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
