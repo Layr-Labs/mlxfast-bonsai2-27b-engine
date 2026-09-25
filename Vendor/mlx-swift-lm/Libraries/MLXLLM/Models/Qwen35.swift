@@ -301,6 +301,15 @@ func qwen35GatedDelta(
     return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
 }
 
+/// The ranked CBv2 track is single-stream. Keep the general row-gather path
+/// available for batched callers, while avoiding one-element arrays and
+/// state-row slices on the production B == 1 path.
+private let qwen35CBv2B1StateFastPath: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_QWEN35_B1_STATE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -955,38 +964,64 @@ final class Qwen35GatedDeltaNet: Module {
 
         let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
+        let out: MLXArray
+        if qwen35CBv2B1StateFastPath, B == 1 {
+            let evaluation = recurrentState[0]
             let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
-        }
-
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
-        let (out, newConvState, newSsmState) = processChunk(
-            qkv: qkv, a: a, b: b,
-            convState: convState, ssmState: ssmState, mask: nil)
-
-        for (row, evaluation) in recurrentState.enumerated() {
+            let convState = state?.conv
+                ?? MLXArray.zeros(
+                    [1, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            let ssmState = state?.ssm
+                ?? MLXArray.zeros(
+                    [1, numVHeads, headVDim, headKDim], dtype: .float32)
+            let recurrence = processChunk(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: ssmState, mask: nil)
             do {
                 try evaluation.stage(
                     modelLayerIndex: modelLayerIndex,
-                    conv: newConvState[row ..< row + 1],
-                    ssm: newSsmState[row ..< row + 1])
+                    conv: recurrence.newConvState,
+                    ssm: recurrence.newSsmState)
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
             }
+            out = recurrence.out
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+
+            let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+            let recurrence = processChunk(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: ssmState, mask: nil)
+
+            for (row, evaluation) in recurrentState.enumerated() {
+                do {
+                    try evaluation.stage(
+                        modelLayerIndex: modelLayerIndex,
+                        conv: recurrence.newConvState[row ..< row + 1],
+                        ssm: recurrence.newSsmState[row ..< row + 1])
+                } catch {
+                    preconditionFailure(
+                        "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
+                }
+            }
+            out = recurrence.out
         }
 
         let normedOut = gatedNorm(out, gate: z)
@@ -1025,23 +1060,35 @@ final class Qwen35GatedDeltaNet: Module {
             (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        let convState: MLXArray
+        let ssmState: MLXArray
+        if qwen35CBv2B1StateFastPath, B == 1 {
+            let state = recurrentState[0].inputState(modelLayerIndex: modelLayerIndex)
+            convState = state?.conv
+                ?? MLXArray.zeros(
+                    [1, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            ssmState = state?.ssm
+                ?? MLXArray.zeros(
+                    [1, numVHeads, headVDim, headKDim], dtype: .float32)
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -1087,16 +1134,26 @@ final class Qwen35GatedDeltaNet: Module {
 
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
-                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState[rowRange]
+                let singleRow = qwen35CBv2B1StateFastPath && B == 1
+                let finalConv = singleRow
+                    ? convInput[0..., S ..< (S + nKeep), 0...]
+                    : convInput[rowRange, S ..< (S + nKeep), 0...]
+                let finalSSM = singleRow ? finalSsmState : finalSsmState[rowRange]
+                let rowConvInput = singleRow ? convInput : convInput[rowRange]
+                let rowQ = singleRow ? qNormed : qNormed[rowRange]
+                let rowK = singleRow ? kNormed : kNormed[rowRange]
+                let rowV = singleRow ? v : v[rowRange]
+                let rowA = singleRow ? a : a[rowRange]
+                let rowB = singleRow ? b : b[rowRange]
+                let rowSsmState = singleRow ? ssmState : ssmState[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
-                    convInput: convInput[rowRange],
-                    q: qNormed[rowRange],
-                    k: kNormed[rowRange],
-                    v: v[rowRange],
-                    a: a[rowRange],
-                    b: b[rowRange],
-                    ssmPre: ssmState[rowRange],
+                    convInput: rowConvInput,
+                    q: rowQ,
+                    k: rowK,
+                    v: rowV,
+                    a: rowA,
+                    b: rowB,
+                    ssmPre: rowSsmState,
                     mask: nil,
                     rowCount: S,
                     convStateRows: nKeep)
@@ -1105,7 +1162,7 @@ final class Qwen35GatedDeltaNet: Module {
                 // its exact tail at commit. A one-row `ssmPre` aliases the
                 // already-accounted committed generation when it existed before
                 // this verify. `v` retains the whole conv output backing.
-                let convOutBacking = convOut[rowRange]
+                let convOutBacking = singleRow ? convOut : convOut[rowRange]
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
@@ -1189,12 +1246,16 @@ final class Qwen35GatedDeltaNet: Module {
             }
 
             for (row, evaluation) in recurrentState.enumerated() {
+                let singleRow = qwen35CBv2B1StateFastPath && B == 1
                 let convStack = concatenated(
                     (0 ..< S).map { s in
-                        convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
+                        singleRow
+                            ? convInput[0..., (s + 1) ..< (s + 1 + nKeep)]
+                            : convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
                     }, axis: 0)
-                let ssmStack = concatenated(
-                    ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
+                let ssmStack = singleRow
+                    ? concatenated(ssmStates, axis: 0)
+                    : concatenated(ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
                 do {
                     try evaluation.stageCaptured(
                         modelLayerIndex: modelLayerIndex,
