@@ -524,7 +524,7 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
+        var queries = DFlash2TrunkChunk.spread(x) { qProj($0) }
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
@@ -542,9 +542,9 @@ private final class DFlash2Attention: Module {
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
             let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                kNorm(DFlash2TrunkChunk.spread(rows) { kProj($0) }.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
                 offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let values = DFlash2TrunkChunk.spread(rows) { vProj($0) }.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
@@ -554,8 +554,8 @@ private final class DFlash2Attention: Module {
                 .transposed(0, 2, 1, 3)
             contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
                 .transposed(0, 2, 1, 3)
-            blockKeys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+            blockKeys = kNorm(DFlash2TrunkChunk.spread(x) { kProj($0) }.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            blockValues = DFlash2TrunkChunk.spread(x) { vProj($0) }.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = rope(contextKeys, offset: cache.offset)
             blockKeys = rope(blockKeys, offset: blockOffset)
         }
@@ -586,7 +586,7 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return DFlash2TrunkChunk.spread(output.transposed(0, 2, 1, 3).reshaped(B, L, -1)) { oProj($0) }
     }
 }
 
@@ -859,6 +859,92 @@ private final class DFlash2GateUpStack {
     }
 }
 
+// MARK: - Row-chunked trunk at block width
+
+/// A block drafter's block is `depth + 1` rows wide — 16 at depth 15 — and the
+/// trunk runs the same weights over every one of them. A single 16-row GEMM
+/// under-occupies on that shape; the same weights read as two 8-row GEMMs is
+/// 15.7% faster on the real five-layer trunk, measured in this repository's own
+/// harness (`policy-sweep.py`) with the policies interleaved in one process so
+/// contention and thermal drift hit each of them equally, eager and compiled:
+///
+///     policy                    eager ms   vs unsplit   compiled ms
+///     one 16-row GEMM             31.46        +0.0%         31.31
+///     gate/up stacked (the base)  31.13        -1.1%         30.88
+///     stacked + two 8-row chunks  26.54       -15.7%         26.52
+///     stacked + four 4-row chunks 51.15       +62.6%            --
+///
+/// Four-row chunks lose badly; eight is the optimum on this pack and this box.
+///
+/// The trunk has no cross-row term, so every output row comes from its own
+/// input row through the same weights: the change is algebraically exact and
+/// nothing is re-quantized or re-represented. It is not bit-identical — an
+/// 8-row GEMM takes a different reduction order than a 16-row one, so the layer
+/// output moves by at most one bf16 ulp (per layer relrms 2.0e-04, worst over
+/// five layers 4.65e-04, against a bf16 eps of 7.8e-03). The drafter only
+/// proposes and the target verifies every token, so the emitted tape is
+/// unchanged.
+///
+/// (An earlier draft of this comment claimed bit-exactness; that claim came
+/// from a comparison whose reference had overflowed to NaN, so every policy
+/// "matched". The numbers above are from a finite-input re-measurement.)
+///
+/// `MLXFAST_DRAFT_ROWCHUNK=0` restores the base's single GEMM;
+/// `MLXFAST_DRAFT_ROWCHUNK_SIZE` overrides the 8.
+enum DFlash2TrunkChunk {
+    static let size: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_ROWCHUNK_SIZE"],
+            let value = Int(raw), value >= 2
+        else { return 8 }
+        return value
+    }()
+
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_ROWCHUNK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The trunk MLP for one row span, on the base's own path: the stacked
+    /// gate/up matmul first, then the unstacked fallback.
+    fileprivate static func whole(
+        _ x: MLXArray, gate: Linear, up: Linear, down: Linear, stack: DFlash2GateUpStack
+    ) -> MLXArray {
+        if let (g, u) = stack.apply(x, gate: gate, up: up) {
+            return down(silu(g) * u)
+        }
+        return down(silu(gate(x)) * up(x))
+    }
+
+    /// `body` over row chunks of `x`, joined back on the row axis.
+    ///
+    /// Only for **row-independent** bodies: projections and per-token norms.
+    /// Never the block attention, which mixes rows, and never the grouped conv.
+    /// The guard keeps this to the block widths the measurement covers (2...16),
+    /// so a 512-row prompt or a long context passes through untouched.
+    /// Measured on the trunk's q/k/v/o + fc set at block width: 3.54 -> 3.04 ms
+    /// (-14.3%). The `fc` projection alone is -17.8%.
+    fileprivate static func spread(
+        _ x: MLXArray, _ body: (MLXArray) -> MLXArray
+    ) -> MLXArray {
+        let rows = x.size / x.dim(-1)
+        guard enabled, rows > size, rows <= 16 else { return body(x) }
+        let flat = x.reshaped(rows, x.dim(-1))
+        var parts: [MLXArray] = []
+        parts.reserveCapacity((rows + size - 1) / size)
+        var start = 0
+        while start < rows {
+            let end = min(start + size, rows)
+            parts.append(body(flat[start ..< end, 0...]))
+            start = end
+        }
+        let joined = concatenated(parts, axis: 0)
+        var shape = x.shape
+        if !shape.isEmpty { shape[shape.count - 1] = joined.dim(-1) }
+        return joined.reshaped(shape)
+    }
+}
+
 private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
@@ -882,10 +968,23 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return down(silu(g) * u)
+        let rows = x.size / x.dim(-1)
+        guard DFlash2TrunkChunk.enabled, rows > DFlash2TrunkChunk.size, rows <= 16 else {
+            return DFlash2TrunkChunk.whole(
+                x, gate: gate, up: up, down: down, stack: gateUp)
         }
-        return down(silu(gate(x)) * up(x))
+        let flat = x.reshaped(rows, x.dim(-1))
+        var parts: [MLXArray] = []
+        parts.reserveCapacity((rows + DFlash2TrunkChunk.size - 1) / DFlash2TrunkChunk.size)
+        var start = 0
+        while start < rows {
+            let end = min(start + DFlash2TrunkChunk.size, rows)
+            parts.append(
+                DFlash2TrunkChunk.whole(
+                    flat[start ..< end, 0...], gate: gate, up: up, down: down, stack: gateUp))
+            start = end
+        }
+        return concatenated(parts, axis: 0).reshaped(x.shape)
     }
 }
 
@@ -1366,7 +1465,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = hiddenNorm(DFlash2TrunkChunk.spread(targetHidden.asType(dtype)) { fc($0) })
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
