@@ -745,6 +745,16 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     }
 }
 
+/// The smallest row count MLX multiplies on the GEMM path instead of the wide gemv.
+private let dflash2ContextPaddedRows = 16
+
+/// Kill switch for padding the drafter's context rows before `fc` (default on).
+private let dflash2ContextPaddingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_CONTEXT_PAD"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Kill switch for the one-launch grouped convolution (default on).
 private let dflash2FusedConvEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_FUSED_CONV"]
@@ -1366,7 +1376,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = hiddenNorm(projectContext(targetHidden.asType(dtype)))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
@@ -1376,6 +1386,24 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return norm(h)
+    }
+
+    /// `fc` over the committed context rows of one block forward.
+    ///
+    /// MLX's wide gemv serves 2 to 15 input rows and streams the whole weight
+    /// once per five rows (`gemv_wide_config` in `backend/metal/matmul.cpp`), so
+    /// eleven to fifteen context rows read `fc`'s BF16 weight three times. Zero
+    /// rows up to sixteen send the product to the GEMM path, which reads it once.
+    /// Two-pass counts are left alone: there the padding costs more than the
+    /// second read. The zero rows are sliced off before anything else sees them.
+    func projectContext(_ hidden: MLXArray) -> MLXArray {
+        let rows = hidden.dim(1)
+        guard dflash2ContextPaddingEnabled, rows > 10, rows < dflash2ContextPaddedRows else {
+            return fc(hidden)
+        }
+        let padding = MLXArray.zeros(
+            [hidden.dim(0), dflash2ContextPaddedRows - rows, hidden.dim(2)], dtype: hidden.dtype)
+        return fc(concatenated([hidden, padding], axis: 1))[0..., ..<rows, 0...]
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
