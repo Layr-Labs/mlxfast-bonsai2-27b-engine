@@ -961,6 +961,25 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// The prompt-width 2-bit tile (BM = BN = BK = 64, 2x2 simdgroups, aligned N,
+// the shapes the 2-bit prefetch path serves) decodes its weights straight into
+// each simdgroup's B fragments instead of staging them in threadgroup memory.
+// The kernel wrapper reads the same flag to drop the unused staging buffer.
+template <
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+struct QmmTNaxRegisterW2 {
+  static constant constexpr const bool value = (bits == 2) && (BM == 64) &&
+      (BN == 64) && (BK == 64) && (WM == 2) && (WN == 2) && aligned_N &&
+      (group_size >= BK) && (group_size % BK == 0);
+};
+
 template <
     typename T,
     const int group_size,
@@ -1068,6 +1087,95 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   Dtile.clear();
 
   x += tm * K;
+
+  // Prompt-width 2-bit tiles: every simdgroup decodes its own 32 weight rows
+  // straight into its B fragments, the way the dense NAX GEMM
+  // (steel/gemm/gemm_nax.h) reads both operands from device memory. No
+  // threadgroup staging and no barriers, so the four simdgroups walk K
+  // independently. A lane's four consecutive K values of a fragment row are
+  // one packed byte. Each element is the prefetch path's
+  // `dequantize_2bit_word` value (same float expression, same cast), and the
+  // A tiles and the MMA sequence over K are unchanged, so the output is
+  // bit-identical to the staged path.
+  if constexpr (QmmTNaxRegisterW2<group_size, bits, aligned_N, BM, BK, BN, WM, WN>::
+                    value) {
+    const short2 frag_coord = BaseNAXFrag::get_coord(); // {fn, fm}
+    const int w_row0 = int(tn) + int(frag_coord.y);
+    const device uint8_t* w_lane = wl + w_row0 * K_w + frag_coord.x / 4;
+    const device T* s_lane = scales + w_row0 * K_g;
+    const device T* b_lane = biases + w_row0 * K_g;
+
+    dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+      float w_scale[TN][2] = {};
+      float w_bias[TN][2] = {};
+
+      STEEL_PRAGMA_NO_UNROLL
+      for (int k = 0; k < K; k += SK) {
+        NAXTile<T, TM, TK> Atile;
+        NAXTile<T, TN, TK> Btile;
+
+        volatile int compiler_barrier;
+
+        if constexpr (kAlignedM.value) {
+          Atile.load(x + k, K);
+        } else {
+          Atile.load_safe(x + k, K, short2(SK, sgp_sm));
+        }
+
+        if (k % group_size == 0) {
+          const int g = k / group_size;
+          STEEL_PRAGMA_UNROLL
+          for (short fr = 0; fr < TN; fr++) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; i++) {
+              const int r = fr * 16 + i * 8;
+              w_scale[fr][i] = float(s_lane[r * K_g + g]);
+              w_bias[fr][i] = float(b_lane[r * K_g + g]);
+            }
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (short fr = 0; fr < TN; fr++) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 2; i++) {
+            const int r = fr * 16 + i * 8;
+            const float s = w_scale[fr][i];
+            const float b = w_bias[fr][i];
+            const float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+            STEEL_PRAGMA_UNROLL
+            for (short kc = 0; kc < TK; kc++) {
+              const uint8_t wb = w_lane[r * K_w + (k + kc * 16) / 4];
+              Btile.frag_at(fr, kc)[i * 4 + 0] =
+                  static_cast<T>(sc[0] * (wb & 0x03) + b);
+              Btile.frag_at(fr, kc)[i * 4 + 1] =
+                  static_cast<T>(sc[1] * (wb & 0x0c) + b);
+              Btile.frag_at(fr, kc)[i * 4 + 2] =
+                  static_cast<T>(sc[2] * (wb & 0x30) + b);
+              Btile.frag_at(fr, kc)[i * 4 + 3] =
+                  static_cast<T>(sc[3] * (wb & 0xc0) + b);
+            }
+          }
+        }
+
+        tile_matmad_nax(
+            Dtile,
+            Atile,
+            metal::bool_constant<transpose_a>{},
+            Btile,
+            metal::bool_constant<transpose_b>{});
+
+        (void)compiler_barrier;
+      }
+
+      if constexpr (kAlignedM.value) {
+        Dtile.store(y + tm * N + tn, N);
+      } else {
+        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+      }
+    });
+    return;
+  }
 
   // 2-bit: load the next K block of weights into registers before the MMAs.
   // Same thread mapping and same Ws values as loader_w.
@@ -1353,7 +1461,11 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  // The register-decoded 2-bit tile never touches the staging buffer, so it
+  // does not reserve one (more threadgroups fit per core).
+  constexpr bool kStagesW =
+      !QmmTNaxRegisterW2<group_size, bits, aligned_N, BM, BK, BN, WM, WN>::value;
+  threadgroup T Ws[kStagesW ? BN * BK_padded : 1];
 
   if (batched) {
     adjust_matrix_offsets<T>(
