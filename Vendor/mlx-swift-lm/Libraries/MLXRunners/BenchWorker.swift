@@ -610,7 +610,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             // `cache_memory` assertable, and reading after it would describe
             // the drain rather than the phase.
             let snapshot = memory.preDrainSnapshot()
-            await releaseSessionsAndSettle()
+            let cacheAfterDrain = await releaseSessionsAndSettle()
             // CBV2_STEP_PROFILE=1: the engine loop's per-phase timing table
             // (launch, readback wait, sampler, per-step phases) on stderr,
             // one table per phase, then reset so the next phase reads clean.
@@ -625,7 +625,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
             response.expertStats = ExpertStreamingStats()
             response.peakRAMGB = memory.peakRAMGB()
             response.completedWork = completedWork
-            response.cacheMemory = memory.cacheMemoryAfterDrain()
+            // The read the settle loop ended on, not a fresh one: a fresh
+            // read races the same stragglers the loop just waited out.
+            response.cacheMemory = cacheAfterDrain
             response.mlxActiveMemoryBytes = snapshot?.active
             response.mlxCacheMemoryBytes = snapshot?.cache
             response.mlxPeakMemoryBytes = snapshot?.peak
@@ -1095,24 +1097,49 @@ public final class BenchWorkerServer: @unchecked Sendable {
         freeRun = nil
     }
 
+    /// How many drains the phase-close settle tries, and the pause between
+    /// two of them. A free that lands after `Memory.clearCache()` (a step's
+    /// last `asyncEval` temporaries, the engine loop's teardown on its own
+    /// queue, a Metal command buffer's completion handler) arrives
+    /// milliseconds later; drains issued back to back with no pause all
+    /// run before it and each reads the same straggler. The budget is
+    /// bounded, so a worker that really leaks still reports a non-zero
+    /// cache and the parent fails the run closed.
+    static let drainSettleAttempts = 50
+    /// See ``drainSettleAttempts``.
+    static let drainSettleInterval: Duration = .milliseconds(20)
+
     /// The phase-close release: shut the free-run engine DOWN before the
-    /// drain, then drain until the allocator is quiescent.
+    /// drain, then drain until the allocator is quiescent. Returns the
+    /// free-buffer cache size the LAST drain left, which is what goes on
+    /// the wire as `cache_memory`.
     ///
     /// WHY. Dropping the last reference to an engine does not free its
     /// arrays at that instant: the loop's task tears them down on its own
     /// thread, and frees that land after the drain sit in the cache the
     /// barrier then reads (a box saw 384 bytes on a resident, down from
     /// 320 KiB before drains settled the stream). Awaiting shutdown puts the
-    /// teardown before the drain; the bounded re-drain covers a straggler.
-    private func releaseSessionsAndSettle() async {
+    /// teardown before the drain. Four drains with no pause between them
+    /// did not cover the stragglers that remained: on 2026-09-25 six ranked
+    /// runs failed the parent's `cache_memory == 0` barrier with 240 KiB to
+    /// 3.7 MiB left, every one on the candidate's warm-up leg. The settle
+    /// now waits ``drainSettleInterval`` between drains, for at most
+    /// ``drainSettleAttempts`` drains, and stops at the first zero read.
+    private func releaseSessionsAndSettle() async -> Int? {
         if let session = freeRun {
             await session.engine.shutdown()
         }
         releaseSessions()
-        for _ in 0 ..< 4 {
+        var cache: Int?
+        for attempt in 1 ... Self.drainSettleAttempts {
             memory.drain()
-            if (memory.cacheMemoryAfterDrain() ?? 0) == 0 { break }
+            cache = memory.cacheMemoryAfterDrain()
+            if (cache ?? 0) == 0 { break }
+            if attempt < Self.drainSettleAttempts {
+                try? await Task.sleep(for: Self.drainSettleInterval)
+            }
         }
+        return cache
     }
 
     private static let greedySampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
