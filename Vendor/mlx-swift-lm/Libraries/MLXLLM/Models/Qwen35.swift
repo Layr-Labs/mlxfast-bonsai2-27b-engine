@@ -222,6 +222,14 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+/// `DARKBLOOM_QWEN35_VERIFY_SLICES=0` (or false/no/off) submits the verify
+/// forward as one graph, as before.
+let qwen35VerifySubmitInSlices: Bool = {
+    let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}()
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -291,6 +299,19 @@ func qwen35GatedDelta(
     stateOnly: Bool = false
 ) -> (MLXArray, MLXArray) {
     let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
+    return qwen35GatedDelta(
+        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: state, mask: mask,
+        stateOnly: stateOnly)
+}
+
+/// `qwen35GatedDelta` on gates already formed by `gatedDeltaGates`. The
+/// verify window forms them once and its accepted-prefix replay slices them:
+/// the gates are element-wise in (a, b), so a row slice of the window's
+/// gates is the same values as the gates of the row slice.
+func qwen35GatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+    state: MLXArray?, mask: MLXArray?, stateOnly: Bool = false
+) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
@@ -299,12 +320,196 @@ func qwen35GatedDelta(
     if ssm.dtype != .float32 {
         ssm = ssm.asType(.float32)
     }
+    // Prompt-width windows (>= 64 rows) take the 8-lanes-per-row kernel;
+    // decode, verify and replay windows take the four-rows kernel.
+    if mask == nil, !stateOnly, let prefill = qwen35GatedDeltaPrefill(
+        q: q, k: k, v: v, g: g, beta: beta, state: ssm)
+    {
+        return prefill
+    }
     if mask == nil, let result = Qwen35GatedDeltaRows.run(
-        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, stateOnly: stateOnly)
+        q: q, k: k, v: v, g: g, beta: beta, state: ssm, stateOnly: stateOnly)
     {
         return result
     }
-    return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
+    return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: ssm, mask: mask)
+}
+
+// MARK: - Prompt-width gated-delta recurrence
+
+/// Wide windows (prompt processing) only. Decode, MTP/DFlash verify and
+/// prefix replay windows are far below this and keep the shared
+/// `gatedDeltaKernel` unchanged. `DARKBLOOM_QWEN35_GDN_PREFILL_KERNEL=0`
+/// restores it everywhere.
+private let qwen35GatedDeltaPrefillMinRows = 64
+
+/// `DARKBLOOM_QWEN35_PREFILL_LAST_QUERY=0` keeps the final layer of a
+/// prompt-sized forward at full width.
+let qwen35PrefillLastQueryEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PREFILL_LAST_QUERY"] != "0"
+
+private let qwen35GatedDeltaPrefillEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_GDN_PREFILL_KERNEL"] != "0"
+
+/// The same recurrence as `gatedDeltaKernel` (GatedDelta.swift), remapped for
+/// a long serial T (64b0ed0). The stock kernel gives each (head, dv) state
+/// row a whole SIMD group, 4 fp32 per lane, and pays two 32-lane `simd_sum`
+/// trees plus a Kahan chain per row per step. Here 8 lanes own one row at 16
+/// fp32 each, so one SIMD group advances 4 rows and each dot product closes
+/// with a 3-step xor butterfly inside its 8-lane group (every lane ends with
+/// the same sum). The decay is applied to the reduced `S . k` (`g * (S . k)`
+/// equals `(g * S) . k`) and to the row during the rank-one update. Only the
+/// fp32 summation order differs from the stock kernel; the state stays fp32.
+private let qwen35GatedDeltaPrefillSource = """
+    auto n = thread_position_in_grid.z;
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    auto hk_idx = hv_idx / (Hv / Hk);
+    constexpr int LANES_PER_ROW = 8;
+    constexpr int ROWS_PER_SIMD = 32 / LANES_PER_ROW;
+    constexpr int n_per_t = Dk / LANES_PER_ROW;
+
+    uint lane = thread_index_in_simdgroup;
+    uint lane_in_row = lane % LANES_PER_ROW;
+    auto dv_idx = thread_position_in_grid.y * ROWS_PER_SIMD + lane / LANES_PER_ROW;
+
+    // q, k: [B, T, Hk, Dk]
+    auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk + lane_in_row * n_per_t;
+    auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk + lane_in_row * n_per_t;
+
+    // v, y: [B, T, Hv, Dv]
+    auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+    // g, beta: [B, T, Hv]
+    auto g_ = g + b_idx * T * Hv;
+    auto beta_ = beta + b_idx * T * Hv;
+
+    // state_in, state_out: [B, Hv, Dv, Dk]
+    auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * n_per_t;
+    auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * n_per_t;
+
+    float state[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+      state[i] = static_cast<float>(i_state[i]);
+    }
+
+    for (int t = 0; t < T; ++t) {
+      float k_t[n_per_t];
+      float q_t[n_per_t];
+      for (int i = 0; i < n_per_t; ++i) {
+        k_t[i] = static_cast<float>(k_[i]);
+        q_t[i] = static_cast<float>(q_[i]);
+      }
+      float g_t = static_cast<float>(g_[hv_idx]);
+      float beta_t = static_cast<float>(beta_[hv_idx]);
+      float v_t = static_cast<float>(v_[dv_idx]);
+
+      float kv0 = 0.0f;
+      float kv1 = 0.0f;
+      float kv2 = 0.0f;
+      float kv3 = 0.0f;
+      for (int i = 0; i < n_per_t; i += 4) {
+        kv0 += state[i] * k_t[i];
+        kv1 += state[i + 1] * k_t[i + 1];
+        kv2 += state[i + 2] * k_t[i + 2];
+        kv3 += state[i + 3] * k_t[i + 3];
+      }
+      float kv_mem = (kv0 + kv1) + (kv2 + kv3);
+      kv_mem += simd_shuffle_xor(kv_mem, ushort(4));
+      kv_mem += simd_shuffle_xor(kv_mem, ushort(2));
+      kv_mem += simd_shuffle_xor(kv_mem, ushort(1));
+      kv_mem = kv_mem * g_t;
+
+      float delta = (v_t - kv_mem) * beta_t;
+
+      float out0 = 0.0f;
+      float out1 = 0.0f;
+      float out2 = 0.0f;
+      float out3 = 0.0f;
+      for (int i = 0; i < n_per_t; i += 4) {
+        state[i] = state[i] * g_t + k_t[i] * delta;
+        state[i + 1] = state[i + 1] * g_t + k_t[i + 1] * delta;
+        state[i + 2] = state[i + 2] * g_t + k_t[i + 2] * delta;
+        state[i + 3] = state[i + 3] * g_t + k_t[i + 3] * delta;
+        out0 += state[i] * q_t[i];
+        out1 += state[i + 1] * q_t[i + 1];
+        out2 += state[i + 2] * q_t[i + 2];
+        out3 += state[i + 3] * q_t[i + 3];
+      }
+      float out = (out0 + out1) + (out2 + out3);
+      out += simd_shuffle_xor(out, ushort(4));
+      out += simd_shuffle_xor(out, ushort(2));
+      out += simd_shuffle_xor(out, ushort(1));
+      if (lane_in_row == 0) {
+        y[dv_idx] = static_cast<InT>(out);
+      }
+
+      // Increment data pointers to next time step
+      q_ += Hk * Dk;
+      k_ += Hk * Dk;
+      v_ += Hv * Dv;
+      y += Hv * Dv;
+      g_ += Hv;
+      beta_ += Hv;
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      o_state[i] = static_cast<StT>(state[i]);
+    }
+    """
+
+/// Built once per process; nil off Metal.
+private let qwen35GatedDeltaPrefillKernel: MLXFast.MLXFastKernel? = {
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        return MLXFast.metalKernel(
+            name: "qwen35_gated_delta_prefill_l8",
+            inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+            outputNames: ["y", "state_out"],
+            source: qwen35GatedDeltaPrefillSource)
+    #else
+        return nil
+    #endif
+}()
+
+/// Launch shape: one SIMD group per 4 state rows, 4 SIMD groups per
+/// threadgroup, `Dv / 4` rows of SIMD groups per head. Inputs, template
+/// arguments, outputs and dtypes mirror `gatedDeltaKernel`. Nil (the caller
+/// keeps the stock kernel) below the prompt width or off the geometry.
+private func qwen35GatedDeltaPrefill(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+    minimumRows: Int = qwen35GatedDeltaPrefillMinRows
+) -> (MLXArray, MLXArray)? {
+    guard qwen35GatedDeltaPrefillEnabled, let kernel = qwen35GatedDeltaPrefillKernel,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4, k.dim(1) >= minimumRows
+    else { return nil }
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    guard Dk % 32 == 0, Dv % 4 == 0, Hk > 0, Hv % Hk == 0,
+        q.shape == k.shape, v.dim(0) == B, v.dim(1) == T,
+        k.dtype == q.dtype, v.dtype == q.dtype
+    else { return nil }
+    let inputType = q.dtype
+    let stateType = state.dtype
+    let outputs = kernel(
+        [q, k, v, g, beta, state, MLXArray(T)],
+        template: [
+            ("InT", inputType),
+            ("StT", stateType),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv / 4, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape],
+        outputDTypes: [inputType, stateType]
+    )
+    return (outputs[0], outputs[1])
 }
 
 /// The gated-delta recurrence of `gatedDeltaKernel`, four value rows per
@@ -1348,24 +1553,41 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        gates: (g: MLXArray, beta: MLXArray)? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = qwen35GatedDelta(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] },
-            stateOnly: true
-        ).1
+        let boundarySsm: MLXArray
+        if let gates, tape.mask == nil {
+            // The verify window's own gates, sliced: no recompute of g and
+            // beta from the taped a and b.
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                g: gates.g[0..., rows, 0...],
+                beta: gates.beta[0..., rows, 0...],
+                state: tape.ssmPre,
+                mask: nil,
+                stateOnly: true
+            ).1
+        } else {
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] },
+                stateOnly: true
+            ).1
+        }
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -1633,14 +1855,15 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
+            // Gates once for the window; the accepted-prefix replay slices
+            // them instead of recomputing them from the taped a and b.
+            let windowGates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
             let recurrence = qwen35GatedDelta(
                 q: qNormed,
                 k: kNormed,
                 v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
+                g: windowGates[0],
+                beta: windowGates[1],
                 state: ssmState,
                 mask: nil)
             out = recurrence.0
@@ -1719,7 +1942,10 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                                tape: tape, committedRows: keepPositions,
+                                gates: (
+                                    g: windowGates[0][rowRange],
+                                    beta: windowGates[1][rowRange]))
                         })
                 } catch {
                     preconditionFailure(
@@ -1879,10 +2105,14 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        lastQueryOnly: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
+        precondition(
+            !lastQueryOnly || (!exactTargetVerify && L > 1),
+            "last-query attention is a prompt-window specialization")
 
         let projected: (MLXArray, MLXArray, MLXArray)
         if exactTargetVerify {
@@ -1899,7 +2129,12 @@ final class Qwen35Attention: Module {
         let vProjection = projected.2
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        let gate = qSplit[1].reshaped(B, L, -1)
+        // A last-query window commits all L rows of K/V but attends, gates
+        // and projects only the newest row; RoPE is applied at full width
+        // below, so the kept query sits at its own absolute position.
+        let rows = lastQueryOnly ? 1 : L
+        let gate = (lastQueryOnly ? qSplit[1][0..., (L - 1)..., 0..., 0...] : qSplit[1])
+            .reshaped(B, rows, -1)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
@@ -1917,11 +2152,22 @@ final class Qwen35Attention: Module {
             keys = rope(keys, offset: offsets)
         }
 
-        let output = cache.updateAndAttend(
-            queries: queries, keys: keys, values: values,
-            scale: scale, sinks: nil)
+        let attendedHeads: MLXArray
+        if lastQueryOnly {
+            guard let lastQuery = cache as? any CBv2LastQueryPrefillLayerCache else {
+                preconditionFailure("last-query attention without a last-query cache")
+            }
+            attendedHeads = lastQuery.updateAndAttendLastQuery(
+                queries: queries[0..., 0..., (L - 1)..., 0...], keys: keys, values: values,
+                scale: scale, sinks: nil)
+        } else {
+            attendedHeads = cache.updateAndAttend(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: nil)
+        }
+        let output = attendedHeads
             .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+            .reshaped(B, rows, -1)
         if !exactTargetVerify, let packed = oProj as? HadamardQuantizedLinear,
             let y = packed.applyAfterSigmoidGate(output, gate: gate, widenOutput: false)
         {
@@ -2263,8 +2509,10 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        lastQueryOnly: Bool = false
     ) -> MLXArray {
+        precondition(!lastQueryOnly || !isLinear, "last-query window on a recurrent layer")
         let r: MLXArray
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
@@ -2284,9 +2532,12 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+                exactTargetVerify: exactTargetVerify, lastQueryOnly: lastQueryOnly)
         }
-        let h = x + r
+        // The input norm above stays full width (every K/V row comes from it);
+        // from the residual on, a last-query window carries its newest row only.
+        let residual = lastQueryOnly ? x[0..., (x.dim(1) - 1)..., 0...] : x
+        let h = residual + r
         let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
@@ -2442,13 +2693,21 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    /// Layers per verify submission slice (see `cbv2Forward`). Four slices
+    /// of sixteen: building one slice on the host must beat the drafter's
+    /// GPU time so the first slice is ready when the GPU frees, and each
+    /// later slice builds far faster than the GPU runs the one before it.
+    /// Four submissions clear both with margin at the fewest extra calls.
+    static let verifySubmitLayers = 16
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
-        captureRecurrentWindow: Bool = false
+        captureRecurrentWindow: Bool = false,
+        lastRowOnly: Bool = false
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -2463,6 +2722,7 @@ public class Qwen35TextModelInner: Module {
         var tapped = [MLXArray?](
             repeating: nil, count: tapLayerIds?.count ?? 0)
         var attentionIndex = 0
+        let finalLayerIndex = layers.count - 1
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
@@ -2475,6 +2735,18 @@ public class Qwen35TextModelInner: Module {
                     "Qwen35 CBv2 attention cache mapped to the wrong model layer")
                 attentionIndex += 1
             }
+            // A caller that reads only the newest row of the output (the
+            // prompt-sized forward) lets the FINAL layer commit every row's
+            // K/V and run q-attention, o_proj and the MLP for that row alone:
+            // no later layer exists to read the other rows, and a tapped layer
+            // would keep them.
+            let lastQueryOnly = lastRowOnly && qwen35PrefillLastQueryEnabled
+                && modelLayerIndex == finalLayerIndex && !captureRecurrentWindow
+                && hiddenStates.dim(1) > 1 && !layer.isLinear
+                && tapLayerIds?.contains(modelLayerIndex) != true
+                && (attentionCache as? any CBv2LastQueryPrefillLayerCache).map {
+                    $0.kind.attention == .full && $0.kind.sharesKVWithLayer == nil
+                } == true
             hiddenStates = layer.cbv2Forward(
                 hiddenStates,
                 modelLayerIndex: modelLayerIndex,
@@ -2482,12 +2754,28 @@ public class Qwen35TextModelInner: Module {
                 recurrentState: recurrentState,
                 positionIds: positionIds,
                 captureRecurrentWindow: captureRecurrentWindow,
-                exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
+                lastQueryOnly: lastQueryOnly)
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            // VERIFY SUBMITS IN SLICES. The drafter's block was submitted
+            // before this graph was built, so the GPU would otherwise idle
+            // from the drafter's last kernel until the host finished building
+            // all 64 layers. Submitting every `verifySubmitLayers` layers
+            // lets the GPU run the front of the tower while the host builds
+            // the rest. The same kernels run on the same inputs in the same
+            // order; only command-buffer boundaries move, so every value is
+            // bit-identical. Verify only: prefill and plain decode are
+            // untouched.
+            if captureRecurrentWindow, qwen35VerifySubmitInSlices,
+                (modelLayerIndex + 1) % Qwen35TextModelInner.verifySubmitLayers == 0,
+                modelLayerIndex + 1 < layers.count
+            {
+                asyncEval([hiddenStates])
             }
         }
         if tapLayerIds == nil {
@@ -2714,11 +3002,16 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             }
             return attending
         }
+        let width = inputEmbedding?.dim(1) ?? inputs.dim(1)
+        let promptSized = width > Qwen35TextModel.promptProjectionMinimumRows
+        // Only the last row of a prompt-sized forward is read, so the final
+        // layer may skip the rest (it still commits every row's K/V).
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
+            recurrentState: recurrentState, positionIds: positionIds,
+            lastRowOnly: promptSized)
         let rows = hidden.dim(1)
-        if rows > Qwen35TextModel.promptProjectionMinimumRows {
+        if promptSized {
             // A prompt-sized forward is only ever read at its last row (the
             // teacher-forced stepper and every engine prefill caller slice
             // `[..., -1, ...]`), so project that row alone instead of all L
@@ -2823,9 +3116,14 @@ extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
             }
             return attending
         }
+        // With the DFlash 2 tap armed, the engine's committed observation is
+        // the tap (`committedObservationHidden`), never these hidden rows, so
+        // the final layer may keep only the last one. A chain drafter reads
+        // every row, so without the tap the trunk stays full width.
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
+            recurrentState: recurrentState, positionIds: positionIds,
+            lastRowOnly: model.dFlash2Tap.layerIds != nil)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly:
