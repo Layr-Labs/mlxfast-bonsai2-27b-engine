@@ -254,6 +254,47 @@ enum Qwen35FusedElementwise {
         compile(shapeless: true) { normed, gate in
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
+
+    /// `x * sigmoid(gate)` widened to FP32 and multiplied by Hadamard signs.
+    /// Same operands and order as `sigmoidMultiply` followed by `rotate`'s
+    /// sign step, fused into one kernel when both inputs are already FP32.
+    static let sigmoidMultiplySigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { output, gate, signs in
+            (output * sigmoid(gate)).asType(.float32) * signs
+        }
+}
+
+/// On unless `MLXFAST_FOLD_HADAMARD_SIGNS` is 0/false/no/off.
+///
+/// A ±1 Hadamard sign commutes with RMSNorm's weight multiply and with the
+/// rounding cast back to the activation dtype, so baking it into a cached
+/// copy of the norm weight is bit-identical and drops the sign dispatch.
+enum Qwen35HadamardSignFold {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_FOLD_HADAMARD_SIGNS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
+/// Evaluated `norm.weight * signs`, one buffer per norm. A plain class so
+/// Module reflection does not treat the product as a parameter.
+private final class Qwen35FoldedNormBox {
+    private let lock = NSLock()
+    private var stored: [ObjectIdentifier: MLXArray] = [:]
+
+    func weight(norm: RMSNorm, signs: MLXArray) -> MLXArray {
+        let key = ObjectIdentifier(norm)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = stored[key] {
+            return cached
+        }
+        let folded = norm.weight * signs.asType(norm.weight.dtype)
+        eval(folded)
+        stored[key] = folded
+        return folded
+    }
 }
 
 /// Input-independent constants a GDN layer derives from its geometry, held
@@ -1270,20 +1311,62 @@ final class Qwen35Attention: Module {
 
     /// q, k and v read the same activation. On a packed Hadamard checkpoint
     /// they share one input transform, so it is computed once.
-    private func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
-        if let shared = sharedHadamardProjections(x, [qProj, kProj, vProj]) {
+    /// `signsApplied` skips that transform's ±1 multiply; the caller folded
+    /// it into the RMSNorm weight.
+    private func projectQKV(
+        _ x: MLXArray, signsApplied: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        if let shared = sharedHadamardProjections(
+            x, [qProj, kProj, vProj], signsApplied: signsApplied)
+        {
             return (shared[0], shared[1], shared[2])
         }
+        precondition(!signsApplied, "pre-signed QKV requires a shared Hadamard transform")
         return (qProj(x), kProj(x), vProj(x))
     }
 
+    /// Shared q/k/v sign vector when folding it into the input RMSNorm is exact.
+    func sharedQKVSignVector() -> MLXArray? {
+        guard Qwen35HadamardSignFold.enabled,
+            let q = qProj as? HadamardQuantizedLinear,
+            let k = kProj as? HadamardQuantizedLinear,
+            let v = vProj as? HadamardQuantizedLinear,
+            q.sharesInputTransform(with: k),
+            q.sharesInputTransform(with: v)
+        else { return nil }
+        return q.transform.signVector
+    }
+
+    private func projectOutput(
+        _ output: MLXArray, gate: MLXArray, exact: Bool
+    ) -> MLXArray {
+        if !exact, Qwen35HadamardSignFold.enabled,
+            let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+            output.dtype == .float32, gate.dtype == .float32
+        {
+            let signed = Qwen35FusedElementwise.sigmoidMultiplySigned(
+                output, gate, packed.transform.signVector)
+            return packed.forwardPreSigned(signed, widenOutput: false)
+        }
+        let projectionInput = sigmoidMultiply(output, gate)
+        if exact {
+            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+        }
+        if let packed = oProj as? HadamardQuantizedLinear {
+            return packed.forwardUnwidened(projectionInput)
+        }
+        return oProj(projectionInput)
+    }
+
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        inputSignsApplied: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let (qProjOutput, kProjOutput, vProjOutput) = projectQKV(x)
+        let (qProjOutput, kProjOutput, vProjOutput) = projectQKV(
+            x, signsApplied: inputSignsApplied)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
@@ -1309,13 +1392,14 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return projectOutput(output, gate: gate, exact: false)
     }
 
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        inputSignsApplied: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1328,7 +1412,7 @@ final class Qwen35Attention: Module {
                 qwen35A3BExactW4G64Projection(vProj, x)
             )
         } else {
-            projected = projectQKV(x)
+            projected = projectQKV(x, signsApplied: inputSignsApplied && !exactTargetVerify)
         }
         let qProjOutput = projected.0
         let kProjection = projected.1
@@ -1358,15 +1442,7 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
-        if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
-        }
-        if let packed = oProj as? HadamardQuantizedLinear {
-            // The residual add widens the FP16 product itself.
-            return packed.forwardUnwidened(projectionInput)
-        }
-        return oProj(projectionInput)
+        return projectOutput(output, gate: gate, exact: exactTargetVerify)
     }
 }
 
@@ -1582,8 +1658,17 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen3NextMLP {
-    func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return qwen35Forward(x) }
+    func sharedGateUpSignVector() -> MLXArray? {
+        guard Qwen35HadamardSignFold.enabled,
+            let gate = gateProj as? HadamardQuantizedLinear,
+            let up = upProj as? HadamardQuantizedLinear,
+            gate.sharesInputTransform(with: up)
+        else { return nil }
+        return gate.transform.signVector
+    }
+
+    func qwen35TargetVerify(_ x: MLXArray, exact: Bool, signsApplied: Bool = false) -> MLXArray {
+        guard exact else { return qwen35Forward(x, signsApplied: signsApplied) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
@@ -1595,14 +1680,17 @@ extension Qwen3NextMLP {
     /// up products stay FP16, `silu(gate) * up` is formed in FP32 together with
     /// the down projection's Hadamard signs, and the down product is left for
     /// the residual add to widen. Same arithmetic, four fewer dispatches.
-    func qwen35Forward(_ x: MLXArray) -> MLXArray {
+    /// `signsApplied` means the shared gate/up signs are already in `x`.
+    func qwen35Forward(_ x: MLXArray, signsApplied: Bool = false) -> MLXArray {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
-            let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
+            let shared = sharedHadamardProjections(
+                x, [gateProj, upProj], widenOutput: false, signsApplied: signsApplied)
         {
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
         }
+        precondition(!signsApplied, "pre-signed gate/up requires a shared Hadamard transform")
         guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
             return self(x)
         }
@@ -1614,6 +1702,7 @@ extension Qwen3NextMLP {
 
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
+    private let foldedNorms = Qwen35FoldedNormBox()
 
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen35GatedDeltaNet?
@@ -1668,13 +1757,19 @@ final class Qwen35DecoderLayer: Module {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
                 nConfirmed: nConfirmed)
+        } else if let signs = selfAttn?.sharedQKVSignVector() {
+            let normed = MLXFast.rmsNorm(
+                x, weight: foldedNorms.weight(norm: inputLayerNorm, signs: signs),
+                eps: inputLayerNorm.eps)
+            r = selfAttn!.callAsFunction(
+                normed, mask: attentionMask, cache: cache, inputSignsApplied: true)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
         let h = x + r
         if let dense = mlp as? Qwen3NextMLP {
-            return h + dense.qwen35Forward(postAttentionLayerNorm(h))
+            return h + denseMLP(dense, h)
         }
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
@@ -1705,23 +1800,45 @@ final class Qwen35DecoderLayer: Module {
             guard let attentionCache else {
                 preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
             }
-            r = selfAttn!.cbv2Forward(
-                inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+            if !exactTargetVerify, let signs = selfAttn?.sharedQKVSignVector() {
+                let normed = MLXFast.rmsNorm(
+                    x, weight: foldedNorms.weight(norm: inputLayerNorm, signs: signs),
+                    eps: inputLayerNorm.eps)
+                r = selfAttn!.cbv2Forward(
+                    normed, cache: attentionCache, positionIds: positionIds,
+                    exactTargetVerify: false, inputSignsApplied: true)
+            } else {
+                r = selfAttn!.cbv2Forward(
+                    inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
+                    exactTargetVerify: exactTargetVerify)
+            }
         }
         let h = x + r
-        let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
-                normalized, exactTargetVerify: exactTargetVerify)
+                postAttentionLayerNorm(h), exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            feedForward = denseMLP(dense, h, exact: exactTargetVerify)
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
         return h + feedForward
+    }
+
+    /// Post-attention RMSNorm with gate/up Hadamard signs folded in, when that
+    /// fold is exact. The unsigned norm is used otherwise.
+    private func denseMLP(
+        _ dense: Qwen3NextMLP, _ h: MLXArray, exact: Bool = false
+    ) -> MLXArray {
+        if !exact, let signs = dense.sharedGateUpSignVector() {
+            let normed = MLXFast.rmsNorm(
+                h, weight: foldedNorms.weight(norm: postAttentionLayerNorm, signs: signs),
+                eps: postAttentionLayerNorm.eps)
+            return dense.qwen35TargetVerify(normed, exact: false, signsApplied: true)
+        }
+        return dense.qwen35TargetVerify(
+            postAttentionLayerNorm(h), exact: exact)
     }
 }
 
@@ -1931,6 +2048,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// Cached `final_norm.weight * lm_head signs`. Not a parameter.
+    private let foldedFinalNorm = Qwen35FoldedNormBox()
+
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -1959,17 +2079,36 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Final RMSNorm plus the vocabulary head. Packed Hadamard signs are folded
+    /// into a cached copy of the norm weight, which is bit-identical to
+    /// `lmHead(model.norm(hidden))` and drops the sign dispatch in front of
+    /// the widest matmul. Exact-verify keeps the unsigned norm.
+    func qwen35HeadLogits(from hidden: MLXArray, exact: Bool = false) -> MLXArray {
+        if !exact, Qwen35HadamardSignFold.enabled,
+            let packed = lmHead as? HadamardQuantizedLinear, packed.gdnLayout == nil
+        {
+            let weight = foldedFinalNorm.weight(
+                norm: model.norm, signs: packed.transform.signVector)
+            let normalized = MLXFast.rmsNorm(hidden, weight: weight, eps: model.norm.eps)
+            return packed.forwardPreSigned(normalized)
+        }
+        let normalized = model.norm(hidden)
+        if exact, let lmHead {
+            return qwen35A3BExactW4G64Projection(lmHead, normalized)
+        }
+        if exact, normalized.dim(1) > 1 {
+            return qwen35A3BTimewiseProjection(normalized) {
+                model.embedTokens.asLinear($0)
+            }
+        }
+        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
         let hidden = model(inputs, cache: cache)
-        var out = model.norm(hidden)
-        if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
-        }
-        return out
+        return qwen35HeadLogits(from: hidden)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -2140,8 +2279,8 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        let normalized = qwen35HeadLogits(from: hidden)
+        return normalized
     }
 }
 
@@ -2183,8 +2322,7 @@ extension Qwen35TextModel: CBv2RecurrentLanguageModelPrefillForwardable {
             // it commits every layer's K/V write and recurrent stage.
             return hidden[0..., -1, 0 ..< 1]
         case .lastPositionLogits:
-            let last = model.norm(hidden[0..., -1, 0...])
-            return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
+            return qwen35HeadLogits(from: hidden[0..., -1, 0...])
         }
     }
 }
@@ -2203,8 +2341,7 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        let logits = qwen35HeadLogits(from: hidden)
         return (logits, hidden)
     }
 }
@@ -2239,9 +2376,7 @@ extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
             // A small handle whose graph depends on the whole trunk.
             return (last[0..., 0..., 0 ..< 1], hidden)
         case .lastPositionLogits:
-            let normalized = model.norm(last)
-            let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
-            return (logits, hidden)
+            return (qwen35HeadLogits(from: last), hidden)
         }
     }
 }
@@ -2265,19 +2400,7 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
             captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits = model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
-            }
-        } else {
-            logits = model.embedTokens.asLinear(normalized)
-        }
+        let logits = qwen35HeadLogits(from: hidden, exact: model.exactTargetVerify)
         return (logits, hidden)
     }
 }
@@ -2354,16 +2477,9 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(normed)
-        } else {
-            logits = model.embedTokens.asLinear(normed)
-        }
         // Return raw capture hidden. The bound Qwen MTP adapter owns the exact
         // target final-norm application when these rows enter trusted history.
-        return (logits, hidden)
+        return (qwen35HeadLogits(from: hidden), hidden)
     }
 
     /// Commit a shorter accepted recurrent prefix from the most recent wide

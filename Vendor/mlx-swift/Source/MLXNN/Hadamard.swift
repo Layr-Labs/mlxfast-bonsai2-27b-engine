@@ -579,7 +579,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 /// computed itself, so outputs are bit-identical to calling each one. Returns
 /// nil when any projection is not packed or uses a different transform.
 public func sharedHadamardProjections(
-    _ x: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+    _ x: MLXArray, _ projections: [Linear], widenOutput: Bool = true,
+    signsApplied: Bool = false
 ) -> [MLXArray]? {
     guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
     var packed = [HadamardQuantizedLinear]()
@@ -590,7 +591,12 @@ public func sharedHadamardProjections(
         else { return nil }
         packed.append(layer)
     }
-    let rotated = first.rotate(x)
+    // signsApplied: the caller already multiplied by this shared ±1 vector.
+    // applyPreSigned then matches rotate's Hadamard input, because ±1 commutes
+    // with the rounding cast that produced the signed activation.
+    let rotated = signsApplied
+        ? first.transform.applyPreSigned(x)
+        : first.rotate(x)
     if let fused = first.fusedSiblingsForward(
         rotated, siblings: packed, widenOutput: widenOutput)
     {
