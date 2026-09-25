@@ -588,7 +588,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = BonsaiGatedDelta.update(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -637,7 +637,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let recurrence = gatedDeltaUpdate(
+        let recurrence = BonsaiGatedDelta.update(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -708,23 +708,43 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        gates: (g: MLXArray, beta: MLXArray)? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = gatedDeltaUpdate(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
-        ).1
+        let boundarySsm: MLXArray
+        if BonsaiGatedDelta.enabled, tape.mask == nil {
+            // The replay keeps only the state. g and beta are the verify's own
+            // (element-wise, so a row slice equals recomputing on the slice).
+            let (g, beta) = gates.map { (g: $0.g[0..., rows, 0...], beta: $0.beta[0..., rows, 0...]) }
+                ?? BonsaiGatedDelta.gates(
+                    a: tape.a[0..., rows, 0...], b: tape.b[0..., rows, 0...],
+                    aLog: aLog, dtBias: dtBias)
+            boundarySsm = BonsaiGatedDelta.recurrence(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                g: g,
+                beta: beta,
+                state: tape.ssmPre,
+                writeOutput: false
+            ).1
+        } else {
+            boundarySsm = gatedDeltaUpdate(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] }
+            ).1
+        }
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -983,7 +1003,15 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = gatedDeltaUpdate(
+            // g and beta once for the window; the accepted-prefix replay
+            // slices them instead of recomputing them from a and b.
+            let gates: (g: MLXArray, beta: MLXArray)? =
+                BonsaiGatedDelta.enabled
+                ? BonsaiGatedDelta.gates(a: a, b: b, aLog: aLog, dtBias: dtBias) : nil
+            let recurrence = gates.map {
+                BonsaiGatedDelta.recurrence(
+                    q: qNormed, k: kNormed, v: v, g: $0.g, beta: $0.beta, state: ssmState)
+            } ?? gatedDeltaUpdate(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1069,7 +1097,8 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                                tape: tape, committedRows: keepPositions,
+                                gates: gates.map { (g: $0.g[rowRange], beta: $0.beta[rowRange]) })
                         })
                 } catch {
                     preconditionFailure(
@@ -1084,7 +1113,7 @@ final class Qwen35GatedDeltaNet: Module {
             ssmStates.reserveCapacity(S)
             var state = ssmState
             for s in 0 ..< S {
-                let (stepOut, next) = gatedDeltaUpdate(
+                let (stepOut, next) = BonsaiGatedDelta.update(
                     q: qNormed[0..., s ..< (s + 1)],
                     k: kNormed[0..., s ..< (s + 1)],
                     v: v[0..., s ..< (s + 1)],
@@ -1220,6 +1249,17 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
+        return projectGatedOutput(output, gate)
+    }
+
+    /// `oProj(output * sigmoid(gate))`. On a packed Hadamard checkpoint the
+    /// gate product is formed inside the fused input rotation (bit-identical).
+    private func projectGatedOutput(_ output: MLXArray, _ gate: MLXArray) -> MLXArray {
+        if let packed = oProj as? HadamardQuantizedLinear,
+            let y = packed.applyAfterSigmoidGate(output, gate: gate)
+        {
+            return y
+        }
         return oProj(sigmoidMultiply(output, gate))
     }
 
@@ -1269,10 +1309,10 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
-        return exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+        if exactTargetVerify {
+            return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
+        }
+        return projectGatedOutput(output, gate)
     }
 }
 
@@ -1499,6 +1539,13 @@ extension Qwen3NextMLP {
     func qwen35Forward(_ x: MLXArray) -> MLXArray {
         guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
             return self(x)
+        }
+        if let packed = downProj as? HadamardQuantizedLinear,
+            let y = packed.applyAfterSwiGLU(gate: shared[0], up: shared[1])
+        {
+            // silu(gate) * up formed inside the down projection's fused input
+            // rotation: same FP32 products in the same order, one kernel.
+            return y
         }
         return downProj(silu(shared[0]) * shared[1])
     }
@@ -2067,6 +2114,42 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
     }
 }
 
+// MARK: - Speculative-leg prompt narrowing
+
+/// The MTP / DFlash 2 prompt forward needs every trunk hidden row (the MTP
+/// head reads `lastHidden`, the DFlash 2 drafter reads the layer tap), but
+/// vocabulary logits only at the positions the engine samples. Without this
+/// conformance the adapter falls back to `cbv2ForwardWithHidden`, which
+/// normalizes and projects all prompt rows through the output head and then
+/// keeps one. The serial path already narrows through `cbv2RecurrentPrefill`.
+extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+        switch requirement {
+        case .evaluationOnly:
+            // Small handle whose graph depends on the whole trunk.
+            return (last[0..., 0..., 0 ..< 1], hidden)
+        case .lastPositionLogits:
+            let normalized = model.norm(last)
+            let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
+        }
+    }
+}
+
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
 
 /// CBv2 consumes only the final prompt position, so the prompt path skips
@@ -2434,6 +2517,18 @@ extension Qwen35Model: CBv2RecurrentMTPForwardable {
     }
 }
 
+extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
+    }
+}
+
 extension Qwen35Model: CBv2RecurrentCaptureMTPForwardable {
     public func cbv2ForwardWithHiddenCaptured(
         _ tokens: MLXArray, caches: [KVCache],
@@ -2514,4 +2609,201 @@ extension Qwen35Model: MTPCapable {
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
     }
+}
+
+// MARK: - Gated-delta recurrence with register prefetch
+
+/// The gated-delta recurrence of `gatedDeltaUpdate` with the kernel's memory
+/// schedule changed and nothing else. The stock kernel loads step t+1's q, k,
+/// v, g and beta only after step t's `y` store, and since `y` may alias an
+/// input the compiler cannot hoist those loads, so every step pays a full
+/// load latency on the serial chain. Here step t+1's inputs are read into
+/// registers before step t's arithmetic. Every arithmetic expression, the
+/// Kahan block's fp pragmas and both `simd_sum`s are the stock kernel's, so
+/// `y` and the final state are bit-identical. `writeOutput == false` (the
+/// accepted-prefix replay, which only keeps the state) skips `y`.
+/// g and beta are computed by the same functions `gatedDeltaUpdate` uses.
+enum BonsaiGatedDelta {
+    /// Route the recurrence through this type (g and beta computed once and
+    /// reused by the accepted-prefix replay). Default on.
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_REUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Use the rescheduled kernel below instead of the stock one. Default off.
+    static let rescheduledKernel: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_KERNEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// `gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:)`.
+    static func update(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        guard enabled, mask == nil else {
+            return gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: state, mask: mask)
+        }
+        let beta = sigmoid(b).asType(.float32)
+        let g = computeGatedDeltaG(aLog, a, dtBias)
+        return recurrence(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
+
+    /// g and beta exactly as `gatedDeltaUpdate` computes them.
+    static func gates(a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray)
+        -> (g: MLXArray, beta: MLXArray)
+    {
+        (computeGatedDeltaG(aLog, a, dtBias), sigmoid(b).asType(.float32))
+    }
+
+    /// The recurrence on precomputed g and beta.
+    static func recurrence(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+        state: MLXArray?, writeOutput: Bool = true
+    ) -> (MLXArray, MLXArray) {
+        let B = q.dim(0)
+        let T = q.dim(1)
+        let Hk = q.dim(2)
+        let Dk = q.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+        if state.dtype != .float32 {
+            state = state.asType(.float32)
+        }
+        guard rescheduledKernel else {
+            // The stock kernel `gatedDeltaUpdate` itself dispatches to.
+            return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        }
+        let outputs = kernel(
+            [q, k, v, g, beta, state, MLXArray(T)],
+            template: [
+                ("InT", q.dtype), ("StT", DType.float32),
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("WRITE_Y", writeOutput),
+            ],
+            grid: (32, Dv, B * Hv),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [q.dtype, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_prefetch",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            const int steps = T;
+            InT qn[n_per_t], kn[n_per_t];
+            InT vn = 0;
+            float gn = 0.0f, bn = 0.0f;
+            if (steps > 0) {
+              for (int i = 0; i < n_per_t; ++i) {
+                qn[i] = q_[n_per_t * dk_idx + i];
+                kn[i] = k_[n_per_t * dk_idx + i];
+              }
+              vn = v_[dv_idx];
+              gn = g_[hv_idx];
+              bn = beta_[hv_idx];
+            }
+
+            for (int t = 0; t < steps; ++t) {
+              InT qc[n_per_t], kc[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                qc[i] = qn[i];
+                kc[i] = kn[i];
+              }
+              InT vc = vn;
+              float gc = gn;
+              float bc = bn;
+              if (t + 1 < steps) {
+                auto q2 = q_ + Hk * Dk;
+                auto k2 = k_ + Hk * Dk;
+                for (int i = 0; i < n_per_t; ++i) {
+                  qn[i] = q2[n_per_t * dk_idx + i];
+                  kn[i] = k2[n_per_t * dk_idx + i];
+                }
+                vn = v_[Hv * Dv + dv_idx];
+                gn = g_[Hv + hv_idx];
+                bn = beta_[Hv + hv_idx];
+              }
+
+              float kv_mem = 0.0f;
+              {
+                // Preserve Kahan summation under Metal's default fast math.
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                float kv_compensation = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = state[i] * gc;
+                  auto product = state[i] * kc[i];
+                  auto corrected = product - kv_compensation;
+                  auto next_sum = kv_mem + corrected;
+                  kv_compensation = (next_sum - kv_mem) - corrected;
+                  kv_mem = next_sum;
+                }
+              }
+              kv_mem = simd_sum(kv_mem);
+
+              auto delta = (vc - kv_mem) * bc;
+
+              if (WRITE_Y) {
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = state[i] + kc[i] * delta;
+                  out += state[i] * qc[i];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              } else {
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = state[i] + kc[i] * delta;
+                }
+              }
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+            """)
 }
