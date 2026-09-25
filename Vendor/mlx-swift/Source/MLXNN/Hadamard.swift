@@ -178,8 +178,15 @@ public struct HadamardGDNLayout {
 public final class HadamardQuantizedLinear: QuantizedLinear {
     public let transform: SignedBlockHadamard
     public let gdnLayout: HadamardGDNLayout?
-    private static let reuseFloat16Constants = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"] == "1"
+    /// On unless explicitly disabled. The native packed operator widens the
+    /// FP16 scales and offsets to FP32 on every call when the rotated input
+    /// is FP32; reuse keeps that exact widening instead of recomputing it.
+    private static let reuseFloat16Constants: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// Qualification witness; this selects reuse, never a different precision
     /// or packed-matmul kernel. The process-wide generic cache kill switch also
