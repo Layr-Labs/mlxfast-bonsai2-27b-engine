@@ -525,40 +525,25 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
+        var contextKeys = kProj(context)
+        var contextValues = vProj(context)
+        var blockKeys = kProj(x)
+        var blockValues = vProj(x)
+
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
+        contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
+            .transposed(0, 2, 1, 3)
+        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        blockKeys = kNorm(blockKeys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         queries = rope(queries, offset: blockOffset)
-
-        var contextKeys: MLXArray
-        var contextValues: MLXArray
-        var blockKeys: MLXArray
-        var blockValues: MLXArray
-        if dflash2KVConcatEnabled {
-            // One K and one V projection over [context; block]. The block's
-            // positions continue the context's, so one rope at the context's
-            // offset rotates every row where the two separate ropes did.
-            let rows = concatenated([context, x], axis: 1)
-            let n = contextLength + L
-            let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
-            contextKeys = keys[0..., 0..., ..<contextLength, 0...]
-            contextValues = values[0..., 0..., ..<contextLength, 0...]
-            blockKeys = keys[0..., 0..., contextLength..., 0...]
-            blockValues = values[0..., 0..., contextLength..., 0...]
-        } else {
-            contextKeys = kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
-                .transposed(0, 2, 1, 3)
-            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
-                .transposed(0, 2, 1, 3)
-            blockKeys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-            contextKeys = rope(contextKeys, offset: cache.offset)
-            blockKeys = rope(blockKeys, offset: blockOffset)
-        }
+        contextKeys = rope(contextKeys, offset: cache.offset)
+        blockKeys = rope(blockKeys, offset: blockOffset)
 
         // Only the CONTEXT keys and values enter the cache. The block's own keys
         // and values are concatenated for this forward and then dropped.
@@ -569,17 +554,11 @@ private final class DFlash2Attention: Module {
 
         var mask: MLXArray?
         if let slidingWindow {
-            // Every query sits at cachedLength + i (i < L), so the context
-            // term `query - key < window` holds for every context key once
-            // cachedLength + L <= window, and a non-causal block term is all
-            // true: the mask would allow everything.
-            if !(dflash2NoMaskEnabled && !isCausal && cachedLength + L <= slidingWindow) {
-                mask = masks.mask(
-                    contextLength: cachedLength,
-                    blockLength: L,
-                    slidingWindow: slidingWindow,
-                    isCausal: isCausal)
-            }
+            mask = masks.mask(
+                contextLength: cachedLength,
+                blockLength: L,
+                slidingWindow: slidingWindow,
+                isCausal: isCausal)
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
@@ -589,20 +568,6 @@ private final class DFlash2Attention: Module {
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
-
-/// Kill switch for the one-projection context+block K/V (default on).
-private let dflash2KVConcatEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-/// Kill switch for dropping a sliding mask that allows everything (default on).
-private let dflash2NoMaskEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_NOMASK"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
 
 // MARK: - The grouped dynamic causal convolution
 
@@ -918,23 +883,10 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates: MLXArray
-        let unary: MLXArray
-        if let top = DFlash2TopK.select(logits, k: topK) {
-            (candidates, unary) = top
-        } else {
-            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-                0..., 0..., (vocabularySize - topK)...]
-            unary = takeAlong(logits, candidates, axis: -1)
-        }
+        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+            0..., 0..., (vocabularySize - topK)...]
+        let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
-
-        if let path = DFlash2GreedyWalk.select(
-            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
-            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
-        {
-            return path
-        }
 
         var predecessor = anchor
         var path = [MLXArray]()
@@ -956,235 +908,6 @@ final class DFlash2CandidateSelector: Module {
         // Draft tokens are token ids, and the engine reads them as Int32.
         return stacked(path, axis: 1).asType(.int32)
     }
-}
-
-/// The top-`k` logits of each row, as `argPartition` + `takeAlong` return them.
-///
-/// `argPartition` runs MLX's stable ascending merge sort, so its last `k`
-/// slots hold the `k` largest values in ascending order, equal values in
-/// index order (the higher index ranks higher), NaN above everything. Two
-/// launches reproduce that exactly: each threadgroup reduces one chunk of a
-/// row to its top `k` by (value, index), then one simdgroup per row merges
-/// the chunk lists and writes them in the sort's slot order, gathering the
-/// values from the logits. Candidates and unary scores are therefore the
-/// same arrays, element for element.
-enum DFlash2TopK {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_KERNEL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let chunks = 8
-    private static let threads = 128
-
-    static func select(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
-        guard enabled, logits.ndim == 3, logits.dim(0) == 1, logits.dtype == .float32
-        else { return nil }
-        let rows = logits.dim(1)
-        let vocabularySize = logits.dim(2)
-        guard rows >= 1, k >= 1, k <= 32, vocabularySize >= k,
-            vocabularySize < Int(Int32.max)
-        else { return nil }
-        let flat = logits.reshaped([rows, vocabularySize])
-        let template: [(String, any KernelTemplateArg)] = [
-            ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
-        ]
-        let parts = chunkKernel(
-            [flat], template: template,
-            grid: (threads * chunks, rows, 1), threadGroup: (threads, 1, 1),
-            outputShapes: [[rows, chunks, k], [rows, chunks, k]],
-            outputDTypes: [.uint32, .uint32])
-        let merged = mergeKernel(
-            [flat, parts[0], parts[1]], template: template,
-            grid: (32, rows, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[rows, k], [rows, k]],
-            outputDTypes: [.uint32, .float32])
-        return (merged[0].reshaped([1, rows, k]), merged[1].reshaped([1, rows, k]))
-    }
-
-    private static let header = """
-            // Order-preserving key: larger float -> larger key; every NaN -> 0xffffffff
-            // (the sort's LessThan puts NaN above +inf); -0 and +0 share a key (they
-            // compare equal). Key 0 is never produced by data and marks an empty slot.
-            inline uint mlxfast_topk_key(float x) {
-                if (isnan(x)) return 0xffffffffu;
-                uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
-                return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-            }
-            // Entries rank by (key, idx): the stable ascending sort keeps equal values in
-            // index order, so among ties the higher index ranks higher.
-            // KK rounds of simdgroup max over per-lane descending lists; each winner pops
-            // its head. Lane r receives the r-th ranked entry (r < KK).
-            template <int KK>
-            inline void mlxfast_topk_simd_merge(thread uint (&k)[KK], thread uint (&id)[KK],
-                                                uint lane, thread uint& outk, thread uint& outi) {
-                for (int r = 0; r < KK; r++) {
-                    uint km = simd_max(k[0]);
-                    uint im = simd_max(k[0] == km ? id[0] : 0u);
-                    if (lane == uint(r)) { outk = km; outi = im; }
-                    if (k[0] == km && id[0] == im) {
-                        for (int j = 0; j < KK - 1; j++) { k[j] = k[j + 1]; id[j] = id[j + 1]; }
-                        k[KK - 1] = 0u; id[KK - 1] = 0u;
-                    }
-                }
-            }
-            """
-
-    private static let chunkKernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_topk_chunk",
-        inputNames: ["logits"],
-        outputNames: ["part_key", "part_idx"],
-        source: """
-            // grid (TPG * S, rows): threadgroup (chunk, row) reduces one chunk of a row to its top-KK
-            constexpr int KK = KTOP;
-            static_assert(TPG % 32 == 0 && TPG / 32 <= 32 && KK <= 32, "one merge simdgroup");
-            const uint t = thread_position_in_threadgroup.x;
-            const uint chunk = threadgroup_position_in_grid.x;
-            const uint row = threadgroup_position_in_grid.y;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            constexpr uint CH = (NV + S - 1) / S;
-            const uint lo = chunk * CH;
-            const uint hi = min(lo + CH, uint(NV));
-            const device float* x = logits + size_t(row) * NV;
-            uint k[KK], id[KK];
-            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            for (uint v = lo + t; v < hi; v += TPG) {
-                uint kx = mlxfast_topk_key(x[v]);
-                if (kx >= k[KK - 1]) {   // this thread visits indices in increasing order
-                    uint ix = v;
-                    for (int j = 0; j < KK; j++) {
-                        bool sw = kx >= k[j];
-                        uint tk = k[j], ti = id[j];
-                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
-                        kx = sw ? tk : kx; ix = sw ? ti : ix;
-                    }
-                }
-            }
-            uint ok = 0u, oi = 0u;
-            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
-            constexpr uint NSG = TPG / 32;
-            threadgroup uint sk[NSG * KK], si[NSG * KK];
-            if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-                for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-                if (lane < NSG) {
-                    for (int j = 0; j < KK; j++) { k[j] = sk[lane * KK + j]; id[j] = si[lane * KK + j]; }
-                }
-                mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
-                if (lane < uint(KK)) {
-                    size_t o = (size_t(row) * S + chunk) * KK + lane;
-                    part_key[o] = ok; part_idx[o] = oi;
-                }
-            }
-            """,
-        header: header)
-
-    private static let mergeKernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_topk_merge",
-        inputNames: ["logits", "part_key", "part_idx"],
-        outputNames: ["cand", "val"],
-        source: """
-            // one simdgroup per row merges the S chunk lists (S <= 32), then writes the
-            // top-KK in the sort's ascending order, with the values gathered from logits.
-            constexpr int KK = KTOP;
-            static_assert(S <= 32 && KK <= 32, "one merge simdgroup");
-            const uint lane = thread_index_in_simdgroup;
-            const uint row = threadgroup_position_in_grid.y;
-            uint k[KK], id[KK];
-            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            if (lane < uint(S)) {
-                for (int j = 0; j < KK; j++) {
-                    size_t o = (size_t(row) * S + lane) * KK + j;
-                    k[j] = part_key[o]; id[j] = part_idx[o];
-                }
-            }
-            uint ok = 0u, oi = 0u;
-            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
-            if (lane < uint(KK)) {
-                uint slot = KK - 1 - lane;
-                uint ii = min(oi, uint(NV - 1));
-                cand[row * KK + slot] = ii;
-                val[row * KK + slot] = logits[size_t(row) * NV + ii];
-            }
-            """,
-        header: header)
-}
-
-/// The greedy candidate walk with every edge score computed up front.
-///
-/// Position 0 scores its candidates against the anchor; every later position
-/// scores its candidates against each candidate of the position before it, as
-/// one `[L-1, K, K]` table built from the same element-wise products and the
-/// same final-axis sum as the per-position loop. One small kernel then walks
-/// the table in order, so the selected path is the loop's path.
-enum DFlash2GreedyWalk {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_FUSED_WALK"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    static func select(
-        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
-        predecessorCodebook: MLXArray, successorCodebook: MLXArray
-    ) -> MLXArray? {
-        guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
-            unary.dtype == .float32
-        else { return nil }
-        let length = candidates.dim(1)
-        let k = candidates.dim(2)
-        guard length >= 1, k >= 1, k <= 32 else { return nil }
-        let c = candidates[0]
-        let first =
-            (take(predecessorCodebook, anchor, axis: 0).expandedDimensions(axis: 1)
-                * projected[0..., 0, 0...].expandedDimensions(axis: 1)
-                * take(successorCodebook, c[0], axis: 0).expandedDimensions(axis: 0))
-            .sum(axis: -1)[0]
-        let later: MLXArray
-        if length > 1 {
-            let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
-            let next = take(successorCodebook, c[1...], axis: 0)
-            later =
-                ((previous * projected[0, 1..., 0...].expandedDimensions(axis: 1))
-                    .expandedDimensions(axis: 2)
-                    * next.expandedDimensions(axis: 1))
-                .sum(axis: -1)
-        } else {
-            later = MLXArray.zeros([1, k, k], dtype: first.dtype)
-        }
-        let path = kernel(
-            [unary[0], first, later, c],
-            template: [("L", length), ("K", k)],
-            grid: (32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[length]],
-            outputDTypes: [.int32])[0]
-        return path.reshaped([1, length])
-    }
-
-    private static let kernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_greedy_walk",
-        inputNames: ["unary", "edge0", "edges", "cand"],
-        outputNames: ["path"],
-        source: """
-            uint c = thread_index_in_simdgroup;
-            int prev = -1;
-            for (uint i = 0; i < L; i++) {
-                float score = -INFINITY;
-                if (c < K) {
-                    float e = (i == 0) ? float(edge0[c])
-                                       : float(edges[((i - 1) * K + uint(prev)) * K + c]);
-                    score = unary[i * K + c] + e;
-                }
-                float m = simd_max(score);
-                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
-                prev = int(sel);
-                if (c == 0) path[i] = int(cand[i * K + sel]);
-            }
-            """)
 }
 
 // MARK: - The drafter
