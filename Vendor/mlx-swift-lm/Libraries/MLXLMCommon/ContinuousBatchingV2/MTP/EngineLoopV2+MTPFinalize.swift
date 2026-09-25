@@ -15,6 +15,16 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// On unless `MLXFAST_DFLASH_PREFILL_CARRY=0`. See `finalizeMTPRound`.
+    static let mtpPrefillCarry: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PREFILL_CARRY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The prefill carry's hidden: a block drafter never reads it.
+    static var mtpPrefillCarryHidden: MLXArray { MLXArray.zeros([1, 1, 1], dtype: .float32) }
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -55,6 +65,33 @@ extension EngineLoopV2 {
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
                 round.finalizedSeedIDs.insert(id)
+            }
+        }
+
+        // A BLOCK drafter reads only the anchor token and the committed
+        // tapped context, never `carry.hidden`, and the prompt forward has
+        // already observed every prompt row's context. So a row whose prompt
+        // just sampled its first token needs no one-token seed step: carry
+        // that token now and the first step of the decode window is a full
+        // verify round. mrv777's queued 393f6a50. The carry is fingerprinted
+        // like any other; a mismatch at plan time drops it and the row seeds
+        // as before. `MLXFAST_DFLASH_PREFILL_CARRY=0` turns it off.
+        if Self.mtpPrefillCarry, mtp.usesBlockDrafter, mtp.tracksPersistentHistory {
+            for observation in round.committedObservationRows {
+                guard !step.discard.contains(observation.id),
+                    !round.finalizedSeedIDs.contains(observation.id),
+                    let rec = scheduler.record(for: observation.id),
+                    rec.generatedTokenCount == 1,
+                    rec.pendingSamples == 0,
+                    let token = rec.tokens.last,
+                    rec.numComputedTokens == rec.tokens.count - 1,
+                    !mtp.hasValidCarry(for: rec)
+                else { continue }
+                mtp.storeCarry(
+                    id: observation.id, token: token,
+                    hidden: Self.mtpPrefillCarryHidden,
+                    tokensCount: rec.tokens.count,
+                    kvOffset: rec.numComputedTokens)
             }
         }
 

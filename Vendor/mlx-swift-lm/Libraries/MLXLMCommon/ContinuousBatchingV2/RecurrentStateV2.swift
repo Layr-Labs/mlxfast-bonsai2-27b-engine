@@ -317,6 +317,14 @@ public final class CBv2RecurrentRequestState {
         let prefixReplay: [Int: CBv2RecurrentPrefixReplayStage]?
     }
 
+    /// On unless `MLXFAST_EARLY_RECURRENT_COMMIT=0`. See the prefix-replay
+    /// branch of `commit(generation:keepPositions:)`.
+    private static let earlyCommittedStateSubmission: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_EARLY_RECURRENT_COMMIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
@@ -512,6 +520,17 @@ public final class CBv2RecurrentRequestState {
                 committedTransitionGeneration = generation
                 committedTransitionRetainedByteCount = retainedBytes
                 committedTransitionRetainedRoots = retainedRoots
+            }
+            // Start the committed state on the GPU now. A strict prefix is a
+            // lazy replay over the accepted rows (and full acceptance may be a
+            // lazy materialization); left alone, the next target verify
+            // evaluates it on its critical path. Submitted here, it runs in
+            // the idle gap while the host plans the next round and builds the
+            // drafter graph. Same arrays, same graph; only the submission
+            // point moves. The idea is ercumentyildirim's (queued 080cb214,
+            // "the committed recurrent state starts on the GPU at finalize").
+            if Self.earlyCommittedStateSubmission {
+                asyncEval(committed.values.flatMap { [$0.conv, $0.ssm].compactMap { $0 } })
             }
         } else {
             guard keepPositions == nil else {
