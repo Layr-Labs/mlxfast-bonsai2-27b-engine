@@ -240,8 +240,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The packed matmul on an input already passed through `rotate`.
     public func applyRotated(_ rotated: MLXArray) -> MLXArray {
-        if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
-            return constantCachedForward(rotated, allowFloat16: true)
+        if permitsFloat16ConstantReuse,
+            rotated.dtype == .float32 || rotated.dtype == .bfloat16
+        {
+            // Affine matmul promotes BF16 activations plus FP16 constants to
+            // FP32 already. Make that exact input widening explicit so both
+            // callers of a shared target/draft head reuse its FP32 constants.
+            return constantCachedForward(rotated.asType(.float32), allowFloat16: true)
         }
         return super.callAsFunction(rotated)
     }
