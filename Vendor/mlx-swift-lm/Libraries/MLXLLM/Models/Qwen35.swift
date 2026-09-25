@@ -2844,6 +2844,15 @@ enum Qwen35FusedHadamard {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Numerics probe only (off by default): `DARKBLOOM_BONSAI_Q8SIM=1` makes
+    /// every prompt-width (>= 64 rows) FP16 rotation round-trip through a
+    /// per-128-group symmetric int8 quantization before the packed matmul.
+    private static let q8Probe: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_Q8SIM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
     private static let header = """
         // Thread-local Hadamard butterfly for 2^R values, as in
         // mlx/backend/metal/kernels/hadamard.h (radix_func).
@@ -2938,9 +2947,28 @@ enum Qwen35FusedHadamard {
         #pragma clang loop unroll(full)
         for (short j = 0; j < 4; j++) {
           const short index = j * 4 * NT + i * 4;
-          #pragma clang loop unroll(full)
-          for (short r = 0; r < 4; r++) {
-            out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);
+          if (QSIM) {
+            // Emulate a per-128-group symmetric int8 quantization of the
+            // rotated activation (numerics probe for the int8 matmul path):
+            // one 128-group is the 4 values of each lane of one simdgroup.
+            float amax = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; r++) {
+              amax = max(amax, fabs(buf[index + r] * 0.03125f));
+            }
+            amax = simd_max(amax);
+            const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+            const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; r++) {
+              const float q = rint(buf[index + r] * 0.03125f * iqs);
+              out[rowbase + bcol + uint(index + r)] = OutT(q * qs);
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; r++) {
+              out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);
+            }
           }
         }
         """
@@ -2950,6 +2978,55 @@ enum Qwen35FusedHadamard {
         inputNames: ["inp", "signs"],
         outputNames: ["out"],
         source: source,
+        header: header,
+        ensureRowContiguous: true)
+
+    // The same rotation quantized per 128-group for the tensor route: three
+    // outputs, the UInt8 codes `round(v / scale) + 128`, the FP32 scale
+    // (absmax / 127, one per row and 128-group: the four values of each lane
+    // of one simdgroup) and the FP32 scaled sum `scale * sum(round(v / scale))`.
+    private static let sourceInt8: String = {
+        let tail = """
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const size_t gbase = size_t(row) * size_t(W / 128) + size_t(bcol / 128) + size_t(i >> 5);
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          const short index = j * 4 * NT + i * 4;
+          float v[4];
+          float amax = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            v[r] = buf[index + r] * 0.03125f;
+            amax = max(amax, fabs(v[r]));
+          }
+          amax = simd_max(amax);
+          const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+          const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
+          float part = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const float q = rint(v[r] * iqs);
+            part += q;
+            out[rowbase + bcol + uint(index + r)] = uint8_t(int(q) + 128);
+          }
+          part = simd_sum(part);
+          if ((i & 31) == 0) {
+            qscale[gbase + size_t(2 * j)] = qs;
+            qsum[gbase + size_t(2 * j)] = qs * part;
+          }
+        }
+        """
+        // The multi-line literal strips its closing delimiter's indentation.
+        guard let cut = source.range(of: "threadgroup_barrier(mem_flags::mem_threadgroup);\n#pragma clang loop unroll(full)\nfor (short j = 0; j < 4; j++) {\n  const short index = j * 4 * NT + i * 4;\n  if (QSIM) {")
+        else { preconditionFailure("fused rotation source changed") }
+        return String(source[source.startIndex ..< cut.lowerBound]) + tail
+    }()
+
+    private static let kernelInt8 = MLXFast.metalKernel(
+        name: "bonsai_signed_hadamard_1024_q8",
+        inputNames: ["inp", "signs"],
+        outputNames: ["out", "qscale", "qsum"],
+        source: sourceInt8,
         header: header,
         ensureRowContiguous: true)
 
@@ -2983,11 +3060,218 @@ enum Qwen35FusedHadamard {
             let template: [(String, any KernelTemplateArg)] = [
                 ("InT", x.dtype), ("OutT", outputDType), ("W", width), ("BPR", blocksPerRow),
                 ("PRESIGNED", preSigned ? 1 : 0), ("GR", repeats), ("GKH", keyHeads), ("GD", headDim),
+                ("QSIM", (q8Probe && rows >= 64 && outputDType == .float16) ? 1 : 0),
             ]
             return kernel(
                 [x, signs], template: template,
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [x.shape], outputDTypes: [outputDType])[0]
+        }
+        SignedBlockHadamard.fusedTransformInt8 = {
+            x, signs, blockSize, preSigned, gdnLayout, groupSize in
+            guard groupSize == 128, blockSize == 1024, x.ndim >= 1,
+                [DType.float32, .float16, .bfloat16].contains(x.dtype),
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(-1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            var repeats = 1
+            var keyHeads = 1
+            var headDim = 1
+            if let gdnLayout {
+                guard gdnLayout.width == width, gdnLayout.valueHeads % gdnLayout.keyHeads == 0,
+                    width % gdnLayout.valueHeads == 0
+                else { return nil }
+                repeats = gdnLayout.valueHeads / gdnLayout.keyHeads
+                keyHeads = gdnLayout.keyHeads
+                headDim = width / gdnLayout.valueHeads
+            }
+            let rows = x.size / width
+            guard rows > 0 else { return nil }
+            let blocksPerRow = width / 1024
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", DType.uint8), ("W", width), ("BPR", blocksPerRow),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", repeats), ("GKH", keyHeads), ("GD", headDim),
+                ("QSIM", 0),
+            ]
+            let groupShape = Array(x.shape.dropLast()) + [width / 128]
+            let outputs = kernelInt8(
+                [x, signs], template: template,
+                grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
+                outputShapes: [x.shape, groupShape, groupShape],
+                outputDTypes: [.uint8, .float32, .float32])
+            return SignedBlockHadamard.Int8Activation(
+                codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+    }
+}
+
+/// The prompt-width packed matmul on the tensor unit over the raw 2-bit codes
+/// (MetalPerformancePrimitives `matmul2d`, `uint8 x uint2b_format -> int32`),
+/// applying each 128-group's FP16 scale and offset in FP32:
+/// `y = sum_g as[m,g] * (s[n,g] * (C[m,n,g] - 128 * colsum[n,g]) + b[n,g] * rs[m,g])`
+/// where `C` is the integer product of the shifted codes `q + 128` with the
+/// weight codes, `colsum` the per-group sum of the weight codes, `as` and
+/// `rs` the activation's per-group scale and code sum. The weights are read
+/// as stored; the scales, offsets and folded code sums are read through a
+/// per-layer derived-constant cache. Installed into
+/// `HadamardQuantizedLinear.tensorPackedMatmul` when the model loads;
+/// `DARKBLOOM_BONSAI_TENSOR_ROUTE=0` keeps the dequantizing kernels.
+enum Qwen35TensorPackedMatmul {
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // The trailing newline matters: the JIT appends the kernel signature
+    // directly after the header text.
+    private static let header = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """
+
+    // grid: (N / 64 * 128, M / 64, 1), threadgroup (128, 1, 1). Inputs: xq
+    // uint8 [M, K], w uint32 [N, K / 16], scalesT / biasesT half [K / 128, N],
+    // uT float [K / 128, N] (= -128 * s * colsum), ascale / rsb float [M, K /
+    // 128], ksz int32 [K, M, N]. Template: OutT.
+    private static let source = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 64;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)xq, dextents<int, 2>(K, M));
+        tensor<device uint2b_format, dextents<int, 2>, tensor_inline> B((device uchar*)w, dextents<int, 2>(K, N));
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        auto tB0 = B.template slice<128, 64>(0, n0);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, int32_t>();
+        constexpr int CAP = 32;
+        // Destination layout (the NAX fragment layout): element i ->
+        //   n = n0 + 16 * (sg & 1) + fn + (i & 3) + 32 * ((i >> 3) & 1)
+        //   m = m0 + 16 * (sg >> 1) + fm + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1)
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        for (int g = 0; g < Kg; g++) {
+          auto tA = A.template slice<128, 64>(g * 128, m0);
+          auto tB = B.template slice<128, 64>(g * 128, n0);
+          op.run(tA, tB, cT);
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
+          const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
+          float as[4], rb[4];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float u = nh ? u1[c] : u0[c];
+            const float t = fma(s, float(cT[i]), u);
+            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) {
+          const int c = i & 3; const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+
+    private static let dimsLock = NSLock()
+    nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
+    private static func dimsArray(k: Int, m: Int, n: Int) -> MLXArray {
+        dimsLock.withLock {
+            if let cached = dims[[k, m, n]] { return cached }
+            let array = MLXArray([Int32(k), Int32(m), Int32(n)])
+            dims[[k, m, n]] = array
+            return array
+        }
+    }
+
+    /// The per-group sums of the 2-bit codes of `weight` (`[n, k / 16]`
+    /// UInt32, 16 codes per word, LSB first), `[n, k / 128]` FP32: the count
+    /// of set low bits plus twice the count of set high bits of each word.
+    private static func codeSums(_ weight: MLXArray, k: Int) -> MLXArray {
+        let n = weight.dim(0)
+        func popcount(_ v: MLXArray) -> MLXArray {
+            var x = v - ((v >> 1) & MLXArray(UInt32(0x5555_5555)))
+            x = (x & MLXArray(UInt32(0x3333_3333))) + ((x >> 2) & MLXArray(UInt32(0x3333_3333)))
+            x = (x + (x >> 4)) & MLXArray(UInt32(0x0F0F_0F0F))
+            return (x * MLXArray(UInt32(0x0101_0101))) >> 24
+        }
+        let low = popcount(weight & MLXArray(UInt32(0x5555_5555)))
+        let high = popcount((weight >> 1) & MLXArray(UInt32(0x5555_5555)))
+        let perWord = low + high * MLXArray(UInt32(2))
+        return perWord.reshaped(n, k / 128, 8).sum(axis: -1).asType(.float32)
+    }
+
+    nonisolated(unsafe) private static var installed = false
+
+    static func installIfNeeded() {
+        guard enabled, !installed else { return }
+        installed = true
+        HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
+            rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
+        }
+        HadamardQuantizedLinear.tensorPackedMatmul = {
+            activation, weight, scales, biases, groupSize, outputDType, cache in
+            let codes = activation.codes
+            guard groupSize == 128, codes.dtype == .uint8, codes.ndim == 2,
+                activation.scales.dtype == .float32, activation.scaledSums.dtype == .float32,
+                weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
+                [DType.float16, .float32].contains(outputDType)
+            else { return nil }
+            let m = codes.dim(0)
+            let k = codes.dim(1)
+            let n = weight.dim(0)
+            guard m % 64 == 0, n % 64 == 0, k % 512 == 0, weight.dim(1) == k / 16,
+                activation.scales.shape == [m, k / 128],
+                activation.scaledSums.shape == [m, k / 128],
+                scales.shape == [n, k / 128], biases.shape == [n, k / 128]
+            else { return nil }
+            let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+            let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
+            let foldedSums = cache.derived(scales, tag: 3) { s in
+                (s.asType(.float32) * codeSums(weight, k: k) * MLXArray(Float(-128)))
+                    .transposed(1, 0).contiguous()
+            }
+            return kernel(
+                [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
+                 activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                template: [("OutT", outputDType)],
+                grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
     }
 }
@@ -3014,6 +3298,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public init(_ args: Qwen35TextConfiguration) {
         Qwen35FusedHadamard.installIfNeeded()
+        Qwen35TensorPackedMatmul.installIfNeeded()
         self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
@@ -3417,7 +3702,14 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
-        lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
+        // The drafter reads the head in FP16 and keeps the FP16 logits: its
+        // top-k reads them directly (see `HadamardQuantizedLinear.drafterHeadFloat16`).
+        if HadamardQuantizedLinear.drafterHeadFloat16,
+            let head = lmHead as? HadamardQuantizedLinear
+        {
+            return head.forwardUnwidened(hidden)
+        }
+        return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
 }
 
