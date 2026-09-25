@@ -61,10 +61,22 @@ public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
 ///   - x: The input tensor to apply RoPE to.
 ///   - cache: The KV cache (determines scalar or per-sequence offset), or `nil`
 ///     for offset 0.
+///   - sharedOffset: Optional per-step snapshot from `graphOffsetArray(for:)`.
+///     When non-`nil`, it is used directly and no per-call `+ 0` snapshot
+///     dispatch is issued. Take the snapshot once per step — before any
+///     `cache.update()` — and thread the same array through every Q/K RoPE
+///     call across layers; offsets don't advance mid-step, so one snapshot
+///     covers ~2 calls/layer. When `nil` (default), falls back to a per-call
+///     `graphOffsetArray(for: cache)` snapshot, preserving existing behavior.
 /// - Returns: The input with rotary positional encoding applied.
-public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
+public func applyRotaryPosition<R: RoPELayer>(
+    _ rope: R, to x: MLXArray, cache: KVCache?, sharedOffset: MLXArray? = nil
+)
     -> MLXArray
 {
+    if let sharedOffset {
+        return rope(x, offset: sharedOffset)
+    }
     if let offsetArray = graphOffsetArray(for: cache) {
         return rope(x, offset: offsetArray)
     }

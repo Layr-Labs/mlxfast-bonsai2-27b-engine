@@ -331,6 +331,11 @@ public final class DFlash2TapSlot {
     /// order the drafter's `fc` expects them. Nil turns the tap off.
     public var layerIds: [Int]?
 
+    /// The dtype the tower fuses tapped rows into, set once at `bind` from
+    /// the drafter's own dtype. Nil keeps the legacy wide path: the tower
+    /// fuses in the trunk dtype and the crossing casts downstream.
+    public var fusedDType: DType?
+
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
@@ -357,9 +362,18 @@ public protocol DFlash2TapTarget: DFlash2Target {
 
     /// How many layers the tower has, so the ids can be checked before a run.
     var dFlash2LayerCount: Int { get }
+
+    /// Aim the tower's tap fusion at the drafter's dtype. The default is a
+    /// no-op, which keeps the legacy path: the tower fuses in the trunk
+    /// dtype and every crossing below casts exactly once.
+    func setDFlash2TapFusedDType(_ dtype: DType?)
 }
 
 extension DFlash2TapTarget {
+    /// Legacy tap targets ignore the fused dtype: the tower keeps fusing in
+    /// the trunk dtype and every crossing below casts exactly once.
+    public func setDFlash2TapFusedDType(_ dtype: DType?) {}
+
     /// Check the ids against this target and turn the tap on.
     ///
     /// A bad id is a refusal, not a clamp: a drafter reading the wrong layers
@@ -823,47 +837,10 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 
 // MARK: - The decoder layer
 
-/// The gate and up projections' weights stacked along the output axis: the
-/// same BF16 bytes as the two loaded weights, concatenated once on first use
-/// and held in a plain class (never a stored `MLXArray` on the module, so
-/// reflection cannot add it to the parameter tree). One matmul over the
-/// stack replaces two over the same input, and the block's 16 rows fill one
-/// wider tensor tile instead of two. `DARKBLOOM_DFLASH2_STACK_GATEUP=0` keeps
-/// the two matmuls.
-private final class DFlash2GateUpStack {
-    private static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_GATEUP"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-    private var weight: MLXArray?
-    private var boundary = 0
-
-    func clear() {
-        weight = nil
-        boundary = 0
-    }
-
-    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
-    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
-        guard Self.enabled, gate.bias == nil, up.bias == nil,
-            gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
-            gate.weight.ndim == 2, up.weight.ndim == 2
-        else { return nil }
-        if weight == nil {
-            weight = concatenated([gate.weight, up.weight], axis: 0)
-            boundary = gate.weight.dim(0)
-        }
-        let y = matmul(x, weight!.T)
-        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
-    }
-}
-
 private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
-    private let gateUp = DFlash2GateUpStack()
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -872,20 +849,8 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
-    public override func update(
-        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
-        modulePath: [String] = []
-    ) throws -> Self {
-        gateUp.clear()
-        return try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return down(silu(g) * u)
-        }
-        return down(silu(gate(x)) * up(x))
+        down(silu(gate(x)) * up(x))
     }
 }
 
@@ -1185,23 +1150,28 @@ enum DFlash2GreedyWalk {
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
-        let rank = projected.dim(-1)
-        guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        guard length >= 1, k >= 1, k <= 32 else { return nil }
         let c = candidates[0]
-        // Gather only the codebook rows the candidate lists can visit. The
-        // fused kernel scores each edge and advances the greedy walk in one
-        // pass, instead of materializing an [L-1, K, K, rank] broadcast.
-        let anchorPredecessor = take(predecessorCodebook, anchor, axis: 0)
-            .asType(.float32).reshaped([-1])
-        let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
-            .asType(.float32).reshaped([-1])
-        let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
-        let projectedRows = projected[0].asType(.float32).reshaped([-1])
-        let scores = unary[0].asType(.float32).reshaped([-1])
-        let candidateIds = c.asType(.uint32).reshaped([-1])
+        let first =
+            (take(predecessorCodebook, anchor, axis: 0).expandedDimensions(axis: 1)
+                * projected[0..., 0, 0...].expandedDimensions(axis: 1)
+                * take(successorCodebook, c[0], axis: 0).expandedDimensions(axis: 0))
+            .sum(axis: -1)[0]
+        let later: MLXArray
+        if length > 1 {
+            let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            let next = take(successorCodebook, c[1...], axis: 0)
+            later =
+                ((previous * projected[0, 1..., 0...].expandedDimensions(axis: 1))
+                    .expandedDimensions(axis: 2)
+                    * next.expandedDimensions(axis: 1))
+                .sum(axis: -1)
+        } else {
+            later = MLXArray.zeros([1, k, k], dtype: first.dtype)
+        }
         let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
-            template: [("L", length), ("K", k), ("R", rank)],
+            [unary[0], first, later, c],
+            template: [("L", length), ("K", k)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1210,30 +1180,22 @@ enum DFlash2GreedyWalk {
     }
 
     private static let kernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_fused_greedy_walk",
-        inputNames: [
-            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
-        ],
+        name: "mlxfast_dflash_greedy_walk",
+        inputNames: ["unary", "edge0", "edges", "cand"],
         outputNames: ["path"],
         source: """
             uint c = thread_index_in_simdgroup;
-            uint previous_slot = 0;
+            int prev = -1;
             for (uint i = 0; i < L; i++) {
                 float score = -INFINITY;
                 if (c < K) {
-                    const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
-                    const uint succ_base = (i * K + c) * R;
-                    float edge = 0.0f;
-                    for (uint d = 0; d < R; d++) {
-                        const float predecessor = i == 0
-                            ? anchor_predecessor[d] : previous[pred_base + d];
-                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
-                    }
-                    score = unary[i * K + c] + edge;
+                    float e = (i == 0) ? float(edge0[c])
+                                       : float(edges[((i - 1) * K + uint(prev)) * K + c]);
+                    score = unary[i * K + c] + e;
                 }
                 float m = simd_max(score);
                 uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
-                previous_slot = sel;
+                prev = int(sel);
                 if (c == 0) path[i] = int(cand[i * K + sel]);
             }
             """)
@@ -1252,6 +1214,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     private let rope: RoPELayer
     private var target: (any DFlash2Target)?
+
+    /// Fused logits epilogue (H4): output multiplier + final softcap baked as
+    /// one compiled elementwise kernel over `[B, k, vocab]`, replacing 2-3
+    /// separate passes. Constants come from the init config, which never
+    /// changes, so the graph cannot go stale.
+    private let fusedLogitsEpilogue: @Sendable (MLXArray) -> MLXArray
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1275,6 +1243,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             traditional: false,
             scalingConfig: nil,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
+        let outputMultiplier = config.dflash.outputMultiplier
+        let softcap = config.dflash.finalLogitSoftcapping
+        self.fusedLogitsEpilogue = compile(shapeless: true) { (logits: MLXArray) -> MLXArray in
+            var out = logits
+            if outputMultiplier != 1 {
+                out = out * outputMultiplier
+            }
+            if let softcap = softcap, softcap > 0 {
+                out = tanh(out / softcap) * softcap
+            }
+            return out
+        }
         super.init()
     }
 
@@ -1288,6 +1268,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         guard target.dFlash2HiddenSize == config.hiddenSize else {
             throw DFlash2Error.hiddenSizeMismatch(
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
+        }
+        // Aim the tower's tap fusion at this drafter's dtype so tapped rows
+        // arrive already fused in BF16 and every crossing below is a
+        // same-dtype no-op. Tap targets without the hook keep the legacy
+        // wide path via the default no-op above.
+        if let tapTarget = target as? any DFlash2TapTarget {
+            tapTarget.setDFlash2TapFusedDType(dtype)
         }
         self.target = target
     }
@@ -1366,7 +1353,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        // The tap fuses to this dtype upstream, so on the fused path this
+        // crossing is a same-dtype no-op and the round's single cast already
+        // happened narrow, per tap shard; otherwise one cast here, as before.
+        let fusedTarget =
+            targetHidden.dtype == dtype ? targetHidden : targetHidden.asType(dtype)
+        let context = hiddenNorm(fc(fusedTarget))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
@@ -1380,14 +1372,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        var logits = target.logitsForDFlash2Hidden(hidden)
-        if config.dflash.outputMultiplier != 1 {
-            logits = logits * config.dflash.outputMultiplier
+        let logits = target.logitsForDFlash2Hidden(hidden)
+        if config.dflash.outputMultiplier == 1,
+            (config.dflash.finalLogitSoftcapping ?? 0) <= 0
+        {
+            return logits
         }
-        if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
-            logits = tanh(logits / cap) * cap
-        }
-        return logits
+        return fusedLogitsEpilogue(logits)
     }
 
     // MARK: Proposing

@@ -995,55 +995,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  // Visit adjacent M tiles of each N tile so prompt-width calls reuse the
-  // packed weight tile while it remains in cache. For a fixed NAX grid this
-  // remaps each (M,N) tile exactly once; tid.z remains the batch index.
-  const int m_tiles = (M + BM - 1) / BM;
-  const int n_tiles = (N + BN - 1) / BN;
-  int y_row;
-  int y_col;
-  if (m_tiles == 1) {
-    // Narrow decode/verify uses a single M tile; avoid runtime div/mod there.
-    y_row = int(tid.y) * BM;
-    y_col = int(tid.x) * BN;
-  } else {
-    const int tile_id = int(tid.y) * n_tiles + int(tid.x);
-    y_row = (tile_id % m_tiles) * BM;
-    y_col = (tile_id / m_tiles) * BN;
-  }
-
-#ifdef MLX_QMM_M16_NAX
-  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
-  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
-  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
-  // are summed through Ws, which this path does not otherwise use.
-  if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
-      const uint cb = simd_gid >> 1;
-      const uint ks = simd_gid & 1;
-      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
-      qmm_m16_block<T, 2>(
-          w,
-          scales,
-          biases,
-          x + y_row * static_cast<int64_t>(K),
-          y + y_row * static_cast<int64_t>(N),
-          K,
-          N,
-          M - y_row,
-          y_col + 32 * int(cb),
-          0,
-          K,
-          ks,
-          simd_lid,
-          red,
-          red);
-      return;
-    }
-  }
-#endif
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w;
 

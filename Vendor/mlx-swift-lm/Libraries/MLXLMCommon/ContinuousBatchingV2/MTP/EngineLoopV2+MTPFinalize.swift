@@ -15,27 +15,6 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
-    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
-    static let submitsCommittedRecurrentStateEarly: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
-
-    /// Start the committed recurrent state on the GPU now (ercumentyildirim,
-    /// `080cb21`). A partially accepted verify commits each recurrent layer by
-    /// replaying the accepted prefix from the pre-verify state; built lazily,
-    /// that replay would run inside the next verify, on the critical path.
-    /// Submitting it here lets the GPU run it behind the early block proposal
-    /// while the host finishes finalize. The arrays and their values are
-    /// exactly the ones the next verify reads.
-    func submitCommittedRecurrentState(for id: CBv2RequestID) {
-        guard Self.submitsCommittedRecurrentStateEarly,
-            let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
-        else { return }
-        let arrays = snapshot.keys.sorted().flatMap { index in
-            [snapshot[index]!.conv, snapshot[index]!.ssm].compactMap { $0 }
-        }
-        if !arrays.isEmpty { asyncEval(arrays) }
-    }
-
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -77,22 +56,6 @@ extension EngineLoopV2 {
                     kvOffset: rec.numComputedTokens)
                 round.finalizedSeedIDs.insert(id)
             }
-        }
-
-        // A prompt row that just sampled its first token carries into a round
-        // directly (block drafter): the token is the next block's anchor and
-        // the prompt's tapped rows are its context. The carry fingerprints the
-        // row exactly as a seed step's would (`tokens.count`, `numComputed`).
-        for carry in round.prefillCarries {
-            guard !step.discard.contains(carry.id),
-                let rec = scheduler.record(for: carry.id),
-                rec.pendingSamples == 0,
-                rec.tokens.count > rec.request.promptTokens.count,
-                let token = rec.tokens.last
-            else { continue }
-            mtp.storeCarry(
-                id: carry.id, token: token, hidden: carry.hidden,
-                tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
         }
 
         guard let verify = round.verify else { return }
@@ -329,7 +292,6 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
-                    submitCommittedRecurrentState(for: id)
                 } else {
                     precondition(
                         evaluations.count == 1 + k,

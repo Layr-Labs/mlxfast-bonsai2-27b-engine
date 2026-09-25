@@ -28,8 +28,10 @@ enum CBv2AttentionV1 {
     /// the composed path is ~4-5 Metal dispatches per call, so very small
     /// blocks trade GPU efficiency for FLOPs already saved.
     ///
-    /// 128 keeps >97% of the achievable work reduction at a quarter of the
-    /// launch overhead of 32. `0` disables blocking entirely (one call for the
+    /// 256 halves the per-chunk dispatch count versus 128: a 512-token
+    /// chunk is 2 blocks per full-attention layer (32 SDPA sets per chunk,
+    /// not 64) while the materialized score tensor stays O(1) in chunk
+    /// length. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
     static let queryBlockSize: Int = {
@@ -37,7 +39,7 @@ enum CBv2AttentionV1 {
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
-        else { return 128 }
+        else { return 256 }
         return value
     }()
 
@@ -615,7 +617,7 @@ enum CBv2AttentionV1 {
     ///
     /// Scope: this applies to every multi-token prompt call that reaches
     /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
-    /// packed prefill. Vision rows keep the same q=128 blocking; each query
+    /// packed prefill. Vision rows keep the same q-block width; each query
     /// block expands its K/V slice only as needed to include complete image
     /// spans touched by that block, then composes causal/window and
     /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.

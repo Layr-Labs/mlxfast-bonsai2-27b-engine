@@ -15,7 +15,9 @@
 //       re-binned from scratch in the step path.
 //   (3) temperature divide (greedy rows use 1.0 — argmax-invariant).
 //   (4) top-k / top-p / min-p via a single descending vocab sort + cumsum
-//       threshold, per-row parameters broadcast as [B, 1] tensors.
+//       threshold, per-row parameters broadcast as [B, 1] tensors. Rows
+//       without an active filter skip the sort via a membership-fixed
+//       subset gather/scatter (their sentinels make it the identity).
 //
 // Batch-composition invariance: every transform is row-independent (per-row
 // reductions along the vocab axis only), so a row's transformed logits
@@ -76,7 +78,8 @@ public final class LogitsPipelineV2 {
     public static let greedyEpsilon: Float = 1e-5
 
     public struct Output {
-        /// Fully transformed logits [B, vocab] (float32), ready for
+        /// Fully transformed logits [B, vocab] (float32, or input dtype on
+        /// the all-greedy no-op fast path), ready for
         /// greedy argmax or Gumbel-max sampling. Masked tokens are -inf.
         public let sampling: MLXArray
         /// log_softmax of the RAW logits [B, vocab], present only when at
@@ -106,6 +109,13 @@ public final class LogitsPipelineV2 {
     private var anyFrequencyPresence = false
     private var anyTemperature = false
     private var anyTopKPMinP = false
+    /// Ascending int32 row indices with an ACTIVE top-k/p/min-p filter
+    /// (a subset of the non-greedy rows). Present only when a PROPER subset
+    /// needs filtering — nil when no row does (stage skipped entirely) or
+    /// every row does (full-width filter, no gather/scatter).
+    private var filterRowIndices: MLXArray?
+    /// Host-side count of `filterRowIndices` rows (membership-change fixed).
+    private var filterCount = 0
 
     // Per-row parameter tensors, [B, 1] float32 unless noted. Built once in
     // `setRows`; never touched in the step path.
@@ -138,6 +148,11 @@ public final class LogitsPipelineV2 {
     public init(vocabSize: Int) {
         precondition(vocabSize > 0, "vocabSize must be positive")
         self.vocabSize = vocabSize
+        // Sampler-side short-width warmup: pipeline creation (first sample,
+        // during load/warm) is the only vocab-known boundary inside the
+        // sampler pair. One-shot per vocab (process-wide pin set inside),
+        // eval+discard, no pipeline state touched.
+        SamplerV2.warmShortWidths(vocabSize: vocabSize)
     }
 
     // MARK: Membership change (host loops allowed here, and only here)
@@ -168,10 +183,12 @@ public final class LogitsPipelineV2 {
         anyFrequencyPresence = false
         anyTemperature = false
         anyTopKPMinP = false
+        var filterIdx = [Int32]()
 
         for (i, row) in rows.enumerated() {
             let p = row.params
             let greedy = p.temperature < Self.greedyEpsilon
+            var needsFilter = false
             if !greedy {
                 allGreedy = false
                 temps[i] = p.temperature
@@ -181,20 +198,25 @@ public final class LogitsPipelineV2 {
                 if p.topK > 0, p.topK < vocabSize {
                     topKs[i] = Int32(p.topK)
                     anyTopKPMinP = true
+                    needsFilter = true
                 }
                 if p.topP > 0, p.topP < 1 {
                     topPs[i] = p.topP
                     anyTopKPMinP = true
+                    needsFilter = true
                 } else if p.topP <= 0 {
                     // top_p == 0 keeps only the most probable token.
                     topPs[i] = 0
                     anyTopKPMinP = true
+                    needsFilter = true
                 }
                 if p.minP > 0 {
                     minPs[i] = min(p.minP, 1)
                     anyTopKPMinP = true
+                    needsFilter = true
                 }
             }
+            if needsFilter { filterIdx.append(Int32(i)) }
             if p.topLogprobs > 0 { wantsLogprobs = true }
             if !p.logitBias.isEmpty { anyBias = true }
             let windowedRepetition = p.repetitionPenalty != 1 && p.repetitionContextSize > 0
@@ -217,6 +239,12 @@ public final class LogitsPipelineV2 {
         topK = anyTopKPMinP ? MLXArray(topKs).reshaped([b, 1]) : nil
         topP = anyTopKPMinP ? MLXArray(topPs).reshaped([b, 1]) : nil
         minP = anyTopKPMinP ? MLXArray(minPs).reshaped([b, 1]) : nil
+        // Subset gate for stage (4): rows whose sentinels make the filter
+        // identity (greedy rows, temperature-only rows) skip the sort. Only
+        // a proper subset gets indices; all-or-nothing stays full-width.
+        filterCount = filterIdx.count
+        filterRowIndices =
+            (anyTopKPMinP && filterIdx.count < b) ? MLXArray(filterIdx) : nil
 
         biasMatrix = anyBias ? Self.buildBiasMatrix(rows: rows, vocabSize: vocabSize) : nil
 
@@ -253,6 +281,8 @@ public final class LogitsPipelineV2 {
         anyFrequencyPresence = false
         anyTemperature = false
         anyTopKPMinP = false
+        filterRowIndices = nil
+        filterCount = 0
         temperature = nil
         repetitionPenalty = nil
         frequencyPenalty = nil
@@ -283,8 +313,16 @@ public final class LogitsPipelineV2 {
             "logits rows (\(logits.dim(0))) != configured rows (\(rowCount)) — call setRows")
 
         // Work in float32 for numerically stable softmax/cumsum (vLLM does
-        // the same). f16→f32 is exact, so greedy argmax is unaffected.
-        var x = logits.asType(.float32)
+        // the same). f16→f32 is exact, so greedy argmax is unaffected — and
+        // on the all-greedy fast path (no bias/penalties/temperature/
+        // top-k-p-min-p/logprobs/hard-mask, consumer is SamplerV2 single
+        // argmax) the upcast is skipped entirely: argmax is invariant
+        // under the exact order-preserving f16→f32 cast.
+        let skipF32Upcast =
+            allGreedy && !anyBias && !anyRepetition && !anyFrequencyPresence
+            && !anyTemperature && !anyTopKPMinP && !wantsLogprobs
+            && hardMask == nil
+        var x = skipF32Upcast ? logits : logits.asType(.float32)
 
         // (0) Raw logprobs BEFORE any transform. (The counter is a telemetry
         // side effect only; the transform pipeline itself stays pure.)
@@ -328,8 +366,27 @@ public final class LogitsPipelineV2 {
         }
 
         // (4) top-k / top-p / min-p via one descending sort + cumsum.
+        // Gated to the rows with an active filter: skipped rows carry the
+        // keep-everything sentinels (k == vocab, p == 2.0, min-p == 0), for
+        // which the stage is the identity, so skipping is bitwise exact.
         if anyTopKPMinP, let topK, let topP, let minP {
-            x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP)
+            if let filterRowIndices {
+                let sub = take(x, filterRowIndices, axis: 0)
+                let filtered = Self.applyTopKTopPMinP(
+                    sub,
+                    topK: take(topK, filterRowIndices, axis: 0),
+                    topP: take(topP, filterRowIndices, axis: 0),
+                    minP: take(minP, filterRowIndices, axis: 0))
+                x = putAlong(
+                    x,
+                    broadcast(
+                        filterRowIndices.reshaped([filterCount, 1]),
+                        to: [filterCount, x.dim(-1)]),
+                    values: filtered,
+                    axis: 0)
+            } else {
+                x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP)
+            }
         }
 
         return Output(sampling: x, rawLogprobs: rawLogprobs)
