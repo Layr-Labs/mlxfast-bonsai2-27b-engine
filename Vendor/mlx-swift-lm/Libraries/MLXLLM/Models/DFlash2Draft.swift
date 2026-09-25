@@ -525,10 +525,26 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        var contextKeys: MLXArray
+        var contextValues: MLXArray
+        var blockKeys: MLXArray
+        var blockValues: MLXArray
+        if B == 1 {
+            // The context and block use the same K/V projections. Projecting
+            // both in one call avoids a second weight read for each matrix.
+            let projectedInput = concatenated([context, x], axis: 1)
+            let projectedKeys = kProj(projectedInput)
+            let projectedValues = vProj(projectedInput)
+            contextKeys = projectedKeys[0..., ..<contextLength, 0...]
+            blockKeys = projectedKeys[0..., contextLength..., 0...]
+            contextValues = projectedValues[0..., ..<contextLength, 0...]
+            blockValues = projectedValues[0..., contextLength..., 0...]
+        } else {
+            contextKeys = kProj(context)
+            contextValues = vProj(context)
+            blockKeys = kProj(x)
+            blockValues = vProj(x)
+        }
 
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
