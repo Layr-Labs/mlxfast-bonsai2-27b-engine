@@ -222,6 +222,102 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+/// Early submission of a trunk forward: at chosen layer boundaries the
+/// forward `asyncEval`s its hidden state, so the GPU runs the front of the
+/// tower while the host is still building the rest. The same kernels run on
+/// the same inputs in the same order; only command-buffer boundaries move,
+/// so every value is bit-identical.
+///
+/// One mechanism, two plans, picked per forward:
+/// - VERIFY (a capture-verify forward). The drafter's block was submitted
+///   before this graph was built, so without slices the GPU idles from the
+///   drafter's last kernel until the host has built all 64 layers.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
+///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
+///   paces encoding against the GPU at 10 in-flight command buffers, so
+///   extra boundaries cost little, and a short first slice matters more as
+///   the GPU gets faster relative to the host build);
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
+///   prefill starts its first layers while the host builds the rest.
+///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
+/// Plain decode and short forwards are untouched. Never over paged KV: its
+/// write faults are checked only after the whole forward is built, before
+/// anything may be evaluated.
+///
+/// A plan is `N` (every N layers), `N@o` (every N layers, shifted so the
+/// first boundary falls after layer `o`), or an explicit list of layer
+/// counts (`4,16,32,48`; `;` also separates); `0`/`off` disables it.
+enum Qwen35TrunkSubmission {
+    static let promptMinimumRows = 128
+
+    struct Plan: Sendable {
+        let stride: Int
+        let offset: Int
+        let explicit: [Int]?
+
+        static let off = Plan(stride: 0, offset: 0, explicit: nil)
+
+        var isOff: Bool { explicit.map { $0.isEmpty } ?? (stride <= 0) }
+
+        /// True when the forward submits after `completedLayers` layers.
+        /// The last layer never splits: the caller's eval takes it.
+        @inline(__always)
+        func submits(after completedLayers: Int, of layerCount: Int) -> Bool {
+            guard completedLayers < layerCount else { return false }
+            if let explicit { return explicit.contains(completedLayers) }
+            return stride > 0 && completedLayers % stride == offset
+        }
+
+        static func parse(_ raw: String?, default fallback: Plan) -> Plan {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                !raw.isEmpty
+            else { return fallback }
+            if ["0", "off", "false", "no"].contains(raw) { return .off }
+            if raw.contains(",") || raw.contains(";") {
+                let counts = raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
+                    Int($0.trimmingCharacters(in: .whitespaces))
+                }.filter { $0 > 0 }
+                return Plan(stride: 0, offset: 0, explicit: counts)
+            }
+            let parts = raw.split(separator: "@")
+            guard let stride = Int(parts[0]), stride >= 0 else { return fallback }
+            let first = parts.count > 1 ? (Int(parts[1]) ?? stride) : stride
+            return Plan(stride: stride, offset: stride > 0 ? first % stride : 0, explicit: nil)
+        }
+    }
+
+    static let verify: Plan = {
+        let env = ProcessInfo.processInfo.environment
+        let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 2, offset: 0, explicit: nil))
+    }()
+
+    static let prompt: Plan = Plan.parse(
+        ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
+        default: Plan(stride: 4, offset: 0, explicit: nil))
+
+    /// The plan for one trunk forward, or nil for a single submission.
+    static func plan(
+        rows: Int, captureRecurrentWindow: Bool, caches: [any CBv2AttendingLayerCache]
+    ) -> Plan? {
+        let plan: Plan
+        if captureRecurrentWindow {
+            plan = verify
+        } else if rows >= promptMinimumRows {
+            plan = prompt
+        } else {
+            return nil
+        }
+        if plan.isOff || caches.contains(where: { $0 is PagedLayerCache }) { return nil }
+        return plan
+    }
+}
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -2250,6 +2346,13 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    /// Layers per verify submission slice (see `cbv2Forward`). Four slices
+    /// of sixteen: building one slice on the host must beat the drafter's
+    /// GPU time so the first slice is ready when the GPU frees, and each
+    /// later slice builds far faster than the GPU runs the one before it.
+    /// Four submissions clear both with margin at the fewest extra calls.
+    static let verifySubmitLayers = 16
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2265,6 +2368,10 @@ public class Qwen35TextModelInner: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        // Early-submission boundaries for this forward (`Qwen35TrunkSubmission`).
+        let submission = Qwen35TrunkSubmission.plan(
+            rows: inputs.dim(1), captureRecurrentWindow: captureRecurrentWindow,
+            caches: caches)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -2296,6 +2403,13 @@ public class Qwen35TextModelInner: Module {
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            // EARLY SUBMISSION (verify slices / prompt pipelining): hand
+            // the GPU the layers built so far. See `Qwen35TrunkSubmission`.
+            if let submission,
+                submission.submits(after: modelLayerIndex + 1, of: layers.count)
+            {
+                asyncEval([hiddenStates])
             }
         }
         if tapLayerIds == nil {

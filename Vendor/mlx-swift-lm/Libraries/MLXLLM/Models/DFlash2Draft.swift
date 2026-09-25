@@ -1200,6 +1200,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     private let rope: RoPELayer
     private var target: (any DFlash2Target)?
+    private var maskTokenEmbedding: MLXArray?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1238,6 +1239,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
         }
         self.target = target
+        let maskEmbedding = target.embedTokensForDFlash2(
+            MLXArray([Int32(config.maskTokenId)], [1, 1]))
+        eval(maskEmbedding)
+        self.maskTokenEmbedding = maskEmbedding
     }
 
     // MARK: The cache
@@ -1310,15 +1315,39 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         // Both crossings from the target cast here. The target's embedding is a
         // MODULE call, never a raw weight read.
-        var h = target.embedTokensForDFlash2(inputs).asType(dtype)
+        // Every proposed block has one committed anchor followed by copies of
+        // the same mask token. The target embedding is a packed 2-bit lookup
+        // followed by an inverse Hadamard transform, so embedding all mask
+        // positions independently repeats identical dequantization and
+        // transform work. The mask row was computed and evaluated at bind
+        // time; broadcast that exact value across the block. Keep the general
+        // one-row case unchanged.
+        let embeddedInputs: MLXArray
+        if inputs.dim(1) > 1 {
+            let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
+            guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
+            let repeatedMasks = broadcast(
+                maskEmbedding, to: [inputs.dim(0), inputs.dim(1) - 1, config.hiddenSize])
+            embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
+        } else {
+            embeddedInputs = target.embedTokensForDFlash2(inputs)
+        }
+        var h = embeddedInputs.asType(dtype)
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
 
         let masks = DFlash2SlidingMaskMemo()
+        let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
+            // EARLY SUBMISSION: hand the GPU the drafter layers built so far
+            // while the host builds the rest and the head. Same kernels, same
+            // order; only command-buffer boundaries move.
+            if !submitAfter.isEmpty, submitAfter.contains(index + 1) {
+                asyncEval([h])
+            }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
@@ -1418,4 +1447,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         eval(drafter)
         return drafter
     }
+}
+
+/// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
+/// Default: after the first layer, so the GPU starts the block (it has been
+/// idle since the verify readback) while the host builds the other layers and
+/// the head; measured locally ~0.2-0.4% decode. `MLXFAST_DRAFT_SLICE_LAYERS`
+/// overrides it with a `,`/`;` list of counts (a count equal to the layer
+/// count submits the trunk before the head); `0`/`off` turns it off.
+enum DFlash2DraftSubmission {
+    static let layers: [Int] = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            !raw.isEmpty
+        else { return [1] }
+        if ["0", "off", "false", "no"].contains(raw) { return [] }
+        return raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
+            Int($0.trimmingCharacters(in: .whitespaces))
+        }.filter { $0 > 0 }
+    }()
 }
