@@ -975,7 +975,7 @@ enum DFlash2TopK {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    private static let chunks = 8
+    private static let chunks = 16
     private static let threads = 128
 
     static func select(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
