@@ -998,39 +998,6 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
 
-#ifdef MLX_QMM_M16_NAX
-  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
-  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
-  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
-  // are summed through Ws, which this path does not otherwise use.
-  if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
-      const uint cb = simd_gid >> 1;
-      const uint ks = simd_gid & 1;
-      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
-      qmm_m16_block<T, 2>(
-          w,
-          scales,
-          biases,
-          x + y_row * static_cast<int64_t>(K),
-          y + y_row * static_cast<int64_t>(N),
-          K,
-          N,
-          M - y_row,
-          y_col + 32 * int(cb),
-          0,
-          K,
-          ks,
-          simd_lid,
-          red,
-          red);
-      return;
-    }
-  }
-#endif
-
   auto wl = (const device uint8_t*)w;
 
   x += y_row * static_cast<int64_t>(K);
