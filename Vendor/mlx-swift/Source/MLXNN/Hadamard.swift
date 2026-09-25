@@ -614,16 +614,36 @@ public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantize
     return packed
 }
 
-/// `sharedHadamardProjections` for an activation that already carries the
-/// shared transform's signs (see `SignedBlockHadamard.applyPreSigned`): the
-/// rotation skips its sign multiply, and every sibling reads the rotated
-/// array `sharedHadamardProjections` would have formed from the unsigned
-/// activation. Nil when the siblings do not share one ungrouped transform.
-public func sharedHadamardProjectionsPreSigned(
-    _ signed: MLXArray, _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
+/// The projection group's sign vector folded onto an FP32 norm weight's
+/// channels: `weight * signVector`. A norm that multiplies by the folded
+/// weight emits the group's rotation input with the signs already applied,
+/// so the rotation's per-call sign-multiply dispatch disappears (see
+/// `sharedHadamardPreSignedProjections`). The fold is exact: a ±1 multiply
+/// is exact and commutes with the norm's per-channel product, whatever the
+/// kernel's association order. nil when the group is not uniformly packed
+/// Hadamard over one ungrouped transform of the weight's width, or the
+/// weight is not the FP32 the rotation reads.
+public func hadamardFoldedNormWeight(
+    _ weight: MLXArray, _ projections: [Linear]
+) -> MLXArray? {
+    guard let siblings = sharedHadamardSiblings(projections),
+        let first = siblings.first,
+        weight.ndim == 1, weight.dtype == .float32,
+        weight.dim(0) == first.transform.width
+    else { return nil }
+    return weight * first.transform.signVector
+}
+
+/// `sharedHadamardProjections` over an activation that already carries the
+/// group's signs (`hadamardFoldedNormWeight` on the producing norm): the
+/// shared rotation is the Hadamard transform alone, one elementwise dispatch
+/// fewer per call. Bit-for-bit the same rotated activation the signed path
+/// computes. nil under the same conditions as `sharedHadamardSiblings`.
+public func sharedHadamardPreSignedProjections(
+    _ signed: MLXArray, _ projections: [Linear], widenOutput: Bool = true
 ) -> [MLXArray]? {
-    guard let first = siblings.first,
-        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    guard let siblings = sharedHadamardSiblings(projections),
+        let first = siblings.first
     else { return nil }
     let rotated = first.transform.applyPreSigned(signed)
     if let fused = first.fusedSiblingsForward(
