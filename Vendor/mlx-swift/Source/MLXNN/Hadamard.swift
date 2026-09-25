@@ -264,9 +264,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 }
 
 /// Applies each packed Hadamard projection to the same activation, rotating it
-/// once. Every projection reads the identical rotated array it would have
-/// computed itself, so outputs are bit-identical to calling each one. Returns
-/// nil when any projection is not packed or uses a different transform.
+/// once. When the projections share one packed format they are multiplied once
+/// against their row-concatenated weights and the product is split back into
+/// each projection's columns; otherwise each projection multiplies the shared
+/// rotated array itself. Returns nil when any projection is not packed or uses
+/// a different transform.
 public func sharedHadamardProjections(_ x: MLXArray, _ projections: [Linear]) -> [MLXArray]? {
     guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
     var packed = [HadamardQuantizedLinear]()
@@ -278,7 +280,70 @@ public func sharedHadamardProjections(_ x: MLXArray, _ projections: [Linear]) ->
         packed.append(layer)
     }
     let rotated = first.rotate(x)
-    return packed.map { $0.applyRotated(rotated) }
+    guard let joint = HadamardProjectionJoin.shared.joint(for: packed) else {
+        return packed.map { $0.applyRotated(rotated) }
+    }
+    var boundaries = [Int]()
+    var offset = 0
+    for layer in packed.dropLast() {
+        offset += layer.weight.dim(0)
+        boundaries.append(offset)
+    }
+    return split(joint.applyRotated(rotated), indices: boundaries, axis: -1)
+}
+
+/// Row-concatenated packed constants for projections that read one rotated
+/// activation. Concatenation copies packed rows with their own scales and
+/// offsets; nothing is unpacked or re-quantized. An entry is rebuilt when any
+/// source array is replaced, and it retains its sources so an identity cannot
+/// be reused by a later allocation. The holder is not a Module, so nothing
+/// enters a parameter tree. All mutable state is guarded by `lock`.
+private final class HadamardProjectionJoin: @unchecked Sendable {
+    static let shared = HadamardProjectionJoin()
+
+    private struct Entry {
+        let sources: [MLXArray]
+        let joint: HadamardQuantizedLinear
+    }
+
+    private let lock = NSLock()
+    private var entries = [[ObjectIdentifier]: Entry]()
+
+    func joint(for layers: [HadamardQuantizedLinear]) -> HadamardQuantizedLinear? {
+        guard layers.count > 1, let first = layers.first,
+            layers.allSatisfy({
+                $0.bias == nil && $0.mode == .affine && $0.bits == first.bits
+                    && $0.groupSize == first.groupSize
+                    && $0.weight.dtype == first.weight.dtype
+                    && $0.weight.dim(1) == first.weight.dim(1)
+                    && $0.scales.dtype == first.scales.dtype
+                    && $0.biases?.dtype == first.biases?.dtype
+            })
+        else { return nil }
+        let sources = layers.flatMap { layer in
+            [layer.weight, layer.scales] + (layer.biases.map { [$0] } ?? [])
+        }
+        let key = layers.map { ObjectIdentifier($0) }
+
+        lock.lock()
+        defer { lock.unlock() }
+        if let entry = entries[key], entry.sources.count == sources.count,
+            zip(entry.sources, sources).allSatisfy({ $0 === $1 })
+        {
+            return entry.joint
+        }
+        let biases = first.biases == nil ? nil : concatenated(layers.map { $0.biases! }, axis: 0)
+        guard
+            let joint = try? HadamardQuantizedLinear(
+                weight: concatenated(layers.map(\.weight), axis: 0),
+                scales: concatenated(layers.map(\.scales), axis: 0),
+                biases: biases, groupSize: first.groupSize, bits: first.bits,
+                transform: first.transform)
+        else { return nil }
+        eval([joint.weight, joint.scales] + (joint.biases.map { [$0] } ?? []))
+        entries[key] = Entry(sources: sources, joint: joint)
+        return joint
+    }
 }
 
 /// Packed folded embeddings with an inverse transform after lookup.
