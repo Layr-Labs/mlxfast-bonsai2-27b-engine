@@ -301,6 +301,19 @@ extension EngineLoopV2 {
                     do {
                         if confirmed > 0 {
                             try evaluations[0].commit(keepPositions: confirmed)
+                            if !["0", "false", "no", "off"].contains(
+                                ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"]?
+                                    .lowercased() ?? "")
+                            {
+                                if let committedStates = recurrentStates[id]?.confirmedStateSnapshot() {
+                                    let arrays = committedStates.values.flatMap {
+                                        [$0.conv, $0.ssm].compactMap { $0 }
+                                    }
+                                    if !arrays.isEmpty {
+                                        asyncEval(arrays)
+                                    }
+                                }
+                            }
                         } else {
                             try evaluations[0].rollback()
                         }
