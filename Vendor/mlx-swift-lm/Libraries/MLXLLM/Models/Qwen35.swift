@@ -2090,7 +2090,15 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        positionedForward(
+        if tokens.dim(1) > 1 {
+            // Unpositioned callers consume the final row; retain [B, 1, vocab]
+            // because their last-position indexing still expects three axes.
+            return cbv2RecurrentPrefill(
+                tokens, inputEmbedding: nil, cache: caches,
+                recurrentState: recurrentState, positionIds: nil,
+                requirement: .lastPositionLogits).expandedDimensions(axis: 1)
+        }
+        return positionedForward(
             tokens, inputEmbedding: nil, cache: caches,
             recurrentState: recurrentState, positionIds: nil)
     }
