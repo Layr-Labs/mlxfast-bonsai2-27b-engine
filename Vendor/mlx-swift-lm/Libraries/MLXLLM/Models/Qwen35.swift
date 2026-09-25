@@ -254,6 +254,28 @@ enum Qwen35FusedElementwise {
         compile(shapeless: true) { normed, gate in
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
+
+    /// On unless explicitly disabled: a packed projection whose input comes
+    /// out of a norm or an elementwise op receives that input with its
+    /// Hadamard signs already applied, and its rotation skips the multiply.
+    static let foldsHadamardSigns: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FOLD_SIGNS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `gatedNormTail` times the output projection's Hadamard signs.
+    static let gatedNormTailSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { normed, gate, signs in
+            (silu(gate.asType(.float32)) * normed.asType(.float32)) * signs
+        }
+
+    /// The attention output gate `x * sigmoid(gate)` times the output
+    /// projection's Hadamard signs, returned in the gate product's dtype.
+    static let sigmoidGateSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { x, gate, signs in
+            ((x * sigmoid(gate)) * signs).asType(x.dtype)
+        }
 }
 
 /// Input-independent constants a GDN layer derives from its geometry, held
@@ -279,6 +301,40 @@ private final class Qwen35GDNDerived {
             qScale = q
             kScale = k
             return (q, k)
+        }
+    }
+}
+
+/// A norm gain with its consumer's Hadamard signs folded in, derived once from
+/// the loaded gain and held outside the parameter tree (a plain class, so
+/// Module reflection sees `.other`). The norm writes `w * y` per element; with
+/// `w * s` it writes `(w * s) * y`, which is `(w * y) * s` exactly: the signs
+/// are ±1, and negating a factor negates a rounded product without changing
+/// its magnitude.
+fileprivate final class Qwen35SignedGain {
+    private let lock = NSLock()
+    private var source: MLXArray?
+    private var signs: MLXArray?
+    private var folded: MLXArray?
+
+    func gain(_ source: MLXArray, signs: MLXArray) -> MLXArray {
+        lock.withLock {
+            if let folded, self.source === source, self.signs === signs {
+                return folded
+            }
+            let value = (source * signs).asType(source.dtype)
+            self.source = source
+            self.signs = signs
+            self.folded = value
+            return value
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            source = nil
+            signs = nil
+            folded = nil
         }
     }
 }
@@ -347,6 +403,24 @@ final class Qwen35GatedDeltaNet: Module {
             return packed.forwardUnwidened(x)
         }
         return outProj(x)
+    }
+
+    /// `projectOut(gatedNorm(out, gate:))` with `out_proj`'s Hadamard signs
+    /// multiplied in by the gated tail's kernel, so the packed projection's
+    /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
+    /// the rotation reads the same values either way.
+    private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        if Qwen35FusedElementwise.foldsHadamardSigns,
+            let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+            packed.transform.width == numVHeads * headVDim
+        {
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
+            let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
+                .asType(out.dtype)
+            return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+        }
+        return projectOut(gatedNorm(out, gate: gate).reshaped(B, S, -1))
     }
 
     init(_ args: Qwen35TextConfiguration) {
@@ -989,8 +1063,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = gatedNorm(out, gate: z)
-        return projectOut(normedOut.reshaped(B, S, -1))
+        return projectGatedOut(out, gate: z, B: B, S: S)
     }
 
     /// CBv2 MTP rectangular verify path. Widths one and two retain the
@@ -1207,12 +1280,11 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = gatedNorm(out, gate: z)
-        let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(outProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(
+                outProj, gatedNorm(out, gate: z).reshaped(B, S, -1))
         }
-        return projectOut(projectionInput)
+        return projectGatedOut(out, gate: z, B: B, S: S)
     }
 }
 
@@ -1358,15 +1430,22 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
-            // The residual add widens the FP16 product itself.
-            return packed.forwardUnwidened(projectionInput)
+            // The output gate and the projection's Hadamard signs share one
+            // kernel; the residual add widens the FP16 product itself.
+            if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
+                output.dtype == gate.dtype
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    output, gate, packed.transform.signVector)
+                return packed.forwardPreSigned(signed, widenOutput: false)
+            }
+            return packed.forwardUnwidened(sigmoidMultiply(output, gate))
         }
-        return oProj(projectionInput)
+        return oProj(sigmoidMultiply(output, gate))
     }
 }
 
@@ -1608,6 +1687,31 @@ extension Qwen3NextMLP {
         }
         return downProj(silu(shared[0]) * shared[1])
     }
+
+    /// `qwen35Forward(norm(h))` with gate and up's Hadamard signs folded into
+    /// the norm's gain, so their shared rotation skips its sign multiply. The
+    /// signed gain yields the plain norm's output times the signs exactly (see
+    /// `Qwen35SignedGain`). Nil when the fold does not apply.
+    fileprivate func qwen35ForwardSignedNorm(
+        _ h: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+    ) -> MLXArray? {
+        guard Qwen35FusedElementwise.foldsHadamardSigns,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let transform = siblings.first?.transform,
+            norm.weight.ndim == 1, norm.weight.dim(0) == transform.width
+        else { return nil }
+        let signedInput = MLXFast.rmsNorm(
+            h, weight: gain.gain(norm.weight, signs: transform.signVector), eps: norm.eps)
+        guard
+            let shared = sharedHadamardProjectionsPreSigned(
+                signedInput, siblings, widenOutput: false)
+        else { return nil }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return down.forwardPreSigned(signed, widenOutput: false)
+    }
 }
 
 // MARK: - Decoder Layer
@@ -1622,6 +1726,28 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    /// The post-attention gain with the MLP's gate/up signs folded in.
+    private let signedGain = Qwen35SignedGain()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -1710,14 +1836,20 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: exactTargetVerify)
         }
         let h = x + r
-        let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
-                normalized, exactTargetVerify: exactTargetVerify)
+                postAttentionLayerNorm(h), exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            if !exactTargetVerify,
+                let folded = dense.qwen35ForwardSignedNorm(
+                    h, norm: postAttentionLayerNorm, gain: signedGain)
+            {
+                feedForward = folded
+            } else {
+                feedForward = dense.qwen35TargetVerify(
+                    postAttentionLayerNorm(h), exact: exactTargetVerify)
+            }
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
