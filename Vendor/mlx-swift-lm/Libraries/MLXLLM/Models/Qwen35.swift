@@ -343,7 +343,8 @@ fileprivate final class Qwen35SignedGain {
 /// the state kept in FP32, matching `gatedDeltaUpdate` op for op.
 func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?,
+    stateOnly: Bool = false
 ) -> (MLXArray, MLXArray) {
     let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
     let B = q.dim(0)
@@ -357,6 +358,11 @@ func qwen35GatedDelta(
     if mask == nil, Qwen35GDNPrefillKernel.applies(q: q, v: v) {
         return Qwen35GDNPrefillKernel.run(
             q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm)
+    }
+    if mask == nil, let result = Qwen35GatedDeltaRows.run(
+        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, stateOnly: stateOnly)
+    {
+        return result
     }
     return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
 }
@@ -607,6 +613,511 @@ enum Qwen35GDNPrefillKernel {
     }
 }
 
+/// The gated-delta recurrence of `gatedDeltaKernel`, four value rows per
+/// simdgroup. Each lane keeps the stock kernel's elements (`4 * lane + i`,
+/// ascending `i`) of four adjacent rows, so the q/k/g/beta loads, the address
+/// arithmetic and the loop overhead are shared by the four independent
+/// recurrences. Every per-element expression is the stock kernel's verbatim —
+/// the Kahan block under the same fp pragmas, `(v - kv) * beta`,
+/// `state + k * delta`, `out += state * q` — and both reductions are the same
+/// `simd_sum` calls, so `y` and the state are bit-identical. The next step's
+/// inputs are loaded (as float4) before the current step's arithmetic from a
+/// second register set, which removes the load latency the stock kernel
+/// exposes behind its `y` store. `stateOnly` (the accepted-prefix replay,
+/// which keeps only the state) skips q, the output sum and `y`.
+enum Qwen35GatedDeltaRows {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+        stateOnly: Bool
+    ) -> (MLXArray, MLXArray)? {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        guard enabled, Dk == 128, Dv % 4 == 0, q.dtype == .float32, k.dtype == .float32,
+            v.dtype == .float32, g.dtype == .float32, beta.dtype == .float32,
+            state.dtype == .float32, Hv % Hk == 0
+        else { return nil }
+        let threadGroup = T > 32 ? (32, 4, 1) : (32, 1, 1)
+        let template: [(String, any KernelTemplateArg)] = [
+            ("InT", DType.float32), ("StT", DType.float32), ("Dk", Dk), ("Dv", Dv),
+            ("Hk", Hk), ("Hv", Hv), ("R", 4),
+        ]
+        if stateOnly {
+            let outputs = stateKernel(
+                [k, v, g, beta, state, MLXArray(T)],
+                template: template,
+                grid: (32, Dv / 4, B * Hv),
+                threadGroup: threadGroup,
+                outputShapes: [state.shape],
+                outputDTypes: [.float32])
+            return (MLXArray.zeros([0], dtype: .float32), outputs[0])
+        }
+        let outputs = outputKernel(
+            [q, k, v, g, beta, state, MLXArray(T)],
+            template: template,
+            grid: (32, Dv / 4, B * Hv),
+            threadGroup: threadGroup,
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private static let outputKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_rows",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: """
+
+        const int T_ = T;
+        constexpr int n_per_t = Dk / 32;
+        const uint lane = thread_index_in_simdgroup;
+        const bool b0 = (lane & 1) != 0; (void)b0;
+        const bool b1 = (lane & 2) != 0; (void)b1;
+        const bool b2 = (lane & 4) != 0; (void)b2;
+        const bool b3 = (lane & 8) != 0; (void)b3;
+        const bool b4 = (lane & 16) != 0; (void)b4;
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv0 = thread_position_in_grid.y * R;
+        auto q_ = q + b_idx * T_ * Hk * Dk + hk_idx * Dk + n_per_t * dk_idx;
+        auto k_ = k + b_idx * T_ * Hk * Dk + hk_idx * Dk + n_per_t * dk_idx;
+        auto v_ = v + b_idx * T_ * Hv * Dv + hv_idx * Dv + dv0;
+        y += b_idx * T_ * Hv * Dv + hv_idx * Dv + dv0;
+        auto g_ = g + b_idx * T_ * Hv + hv_idx;
+        auto beta_ = beta + b_idx * T_ * Hv + hv_idx;
+        auto i_state = state_in + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
+        auto o_state = state_out + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
+        float state[R][n_per_t];
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            state[r][i] = static_cast<float>(i_state[r * Dk + i]);
+        float kA[n_per_t]; float qA[n_per_t]; float vA[R]; float gA, bA;
+        float kB[n_per_t]; float qB[n_per_t]; float vB[R]; float gB, bB;
+        (void)lane;
+        
+        if (T_ > 0) {
+          { float4 t4 = *(const device float4*)(k_ + (0) * (Hk * Dk)); kA[0] = t4.x; kA[1] = t4.y; kA[2] = t4.z; kA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(q_ + (0) * (Hk * Dk)); qA[0] = t4.x; qA[1] = t4.y; qA[2] = t4.z; qA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (0) * (Hv * Dv) + 0); vA[0] = t4.x; vA[1] = t4.y; vA[2] = t4.z; vA[3] = t4.w; }
+          gA = g_[(0) * Hv]; bA = beta_[(0) * Hv];
+        }
+        int t = 0;
+        for (; t + 2 < T_; t += 2) {
+          { float4 t4 = *(const device float4*)(k_ + (t + 1) * (Hk * Dk)); kB[0] = t4.x; kB[1] = t4.y; kB[2] = t4.z; kB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(q_ + (t + 1) * (Hk * Dk)); qB[0] = t4.x; qB[1] = t4.y; qB[2] = t4.z; qB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 1) * (Hv * Dv) + 0); vB[0] = t4.x; vB[1] = t4.y; vB[2] = t4.z; vB[3] = t4.w; }
+          gB = g_[(t + 1) * Hv]; bB = beta_[(t + 1) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              out[r] += state[r][i] * qA[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = out[r]; out[r] = simd_sum(x); }
+          for (int r = 0; r < R; ++r) y[(t) * (Hv * Dv) + r] = static_cast<InT>(out[r]);
+        }
+          { float4 t4 = *(const device float4*)(k_ + (t + 2) * (Hk * Dk)); kA[0] = t4.x; kA[1] = t4.y; kA[2] = t4.z; kA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(q_ + (t + 2) * (Hk * Dk)); qA[0] = t4.x; qA[1] = t4.y; qA[2] = t4.z; qA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 2) * (Hv * Dv) + 0); vA[0] = t4.x; vA[1] = t4.y; vA[2] = t4.z; vA[3] = t4.w; }
+          gA = g_[(t + 2) * Hv]; bA = beta_[(t + 2) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gB;
+                auto product = state[r][i] * kB[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vB[r] - kv_mem[r]) * bB;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kB[i] * delta;
+              out[r] += state[r][i] * qB[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = out[r]; out[r] = simd_sum(x); }
+          for (int r = 0; r < R; ++r) y[(t + 1) * (Hv * Dv) + r] = static_cast<InT>(out[r]);
+        }
+        }
+        if (t + 1 < T_) {
+          { float4 t4 = *(const device float4*)(k_ + (t + 1) * (Hk * Dk)); kB[0] = t4.x; kB[1] = t4.y; kB[2] = t4.z; kB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(q_ + (t + 1) * (Hk * Dk)); qB[0] = t4.x; qB[1] = t4.y; qB[2] = t4.z; qB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 1) * (Hv * Dv) + 0); vB[0] = t4.x; vB[1] = t4.y; vB[2] = t4.z; vB[3] = t4.w; }
+          gB = g_[(t + 1) * Hv]; bB = beta_[(t + 1) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              out[r] += state[r][i] * qA[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = out[r]; out[r] = simd_sum(x); }
+          for (int r = 0; r < R; ++r) y[(t) * (Hv * Dv) + r] = static_cast<InT>(out[r]);
+        }
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gB;
+                auto product = state[r][i] * kB[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vB[r] - kv_mem[r]) * bB;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kB[i] * delta;
+              out[r] += state[r][i] * qB[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = out[r]; out[r] = simd_sum(x); }
+          for (int r = 0; r < R; ++r) y[(t + 1) * (Hv * Dv) + r] = static_cast<InT>(out[r]);
+        }
+        } else if (t < T_) {
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              out[r] += state[r][i] * qA[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = out[r]; out[r] = simd_sum(x); }
+          for (int r = 0; r < R; ++r) y[(t) * (Hv * Dv) + r] = static_cast<InT>(out[r]);
+        }
+        }
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            o_state[r * Dk + i] = static_cast<StT>(state[r][i]);
+        """)
+
+    private static let stateKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_rows_state",
+        inputNames: ["k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["state_out"],
+        source: """
+
+        const int T_ = T;
+        constexpr int n_per_t = Dk / 32;
+        const uint lane = thread_index_in_simdgroup;
+        const bool b0 = (lane & 1) != 0; (void)b0;
+        const bool b1 = (lane & 2) != 0; (void)b1;
+        const bool b2 = (lane & 4) != 0; (void)b2;
+        const bool b3 = (lane & 8) != 0; (void)b3;
+        const bool b4 = (lane & 16) != 0; (void)b4;
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv0 = thread_position_in_grid.y * R;
+        
+        auto k_ = k + b_idx * T_ * Hk * Dk + hk_idx * Dk + n_per_t * dk_idx;
+        auto v_ = v + b_idx * T_ * Hv * Dv + hv_idx * Dv + dv0;
+        
+        auto g_ = g + b_idx * T_ * Hv + hv_idx;
+        auto beta_ = beta + b_idx * T_ * Hv + hv_idx;
+        auto i_state = state_in + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
+        auto o_state = state_out + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
+        float state[R][n_per_t];
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            state[r][i] = static_cast<float>(i_state[r * Dk + i]);
+        float kA[n_per_t]; float vA[R]; float gA, bA;
+        float kB[n_per_t]; float vB[R]; float gB, bB;
+        (void)lane;
+        
+        if (T_ > 0) {
+          { float4 t4 = *(const device float4*)(k_ + (0) * (Hk * Dk)); kA[0] = t4.x; kA[1] = t4.y; kA[2] = t4.z; kA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (0) * (Hv * Dv) + 0); vA[0] = t4.x; vA[1] = t4.y; vA[2] = t4.z; vA[3] = t4.w; }
+          gA = g_[(0) * Hv]; bA = beta_[(0) * Hv];
+        }
+        int t = 0;
+        for (; t + 2 < T_; t += 2) {
+          { float4 t4 = *(const device float4*)(k_ + (t + 1) * (Hk * Dk)); kB[0] = t4.x; kB[1] = t4.y; kB[2] = t4.z; kB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 1) * (Hv * Dv) + 0); vB[0] = t4.x; vB[1] = t4.y; vB[2] = t4.z; vB[3] = t4.w; }
+          gB = g_[(t + 1) * Hv]; bB = beta_[(t + 1) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              
+            }
+          }
+          
+          
+        }
+          { float4 t4 = *(const device float4*)(k_ + (t + 2) * (Hk * Dk)); kA[0] = t4.x; kA[1] = t4.y; kA[2] = t4.z; kA[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 2) * (Hv * Dv) + 0); vA[0] = t4.x; vA[1] = t4.y; vA[2] = t4.z; vA[3] = t4.w; }
+          gA = g_[(t + 2) * Hv]; bA = beta_[(t + 2) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gB;
+                auto product = state[r][i] * kB[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vB[r] - kv_mem[r]) * bB;
+            
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kB[i] * delta;
+              
+            }
+          }
+          
+          
+        }
+        }
+        if (t + 1 < T_) {
+          { float4 t4 = *(const device float4*)(k_ + (t + 1) * (Hk * Dk)); kB[0] = t4.x; kB[1] = t4.y; kB[2] = t4.z; kB[3] = t4.w; }
+          { float4 t4 = *(const device float4*)(v_ + (t + 1) * (Hv * Dv) + 0); vB[0] = t4.x; vB[1] = t4.y; vB[2] = t4.z; vB[3] = t4.w; }
+          gB = g_[(t + 1) * Hv]; bB = beta_[(t + 1) * Hv];
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              
+            }
+          }
+          
+          
+        }
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gB;
+                auto product = state[r][i] * kB[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vB[r] - kv_mem[r]) * bB;
+            
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kB[i] * delta;
+              
+            }
+          }
+          
+          
+        }
+        } else if (t < T_) {
+          {
+          float kv_mem[R];
+          
+          {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            for (int r = 0; r < R; ++r) {
+              kv_mem[r] = 0.0f;
+              float kv_compensation = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = state[r][i] * gA;
+                auto product = state[r][i] * kA[i];
+                auto corrected = product - kv_compensation;
+                auto next_sum = kv_mem[r] + corrected;
+                kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                kv_mem[r] = next_sum;
+              }
+            }
+          }
+          for (int r = 0; r < R; ++r) { float x = kv_mem[r]; kv_mem[r] = simd_sum(x); }
+          
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vA[r] - kv_mem[r]) * bA;
+            
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kA[i] * delta;
+              
+            }
+          }
+          
+          
+        }
+        }
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            o_state[r * Dk + i] = static_cast<StT>(state[r][i]);
+        """)
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -648,6 +1159,26 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// `out_proj` on the normed output. When the projection is packed on the
     /// matrix route the FP16 product is left for the residual add to widen.
+    /// The front end (conv, silu, split, q/k norms) in one kernel; nil when it
+    /// does not apply (the composed ops then run as before).
+    private func fusedFront(convState: MLXArray, qkv: MLXArray) -> (MLXArray, MLXArray, MLXArray)? {
+        let invScale = pow(Float(headKDim), -0.5)
+        return Qwen35GDNFront.run(
+            convState: convState, qkv: qkv, convWeight: conv1d.weight,
+            numKHeads: numKHeads, numVHeads: numVHeads, headDim: headKDim,
+            convKernelSize: convKernelSize, qScale: pow(invScale, 2), kScale: invScale,
+            eps: 1e-6)
+    }
+
+    /// `projectOut(gatedNorm(out, gate:).reshaped(B, S, -1))` with the norm, the
+    /// gate tail, the value layout and the rotation in one kernel (the same
+    /// FP32 arithmetic). Nil when the fused path does not apply.
+    private func projectGatedNormFused(_ out: MLXArray, gate: MLXArray) -> MLXArray? {
+        guard let packed = outProj as? HadamardQuantizedLinear else { return nil }
+        return packed.applyAfterGatedRMSNorm(
+            out, gate: gate, weight: norm.weight, eps: norm.eps, widenOutput: false)
+    }
+
     private func projectOut(_ x: MLXArray) -> MLXArray {
         if let packed = outProj as? HadamardQuantizedLinear {
             return packed.forwardUnwidened(x)
@@ -992,20 +1523,37 @@ final class Qwen35GatedDeltaNet: Module {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
-        let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
-        let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let newConvState: MLXArray
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        let v: MLXArray
+        if let front = fusedFront(convState: convState, qkv: qkv) {
+            // The retained tail is the last three conv-input rows; for a chunk
+            // of at least three rows those are qkv rows (same values, same
+            // contiguous copy `retainedConvTail` makes).
+            if S >= nKeep {
+                newConvState = retainedConvTail(of: qkv, keeping: nKeep, chunkWidth: S)
+            } else {
+                let convInput = concatenated([convState, qkv], axis: 1)
+                newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
+            }
+            (qNormed, kNormed, v) = front
+        } else {
+            let convInput = concatenated([convState, qkv], axis: 1)
+            newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
+            let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+            v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
-        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+            let dtype = q.dtype
+            let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
+            qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+            kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+        }
 
         let (out, newSsmState) = qwen35GatedDelta(
             q: qNormed,
@@ -1142,7 +1690,8 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
+            mask: tape.mask.map { $0[0..., rows] },
+            stateOnly: true
         ).1
         let boundaryConvView = tape.convInput[
             0...,
@@ -1316,6 +1865,9 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
+        if let fused = projectGatedNormFused(out, gate: z) {
+            return fused
+        }
         return projectGatedOut(out, gate: z, B: B, S: S)
     }
 
@@ -1376,25 +1928,34 @@ final class Qwen35GatedDeltaNet: Module {
         let nKeep = convKernelSize - 1
         let convInput = concatenated([convState, qkv], axis: 1)
         let convOut: MLXArray
-        if exactTargetVerify, S > 1 {
-            convOut = silu(concatenated(
-                (0 ..< S).map { position in
-                    conv1d(convInput[
-                        0..., position ..< (position + convKernelSize), 0...])
-                }, axis: 1))
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        let v: MLXArray
+        if !exactTargetVerify, let front = fusedFront(convState: convState, qkv: qkv) {
+            (qNormed, kNormed, v) = front
+            // The replay accounting's "conv output backing" is v's own buffer.
+            convOut = v
         } else {
-            convOut = silu(conv1d(convInput))
+            if exactTargetVerify, S > 1 {
+                convOut = silu(concatenated(
+                    (0 ..< S).map { position in
+                        conv1d(convInput[
+                            0..., position ..< (position + convKernelSize), 0...])
+                    }, axis: 1))
+            } else {
+                convOut = silu(conv1d(convInput))
+            }
+
+            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+            v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+            let dtype = q.dtype
+            let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
+            qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+            kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
         }
-
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
-        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
 
         let out: MLXArray
         if S >= 3 {
@@ -1532,6 +2093,9 @@ final class Qwen35GatedDeltaNet: Module {
                 }
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
+        }
+        if !exactTargetVerify, let fused = projectGatedNormFused(out, gate: z) {
+            return fused
         }
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(
@@ -1683,6 +2247,13 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
+        if !exactTargetVerify, let packed = oProj as? HadamardQuantizedLinear,
+            let y = packed.applyAfterSigmoidGate(output, gate: gate, widenOutput: false)
+        {
+            // output * sigmoid(gate) formed inside the fused rotation; the
+            // residual add widens the product as before.
+            return y
+        }
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
         }
@@ -1931,6 +2502,12 @@ extension Qwen3NextMLP {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
             let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
         {
+            // silu(gate) * up, the down projection's signs and its transform in
+            // one kernel; the same products in the same order as the compiled
+            // chain plus `forwardPreSigned`.
+            if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+                return y
+            }
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
@@ -1961,6 +2538,11 @@ extension Qwen3NextMLP {
             let shared = sharedHadamardProjectionsPreSigned(
                 signedInput, siblings, widenOutput: false)
         else { return nil }
+        // silu(gate) * up, the down projection's signs and its transform in
+        // one kernel, as `qwen35Forward` does on the unfolded path.
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return y
+        }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
@@ -3037,4 +3619,161 @@ extension Qwen35Model: MTPCapable {
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
     }
+}
+
+// MARK: - Gated-delta front end in one kernel
+
+/// The GDN front end — `silu(conv1d([convState; qkv]))`, its q/k/v split and
+/// the q/k RMS norms with their head scales — in one kernel, bit-identical to
+/// the composed ops: the depthwise conv's four taps as the stock kernel's
+/// contracted `acc += in * w` (explicit `fma`, same tap order), the compiled
+/// `x * sigmoid(x)` with MLX's `Sigmoid` verbatim, and `rms_single_row` over
+/// each 128-wide head (lane `l` owns elements `4l..4l+3`, `fma` partials in
+/// element order, `simd_sum`, `precise::rsqrt(ss / 128 + eps)`,
+/// `scale * (x * inv)`). The conv input is never materialized; a row-strided
+/// `qkv` view (the column slice of a fused sibling projection) is read in place.
+enum Qwen35GDNFront {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_FRONT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// (qNormed, kNormed, v), or nil when the fused front does not apply.
+    static func run(
+        convState: MLXArray, qkv: MLXArray, convWeight: MLXArray,
+        numKHeads: Int, numVHeads: Int, headDim: Int, convKernelSize: Int,
+        qScale: Float, kScale: Float, eps: Float
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        let convDim = (2 * numKHeads + numVHeads) * headDim
+        guard enabled, headDim == 128, convKernelSize == 4, qkv.ndim == 3,
+            qkv.dtype == .float32, convState.dtype == .float32, convWeight.dtype == .float32,
+            qkv.dim(2) == convDim, convState.ndim == 3, convState.dim(0) == qkv.dim(0),
+            convState.dim(1) == 3, convState.dim(2) == convDim,
+            convWeight.shape == [convDim, 4, 1]
+        else { return nil }
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let rows = S >= 256 ? 8 : (S >= 64 ? 4 : 1)
+        let params = MLXArray([eps, qScale, kScale, 1.0, Float(headDim)])
+        // Row-strided views are read in place; the float4 loads need 16-byte
+        // aligned rows, which a contiguous copy always has.
+        let qkvIn = qkv.strides[2] == 1 && qkv.strides[1] % 4 == 0 && qkv.strides[0] % 4 == 0
+            ? qkv : contiguous(qkv)
+        let stateIn = convState.strides[2] == 1 && convState.strides[1] % 4 == 0
+            && convState.strides[0] % 4 == 0 ? convState : contiguous(convState)
+        let outputs = kernel(
+            [stateIn, qkvIn, convWeight, params],
+            template: [("ROWS", rows), ("KH", numKHeads), ("VH", numVHeads)],
+            grid: ((convDim / 128) * 32, (S + rows - 1) / rows, B),
+            threadGroup: (32 * 8, 1, 1),
+            outputShapes: [
+                [B, S, numKHeads, headDim], [B, S, numKHeads, headDim],
+                [B, S, numVHeads, headDim],
+            ],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gdn_front",
+        inputNames: ["conv_state", "qkv", "conv_w", "params"],
+        outputNames: ["qn", "kn", "vout"],
+        source: """
+
+              const uint lane = thread_index_in_simdgroup;
+              const uint blk = thread_position_in_grid.x / 32;      // tg.x is a multiple of 32
+              const uint b = thread_position_in_grid.z;
+              const int S = qkv_shape[1];
+              const int t_begin = int(thread_position_in_grid.y) * ROWS;
+              const int t_end = min(t_begin + ROWS, S);
+
+              const float eps = params[0];
+              const float q_scale = params[1];
+              const float k_scale = params[2];
+              const float one = params[3];      // the 0-dim weight array(1) MLXFast.rmsNorm passes for weight: none
+              const float axis_f = params[4];   // float(axis_size) = 128
+
+              const uint c = blk * 128 + lane * 4;  // this lane's 4 channels: c .. c+3
+
+              // conv weight [10240, 4, 1] (row contiguous): 16 consecutive floats = 4 taps of channels c..c+3
+              const device float4* wp = reinterpret_cast<const device float4*>(conv_w + c * 4);
+              const float4 wc0 = wp[0], wc1 = wp[1], wc2 = wp[2], wc3 = wp[3];
+              // tap-major: wtI[j] = weight of channel c+j for tap I
+              const float4 wt0 = float4(wc0[0], wc1[0], wc2[0], wc3[0]);
+              const float4 wt1 = float4(wc0[1], wc1[1], wc2[1], wc3[1]);
+              const float4 wt2 = float4(wc0[2], wc1[2], wc2[2], wc3[2]);
+              const float4 wt3 = float4(wc0[3], wc1[3], wc2[3], wc3[3]);
+
+              const device float* csp = conv_state + b * conv_state_strides[0] + c;
+              const device float* qp = qkv + b * qkv_strides[0] + c;
+              const int64_t cs_r = conv_state_strides[1];
+              const int64_t q_r = qkv_strides[1];
+
+              // Sliding 4-row window over the (never materialized) convInput = [convState ; qkv]:
+              // convInput row r = convState row r (r < 3) or qkv row r - 3.
+            #define GDN_IN_ROW(r) (*reinterpret_cast<const device float4*>( \\
+                ((r) < 3) ? (csp + int64_t(r) * cs_r) : (qp + int64_t((r) - 3) * q_r)))
+              float4 x0;
+              float4 x1 = GDN_IN_ROW(t_begin);
+              float4 x2 = GDN_IN_ROW(t_begin + 1);
+              float4 x3 = GDN_IN_ROW(t_begin + 2);
+            #undef GDN_IN_ROW
+
+              for (int t = t_begin; t < t_end; ++t) {
+                x0 = x1;
+                x1 = x2;
+                x2 = x3;
+                x3 = *reinterpret_cast<const device float4*>(qp + int64_t(t) * q_r);  // convInput row t+3
+
+                // depthwise_conv_1d: float acc = 0.0; acc += in[t+i] * w[i] (fmuladd -> fma), i = 0..3
+                float4 acc = float4(0.0f);
+                acc = metal::fma(x0, wt0, acc);
+                acc = metal::fma(x1, wt1, acc);
+                acc = metal::fma(x2, wt2, acc);
+                acc = metal::fma(x3, wt3, acc);
+
+                // compiled silu: tmp_s = Sigmoid()(x); tmp_o = Multiply()(x, tmp_s)
+                float4 o;
+                for (int j = 0; j < 4; ++j) {
+                  float sg = gdn_front_sigmoid(acc[j]);
+                  o[j] = acc[j] * sg;
+                }
+
+                const size_t row = size_t(b) * size_t(S) + size_t(t);
+                if (blk < 2 * KH) {
+                  // rms_single_row, axis_size 128 (32 threads, N_READS 4): lane-partial over its 4
+                  // elements in order, then simd_sum
+                  float ss = 0;
+                  for (int j = 0; j < 4; ++j) {
+                    ss = metal::fma(o[j], o[j], ss);
+                  }
+                  ss = simd_sum(ss);
+                  ss = simd_broadcast(ss, ushort(0));  // stock uses lane 0's total (+ 31 exact zeros)
+                  const float inv = metal::precise::rsqrt(ss / axis_f + eps);
+                  float4 nrm;
+                  for (int j = 0; j < 4; ++j) {
+                    nrm[j] = one * (o[j] * inv);  // w[w_stride * i] * static_cast<T>(thread_x[i] * inv)
+                  }
+                  if (blk < KH) {
+                    *reinterpret_cast<device float4*>(qn + (row * KH + blk) * 128 + lane * 4) =
+                        q_scale * nrm;  // MLXArray(q_scale) * rmsNorm(q)
+                  } else {
+                    *reinterpret_cast<device float4*>(kn + (row * KH + (blk - KH)) * 128 + lane * 4) =
+                        k_scale * nrm;  // MLXArray(k_scale) * rmsNorm(k)
+                  }
+                } else {
+                  *reinterpret_cast<device float4*>(vout + (row * VH + (blk - 2 * KH)) * 128 + lane * 4) = o;
+                }
+              }
+            """,
+        header: """
+
+            // Verbatim arithmetic of mlx/backend/metal/kernels/unary_ops.h `Sigmoid` + `Multiply`.
+            inline float gdn_front_sigmoid(float x) {
+              auto y = 1 / (1 + metal::exp(metal::abs(x)));
+              return (x < 0) ? y : 1 - y;
+            }
+            """,
+        ensureRowContiguous: false)
 }

@@ -15,6 +15,16 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// Kill switch for the prompt-produced block carry (default on).
+    static let mtpPrefillBlockCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PREFILL_CARRY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The block path never reads a carry's hidden; a lazy scalar stands in.
+    static var mtpBlockCarryPlaceholder: MLXArray { MLXArray.zeros([1, 1, 1], dtype: .float32) }
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -55,6 +65,32 @@ extension EngineLoopV2 {
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
                 round.finalizedSeedIDs.insert(id)
+            }
+        }
+
+        // A BLOCK drafter needs no seed step after the prompt. Its proposal
+        // reads only the anchor token and the committed tapped context, and
+        // the prompt forward just observed every prompt row. So the prompt's
+        // sampled token is already a valid carry: the next step verifies a
+        // full block instead of spending one plain target forward on it. The
+        // carry's hidden is never read by the block path.
+        if Self.mtpPrefillBlockCarryEnabled, mtp.usesBlockDrafter,
+            mtp.tracksPersistentHistory
+        {
+            let sampled = Set(step.sampledRows)
+            for observation in round.committedObservationRows {
+                let id = observation.id
+                guard sampled.contains(id), !round.finalizedSeedIDs.contains(id),
+                    !step.discard.contains(id),
+                    let rec = scheduler.record(for: id),
+                    rec.generatedTokenCount == 1,
+                    rec.numComputedTokens == rec.tokens.count - 1,
+                    !mtp.hasValidCarry(for: rec),
+                    let token = rec.tokens.last
+                else { continue }
+                mtp.storeCarry(
+                    id: id, token: token, hidden: Self.mtpBlockCarryPlaceholder,
+                    tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
             }
         }
 
