@@ -1716,3 +1716,4 @@ extension FusedInputHadamardKernel {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 }
+private let gauntletRedraw_5c030489_20260925T234114Z: Int = 0
