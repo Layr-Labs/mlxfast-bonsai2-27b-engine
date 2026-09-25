@@ -525,25 +525,47 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
-
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
-        contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        blockKeys = kNorm(blockKeys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-        blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         queries = rope(queries, offset: blockOffset)
-        contextKeys = rope(contextKeys, offset: cache.offset)
-        blockKeys = rope(blockKeys, offset: blockOffset)
+
+        let contextKeys: MLXArray
+        let contextValues: MLXArray
+        let blockKeys: MLXArray
+        let blockValues: MLXArray
+        if contextLength > 0, context.dtype == x.dtype {
+            // The context rows and the block rows are one unbroken run of
+            // positions starting at `cache.offset`, and both go through the
+            // same `k_proj`, `v_proj`, key norm and rotation. One pass over the
+            // joined rows reads each projection weight once per forward
+            // instead of twice; the key norm and the rotation are per row, so
+            // splitting the result afterwards gives each side its own rows.
+            let rows = concatenated([context, x], axis: 1)
+            let total = contextLength + L
+            let jointKeys = rope(
+                kNorm(kProj(rows).reshaped(B, total, kvHeads, -1)).transposed(0, 2, 1, 3),
+                offset: cache.offset)
+            let jointValues = vProj(rows).reshaped(B, total, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            contextKeys = jointKeys[0..., 0..., ..<contextLength, 0...]
+            contextValues = jointValues[0..., 0..., ..<contextLength, 0...]
+            blockKeys = jointKeys[0..., 0..., contextLength..., 0...]
+            blockValues = jointValues[0..., 0..., contextLength..., 0...]
+        } else {
+            contextKeys = rope(
+                kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+                    .transposed(0, 2, 1, 3),
+                offset: cache.offset)
+            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            blockKeys = rope(
+                kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3),
+                offset: blockOffset)
+            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        }
 
         // Only the CONTEXT keys and values enter the cache. The block's own keys
         // and values are concatenated for this forward and then dropped.
@@ -881,10 +903,68 @@ final class DFlash2CandidateSelector: Module {
     ///   - logits: the drafter's logits over the same positions, `[B, L, vocab]`.
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
-    func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
+    /// How many equal chunks the two-stage candidate search splits the
+    /// vocabulary into, or nil when the one-stage search is kept.
+    ///
+    /// Both stages must fit ONE sort threadgroup (`gpu_merge_sort` sorts at
+    /// most `bn * tn = 512 * 4 = 2048` elements in a single block): a chunk is
+    /// at most 2048 wide, and the `chunks * topK` survivors are at most 2048.
+    /// A vocabulary that already fits one block gains nothing.
+    static func candidateChunks(vocabularySize: Int, topK: Int) -> Int? {
+        let singleBlock = 2048
+        guard vocabularySize > singleBlock, topK >= 1, topK <= singleBlock / 2 else {
+            return nil
+        }
+        for chunks in 2 ... (singleBlock / topK)
+        where vocabularySize % chunks == 0
+            && vocabularySize / chunks <= singleBlock
+            && vocabularySize / chunks >= topK
+        {
+            return chunks
+        }
+        return nil
+    }
+
+    /// The `topK` largest logits' token ids per position, `[B, L, topK]`,
+    /// ascending by logit like the one-stage `argPartition` it replaces.
+    ///
+    /// `argPartition` is a FULL sort on the GPU (`ArgPartition::eval_gpu`
+    /// routes to `gpu_merge_sort`), and a 248320-wide row is a multi-block
+    /// merge sort: one block sort plus seven partition/merge passes over the
+    /// whole row. The two-stage search is EXACT: every member of the row's
+    /// top-k is in the top-k of its own chunk, so the top-k of the chunk
+    /// survivors is the row's top-k. Each stage is one single-block sort.
+    func topCandidates(_ logits: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        guard let chunks = Self.candidateChunks(vocabularySize: vocabularySize, topK: topK)
+        else {
+            return argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
+        let batch = logits.dim(0)
+        let length = logits.dim(1)
+        let width = vocabularySize / chunks
+        let survivors = chunks * topK
+
+        // Stage 1: each chunk's own top-k, local to the chunk.
+        let blocks = logits.reshaped(batch, length, chunks, width)
+        let local = argPartition(blocks, kth: width - topK, axis: -1)[
+            0..., 0..., 0..., (width - topK)...]
+        let localValues = takeAlong(blocks, local, axis: -1)
+            .reshaped(batch, length, survivors)
+        let chunkStart = MLXArray(
+            (0 ..< chunks).map { Int32($0 * width) }, [1, 1, chunks, 1])
+        let global = (local.asType(.int32) + chunkStart)
+            .reshaped(batch, length, survivors)
+
+        // Stage 2: the top-k of the survivors, mapped back to token ids.
+        let picked = argPartition(localValues, kth: survivors - topK, axis: -1)[
+            0..., 0..., (survivors - topK)...]
+        return takeAlong(global, picked, axis: -1)
+    }
+
+    func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
+        let candidates = topCandidates(logits)
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
@@ -904,8 +984,9 @@ final class DFlash2CandidateSelector: Module {
                 positionCandidates, selected.expandedDimensions(axis: -1), axis: -1)[0..., 0]
             path.append(predecessor)
         }
-        // `argPartition` indexes in UInt32, so the path inherits that dtype.
-        // Draft tokens are token ids, and the engine reads them as Int32.
+        // The one-stage `argPartition` indexes in UInt32 and the two-stage
+        // search in Int32. Draft tokens are token ids, and the engine reads
+        // them as Int32.
         return stacked(path, axis: 1).asType(.int32)
     }
 }
