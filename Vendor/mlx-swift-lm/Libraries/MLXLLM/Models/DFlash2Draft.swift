@@ -702,6 +702,58 @@ final class DFlash2CandidateSelector: Module {
         super.init()
     }
 
+    /// On unless explicitly disabled. It selects how the candidate lists are
+    /// found, never which lists: both paths return the same indices in the
+    /// same order.
+    private static let chunkedCandidateSearch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_CHUNKED_TOPK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Vocabulary entries per chunk of the candidate prefilter.
+    private static let candidateChunk = 128
+
+    /// The `topK` highest-scoring vocabulary ids at every block position,
+    /// lowest first: the tail of the stable ascending argsort that
+    /// `argPartition` produces. On Metal `argPartition` IS that full sort, a
+    /// multi-block merge sort that for 248 320 entries runs 122 block sorts
+    /// and seven dependent merge rounds over the whole vocabulary per round.
+    ///
+    /// Every entry of the top `topK` lies in a chunk whose maximum ranks among
+    /// the top `topK` chunk maxima: a chunk ranked lower sits below `topK`
+    /// chunks, and each of those holds an entry that ranks above everything in
+    /// it. So one chunk-maximum reduction, one sort over the chunk maxima and
+    /// one sort over the `topK` winning chunks find the same set. The winners
+    /// are gathered in ascending vocabulary order, so the stable sort breaks
+    /// value ties by vocabulary id exactly as the full sort does: the result
+    /// is the same ids in the same order.
+    func topCandidates(_ logits: MLXArray) -> MLXArray {
+        let vocabularySize = logits.dim(-1)
+        let chunk = Self.candidateChunk
+        let chunkCount = vocabularySize / chunk
+        guard Self.chunkedCandidateSearch, logits.ndim == 3,
+            vocabularySize % chunk == 0, topK * chunk * 4 <= vocabularySize
+        else {
+            return argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
+        let batch = logits.dim(0)
+        let positions = logits.dim(1)
+        let chunkMaxima = logits.reshaped([batch, positions, chunkCount, chunk]).max(axis: -1)
+        let winners = MLX.sorted(
+            argPartition(chunkMaxima, kth: chunkCount - topK, axis: -1)[
+                0..., 0..., (chunkCount - topK)...],
+            axis: -1)
+        let window = topK * chunk
+        let offsets = MLXArray((0 ..< chunk).map { UInt32($0) })
+        let ids = ((winners * MLXArray(UInt32(chunk))).expandedDimensions(axis: -1) + offsets)
+            .reshaped([batch, positions, window])
+        let local = argPartition(takeAlong(logits, ids, axis: -1), kth: window - topK, axis: -1)[
+            0..., 0..., (window - topK)...]
+        return takeAlong(ids, local, axis: -1)
+    }
+
     /// The greedy path.
     ///
     /// - Parameters:
@@ -710,9 +762,7 @@ final class DFlash2CandidateSelector: Module {
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
-        let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates = topCandidates(logits)
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 

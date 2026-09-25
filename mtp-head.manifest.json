@@ -5,6 +5,6 @@
   "spec": {
     "decoder": "dflash",
     "enabled": true,
-    "num_speculative_tokens": 12
+    "num_speculative_tokens": 9
   }
 }
