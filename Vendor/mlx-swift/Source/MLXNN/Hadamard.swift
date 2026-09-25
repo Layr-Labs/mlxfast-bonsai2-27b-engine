@@ -141,6 +141,32 @@ public struct SignedBlockHadamard {
             outputDType: outputDType)
     }
 
+    /// `(x + y, self(rmsNorm(x + y, weight, eps)))` for a decoder-layer
+    /// boundary in one kernel: the residual add (an FP16 `y` widened exactly),
+    /// MLX's `rms_looped` reduction replicated lane for lane, the output
+    /// expression `w * (h * inv)`, the signs and the transform. With
+    /// `writeNormed` it also returns `rmsNorm(x + y, weight, eps)`. Every
+    /// output is bit-identical to the composed ops; a one-time self-test on the
+    /// running GPU checks that before first use. Nil when it does not apply.
+    public func addRMSNormRotated(
+        _ x: MLXArray, _ y: MLXArray, weight: MLXArray, eps: Float, writeNormed: Bool,
+        rotatedDType: DType = .float32
+    ) -> (sum: MLXArray, rotated: MLXArray, normed: MLXArray?)? {
+        guard AddNormHadamardKernel.enabled, blockSize == 1024,
+            width == AddNormHadamardKernel.width,
+            (x.dtype == .float32 && (y.dtype == .float32 || y.dtype == .float16))
+                || (x.dtype == .float16 && y.dtype == .float16),
+            x.shape == y.shape, x.ndim > 0,
+            x.dim(-1) == width, weight.dtype == .float32, weight.shape == [width],
+            AddNormHadamardKernel.verified(weight: weight, eps: eps, transform: self)
+        else { return nil }
+        guard rotatedDType == .float32 || rotatedDType == .float16 else { return nil }
+        let out = AddNormHadamardKernel.apply(
+            x, y, weight: weight, signs: signs, eps: eps, writeNormed: writeNormed,
+            rotatedDType: rotatedDType)
+        return (out.h, out.rot, out.normed)
+    }
+
     /// The sign vector as an array, for a caller that folds the sign flip into
     /// an elementwise op it already runs on the activation. Read only.
     public var signVector: MLXArray { signs }
@@ -825,6 +851,41 @@ public func sharedHadamardProjections(
     return packed.map { $0.applyRotated(rotated) }
 }
 
+/// `sharedHadamardProjections` for an activation that already went through
+/// the first projection's `rotate` (for example inside a fused residual, norm
+/// and rotation kernel). An FP16 `rotated` is an FP32 rotation already rounded
+/// to the stack's read dtype (`HadamardQuantizedLinear.routedInputDType`);
+/// only the routed stack may take it. Same matmuls, same outputs.
+public func sharedHadamardProjections(
+    rotated: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let packed = sharedHadamardSiblings(projections), let first = packed.first else {
+        return nil
+    }
+    if let fused = first.fusedSiblingsForward(
+        rotated, siblings: packed, widenOutput: widenOutput, sourceDType: .float32)
+    {
+        return fused
+    }
+    guard rotated.dtype == .float32 else { return nil }
+    return packed.map { $0.applyRotated(rotated) }
+}
+
+extension HadamardQuantizedLinear {
+    /// The dtype the routed stack of `siblings` reads an FP32 activation of
+    /// `rows` rows in, when that routed stack certainly applies; nil otherwise.
+    /// A producer that already rounds its rotation to this dtype saves the
+    /// stack's cast and returns the same values.
+    public static func routedInputDType(rows: Int, siblings: [HadamardQuantizedLinear])
+        -> DType?
+    {
+        guard let first = siblings.first else { return nil }
+        let k = first.weight.dim(1) * 32 / first.bits
+        guard first.fusedSiblingsApply(siblings, rows: rows, k: k) else { return nil }
+        return first.fusedSiblingsInputDType(siblings, rows: rows, sourceDType: .float32)
+    }
+}
+
 /// The packed projections that share one transform, when every one of them is
 /// packed with that same transform and none has a GDN layout; nil otherwise.
 public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantizedLinear]? {
@@ -1205,5 +1266,262 @@ extension FusedInputHadamardKernel {
               return (x < 0) ? y : 1 - y;
             }
 
+            """)
+}
+
+// MARK: - Residual add, RMSNorm and signed Hadamard in one kernel
+
+/// The decoder-layer boundary `h = x + y; rot = rotate(rmsNorm(h, w, eps))`
+/// as one dispatch: grid (1024, rows, 1), threadgroup (1024, 1, 1), one
+/// threadgroup per 5120-wide row. The reduction is MLX's `rms_looped` lane for
+/// lane (1024 lanes, four reads per lane per pass, `metal::fma` partials as the
+/// compiled `acc += xi * xi`, `simd_sum`, 32 simdgroup partials, a second
+/// `simd_sum`, `precise::rsqrt(acc / axis_size + eps)` with `axis_size` and
+/// `eps` as runtime values), then `w * (h * inv)` and the engine's own FWHT
+/// butterflies (radix 16, 16, 4, final `* 1/32`). `BONSAI_FUSED_ADDNORM=0`
+/// keeps the composed ops.
+enum AddNormHadamardKernel {
+    static let width = 5120
+    /// MLX's rms_looped lanes (the rms_loopedfloat32 pipeline's
+    /// maxTotalThreadsPerThreadgroup).
+    static let lanes = 1024
+
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_ADDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return FusedInputHadamardKernel.enabled
+            && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(width))
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var state: Bool?
+
+    /// Run the self-test once per process, with the first caller's weight and
+    /// transform; every later call returns the cached verdict.
+    static func verified(weight: MLXArray, eps: Float, transform: SignedBlockHadamard) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let state { return state }
+        let passed = selfTest(weight: weight, eps: eps, transform: transform)
+        state = passed
+        return passed
+    }
+
+    static func apply(
+        _ x: MLXArray, _ y: MLXArray, weight: MLXArray, signs: MLXArray, eps: Float,
+        writeNormed: Bool, rotatedDType: DType = .float32
+    ) -> (h: MLXArray, rot: MLXArray, normed: MLXArray?) {
+        let rows = x.size / width
+        let outs = kernel(
+            [x, y, weight, signs, MLXArray(eps), axisSize],
+            template: [
+                ("WIDTH", width), ("XT", x.dtype), ("InT", y.dtype), ("WT", weight.dtype),
+                ("RT", rotatedDType), ("WRITE_NORMED", writeNormed),
+            ],
+            grid: (lanes, rows, 1),
+            threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape, x.shape, writeNormed ? x.shape : [1]],
+            outputDTypes: [x.dtype, rotatedDType, .float32])
+        return (outs[0], outs[1], writeNormed ? outs[2] : nil)
+    }
+
+    /// Fused against the engine's own composed ops (`x + y`, `MLXFast.rmsNorm`,
+    /// the transform) on random rows at 1, 16 and 512 rows, FP32 and FP16 `y`,
+    /// with and without `normed`, compared on raw bits. Any MLX error counts as
+    /// a failure, and a failure keeps the composed path.
+    private static func selfTest(weight: MLXArray, eps: Float, transform: SignedBlockHadamard)
+        -> Bool
+    {
+        do {
+            return try withError {
+                for (rows, seed) in [(1, 11), (16, 12), (512, 13)] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let x32 = MLXRandom.normal(
+                        [rows, width], key: MLXRandom.key(UInt64(seed + 100))) * scale
+                    let y32 = MLXRandom.normal(
+                        [rows, width], key: MLXRandom.key(UInt64(seed + 200))) * scale
+                    let cases: [(MLXArray, MLXArray)] = [
+                        (x32, y32), (x32, y32.asType(.float16)),
+                        (x32.asType(.float16), y32.asType(.float16)),
+                    ]
+                    for (x, y) in cases {
+                        let h0 = x + y
+                        let n0 = MLXFast.rmsNorm(h0, weight: weight, eps: eps)
+                        let r0 = transform(n0)
+                        for (writeNormed, rotatedDType) in [
+                            (false, DType.float32), (true, .float32), (false, .float16),
+                        ] {
+                            let (h1, r1, n1) = apply(
+                                x, y, weight: weight, signs: transform.signVector, eps: eps,
+                                writeNormed: writeNormed, rotatedDType: rotatedDType)
+                            var pairs = [(h0, h1), (r0.asType(rotatedDType), r1)]
+                            if let n1 { pairs.append((n0, n1)) }
+                            for (a, b) in pairs {
+                                guard a.dtype == b.dtype, a.shape == b.shape else { return false }
+                                let bits: DType = a.dtype == .float16 ? .uint16 : .uint32
+                                let same = arrayEqual(a.view(dtype: bits), b.view(dtype: bits))
+                                eval(same)
+                                if !same.item(Bool.self) { return false }
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+        } catch {
+            return false
+        }
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_addnorm_hadamard_1024",
+        inputNames: ["x", "y", "w", "signs", "eps", "axis_size"],
+        outputNames: ["h_out", "rot", "normed"],
+        source: """
+            constexpr uint NR = 4;                                    // RMS_N_READS
+            constexpr uint LSIZE = 1024;                              // rms_looped threadgroup size
+            constexpr uint NCH = (WIDTH + LSIZE * NR - 1) / (LSIZE * NR);  // rms_looped passes (2)
+            constexpr uint NT_FWHT = WIDTH / 16;                      // 64 FWHT threads per block (320)
+            static_assert(WIDTH % 1024 == 0, "block Hadamard needs WIDTH % 1024 == 0");
+            static_assert(WIDTH > 4096, "MLX uses rms_looped only above RMS_LOOPED_LIMIT = 4096");
+            static_assert(WIDTH <= 7168, "row buffer must fit in 32 KB of threadgroup memory");
+            static_assert(metal::is_same_v<XT, float> || (metal::is_same_v<XT, half> && metal::is_same_v<InT, half>),
+                          "residual dtype XT: float (y float or half), or XT = InT = half");
+
+            const uint lid = thread_position_in_threadgroup.x;       // == MLX rms_looped lid
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(threadgroup_position_in_grid.y) * WIDTH;
+
+            threadgroup float row_buf[WIDTH];
+            threadgroup float local_sums[32];
+
+            // ---- h = x + y in XT (FP32: y widened exactly; FP16: half + half as MLX's Add);
+            // lane lid's sum of squares of float(h) in MLX order:
+            // for (r = 0; r < WIDTH; r += 4096) x[r + 4*lid + i], i = 0..3, when in range
+            float hreg[NCH][NR];
+            float acc = 0;
+            BONSAI_UNROLL for (uint c = 0; c < NCH; c++) {
+              const uint r = c * LSIZE * NR;
+              if (r + lid * NR + NR <= WIDTH) {
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  const uint p = r + lid * NR + i;
+                  // MLX Add in the residual dtype XT: float + float(y), or half + half
+                  const XT hx = static_cast<XT>(x[base + p]) + static_cast<XT>(y[base + p]);
+                  h_out[base + p] = hx;
+                  const float hi = static_cast<float>(hx);   // rms_norm's astype(h, float32): exact
+                  hreg[c][i] = hi;
+                  row_buf[p] = hi;
+                  acc = metal::fma(hi, hi, acc);      // == MLX `acc += xi * xi` (contracted to FMA)
+                }
+              }
+            }
+
+            // ---- rms_looped reduction ----
+            acc = simd_sum(acc);
+            if (lane == 0) {
+              local_sums[sg] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = metal::precise::rsqrt(simd_sum(local_sums[lane]) / axis_size + eps);
+
+            // ---- optional normed = w * (h * inv), MLX's output expression, coalesced ----
+            if (WRITE_NORMED) {
+              BONSAI_UNROLL for (uint c = 0; c < NCH; c++) {
+                const uint r = c * LSIZE * NR;
+                if (r + lid * NR + NR <= WIDTH) {
+                  BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                    const uint p = r + lid * NR + i;
+                    normed[base + p] = static_cast<float>(w[p]) * static_cast<float>(hreg[c][i] * inv);
+                  }
+                }
+              }
+            }
+
+            // ---- normed * sign and FWHT stage 1 (radix 16, h = 1) in registers ----
+            const bool active = lid < NT_FWHT;
+            float v[16];
+            if (active) {
+              const uint g0 = 16 * lid;              // block g0 / 1024, in-block group lid % 64
+              BONSAI_UNROLL for (uint r = 0; r < 16; r++) {
+                const uint p = g0 + r;
+                const float n = static_cast<float>(w[p]) * static_cast<float>(row_buf[p] * inv);
+                v[r] = n * signs[p];
+              }
+              bonsai_hadamard_radix<16>(v);
+              BONSAI_UNROLL for (uint r = 0; r < 16; r++) {
+                row_buf[g0 + r] = v[r];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- FWHT stages 2 (radix 16, h = 16) and 3 (radix 4, h = 256): reference code ----
+            {
+              constexpr short NT = 64;
+              short i = short(lid % NT);
+              threadgroup float* buf = row_buf + (lid / NT) * 1024;
+              short h = 16;
+              if (active) {
+                short k = i & (h - 1);
+                short j = ((i - k) << 4) + k;
+                BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+                  v[r] = buf[j + h * r];
+                }
+                bonsai_hadamard_radix<16>(v);
+                BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+                  buf[j + h * r] = v[r];
+                }
+              }
+              h <<= 4;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (active) {
+                BONSAI_UNROLL for (short t = 0; t < 4; t++) {
+                  short index = i + t * NT;
+                  short k = index & (h - 1);
+                  short j = ((index - k) << 2) + k;
+                  BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                    v[r] = buf[j + h * r];
+                  }
+                  bonsai_hadamard_radix<4>(v);
+                  BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                    buf[j + h * r] = v[r];
+                  }
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // ---- rot = FWHT * 0.03125 (= 1/sqrt(1024), exact), coalesced ----
+            BONSAI_UNROLL for (uint c = 0; c < NCH; c++) {
+              const uint r = c * LSIZE * NR;
+              if (r + lid * NR + NR <= WIDTH) {
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  const uint p = r + lid * NR + i;
+                  rot[base + p] = static_cast<RT>(row_buf[p] * 0.03125f);
+                }
+              }
+            }
+            """,
+        header: """
+            #define BONSAI_UNROLL _Pragma("clang loop unroll(full)")
+
+            template <short R>
+            METAL_FUNC void bonsai_hadamard_radix(thread float* x) {
+              constexpr short logR = __builtin_ctz(R);
+              short h = 1;
+              BONSAI_UNROLL for (short s = 0; s < logR; s++) {
+                BONSAI_UNROLL for (short i = 0; i < R / 2; i++) {
+                  short k = i & (h - 1);
+                  short j = ((i - k) << 1) + k;
+                  float a = x[j];
+                  float b = x[j + h];
+                  x[j] = a + b;
+                  x[j + h] = a - b;
+                }
+                h <<= 1;
+              }
+            }
             """)
 }
