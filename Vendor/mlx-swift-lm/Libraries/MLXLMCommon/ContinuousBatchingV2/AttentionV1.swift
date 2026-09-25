@@ -705,10 +705,19 @@ enum CBv2AttentionV1 {
         newTokenCount: Int, window: Int?, scale: Float,
         sinks: MLXArray?, softcap: Float?, keepMask: MLXArray? = nil
     ) -> MLXArray {
-        attendQueryBlocks(
+        // The single-pass vector kernel assigns one threadgroup per query,
+        // so causal queries are independent and keep the serial arithmetic.
+        // Fall back before any kernel/mask regime where that proof changes.
+        let gqa = queries.dim(1) / keys.dim(1)
+        let blockSize =
+            window == nil && sinks == nil && softcap == nil && keepMask == nil
+                && keys.dim(2) < 1024
+            ? min(8, max(1, 32 / gqa))
+            : 1
+        return attendQueryBlocks(
             queries: queries, keys: keys, values: values,
             newTokenCount: newTokenCount, window: window, scale: scale,
-            sinks: sinks, softcap: softcap, blockSize: 1, keepMask: keepMask)
+            sinks: sinks, softcap: softcap, blockSize: blockSize, keepMask: keepMask)
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast

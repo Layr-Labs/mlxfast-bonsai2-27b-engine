@@ -2034,7 +2034,10 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
+        // Every caller of this unpositioned seam consumes only the final
+        // prompt position. Verify forwards use the hidden/capture seams below.
+        let output = hidden.dim(1) > 1 ? hidden[0..., -1, 0...] : hidden
+        let normalized = model.norm(output)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 }
