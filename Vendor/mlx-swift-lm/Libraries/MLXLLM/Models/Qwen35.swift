@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1129,6 +1130,92 @@ final class Qwen35GatedDeltaNet: Module {
 
 // MARK: - Attention
 
+/// Derived packed rows only; this is not a Module and cannot add checkpoint keys.
+private final class Qwen35HadamardKVCache {
+    private struct Entry {
+        let identities: [UInt]
+        let snapshots: [MLXArray]
+        let stream: StreamOrDevice
+        let projection: HadamardQuantizedLinear
+    }
+
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func clear() {
+        lock.withLock { entry = nil }
+    }
+
+    func projection(
+        k: HadamardQuantizedLinear, v: HadamardQuantizedLinear
+    ) -> HadamardQuantizedLinear? {
+        lock.withLock {
+            guard k.bits == 2, v.bits == 2,
+                k.groupSize == 128, v.groupSize == 128,
+                k.mode == .affine, v.mode == .affine,
+                k.bias == nil, v.bias == nil,
+                k.transform.blockSize == 1024,
+                k.sharesInputTransform(with: v),
+                k.weight.ndim == 2, k.weight.dim(0) > 0,
+                k.weight.shape == v.weight.shape,
+                k.weight.dtype == .uint32, v.weight.dtype == .uint32,
+                k.weight.dim(1) * 16 == k.transform.width,
+                k.scales.shape == [k.weight.dim(0), k.transform.width / 128],
+                v.scales.shape == k.scales.shape,
+                k.scales.dtype == .float16, v.scales.dtype == .float16,
+                let kb = k.biases, let vb = v.biases,
+                kb.shape == k.scales.shape, vb.shape == v.scales.shape,
+                kb.dtype == .float16, vb.dtype == .float16,
+                k.trainableParameters().flattened().isEmpty,
+                v.trainableParameters().flattened().isEmpty
+            else {
+                entry = nil
+                return nil
+            }
+
+            let sources = [k.weight, k.scales, kb, v.weight, v.scales, vb]
+            var identities: [UInt] = []
+            for source in sources {
+                var identity: UInt = 0
+                var canCache = false
+                guard _mlx_array_constant_cache_identity(&identity, &canCache, source.ctx) == 0,
+                    canCache
+                else { return nil }
+                identities.append(identity)
+            }
+            let stream = StreamOrDevice.default
+            if let entry, entry.identities == identities, entry.stream == stream,
+                entry.projection.sharesInputTransform(with: k)
+            {
+                return entry.projection
+            }
+
+            // Retain each backing descriptor so updates cannot cause an ABA hit.
+            var snapshots: [MLXArray] = []
+            for source in sources {
+                var context = mlx_array_new()
+                guard mlx_array_set(&context, source.ctx) == 0 else {
+                    mlx_array_free(context)
+                    return nil
+                }
+                snapshots.append(MLXArray(context))
+            }
+            let weight = concatenated([snapshots[0], snapshots[3]], axis: 0)
+            let scales = concatenated([snapshots[1], snapshots[4]], axis: 0)
+            let biases = concatenated([snapshots[2], snapshots[5]], axis: 0)
+            eval(weight, scales, biases)
+            guard let projection = try? HadamardQuantizedLinear(
+                weight: weight, scales: scales, biases: biases,
+                groupSize: 128, bits: 2, transform: k.transform)
+            else { return nil }
+            entry = Entry(
+                identities: identities, snapshots: snapshots,
+                stream: stream, projection: projection)
+            return projection
+        }
+    }
+}
+
 final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
@@ -1144,6 +1231,22 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
     let mrope: Qwen35MRoPE
+    private let hadamardKVCache = Qwen35HadamardKVCache()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        hadamardKVCache.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        hadamardKVCache.clear()
+        try super.updateModule(key: key, value)
+    }
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1182,6 +1285,17 @@ final class Qwen35Attention: Module {
     /// q, k and v read the same activation. On a packed Hadamard checkpoint
     /// they share one input transform, so it is computed once.
     private func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let q = qProj as? HadamardQuantizedLinear,
+            let k = kProj as? HadamardQuantizedLinear,
+            let v = vProj as? HadamardQuantizedLinear,
+            q.sharesInputTransform(with: k), q.sharesInputTransform(with: v),
+            let fusedKV = hadamardKVCache.projection(k: k, v: v)
+        {
+            let rotated = q.rotate(x)
+            let query = q.applyRotated(rotated)
+            let kv = fusedKV.applyRotated(rotated).split(parts: 2, axis: -1)
+            return (query, kv[0], kv[1])
+        }
         if let shared = sharedHadamardProjections(x, [qProj, kProj, vProj]) {
             return (shared[0], shared[1], shared[2])
         }
