@@ -2103,6 +2103,49 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     }
 }
 
+/// Prompt-forward refinement for the request-stateful DFlash 2 assistant.
+///
+/// `cbv2ForwardWithHidden` projects the vocabulary at EVERY prompt row because
+/// the capture-verify path needs per-position logits. The prompt does not: the
+/// engine immediately narrows to the final row (`narrowPrefillOutput`), so the
+/// other 511 rows of the [B, L, 248320] projection are discarded. The serial
+/// control leg never pays this — `cbv2RecurrentPrefill` already projects one
+/// row — so the cost falls on the speculative candidate leg alone.
+///
+/// The drafter still needs every hidden row, so `lastHidden` stays the full
+/// pre-norm trunk output and the tap is unchanged. Only the vocabulary
+/// projection narrows. Final RMSNorm is row-independent, so norm-after-slice
+/// equals slice-after-norm for the surviving row — the same argument the
+/// prompt-only narrowing above already relies on.
+extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        // Range slice keeps axis 1, so logits stay [B, 1, vocab] and the
+        // engine's existing `logits[0..., -1, 0...]` narrowing is unchanged.
+        let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+        switch requirement {
+        case .evaluationOnly:
+            return (last[0..., 0..., 0 ..< 1], hidden)
+        case .lastPositionLogits:
+            let normalized = model.norm(last)
+            let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
+        }
+    }
+}
+
 extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
     /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
     /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
@@ -2403,6 +2446,18 @@ extension Qwen35Model: CBv2RecurrentMTPForwardable {
         languageModel.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
     }
 }
 
