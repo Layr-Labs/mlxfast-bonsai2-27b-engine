@@ -524,7 +524,7 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
+        var queries = dflash2Project(qProj, x)
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
@@ -542,20 +542,20 @@ private final class DFlash2Attention: Module {
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
             let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                kNorm(dflash2Project(kProj, rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
                 offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let values = dflash2Project(vProj, rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
             blockValues = values[0..., 0..., contextLength..., 0...]
         } else {
-            contextKeys = kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+            contextKeys = kNorm(dflash2Project(kProj, context).reshaped(B, contextLength, kvHeads, -1))
                 .transposed(0, 2, 1, 3)
-            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+            contextValues = dflash2Project(vProj, context).reshaped(B, contextLength, kvHeads, -1)
                 .transposed(0, 2, 1, 3)
-            blockKeys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+            blockKeys = kNorm(dflash2Project(kProj, x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            blockValues = dflash2Project(vProj, x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = rope(contextKeys, offset: cache.offset)
             blockKeys = rope(blockKeys, offset: blockOffset)
         }
@@ -586,7 +586,7 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return dflash2Project(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
 
@@ -603,6 +603,80 @@ private let dflash2NoMaskEnabled: Bool = {
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
+
+/// Kill switch for the wide-output M=16 projection split (default on).
+///
+/// `gemv_wide` refuses `passes > 3`, so an M=16 BF16 matmul misses it.
+/// On this M4 Pro, at K=5120, unsplit M=16 is faster for N<=5120 and
+/// slower once N>=6144. An 8+8 cut beats 15+1 on every wide N measured
+/// (gate 17408: 2.218 ms unsplit, 1.935 ms as 15+1, 1.588 ms as 8+8).
+/// The drafter `fc` is the opposite shape, [5120, 25600]: 1.562 ms
+/// unsplit, 3.498 ms as 15+1. Only output dim >= 6144 is split, and
+/// the cut is 8+8 on NAX, or output strips on non-NAX.
+private let dflash2M16SplitEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_M16_SPLIT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Smallest output dimension where an 8+8 split beat unsplit M=16.
+private let dflash2M16SplitMinOutput = 6144
+
+/// Gate/up output width. 4×4096+1024 covers it with every strip N ≤ K.
+private let dflash2WideOutput = 17408
+
+/// Non-NAX `steel_gemm_splitk` requires `K >= max(M, N)`. This box is
+/// `applegpu_g16s` (generation 16), so NAX is off and an M=16 gate
+/// (N=17408, K=5120) misses that predicate. Strips with N≤5120 hit it.
+/// NAX (generation ≥ 17, or ≥ 18 when the architecture ends in `p`) does
+/// not use that predicate; keep gemv_wide there. `MLXFAST_DFLASH_NSTRIP=1`
+/// forces strips, `=0` forces the 8+8 cut.
+private let dflash2PreferOutputStrips: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_NSTRIP"]?.lowercased() {
+        if ["1", "true", "yes", "on"].contains(raw) { return true }
+        if ["0", "false", "no", "off"].contains(raw) { return false }
+    }
+    let name = GPU.deviceInfo().architecture
+    guard let g = name.lastIndex(of: "g") else { return false }
+    let rest = name[name.index(after: g)...]
+    let digits = rest.prefix { $0.isNumber }
+    guard let generation = Int(digits) else { return false }
+    let suffix = rest.dropFirst(digits.count).first
+    let naxGeneration = suffix == "p" ? 18 : 17
+    return generation < naxGeneration
+}()
+
+/// True when this GPU's generation meets `metal::Device::use_nax`
+/// (17, or 18 if the architecture name ends in `p`). `gemv_wide` is
+/// attempted before that GEMM, so an M=16 split on these devices
+/// replaces the tensor kernel with scalar streams.
+private let dflash2NAXAvailable: Bool = {
+    let name = GPU.deviceInfo().architecture
+    guard let g = name.lastIndex(of: "g") else { return false }
+    let rest = name[name.index(after: g)...]
+    let digits = rest.prefix { $0.isNumber }
+    guard let generation = Int(digits) else { return false }
+    let suffix = rest.dropFirst(digits.count).first
+    let naxGeneration = suffix == "p" ? 18 : 17
+    return generation >= naxGeneration
+}()
+
+/// Project `x` through `linear`. Wide M=16 outputs are split only when
+/// NAX is off, where 8+8 or output strips beat the bm=64 fallback.
+/// Narrow outputs (down, fc, o) stay on the unsplit kernel.
+private func dflash2Project(_ linear: Linear, _ x: MLXArray) -> MLXArray {
+    guard dflash2M16SplitEnabled, !dflash2NAXAvailable, x.ndim >= 2, linear.bias == nil
+    else { return linear(x) }
+    let axis = x.ndim - 2
+    guard x.dim(axis) == 16, linear.weight.dim(0) >= dflash2M16SplitMinOutput
+    else { return linear(x) }
+    if dflash2PreferOutputStrips, linear.weight.dim(0) == dflash2WideOutput {
+        let parts = linear.weight.split(indices: [4096, 8192, 12288, 16384], axis: 0)
+        return concatenated(parts.map { matmul(x, $0.T) }, axis: -1)
+    }
+    let parts = x.split(indices: [8], axis: axis)
+    return concatenated([linear(parts[0]), linear(parts[1])], axis: axis)
+}
 
 // MARK: - The grouped dynamic causal convolution
 
@@ -712,7 +786,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic-tap
     /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let projection = kernelProjection(hidden)
+        let projection = dflash2Project(kernelProjection, hidden)
         if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
             return (fused, projection)
         }
@@ -836,7 +910,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        dflash2Project(down, silu(dflash2Project(gate, x)) * dflash2Project(up, x))
     }
 }
 
@@ -927,7 +1001,7 @@ final class DFlash2CandidateSelector: Module {
                 0..., 0..., (vocabularySize - topK)...]
             unary = takeAlong(logits, candidates, axis: -1)
         }
-        let projected = hiddenProjection(hidden)
+        let projected = dflash2Project(hiddenProjection, hidden)
 
         if let path = DFlash2GreedyWalk.select(
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
@@ -1314,7 +1388,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = hiddenNorm(dflash2Project(fc, targetHidden.asType(dtype)))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
