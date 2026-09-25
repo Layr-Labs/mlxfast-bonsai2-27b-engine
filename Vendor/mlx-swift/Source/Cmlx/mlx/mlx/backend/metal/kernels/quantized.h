@@ -2495,6 +2495,28 @@ template <
     }
     return;
   }
+  // FP16 input takes the same body: its fragments and accumulators are FP32
+  // (U), and the half activations, scales and offsets widen exactly on load,
+  // so every product and sum is the one the FP32 body forms from those
+  // values. The FP32 scratch of the cross-simdgroup reduction fits in the
+  // half-typed Xs / Ws for one 16-row half; wider tiles keep the SIMD body.
+  if constexpr (
+      kSplitkNax && metal::is_same_v<T, half> && bits == 2 &&
+      group_size == 128 && BM == 32 && BN == 32) {
+    static_assert(
+        2 * 8 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
+        "splitk NAX half reduction must fit in Xs / Ws");
+    const int rows = min(M - int(tid.y) * BM, BM);
+    if (rows <= 16) {
+      const device T* xt = x + int(tid.y) * BM * static_cast<int64_t>(K);
+      device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
+      qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
+          (const device uint32_t*)wl, scales, biases, xt, yt, K, N, rows,
+          k_partition_size, int(tid.x) * BN, simd_gid, simd_lid,
+          (threadgroup float*)Xs, (threadgroup float*)Ws);
+      return;
+    }
+  }
 #endif
   qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
       (const device uint32_t*)wl,

@@ -380,6 +380,18 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     private static let vocabularyHeadMinimumRows = 65536
     /// The core splits K whenever the 32x32 tile count is at most this.
     private static let splitKTileCeiling = 256
+    /// The split-K tensor body takes FP16 input for one 16-row half of its
+    /// 32-row tile; a split-K projection over more rows keeps the FP32 read.
+    private static let splitKHalfRowLimit = 16
+
+    /// On unless explicitly disabled: a narrow (split-K) projection at a
+    /// verify width reads its rotated activation in the route dtype too.
+    private static let narrowHalfRead: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_BONSAI_NARROW_HALF"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     private let matrixRoute = HadamardMatrixRouteOperands()
 
@@ -405,11 +417,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     ///
     /// - rows below the threshold are zero-padded up to it, so the core takes
     ///   the matrix path (the padded rows are dropped from the result);
-    /// - a wide tower projection reads its rotated activation in
+    /// - a tower projection reads its rotated activation in
     ///   `matrixRouteInputDType` (FP16: the packed FP16 constants are used as
     ///   stored, the FP16 result is widened back so every consumer sees the
-    ///   dtype it saw before); a narrow one and the vocabulary head keep the
-    ///   FP32 read with the cached widened constants;
+    ///   dtype it saw before), a wide one on `qmm_t_nax` and a narrow one on
+    ///   the split-K tensor body up to 16 rows; a narrow one over more rows and
+    ///   the vocabulary head keep the FP32 read with the cached widened constants;
     /// - a BF16 input (the drafter reading the shared head) is widened to
     ///   FP32 exactly, as the core would, and reuses the cached widened
     ///   constants instead of casting them on every call.
@@ -472,16 +485,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let paddedRows = max(rows, matrixRegimeMinimumRows)
 
         // The core splits K for a projection with at most 256 32x32 tiles and
-        // runs the split-K body; that body is on the tensor unit for FP32
-        // input only, so a narrow projection (o, out, down on this pack) keeps
-        // the FP32 read. A wide one takes `qmm_t_nax` in the route dtype. BF16
+        // runs the split-K body; that body is on the tensor unit for FP32 input
+        // and, for one 16-row half, for FP16 input, so a narrow projection (o,
+        // out, down on this pack) reads FP16 at a verify width and FP32 above
+        // it. A wide one takes `qmm_t_nax` in the route dtype. BF16
         // activations (the drafter's head input) widen to FP32 exactly, as
         // the core's own promotion would, and a vocabulary head keeps FP32.
         let nTiles = (n + 31) / 32
         let mTiles = (paddedRows + 31) / 32
         let narrow = nTiles * mTiles <= splitKTileCeiling
+        let narrowFloat32 =
+            narrow && !(narrowHalfRead && paddedRows <= splitKHalfRowLimit)
         let inputDType: DType =
-            (narrow || n >= vocabularyHeadMinimumRows || x.dtype == .bfloat16)
+            (narrowFloat32 || n >= vocabularyHeadMinimumRows || x.dtype == .bfloat16)
             ? .float32 : matrixRouteInputDType
         let routeScales: MLXArray
         let routeBiases: MLXArray?
