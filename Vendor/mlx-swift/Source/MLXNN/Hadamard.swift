@@ -45,9 +45,49 @@ public struct SignedBlockHadamard {
             && (signs === other.signs || signValues == other.signValues)
     }
 
+    /// On unless explicitly disabled. Signs, the FP32 block transform, its
+    /// scale and the dtype restore run as one dispatch instead of a sign
+    /// multiply followed by the stock transform. The butterfly stages, their
+    /// order and the scale match the stock kernel, so outputs are identical.
+    private static let fusedSignedTransform: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_BONSAI_FUSED_SIGNED_HADAMARD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let warmth = FusedTransformWarmth()
+
+    /// Blocks of 4^k keep the stock 1/sqrt(N) scale an exact power of two.
+    private var usesFusedTransform: Bool {
+        Self.fusedSignedTransform && blockSize >= 16
+            && blockSize.trailingZeroBitCount.isMultiple(of: 2)
+            && Device.defaultDevice().deviceType == .gpu
+    }
+
+    /// Builds the fused kernel for every activation dtype once per block
+    /// size, at load, so no timed forward pays a Metal library build for it.
+    public func warmFusedTransform() {
+        guard usesFusedTransform, Self.warmth.claim(blockSize) else { return }
+        let outputs: [MLXArray] = [DType.float32, .bfloat16, .float16].map {
+            self.callAsFunction(MLXArray.zeros([1, width], dtype: $0))
+        }
+        eval(outputs)
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if usesFusedTransform, x.size > 0 {
+            let lanes = blockSize / 16
+            return signedBlockHadamardKernel(
+                [x, signs],
+                template: [("OutT", x.dtype), ("N", blockSize)],
+                grid: (lanes, width / blockSize, x.size / width),
+                threadGroup: (lanes, 1, 1),
+                outputShapes: [x.shape],
+                outputDTypes: [x.dtype])[0]
+        }
         return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
             .reshaped(x.shape).asType(x.dtype)
     }
@@ -66,6 +106,133 @@ public struct SignedBlockHadamard {
             "Hadamard input must have a real floating-point dtype")
     }
 }
+
+/// Block sizes whose fused rotation kernels were already built at load.
+private final class FusedTransformWarmth: @unchecked Sendable {
+    private let lock = NSLock()
+    private var blockSizes = Set<Int>()
+
+    func claim(_ blockSize: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return blockSizes.insert(blockSize).inserted
+    }
+}
+
+/// `(x * signs) H` for one block per threadgroup, in one dispatch. The grid is
+/// (lanes, blocks per row, rows): a threadgroup's y position is its block
+/// within the row and selects the matching slice of the sign vector.
+///
+/// This is the stock `hadamard_n` schedule (radix 16, four-wide reads, the
+/// same stage order and butterfly operands, FP32 threadgroup buffer), with the
+/// sign multiply applied as each element is read and the output dtype
+/// conversion applied as each element is written. The butterflies run with
+/// reassociation and contraction off, so each rounds exactly as in the stock
+/// kernel; the sign and power-of-two scale multiplies are exact.
+private let signedBlockHadamardKernel = MLXFast.metalKernel(
+    name: "prism_signed_block_hadamard",
+    inputNames: ["x", "signs"],
+    outputNames: ["out"],
+    source: """
+        constexpr int R = 16;
+        constexpr int W = 4;
+        constexpr int lanes = N / R;
+        constexpr int logN = __builtin_ctz(N);
+        constexpr int logR = 4;
+        constexpr int steps = logN / logR;
+        constexpr int logFinal = logN % logR;
+        constexpr int finalRadix = 1 << logFinal;
+        constexpr float scale = 1.0f / float(1 << (logN / 2));
+
+        threadgroup float buf[N];
+
+        const int i = int(thread_position_in_threadgroup.x);
+        const int blockInRow = int(threadgroup_position_in_grid.y);
+        const size_t block = size_t(threadgroup_position_in_grid.z) * threadgroups_per_grid.y
+            + size_t(blockInRow);
+        const size_t base = block * size_t(N);
+        const int signBase = blockInRow * N;
+
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < R / W; j++) {
+          const int index = j * W * lanes + i * W;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < W; r++) {
+            buf[index + r] =
+                static_cast<float>(x[base + index + r]) * signs[signBase + index + r];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float v[R];
+        int h = 1;
+        #pragma clang loop unroll(full)
+        for (int s = 0; s < steps; s++) {
+          const int k = i & (h - 1);
+          const int j = ((i - k) << logR) + k;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < R; r++) {
+            v[r] = buf[j + h * r];
+          }
+          prism_signed_hadamard_radix<R>(v);
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < R; r++) {
+            buf[j + h * r] = v[r];
+          }
+          h <<= logR;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (finalRadix > 1) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < R / finalRadix; t++) {
+            const int index = i + t * lanes;
+            const int k = index & (h - 1);
+            const int j = ((index - k) << logFinal) + k;
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < finalRadix; r++) {
+              v[r] = buf[j + h * r];
+            }
+            prism_signed_hadamard_radix<finalRadix>(v);
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < finalRadix; r++) {
+              buf[j + h * r] = v[r];
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < R / W; j++) {
+          const int index = j * W * lanes + i * W;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < W; r++) {
+            out[base + index + r] = static_cast<OutT>(buf[index + r] * scale);
+          }
+        }
+        """,
+    header: """
+        template <int R>
+        inline void prism_signed_hadamard_radix(thread float* v) {
+          #pragma clang fp reassociate(off)
+          #pragma clang fp contract(off)
+          constexpr int logR = __builtin_ctz(R);
+          int h = 1;
+          #pragma clang loop unroll(full)
+          for (int s = 0; s < logR; s++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R / 2; i++) {
+              const int k = i & (h - 1);
+              const int j = ((i - k) << 1) + k;
+              const float a = v[j];
+              const float b = v[j + h];
+              v[j] = a + b;
+              v[j + h] = a - b;
+            }
+            h <<= 1;
+          }
+        }
+        """)
 
 /// The version-1 `prism.hadamard.*` metadata exported as a JSON object.
 ///
@@ -227,6 +394,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             weight: weight, bias: bias, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
         freeze()
+        transform.warmFusedTransform()
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
