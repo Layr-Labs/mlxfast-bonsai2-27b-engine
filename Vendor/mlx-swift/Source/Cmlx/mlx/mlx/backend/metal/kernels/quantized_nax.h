@@ -995,8 +995,12 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // Run the M tiles of one weight tile next to each other, so the weight
+  // tile is read from memory once and not once per M tile. Same tile set.
+  const int m_tiles = (M + BM - 1) / BM;
+  const int tile_id = int(tid.y) * ((N + BN - 1) / BN) + int(tid.x);
+  const int y_row = (tile_id % m_tiles) * BM;
+  const int y_col = (tile_id / m_tiles) * BN;
 
   auto wl = (const device uint8_t*)w;
 
