@@ -524,7 +524,7 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
+        var queries = dflash2Project(qProj, x)
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
@@ -542,20 +542,20 @@ private final class DFlash2Attention: Module {
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
             let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                kNorm(dflash2Project(kProj, rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
                 offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let values = dflash2Project(vProj, rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
             blockValues = values[0..., 0..., contextLength..., 0...]
         } else {
-            contextKeys = kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+            contextKeys = kNorm(dflash2Project(kProj, context).reshaped(B, contextLength, kvHeads, -1))
                 .transposed(0, 2, 1, 3)
-            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+            contextValues = dflash2Project(vProj, context).reshaped(B, contextLength, kvHeads, -1)
                 .transposed(0, 2, 1, 3)
-            blockKeys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+            blockKeys = kNorm(dflash2Project(kProj, x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            blockValues = dflash2Project(vProj, x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = rope(contextKeys, offset: cache.offset)
             blockKeys = rope(blockKeys, offset: blockOffset)
         }
@@ -586,7 +586,7 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return dflash2Project(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
 
@@ -603,6 +603,32 @@ private let dflash2NoMaskEnabled: Bool = {
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
+
+/// Kill switch for the M=16 projection split (default on).
+///
+/// `gemv_wide` serves a transposed BF16 weight for `passes = (M + 4) / 5`
+/// and refuses `passes > 3`, so M=15 stays on that kernel and M=16 falls
+/// into a row-padded GEMM. On the pinned drafter gate weight
+/// (17408 x 5120, bf16) a compiled graph measured M=16 at 2.645 ms and a
+/// 15+1 split at 1.805 ms. The split is row-independent: each row is the
+/// matmul the dispatch already runs for that length. Max abs difference
+/// versus the unsplit product was 0.125 against an output rms of 8.78.
+private let dflash2M16SplitEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_M16_SPLIT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Project `x` through `linear`, splitting a length-16 sequence axis so the
+/// matmul hits `gemv_wide` (15 rows) plus a length-1 gemv instead of the
+/// padded M=16 GEMM. Any other length is unchanged.
+private func dflash2Project(_ linear: Linear, _ x: MLXArray) -> MLXArray {
+    guard dflash2M16SplitEnabled, x.ndim >= 2 else { return linear(x) }
+    let axis = x.ndim - 2
+    guard x.dim(axis) == 16 else { return linear(x) }
+    let parts = x.split(indices: [15], axis: axis)
+    return concatenated([linear(parts[0]), linear(parts[1])], axis: axis)
+}
 
 // MARK: - The grouped dynamic causal convolution
 
@@ -712,7 +738,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic-tap
     /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let projection = kernelProjection(hidden)
+        let projection = dflash2Project(kernelProjection, hidden)
         if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
             return (fused, projection)
         }
@@ -836,7 +862,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        dflash2Project(down, silu(dflash2Project(gate, x)) * dflash2Project(up, x))
     }
 }
 
@@ -927,7 +953,7 @@ final class DFlash2CandidateSelector: Module {
                 0..., 0..., (vocabularySize - topK)...]
             unary = takeAlong(logits, candidates, axis: -1)
         }
-        let projected = hiddenProjection(hidden)
+        let projected = dflash2Project(hiddenProjection, hidden)
 
         if let path = DFlash2GreedyWalk.select(
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
@@ -1314,7 +1340,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = hiddenNorm(dflash2Project(fc, targetHidden.asType(dtype)))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
