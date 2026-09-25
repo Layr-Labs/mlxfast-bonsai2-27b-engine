@@ -1136,28 +1136,23 @@ enum DFlash2GreedyWalk {
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
-        guard length >= 1, k >= 1, k <= 32 else { return nil }
+        let rank = projected.dim(-1)
+        guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
         let c = candidates[0]
-        let first =
-            (take(predecessorCodebook, anchor, axis: 0).expandedDimensions(axis: 1)
-                * projected[0..., 0, 0...].expandedDimensions(axis: 1)
-                * take(successorCodebook, c[0], axis: 0).expandedDimensions(axis: 0))
-            .sum(axis: -1)[0]
-        let later: MLXArray
-        if length > 1 {
-            let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
-            let next = take(successorCodebook, c[1...], axis: 0)
-            later =
-                ((previous * projected[0, 1..., 0...].expandedDimensions(axis: 1))
-                    .expandedDimensions(axis: 2)
-                    * next.expandedDimensions(axis: 1))
-                .sum(axis: -1)
-        } else {
-            later = MLXArray.zeros([1, k, k], dtype: first.dtype)
-        }
+        // Gather only the codebook rows the candidate lists can visit. The
+        // fused kernel scores each edge and advances the greedy walk in one
+        // pass, instead of materializing an [L-1, K, K, rank] broadcast.
+        let anchorPredecessor = take(predecessorCodebook, anchor, axis: 0)
+            .asType(.float32).reshaped([-1])
+        let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            .asType(.float32).reshaped([-1])
+        let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
+        let projectedRows = projected[0].asType(.float32).reshaped([-1])
+        let scores = unary[0].asType(.float32).reshaped([-1])
+        let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
-            [unary[0], first, later, c],
-            template: [("L", length), ("K", k)],
+            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+            template: [("L", length), ("K", k), ("R", rank)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1166,22 +1161,30 @@ enum DFlash2GreedyWalk {
     }
 
     private static let kernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_greedy_walk",
-        inputNames: ["unary", "edge0", "edges", "cand"],
+        name: "mlxfast_dflash_fused_greedy_walk",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
         outputNames: ["path"],
         source: """
             uint c = thread_index_in_simdgroup;
-            int prev = -1;
+            uint previous_slot = 0;
             for (uint i = 0; i < L; i++) {
                 float score = -INFINITY;
                 if (c < K) {
-                    float e = (i == 0) ? float(edge0[c])
-                                       : float(edges[((i - 1) * K + uint(prev)) * K + c]);
-                    score = unary[i * K + c] + e;
+                    const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
+                    const uint succ_base = (i * K + c) * R;
+                    float edge = 0.0f;
+                    for (uint d = 0; d < R; d++) {
+                        const float predecessor = i == 0
+                            ? anchor_predecessor[d] : previous[pred_base + d];
+                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
+                    }
+                    score = unary[i * K + c] + edge;
                 }
                 float m = simd_max(score);
                 uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
-                prev = int(sel);
+                previous_slot = sel;
                 if (c == 0) path[i] = int(cand[i * K + sel]);
             }
             """)
