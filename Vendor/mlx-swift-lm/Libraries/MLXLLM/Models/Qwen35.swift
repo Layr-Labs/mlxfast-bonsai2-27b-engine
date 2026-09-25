@@ -868,14 +868,6 @@ final class Qwen35GatedDeltaNet: Module {
     /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
     /// the rotation reads the same values either way.
     private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
-        // The per-head norm, the gated tail, the signs, the transform and the
-        // route dtype's rounding in one kernel (ercumentyildirim, `ade7529`).
-        if let packed = outProj as? HadamardQuantizedLinear,
-            let y = packed.applyAfterGatedRMSNorm(
-                out, gate: gate, weight: norm.weight, eps: norm.eps, widenOutput: false)
-        {
-            return y
-        }
         if Qwen35FusedElementwise.foldsHadamardSigns,
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
@@ -1980,13 +1972,6 @@ final class Qwen35Attention: Module {
             return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, attendedGate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
-            // The gate product, the signs, the transform and the route
-            // dtype's rounding in one kernel (ercumentyildirim, `ade7529`).
-            if let y = packed.applyAfterSigmoidGate(
-                output, gate: attendedGate, widenOutput: false)
-            {
-                return y
-            }
             // The output gate and the projection's Hadamard signs share one
             // kernel; the residual add widens the FP16 product itself.
             if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
@@ -2231,11 +2216,6 @@ extension Qwen3NextMLP {
         if let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
             let shared = sharedHadamardProjections(x, [gateProj, upProj], widenOutput: false)
         {
-            if let y = down.applyAfterSwiGLU(
-                gate: shared[0], up: shared[1], widenOutput: false)
-            {
-                return y
-            }
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
@@ -2266,9 +2246,6 @@ extension Qwen3NextMLP {
             let shared = sharedHadamardProjectionsPreSigned(
                 signedInput, siblings, widenOutput: false)
         else { return nil }
-        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
-            return y
-        }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
