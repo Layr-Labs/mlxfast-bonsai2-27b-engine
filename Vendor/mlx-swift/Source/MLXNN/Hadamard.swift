@@ -658,3 +658,34 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             groupSize: groupSize, bits: bits)
     }
 }
+
+/// Darkbloom Hadamard-path valve. `ALL=off` stands down.
+public enum Bonsai2HadamardSigns {
+    public static func isArmed() -> Bool {
+        if let raw = getenv("BONSAI2_VALVE"), String(cString: raw) == "ALL=off" {
+            return false
+        }
+        guard let raw = getenv("BONSAI2_HADAMARD_SIGNS") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
+
+/// One shared Hadamard activation cast to float32. Each quantized matmul
+/// otherwise repeats that cast. Opt-in. `ALL=off` leaves the dtype unchanged.
+/// Set `BONSAI2_HAT_F32=1`.
+public enum Bonsai2HatF32 {
+    public static func isArmed() -> Bool {
+        if let raw = getenv("BONSAI2_VALVE"), String(cString: raw) == "ALL=off" {
+            return false
+        }
+        guard let raw = getenv("BONSAI2_HAT_F32") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    public static func share(_ hat: MLXArray) -> MLXArray {
+        guard isArmed(), hat.dtype != .float32 else { return hat }
+        let y = hat.asType(.float32)
+        eval(y)
+        return y
+    }
+}
