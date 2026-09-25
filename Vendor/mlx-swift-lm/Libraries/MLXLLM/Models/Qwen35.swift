@@ -375,10 +375,14 @@ func qwen35GatedDelta(
 /// shuffles instead of 40. Pairwise sums are identical, so the outputs are
 /// bit-identical; this is checked once per process on this device against
 /// the stock kernel (random operands, both outputs compared bit for bit), and
-/// the stock kernel is used if the check fails. Only windows of at least
-/// `minimumT` rows use it; `MLXFAST_GDN_PREFILL_KERNEL=0` disables it.
+/// the stock kernel is used if the check fails. Every unmasked window uses
+/// it, speculative verify windows included: the window length is a runtime
+/// argument and the grid does not depend on it, so a 16-row verify runs the
+/// same pipeline and the same per-step arithmetic as a prompt chunk.
+/// `MLXFAST_GDN_PREFILL_KERNEL=0` disables it.
 enum Qwen35GDNPrefillKernel {
-    static let minimumT = 64
+    static let minimumT = 1
+    private static let checkT = 64
     private static let rows = 4
 
     static let enabled: Bool =
@@ -585,7 +589,7 @@ enum Qwen35GDNPrefillKernel {
     }
 
     private static func selfCheck(_ geo: Geometry, dtype: DType) -> Bool {
-        let T = minimumT
+        let T = checkT
         let keys = MLXRandom.split(key: MLXRandom.key(0x6d6c_7866), into: 9)
         // Wide magnitude spread so the pairwise sums actually differ by order.
         func spread(_ shape: [Int], _ i: Int) -> MLXArray {
