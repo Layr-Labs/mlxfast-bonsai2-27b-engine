@@ -525,10 +525,26 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        var contextKeys: MLXArray
+        var contextValues: MLXArray
+        var blockKeys: MLXArray
+        var blockValues: MLXArray
+        if B == 1 {
+            // The context and block use the same K/V projections. Projecting
+            // both in one call avoids a second weight read for each matrix.
+            let projectedInput = concatenated([context, x], axis: 1)
+            let projectedKeys = kProj(projectedInput)
+            let projectedValues = vProj(projectedInput)
+            contextKeys = projectedKeys[0..., ..<contextLength, 0...]
+            blockKeys = projectedKeys[0..., contextLength..., 0...]
+            contextValues = projectedValues[0..., ..<contextLength, 0...]
+            blockValues = projectedValues[0..., contextLength..., 0...]
+        } else {
+            contextKeys = kProj(context)
+            contextValues = vProj(context)
+            blockKeys = kProj(x)
+            blockValues = vProj(x)
+        }
 
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
@@ -849,6 +865,65 @@ private final class DFlash2DecoderLayer: Module {
 
 // MARK: - The candidate selector
 
+/// One threadgroup walks the 12-position greedy path. Each of its 16
+/// simdgroups owns one candidate and reproduces MLX's BF16 rank-256 row sum:
+/// four adjacent values per lane, two blocks, then a simdgroup reduction.
+private let dflash2GreedyPathKernel = MLXFast.metalKernel(
+    name: "dflash2_greedy_path_bf16",
+    inputNames: [
+        "candidates", "unary", "projected", "predecessor_book",
+        "successor_book", "anchor",
+    ],
+    outputNames: ["path"],
+    source: """
+        #pragma clang fp contract(off)
+        constexpr uint K = 16;
+        constexpr uint R = 256;
+        uint tid = thread_position_in_threadgroup.x;
+        uint candidate_lane = simdgroup_index_in_threadgroup;
+        uint rank_lane = thread_index_in_simdgroup;
+        uint length = uint(candidates_shape[1]);
+        threadgroup float scores[K];
+        threadgroup uint ids[K];
+        threadgroup uint previous;
+        if (tid == 0) previous = uint(anchor[0]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint position = 0; position < length; ++position) {
+            uint id = uint(candidates[position * K + candidate_lane]);
+            bfloat16_t partial = bfloat16_t(0.0f);
+            for (uint block = 0; block < 2; ++block) {
+                for (uint j = 0; j < 4; ++j) {
+                    uint r = block * 128 + rank_lane * 4 + j;
+                    float left = float(predecessor_book[previous * R + r]);
+                    float middle = float(projected[position * R + r]);
+                    float right = float(successor_book[id * R + r]);
+                    bfloat16_t first = bfloat16_t(left * middle);
+                    bfloat16_t second = bfloat16_t(float(first) * right);
+                    partial = bfloat16_t(float(second) + float(partial));
+                }
+            }
+            bfloat16_t edge = simd_sum(partial);
+            if (rank_lane == 0) {
+                float score = float(unary[position * K + candidate_lane]) + float(edge);
+                if constexpr (UNARY_BF16 == 1) score = float(bfloat16_t(score));
+                scores[candidate_lane] = score;
+                ids[candidate_lane] = id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint best = 0;
+                for (uint k = 1; k < K; ++k) {
+                    if (scores[k] > scores[best]) best = k;
+                }
+                previous = ids[best];
+                path[position] = int(previous);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """,
+    ensureRowContiguous: true)
+
 /// The low-rank edge-scored greedy path over the per-position candidate lists.
 ///
 /// The track is greedy, so only the temperature-0 path of the reference
@@ -887,6 +962,11 @@ final class DFlash2CandidateSelector: Module {
             0..., 0..., (vocabularySize - topK)...]
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
+        if let fused = fusedGreedyPath(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor)
+        {
+            return fused
+        }
 
         var predecessor = anchor
         var path = [MLXArray]()
@@ -907,6 +987,30 @@ final class DFlash2CandidateSelector: Module {
         // `argPartition` indexes in UInt32, so the path inherits that dtype.
         // Draft tokens are token ids, and the engine reads them as Int32.
         return stacked(path, axis: 1).asType(.int32)
+    }
+
+    private func fusedGreedyPath(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray
+    ) -> MLXArray? {
+        let length = candidates.dim(1)
+        guard topK == 16, length > 0,
+            candidates.shape == [1, length, 16], candidates.dtype == .uint32,
+            unary.shape == candidates.shape, [.bfloat16, .float32].contains(unary.dtype),
+            projected.shape == [1, length, 256], projected.dtype == .bfloat16,
+            predecessorCodebook.dim(1) == 256, predecessorCodebook.dtype == .bfloat16,
+            successorCodebook.shape == predecessorCodebook.shape,
+            successorCodebook.dtype == .bfloat16,
+            anchor.shape == [1], anchor.dtype == .int32
+        else { return nil }
+
+        return dflash2GreedyPathKernel(
+            [
+                candidates, unary, projected, predecessorCodebook,
+                successorCodebook, anchor,
+            ],
+            template: [("UNARY_BF16", unary.dtype == .bfloat16 ? 1 : 0)],
+            grid: (512, 1, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[1, length]], outputDTypes: [.int32])[0]
     }
 }
 
