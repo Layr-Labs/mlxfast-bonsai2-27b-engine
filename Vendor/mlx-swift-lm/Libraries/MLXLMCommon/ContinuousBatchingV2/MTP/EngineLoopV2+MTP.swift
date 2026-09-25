@@ -86,14 +86,15 @@ extension EngineLoopV2 {
                 uniqueKeysWithValues: work.map { ($0.rec.id, $0.rec.plannedPrefillChunkSize) })
         }
         if graph.verify != nil || !graph.seedRows.isEmpty
-            || !graph.committedObservationRows.isEmpty
+            || !graph.committedObservationRows.isEmpty || !graph.prefillCarries.isEmpty
         {
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden,
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
-                committedObservationRows: graph.committedObservationRows)
+                committedObservationRows: graph.committedObservationRows,
+                prefillCarries: graph.prefillCarries)
         }
         step.forwardShapes = shapes
         shapes?.attach()

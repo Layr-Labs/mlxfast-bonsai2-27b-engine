@@ -1015,7 +1015,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        for waiter in waiters { waiter.resume() }
+        // Settle before the shutdown barrier wakes. The worker's phase-close
+        // drain synchronizes `MLX.Stream()`, the calling thread's own C++
+        // default stream (its own command queue), not the global `Stream.gpu`
+        // every forward is encoded on; GPU work a round left in flight then
+        // frees its temporaries into the allocator cache AFTER that drain and
+        // benchd reads a non-zero `cache_memory`. A follow-up block on this
+        // serial queue also runs after the current block's locals are gone.
+        // Shutdown only: never inside a timed window.
+        engineQueue.async {
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+            for waiter in waiters { waiter.resume() }
+        }
     }
 
     // MARK: Submission (from EngineV2)
