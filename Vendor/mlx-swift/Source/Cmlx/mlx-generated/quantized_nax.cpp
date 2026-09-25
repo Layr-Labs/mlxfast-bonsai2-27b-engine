@@ -496,9 +496,10 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
-inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+// W is the output pointer type: the threadgroup block loader's tile, or a
+// thread-local decode that the loader then stores as one aggregate.
+template <typename U, int N, int bits, typename W>
+inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -583,6 +584,13 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// One packed byte's decoded values, written to threadgroup memory as a single
+// element-aligned aggregate, the way steel's BlockLoader writes its ReadVector.
+template <typename T, int N>
+struct alignas(sizeof(T)) DequantizedPack {
+  T v[N];
+};
+
 template <
     typename T,
     short BROWS,
@@ -655,9 +663,22 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+    if constexpr (bits == 2 && reduction_dim == 1) {
+      // Decode each byte into registers with the same dequantize, then store
+      // its four values at once: four scalar stores per byte land 4-way bank
+      // conflicted at this dst_ld. Values and positions are unchanged.
+      for (int i = 0; i < n_reads; i++) {
+        DequantizedPack<T, pack_factor> decoded;
+        dequantize<T, pack_factor, bits>(
+            src + i * bytes_per_pack, scale, bias, decoded.v);
+        *((threadgroup DequantizedPack<T, pack_factor>*)(dst + i * pack_factor)) =
+            decoded;
+      }
+    } else {
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, pack_factor, bits>(
+            src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+      }
     }
   }
 
@@ -682,12 +703,25 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
-          (device uint8_t*)(src + i * bytes_per_pack),
-          scale,
-          bias,
-          dst + i * pack_factor);
+    if constexpr (bits == 2 && reduction_dim == 1) {
+      for (int i = 0; i < n_reads; i++) {
+        DequantizedPack<T, pack_factor> decoded;
+        dequantize<T, pack_factor, bits>(
+            (device uint8_t*)(src + i * bytes_per_pack),
+            scale,
+            bias,
+            decoded.v);
+        *((threadgroup DequantizedPack<T, pack_factor>*)(dst + i * pack_factor)) =
+            decoded;
+      }
+    } else {
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, pack_factor, bits>(
+            (device uint8_t*)(src + i * bytes_per_pack),
+            scale,
+            bias,
+            dst + i * pack_factor);
+      }
     }
   }
 
