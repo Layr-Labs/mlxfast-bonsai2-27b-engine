@@ -599,6 +599,31 @@ public func sharedHadamardProjections(
     return packed.map { $0.applyRotated(rotated) }
 }
 
+/// `sharedHadamardProjections` for an activation that already carries the
+/// transform's signs (see `SignedBlockHadamard.applyPreSigned`): the same
+/// rotation and the same packed matmuls, with the sign multiply done by the
+/// caller inside an op it already runs.
+public func sharedHadamardProjectionsPreSigned(
+    _ signed: MLXArray, _ projections: [Linear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let packed = sharedHadamardSiblings(projections), let first = packed.first else {
+        return nil
+    }
+    let rotated = first.transform.applyPreSigned(signed)
+    if let fused = first.fusedSiblingsForward(
+        rotated, siblings: packed, widenOutput: widenOutput)
+    {
+        return fused
+    }
+    return packed.map { $0.applyRotated(rotated) }
+}
+
+/// The sign vector every one of these projections applies to its input, when
+/// they are all packed with one transform and none has a GDN layout.
+public func sharedHadamardSigns(_ projections: [Linear]) -> MLXArray? {
+    sharedHadamardSiblings(projections)?.first?.transform.signVector
+}
+
 /// The packed projections that share one transform, when every one of them is
 /// packed with that same transform and none has a GDN layout; nil otherwise.
 public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantizedLinear]? {
