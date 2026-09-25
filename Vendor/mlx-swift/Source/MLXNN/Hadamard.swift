@@ -52,6 +52,19 @@ public struct SignedBlockHadamard {
             .reshaped(x.shape).asType(x.dtype)
     }
 
+    /// The explicit ±1 input signs, FP32, shared by every transform of this width.
+    public var signVector: MLXArray { signs }
+
+    /// `callAsFunction` for an FP32 input that already carries the signs,
+    /// i.e. `y == x.asType(.float32) * signs`. Multiplying by ±1 is exact, so
+    /// a producer that applies the signs itself feeds the Hadamard stage the
+    /// identical array and the result is bit-identical.
+    public func rotatePresigned(_ y: MLXArray) -> MLXArray {
+        validate(y)
+        precondition(y.dtype == .float32, "presigned Hadamard input must be FP32")
+        return hadamardTransform(y.reshaped([-1, blockSize])).reshaped(y.shape)
+    }
+
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -251,6 +264,75 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func sharesInputTransform(with other: HadamardQuantizedLinear) -> Bool {
         gdnLayout == nil && other.gdnLayout == nil
             && transform.isIdentical(to: other.transform)
+    }
+
+    /// The signs `rotate` applies, when nothing precedes them (no GDN layout
+    /// permutation). A producer may then apply them itself and call
+    /// `applyPresigned`.
+    public var presignVector: MLXArray? { gdnLayout == nil ? transform.signVector : nil }
+
+    /// `callAsFunction` on an FP32 input that already carries `presignVector`.
+    public func applyPresigned(_ y: MLXArray) -> MLXArray {
+        precondition(gdnLayout == nil, "presigned input with a GDN layout")
+        return applyRotated(transform.rotatePresigned(y))
+    }
+}
+
+/// The common signs of projections that share one input transform, or nil.
+public func sharedHadamardSigns(_ projections: [Linear]) -> MLXArray? {
+    guard let first = projections.first as? HadamardQuantizedLinear,
+        let signs = first.presignVector
+    else { return nil }
+    for projection in projections {
+        guard let layer = projection as? HadamardQuantizedLinear,
+            layer.sharesInputTransform(with: first)
+        else { return nil }
+    }
+    return signs
+}
+
+/// `sharedHadamardProjections` for an FP32 input that already carries the
+/// shared signs (see `sharedHadamardSigns`). Rotates once, bit-identically.
+public func sharedHadamardProjectionsPresigned(_ y: MLXArray, _ projections: [Linear])
+    -> [MLXArray]?
+{
+    guard sharedHadamardSigns(projections) != nil,
+        let first = projections.first as? HadamardQuantizedLinear
+    else { return nil }
+    let rotated = first.transform.rotatePresigned(y)
+    return projections.map { ($0 as! HadamardQuantizedLinear).applyRotated(rotated) }
+}
+
+/// A normalization weight with a consumer's Hadamard signs folded in.
+///
+/// `rms_norm.metal` writes `w[i] * T(x[i] * inv)`. Multiplying `w` by ±1
+/// first is exact, so `rmsNorm(x, w * s) == rmsNorm(x, w) * s` bit for bit and
+/// the separate sign multiply disappears. The fold is an input-independent
+/// derived constant, like the widened-scale cache; the loaded weight is not
+/// modified. Deliberately neither an MLXArray nor a Module, so reflecting the
+/// owner does not add the folded constant to the parameter tree. Use only on
+/// paths that are never compile-traced.
+public final class SignFoldedWeight: @unchecked Sendable {
+    private struct Entry {
+        let weight: MLXArray
+        let signs: MLXArray
+        let folded: MLXArray
+    }
+
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    public init() {}
+
+    public func callAsFunction(_ weight: MLXArray, signs: MLXArray) -> MLXArray {
+        lock.withLock { () -> MLXArray in
+            if let cached = self.entry, cached.weight === weight, cached.signs === signs {
+                return cached.folded
+            }
+            let folded = (weight * signs).asType(weight.dtype)
+            self.entry = Entry(weight: weight, signs: signs, folded: folded)
+            return folded
+        }
     }
 }
 
