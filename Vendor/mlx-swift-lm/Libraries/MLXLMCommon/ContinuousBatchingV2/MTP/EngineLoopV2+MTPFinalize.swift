@@ -7,14 +7,17 @@ import Foundation
 import MLX
 
 extension EngineLoopV2 {
-    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
-    /// event instead of polling it (ercumentyildirim `cc0895d`).
-    static let pollsAcceptancePacket: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
 
+    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
+    /// event instead of polling it. Ported from ercumentyildirim's `cc0895d`
+    /// (rejected only against a higher concurrent frontier), where the step
+    /// thread polls the packet so it wakes the instant the verify finishes
+    /// and stays on a clocked-up core for the finalize and the next graph
+    /// build, which sit on the GPU's critical path. The blocking read below
+    /// then returns at once. No GPU work is added and no ordering changes:
+    /// the poll only replaces the sleep with a spin on the same event.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -115,21 +118,15 @@ extension EngineLoopV2 {
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
         if Self.pollsAcceptancePacket {
-            // The packet was submitted with the verify (asyncEval at launch).
-            // Poll it instead of sleeping on its completion event: the step
-            // thread stays on a clocked-up core and resumes the instant the
-            // verify finishes, and the finalize and the next round's graph
-            // build are on the GPU's critical path. Bounded: after 200 ms the
-            // blocking read below takes over.
+            // Poll the packet instead of sleeping on its completion event.
+            // The spin is bounded by the packet's own graph: once the verify
+            // kernels complete, `available` turns true and the read below
+            // returns immediately. `BONSAI_POLL_PACKET=0` restores the
+            // sleeping wait.
             var available = false
-            var spins = 0
-            let deadline = DispatchTime.now().uptimeNanoseconds &+ 200_000_000
             while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
                 !available
-            {
-                spins &+= 1
-                if spins & 4095 == 0, DispatchTime.now().uptimeNanoseconds > deadline { break }
-            }
+            {}
         }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
