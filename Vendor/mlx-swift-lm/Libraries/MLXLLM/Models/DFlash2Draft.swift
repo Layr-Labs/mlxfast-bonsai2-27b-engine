@@ -594,27 +594,161 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         return output.reshaped(hidden.shape)
     }
 
-    /// The first tap. Returns the convolved input and the dynamic taps the
-    /// matching ``finish(_:dynamic:)`` needs.
+    /// On unless explicitly disabled. It selects how a tap is evaluated,
+    /// never what it computes: both paths run the same element operations in
+    /// the same order and dtype.
+    private static let fusedEvaluation: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_FUSED_CONV"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The first tap. Returns the convolved input and the raw tap projection,
+    /// `[B, L, 2 * kernelSize * groups]`, whose second half the matching
+    /// ``finish(_:dynamic:residual:)`` reads.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
         let dynamic = kernelProjection(hidden)
-            .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
+        if let fused = fusedConvolve(hidden, dynamic: dynamic, tap: 0, residual: nil) {
+            return (fused, dynamic)
+        }
         return (
             Self.convolve(
                 hidden: hidden,
-                dynamic: dynamic[0..., 0..., 0, 0..., 0...],
+                dynamic: taps(dynamic, of: hidden, tap: 0),
                 base: baseKernel[0],
                 groupSize: groupSize),
-            dynamic[0..., 0..., 1, 0..., 0...]
+            dynamic
         )
     }
 
-    /// The second tap, over the sub-layer's output.
-    func finish(_ hidden: MLXArray, dynamic: MLXArray) -> MLXArray {
-        Self.convolve(
-            hidden: hidden, dynamic: dynamic, base: baseKernel[1], groupSize: groupSize)
+    /// The second tap, over the sub-layer's output, added onto the residual
+    /// stream: `residual + convolve(hidden)`.
+    func finish(_ hidden: MLXArray, dynamic: MLXArray, residual: MLXArray) -> MLXArray {
+        if let fused = fusedConvolve(hidden, dynamic: dynamic, tap: 1, residual: residual) {
+            return fused
+        }
+        return residual
+            + Self.convolve(
+                hidden: hidden,
+                dynamic: taps(dynamic, of: hidden, tap: 1),
+                base: baseKernel[1],
+                groupSize: groupSize)
+    }
+
+    /// One tap's `[B, L, kernelSize, groups]` view of the raw projection.
+    private func taps(_ dynamic: MLXArray, of hidden: MLXArray, tap: Int) -> MLXArray {
+        dynamic.reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)[
+            0..., 0..., tap, 0..., 0...]
+    }
+
+    /// `[residual +] convolve(hidden)` for one tap as ONE kernel.
+    ///
+    /// `convolve` spells a tap as a zero fill, a shifted concatenation and a
+    /// multiply/add pair per offset: ten dependent dispatches over a
+    /// `[B, L, hidden]` block of a few hundred KB, plus the residual add the
+    /// layer issues after `finish`. Each thread here produces one output
+    /// element with those operations in that order, in the tap's own dtype,
+    /// each rounded where the op chain rounds it, so the result is the same
+    /// array. Returns nil, and the caller keeps the op chain, whenever the
+    /// dtypes or shapes are not the plain same-dtype case the kernel covers.
+    private func fusedConvolve(
+        _ hidden: MLXArray, dynamic: MLXArray, tap: Int, residual: MLXArray?
+    ) -> MLXArray? {
+        guard Self.fusedEvaluation, hidden.ndim == 3 else { return nil }
+        let dtype = hidden.dtype
+        let batch = hidden.dim(0)
+        let length = hidden.dim(1)
+        let width = hidden.dim(2)
+        let residualMatches = residual.map { $0.dtype == dtype && $0.shape == hidden.shape } ?? true
+        guard [DType.bfloat16, .float16, .float32].contains(dtype),
+            dynamic.dtype == dtype, baseKernel.dtype == dtype, residualMatches,
+            batch * length > 0, width == groups * groupSize,
+            dynamic.shape == [batch, length, 2 * kernelSize * groups],
+            baseKernel.shape == [2, kernelSize, width]
+        else { return nil }
+
+        var inputs: [MLXArray] = [hidden, dynamic, baseKernel]
+        var kernel = dflash2GroupedDynamicConvKernel
+        if let residual {
+            inputs.append(residual)
+            kernel = dflash2GroupedDynamicConvResidualKernel
+        }
+        return kernel(
+            inputs,
+            template: [
+                ("ConvT", dtype),
+                ("ConvWidth", width),
+                ("ConvGroups", groups),
+                ("ConvGroupSize", groupSize),
+                ("ConvTaps", kernelSize),
+                ("ConvLength", length),
+                ("ConvTap", tap),
+            ],
+            grid: (width, batch * length, 1),
+            threadGroup: (Swift.min(256, width), 1, 1),
+            outputShapes: [hidden.shape],
+            outputDTypes: [dtype]
+        )[0]
     }
 }
+
+/// The body of the fused tap. Thread `(h, row)` computes
+/// `out[row, h] = [residual[row, h] +] sum_o (base[tap, o, h] * v_o + dynamic[row, tap, o, g] * v_o)`
+/// with `v_o = hidden[row - o, h]`, zero before the block start, accumulated
+/// exactly as `convolve` does: `acc = acc + base * v`, then
+/// `acc = acc + dynamic * v`, per offset, each product and sum rounded to the
+/// tap dtype. Contraction and reassociation are off so no FMA or reordering
+/// changes a rounding.
+private func dflash2GroupedDynamicConvSource(residual: Bool) -> String {
+    let store =
+        residual
+        ? """
+              const ConvT carried = conv_residual[index];
+              conv_out[index] = carried + acc;
+          """
+        : """
+              conv_out[index] = acc;
+          """
+    return """
+        const int h = int(thread_position_in_grid.x);
+        const int row = int(thread_position_in_grid.y);
+        const int position = row % ConvLength;
+        const int index = row * ConvWidth + h;
+        auto tap_row = conv_taps + row * (2 * ConvTaps * ConvGroups)
+            + ConvTap * ConvTaps * ConvGroups + h / ConvGroupSize;
+        auto base_col = conv_base + ConvTap * ConvTaps * ConvWidth + h;
+        ConvT acc = static_cast<ConvT>(0.0f);
+        {
+          #pragma clang fp reassociate(off)
+          #pragma clang fp contract(off)
+          for (int offset = 0; offset < ConvTaps; ++offset) {
+            ConvT value = static_cast<ConvT>(0.0f);
+            if (position >= offset) {
+              value = conv_in[index - offset * ConvWidth];
+            }
+            const ConvT base_weight = base_col[offset * ConvWidth];
+            const ConvT from_base = base_weight * value;
+            acc = acc + from_base;
+            const ConvT dynamic_weight = tap_row[offset * ConvGroups];
+            const ConvT from_dynamic = dynamic_weight * value;
+            acc = acc + from_dynamic;
+          }
+        \(store)
+        }
+        """
+}
+
+private let dflash2GroupedDynamicConvKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_dynamic_conv",
+    inputNames: ["conv_in", "conv_taps", "conv_base"],
+    outputNames: ["conv_out"],
+    source: dflash2GroupedDynamicConvSource(residual: false))
+
+private let dflash2GroupedDynamicConvResidualKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_dynamic_conv_residual",
+    inputNames: ["conv_in", "conv_taps", "conv_base", "conv_residual"],
+    outputNames: ["conv_out"],
+    source: dflash2GroupedDynamicConvSource(residual: true))
 
 // MARK: - The decoder layer
 
@@ -666,12 +800,11 @@ private final class DFlash2DecoderLayer: Module {
         _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        let attended = x
-            + attentionConv.finish(
-                selfAttn(attentionInput, context: context, rope: rope, cache: cache),
-                dynamic: attentionTaps)
+        let attended = attentionConv.finish(
+            selfAttn(attentionInput, context: context, rope: rope, cache: cache),
+            dynamic: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+        return mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps, residual: attended)
     }
 }
 
