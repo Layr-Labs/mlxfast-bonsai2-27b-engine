@@ -1879,7 +1879,8 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        mropeFactorCache: Qwen35MRoPEFactorCache? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1910,7 +1911,8 @@ final class Qwen35Attention: Module {
         // before the cache advances and use the array RoPE overload.
         if let positionIds {
             (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+                queries: queries, keys: keys, positionIds: positionIds,
+                factorCache: mropeFactorCache)
         } else {
             let offsets = cache.positionOffsets + 0
             queries = rope(queries, offset: offsets)
@@ -1939,6 +1941,17 @@ final class Qwen35Attention: Module {
         }
         return oProj(projectionInput)
     }
+}
+
+/// Per-forward cache for the position-dependent default M-RoPE factors.
+/// All full-attention layers in one CBv2 forward receive the same positions
+/// and rotary configuration, so the first layer can build cosine/sine once
+/// and later layers can reuse the evaluated arrays.
+final class Qwen35MRoPEFactorCache {
+    var positionShape: [Int]?
+    var dtype: DType?
+    var cosine: MLXArray?
+    var sine: MLXArray?
 }
 
 /// Qwen3.5 interleaved 3-axis M-RoPE. Request positions arrive as function
@@ -1998,7 +2011,8 @@ final class Qwen35MRoPE {
     }
 
     func apply(
-        queries: MLXArray, keys: MLXArray, positionIds: MLXArray
+        queries: MLXArray, keys: MLXArray, positionIds: MLXArray,
+        factorCache: Qwen35MRoPEFactorCache? = nil
     ) -> (MLXArray, MLXArray) {
         var positions = positionIds
         if positions.ndim == 2 {
@@ -2010,12 +2024,28 @@ final class Qwen35MRoPE {
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
         if let defaultInvFreq {
-            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
-            let angles = concatenated([frequency, frequency], axis: -1)
-            let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
-            let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+            let cosine: MLXArray
+            let sine: MLXArray
+            if let factorCache,
+               factorCache.positionShape == positions.shape,
+               factorCache.dtype == queries.dtype,
+               let cachedCosine = factorCache.cosine,
+               let cachedSine = factorCache.sine
+            {
+                cosine = cachedCosine
+                sine = cachedSine
+            } else {
+                let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                    * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+                let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+                let angles = concatenated([frequency, frequency], axis: -1)
+                cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+                sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+                factorCache?.positionShape = positions.shape
+                factorCache?.dtype = queries.dtype
+                factorCache?.cosine = cosine
+                factorCache?.sine = sine
+            }
             func applyDefault(_ value: MLXArray) -> MLXArray {
                 let rotating = value[.ellipsis, ..<rotaryDim]
                 let half = rotating.dim(-1) / 2
@@ -2026,7 +2056,25 @@ final class Qwen35MRoPE {
                     ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
                     : rotated
             }
-            return (applyDefault(queries), applyDefault(keys))
+            // Q and K share batch, sequence, head dimension and dtype on the
+            // self-attention path. Rotate their head-stacked tensor once, then
+            // restore the original query/key head ranges. Keep the native
+            // two-call path as a conservative fallback for unusual callers.
+            guard queries.ndim == keys.ndim,
+                  queries.dim(0) == keys.dim(0),
+                  queries.dim(2) == keys.dim(2),
+                  queries.dim(3) == keys.dim(3),
+                  queries.dtype == keys.dtype
+            else {
+                return (applyDefault(queries), applyDefault(keys))
+            }
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotated = applyDefault(combined)
+            return (
+                rotated[0..., ..<queryHeads, 0..., 0...],
+                rotated[0..., queryHeads..., 0..., 0...]
+            )
         }
 
         let queryHeads = queries.dim(1)
@@ -2263,7 +2311,8 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        mropeFactorCache: Qwen35MRoPEFactorCache? = nil
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
@@ -2284,7 +2333,8 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+                exactTargetVerify: exactTargetVerify,
+                mropeFactorCache: mropeFactorCache)
         }
         let h = x + r
         let normalized = postAttentionLayerNorm(h)
@@ -2325,6 +2375,16 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
     let exactTargetVerify: Bool
+
+    /// DFlash verify builds are submitted in sixteen-layer slices so the
+    /// device can evaluate the completed prefix while Swift constructs the
+    /// next slice. The default stays enabled; the switch is a diagnostic
+    /// escape hatch for cross-device comparisons.
+    private static let verifySlicesEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -2460,6 +2520,10 @@ public class Qwen35TextModelInner: Module {
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
+        // All full-attention layers in this forward see the same explicit
+        // positions. Share their default M-RoPE cosine/sine factors while
+        // retaining the old per-layer path when positions are absent.
+        let mropeFactorCache = positionIds.map { _ in Qwen35MRoPEFactorCache() }
         var tapped = [MLXArray?](
             repeating: nil, count: tapLayerIds?.count ?? 0)
         var attentionIndex = 0
@@ -2482,7 +2546,17 @@ public class Qwen35TextModelInner: Module {
                 recurrentState: recurrentState,
                 positionIds: positionIds,
                 captureRecurrentWindow: captureRecurrentWindow,
-                exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
+                mropeFactorCache: mropeFactorCache)
+            // The verify path has 64 layers. Four boundaries keep graph
+            // construction ahead of the GPU without changing layer order or
+            // the hidden value; normal serial/prefill paths remain one graph.
+            if captureRecurrentWindow, Self.verifySlicesEnabled,
+                (modelLayerIndex + 1) % 16 == 0,
+                modelLayerIndex + 1 < layers.count
+            {
+                asyncEval([hiddenStates])
+            }
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
