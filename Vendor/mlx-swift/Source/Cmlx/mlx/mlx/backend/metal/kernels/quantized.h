@@ -1077,6 +1077,120 @@ METAL_FUNC void qmv_wide_rr_impl(
   }
 }
 
+// Single-tile form of qmv_wide_rr_impl for grids of exactly two x-tiles.
+// Threadgroup x == 0 computes both tiles (all M vectors) and x == 1 returns,
+// so each row's weights are decoded once per 4-value slice and reused across
+// both tiles' vectors instead of being decoded again by a second threadgroup.
+// Lanes split K in 4-value slices (one byte per row) to bound registers:
+// rows x 4 decoded weights, one tile's x slice, and both tiles' partials.
+template <typename T, int group_size, int bits, int vecs_per_tg, int rows>
+METAL_FUNC void qmv_wide_lite_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    const int M,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int vpt = 4;
+  constexpr int step = vpt * SIMD_SIZE;
+  constexpr int n_blk = 2;
+
+  typedef float U;
+
+  const int row0 = tid.y * (rows * num_simdgroups) + rows * simd_gid;
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / group_size;
+
+  U result[n_blk][rows][vecs_per_tg];
+#pragma unroll
+  for (int b = 0; b < n_blk; b++) {
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        result[b][r][v] = 0;
+      }
+    }
+  }
+
+  for (int k = simd_lid * vpt; k < in_vec_size; k += step) {
+    const int g = k / group_size;
+    U w_dq[rows][vpt];
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+      const int rr = min(row0 + r, out_vec_size - 1);
+      const device uint8_t* wc =
+          (const device uint8_t*)w + rr * in_vec_size_w + k * bits / 8;
+      dequantize<U, vpt, bits>(
+          wc,
+          static_cast<U>(scales[rr * in_vec_size_g + g]),
+          static_cast<U>(biases[rr * in_vec_size_g + g]),
+          w_dq[r]);
+    }
+#pragma unroll
+    for (int b = 0; b < n_blk; b++) {
+      U xr[vecs_per_tg][vpt];
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        const device T* xc =
+            x + min(b * vecs_per_tg + v, M - 1) * in_vec_size + k;
+#pragma unroll
+        for (int i = 0; i < vpt; i++) {
+          xr[v][i] = static_cast<U>(xc[i]);
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < rows; r++) {
+#pragma unroll
+        for (int v = 0; v < vecs_per_tg; v++) {
+          U acc = 0;
+#pragma unroll
+          for (int i = 0; i < vpt; i++) {
+            acc += xr[v][i] * w_dq[r][i];
+          }
+          result[b][r][v] += acc;
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int b = 0; b < n_blk; b++) {
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        result[b][r][v] = simd_sum(result[b][r][v]);
+      }
+    }
+  }
+
+  if (simd_lid == 0) {
+#pragma unroll
+    for (int b = 0; b < n_blk; b++) {
+#pragma unroll
+      for (int r = 0; r < rows; r++) {
+        if (row0 + r < out_vec_size) {
+#pragma unroll
+          for (int v = 0; v < vecs_per_tg; v++) {
+            const int vec = b * vecs_per_tg + v;
+            if (vec < M) {
+              y[vec * out_vec_size + row0 + r] =
+                  static_cast<T>(result[b][r][v]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
@@ -1095,6 +1209,25 @@ METAL_FUNC void qmv_wide_impl(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   if constexpr (bits == 2 && group_size % 8 == 0) {
     if (in_vec_size % (8 * SIMD_SIZE) == 0) {
+      // Two x-tiles (host n_tiles == 2): threadgroup x == 0 takes both.
+      if (M > vecs_per_tg && M <= 2 * vecs_per_tg) {
+        if (tid.x != 0) {
+          return;
+        }
+        qmv_wide_lite_impl<T, group_size, bits, vecs_per_tg, SIMD_SIZE / k_lanes>(
+            w,
+            scales,
+            biases,
+            x,
+            y,
+            in_vec_size,
+            out_vec_size,
+            M,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+      }
       qmv_wide_rr_impl<T, group_size, bits, vecs_per_tg, SIMD_SIZE / k_lanes>(
           w,
           scales,
