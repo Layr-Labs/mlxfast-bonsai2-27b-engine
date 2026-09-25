@@ -573,6 +573,7 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        var blockDraftIDs: MLXArray?
         if let block = mtp.blockDrafter {
             // ONE propose per round. The block is the row's last committed
             // token followed by k mask tokens, and the drafter's single
@@ -616,6 +617,10 @@ extension EngineLoopV2 {
             }
             let batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
+            // The block proposal already has the final [B, k] draft-ID
+            // layout. Keep that array for finalization instead of rebuilding
+            // the same graph from the per-column slices below.
+            blockDraftIDs = batched
             // The whole block is known before target construction starts, so
             // publish it now; finalization still joins it through the
             // acceptance packet.
@@ -686,7 +691,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = blockDraftIDs ?? stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
