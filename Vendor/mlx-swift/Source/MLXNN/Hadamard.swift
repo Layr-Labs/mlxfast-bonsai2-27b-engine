@@ -468,15 +468,51 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// output rounding rather than the product precision. The token gate
     /// prices that. Returns nil when the route does not apply.
     private func matrixRegimeForward(_ x: MLXArray, widenOutput: Bool = true) -> MLXArray? {
-        guard Self.routeApplies(to: self), x.dtype == .float32 || x.dtype == .bfloat16,
+        // An FP16 `x` is always a rotation that already stored the FP16 read
+        // this route makes (`routedRotationDType`): it stands for the FP32
+        // activation, and the route treats it exactly as that activation.
+        let preCast = x.dtype == .float16
+        guard Self.routeApplies(to: self),
+            x.dtype == .float32 || x.dtype == .bfloat16 || preCast,
             x.ndim >= 2
         else { return nil }
         let k = x.dim(-1)
         guard x.size / k >= 2, k % 64 == 0, k % groupSize == 0 else { return nil }
+        if preCast {
+            precondition(
+                Self.routeInputDType(rows: x.size / k, n: weight.dim(0), sourceDType: .float32)
+                    == .float16,
+                "Hadamard route: FP16 rotation reached an FP32-read projection")
+        }
         return Self.matrixRoutedMatmul(
             x, weight: weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits, mode: mode, operands: matrixRoute,
-            widenOutput: widenOutput)
+            widenOutput: widenOutput, sourceDType: preCast ? .float32 : nil)
+    }
+
+    /// Off when `BONSAI_ROTATE_TO_ROUTE=0`. See `routedRotationDType`.
+    static let rotateToRouteEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_ROTATE_TO_ROUTE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// FP16 when this layer's matrix route would cast an FP32 rotated
+    /// activation of `rows` rows to FP16 before the matmul (so the rotation
+    /// can store that FP16 itself); nil when the route keeps FP32 or does not
+    /// apply.
+    public func routedRotationDType(rows: Int) -> DType? {
+        let k = weight.dim(1) * 32 / bits
+        guard Self.rotateToRouteEnabled, Self.routeApplies(to: self), rows >= 2,
+            k % 64 == 0, k % groupSize == 0,
+            Self.routeInputDType(rows: rows, n: weight.dim(0), sourceDType: .float32)
+                == .float16
+        else { return nil }
+        return .float16
+    }
+
+    private static func rows(_ x: MLXArray) -> Int {
+        x.ndim >= 1 ? x.size / max(x.dim(-1), 1) : 0
     }
 
     /// `callAsFunction` for a consumer that promotes dtypes itself, such as
@@ -485,7 +521,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// the same values exactly, so the arithmetic is unchanged and one cast
     /// dispatch per call is saved.
     public func forwardUnwidened(_ x: MLXArray) -> MLXArray {
-        let rotated = rotate(x)
+        let rotated =
+            x.dtype == .float32 && x.ndim >= 2
+            ? rotate(x, outputDType: routedRotationDType(rows: Self.rows(x)) ?? x.dtype)
+            : rotate(x)
         return matrixRegimeForward(rotated, widenOutput: false) ?? applyRotated(rotated)
     }
 
@@ -494,7 +533,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// FP16 product unwidened. Not for a layer with a GDN layout.
     public func forwardPreSigned(_ signed: MLXArray, widenOutput: Bool = true) -> MLXArray {
         precondition(gdnLayout == nil, "pre-signed forward needs an ungrouped layout")
-        let rotated = transform.applyPreSigned(signed)
+        let rotated =
+            signed.dtype == .float32 && signed.ndim >= 2
+            ? transform.applyPreSigned(
+                signed,
+                outputDType: routedRotationDType(rows: Self.rows(signed)) ?? signed.dtype)
+            : transform.applyPreSigned(signed)
         if !widenOutput, let routed = matrixRegimeForward(rotated, widenOutput: false) {
             return routed
         }
