@@ -810,6 +810,16 @@ final class Qwen35DenseSiblingStack {
     }
 }
 
+/// One-row recurrent state is already that row. Skip the `[0, 1)` slice.
+enum Bonsai2B1RecurrentRow {
+    static func row(_ state: MLXArray, index: Int, batch: Int) -> MLXArray {
+        if batch == 1, index == 0, state.ndim > 0, state.dim(0) == 1 {
+            return state
+        }
+        return state[index ..< index + 1]
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -1498,6 +1508,12 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
+    /// A one-row batch is already the row. The slice `[0, 1)` copies that
+    /// view. Wider batches still take `state[index, index + 1)`.
+    func stageRow(_ state: MLXArray, index: Int, batch: Int) -> MLXArray {
+        Bonsai2B1RecurrentRow.row(state, index: index, batch: batch)
+    }
+
     /// CBv2 target path. Request-owned conv/SSM rows are gathered into the
     /// active rectangle, evaluated once, then split back into their owning
     /// transactions. No recurrent tensor is represented as attention KV.
@@ -1538,8 +1554,8 @@ final class Qwen35GatedDeltaNet: Module {
             do {
                 try evaluation.stage(
                     modelLayerIndex: modelLayerIndex,
-                    conv: newConvState[row ..< row + 1],
-                    ssm: newSsmState[row ..< row + 1])
+                    conv: stageRow(newConvState, index: row, batch: B),
+                    ssm: stageRow(newSsmState, index: row, batch: B))
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
@@ -1678,15 +1694,15 @@ final class Qwen35GatedDeltaNet: Module {
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState[rowRange]
+                let finalSSM = stageRow(finalSsmState, index: row, batch: B)
                 let tape = ArraysCache.PrefixReplayTape(
-                    convInput: convInput[rowRange],
-                    q: qNormed[rowRange],
-                    k: kNormed[rowRange],
-                    v: v[rowRange],
-                    a: a[rowRange],
-                    b: b[rowRange],
-                    ssmPre: ssmState[rowRange],
+                    convInput: stageRow(convInput, index: row, batch: B),
+                    q: stageRow(qNormed, index: row, batch: B),
+                    k: stageRow(kNormed, index: row, batch: B),
+                    v: stageRow(v, index: row, batch: B),
+                    a: stageRow(a, index: row, batch: B),
+                    b: stageRow(b, index: row, batch: B),
+                    ssmPre: stageRow(ssmState, index: row, batch: B),
                     mask: nil,
                     rowCount: S,
                     convStateRows: nKeep)
@@ -1784,7 +1800,7 @@ final class Qwen35GatedDeltaNet: Module {
                         convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
                     }, axis: 0)
                 let ssmStack = concatenated(
-                    ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
+                    ssmStates.map { stageRow($0, index: row, batch: B) }, axis: 0)
                 do {
                     try evaluation.stageCaptured(
                         modelLayerIndex: modelLayerIndex,
