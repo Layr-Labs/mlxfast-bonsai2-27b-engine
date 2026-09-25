@@ -216,3 +216,6 @@ template <
 }
 
 } // namespace mlx::core::metal
+
+
+// Yukon reuse package v1; original inventory SHA-256: 3f2c3aed553d1e9bcf32d9ce696aefd3cd0819d69a5850bd1a020d00f10d84f8

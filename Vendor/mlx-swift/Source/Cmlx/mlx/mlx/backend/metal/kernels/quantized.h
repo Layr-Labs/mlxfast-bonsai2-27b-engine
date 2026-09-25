@@ -982,101 +982,6 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-// Row-reuse form of qmv_wide for 2-bit weights. All 32 lanes split K in
-// 8-value slices, so each lane loads its x slice once per step and reuses it
-// across the simdgroup's `rows` output rows, and each decoded weight slice is
-// reused across the vecs_per_tg vectors. Same grid as qmv_wide_impl.
-template <typename T, int group_size, int bits, int vecs_per_tg, int rows>
-METAL_FUNC void qmv_wide_rr_impl(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device T* y,
-    const int in_vec_size,
-    const int out_vec_size,
-    const int M,
-    uint3 tid,
-    uint simd_gid,
-    uint simd_lid) {
-  constexpr int num_simdgroups = 2;
-  constexpr int vpt = 8;
-  constexpr int step = vpt * SIMD_SIZE;
-
-  typedef float U;
-
-  const int row0 = tid.y * (rows * num_simdgroups) + rows * simd_gid;
-  const int vec0 = tid.x * vecs_per_tg;
-  const int in_vec_size_w = in_vec_size * bits / 8;
-  const int in_vec_size_g = in_vec_size / group_size;
-
-  U result[rows][vecs_per_tg];
-#pragma unroll
-  for (int r = 0; r < rows; r++) {
-#pragma unroll
-    for (int v = 0; v < vecs_per_tg; v++) {
-      result[r][v] = 0;
-    }
-  }
-
-  for (int k = simd_lid * vpt; k < in_vec_size; k += step) {
-    U xr[vecs_per_tg][vpt];
-#pragma unroll
-    for (int v = 0; v < vecs_per_tg; v++) {
-      const device T* xc = x + min(vec0 + v, M - 1) * in_vec_size + k;
-#pragma unroll
-      for (int i = 0; i < vpt; i++) {
-        xr[v][i] = static_cast<U>(xc[i]);
-      }
-    }
-    const int g = k / group_size;
-#pragma unroll
-    for (int r = 0; r < rows; r++) {
-      const int rr = min(row0 + r, out_vec_size - 1);
-      const device uint8_t* wc =
-          (const device uint8_t*)w + rr * in_vec_size_w + k * bits / 8;
-      U w_dq[vpt];
-      dequantize<U, vpt, bits>(
-          wc,
-          static_cast<U>(scales[rr * in_vec_size_g + g]),
-          static_cast<U>(biases[rr * in_vec_size_g + g]),
-          w_dq);
-#pragma unroll
-      for (int v = 0; v < vecs_per_tg; v++) {
-        U acc = 0;
-#pragma unroll
-        for (int i = 0; i < vpt; i++) {
-          acc += xr[v][i] * w_dq[i];
-        }
-        result[r][v] += acc;
-      }
-    }
-  }
-
-#pragma unroll
-  for (int r = 0; r < rows; r++) {
-#pragma unroll
-    for (int v = 0; v < vecs_per_tg; v++) {
-      result[r][v] = simd_sum(result[r][v]);
-    }
-  }
-
-  if (simd_lid == 0) {
-#pragma unroll
-    for (int r = 0; r < rows; r++) {
-      if (row0 + r < out_vec_size) {
-#pragma unroll
-        for (int v = 0; v < vecs_per_tg; v++) {
-          if (vec0 + v < M) {
-            y[(vec0 + v) * out_vec_size + row0 + r] =
-                static_cast<T>(result[r][v]);
-          }
-        }
-      }
-    }
-  }
-}
-
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
@@ -1093,23 +998,6 @@ METAL_FUNC void qmv_wide_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  if constexpr (bits == 2 && group_size % 8 == 0) {
-    if (in_vec_size % (8 * SIMD_SIZE) == 0) {
-      qmv_wide_rr_impl<T, group_size, bits, vecs_per_tg, SIMD_SIZE / k_lanes>(
-          w,
-          scales,
-          biases,
-          x,
-          y,
-          in_vec_size,
-          out_vec_size,
-          M,
-          tid,
-          simd_gid,
-          simd_lid);
-      return;
-    }
-  }
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)

@@ -223,10 +223,7 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
 
         if B == 1 {
-            // A verify rectangle without a keep mask attends in ONE causal
-            // call: the same visible prefix per query, one dispatch instead of
-            // one per column. Near-tie rounding is priced by the token gate.
-            if serializeQueries, L > 1, keepMask != nil {
+            if serializeQueries, L > 1 {
                 return updateAndAttendRowSerialQueries(
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
