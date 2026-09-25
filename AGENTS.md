@@ -61,11 +61,10 @@ recorded on the track's own box, published in R2 under
 the box's runner service exports as `MLXFAST_QWEN38_GOLDEN_DIR`. They are never
 in git.
 
-The two public captures for the local modes are R2 objects too. The fixture
-pins them in `public_captures`, and `tools/fetch-goldens.sh --public` fetches
-them into `correctness_prompts/bonsai2-27b-mlx-v1/`, which git ignores. They
-carry the pending sentinel until the organizer records them. Never commit a
-golden, a capture, a prompt file or an R2 key.
+The two public captures for the local modes are different material. They ship
+in this repository under `correctness_prompts/bonsai2-27b-mlx-v1/`, so a local
+test needs no R2 access. Never commit a hidden golden, a pool tape, a prompt
+file or an R2 key.
 
 Scoring is paired, with a per-box baseline. A ranked run measures two legs on
 the same box in the same job, over the one live golden: a serial-control leg on

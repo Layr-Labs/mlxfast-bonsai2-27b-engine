@@ -82,9 +82,14 @@ private_prompts.json
 private_prompts*.json
 gpqa_reference_cases.json
 gpqa_reference_cases*.json
-# Goldens, captures and prompts live in R2, never in git. tools/fetch-goldens.sh
-# --public writes the public captures here.
-correctness_prompts/
+# The two public captures ship in git under correctness_prompts/bonsai2-27b-mlx-v1/.
+# Hidden material never does. These patterns keep a stray recording out of a commit.
+correctness_prompts/*correctness_golden*.json
+correctness_prompts/*golden_prompt*.json
+correctness_prompts/*golden_prompt*.txt
+correctness_prompts/*private*.json
+correctness_prompts/*private*.txt
+correctness_prompts/*gpqa_reference_cases*.json
 
 # IDE
 .vscode/

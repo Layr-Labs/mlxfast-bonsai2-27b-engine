@@ -435,17 +435,5 @@
       "sha256": "c27d8824e047aa09f359df83986035fe14b148feadb7fc3be6f255373ebbb6eb",
       "bytes": 33762
     }
-  },
-  "public_captures": {
-    "local_iterate": {
-      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json",
-      "sha256": "cc5952f782f6ddba1ff46abf173c3372704579d82d4d6a5a2c45d90cde42be9e",
-      "bytes": 10663
-    },
-    "local_submit": {
-      "r2_path": "correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json",
-      "sha256": "c1c42007bfd0989543c4b4d664483749bd3c278ec998915b80a294bd505122fd",
-      "bytes": 21007
-    }
   }
 }

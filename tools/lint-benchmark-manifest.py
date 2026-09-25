@@ -49,9 +49,6 @@ What it asserts, in order:
                         pair is MEASURED live on the ranked box (serial-control
                         leg + candidate leg, David ruling 2026-09-08), so a
                         stored baseline is a stale denominator from another box.
-  5a3. no golden in git NO file under correctness_prompts/ is tracked by git.
-                        Goldens, public captures and prompts are R2 objects; the
-                        repository carries sha256 + bytes pins only.
   5c. reference commit  contractPath declares baseline_reference_commit as a
                         40-hex engine commit -- the tree MLXFAST_BASELINE_WORKSPACE
                         must be at, which tools/ranked-box-preflight.sh enforces.
@@ -100,7 +97,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 
 # --- per-track scoring-constant registry ------------------------------------
@@ -1186,10 +1182,10 @@ class Linter:
         name: a committed copy is organizer material in a participant's clone,
         and it is also a second source of truth for bytes the box already pins.
 
-        The PUBLIC captures (public_captures) are participant material for
-        local runs. tools/fetch-goldens.sh --public writes them to their
-        r2_path in the checkout, so this check does not look at them; check
-        5a3 keeps them out of git.
+        The PUBLIC captures under correctness_prompts/bonsai2-27b-mlx-v1/ are
+        participant material for local runs and ship in git. They are not
+        pinned in timed_prompt_pool or live_golden_speculative, so this check
+        never looks at them.
         """
         pinned: set[str] = set()
         for entry in contract.get("timed_prompt_pool", []):
@@ -1229,36 +1225,6 @@ class Linter:
             f"goldens: none of the {len(pinned)} pinned track golden(s) is in this tree "
             "(they live in R2 and on the box, staged as MLXFAST_QWEN38_GOLDEN_DIR)"
         )
-
-    # -- 5a3 ---------------------------------------------------------------
-    def check_no_tracked_golden(self) -> None:
-        """No file under correctness_prompts/ is tracked by git.
-
-        Goldens, public captures and prompt files live in R2, never in the
-        repository (David, 2026-09-21: "goldens and keys are only in R2, never
-        in repo"). The contract fixture pins them by r2_path, sha256 and bytes,
-        and tools/fetch-goldens.sh fetches them into correctness_prompts/,
-        which .gitignore excludes. A force-added file is refused here by name.
-        """
-        try:
-            listed = subprocess.run(
-                ["git", "-C", self.root, "ls-files", "--", GOLDEN_ROOT],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.split()
-        except (OSError, subprocess.CalledProcessError) as exc:
-            self.fail(f"goldens: cannot list the tracked files under {GOLDEN_ROOT}/: {exc}")
-            return
-        if listed:
-            for rel in listed:
-                self.fail(
-                    f"goldens: {rel} is tracked by git. Goldens, captures and prompts are "
-                    "R2 objects pinned in the contract fixture, never repository files. "
-                    "Remove it with git rm"
-                )
-            return
-        self.ok(f"goldens: git tracks no file under {GOLDEN_ROOT}/ (they live in R2)")
 
     # -- 5b ----------------------------------------------------------------
     def check_no_golden_baseline_pair(self, contract: dict) -> None:
@@ -1476,7 +1442,6 @@ class Linter:
         self.check_commands(manifest)
         contract = self.check_contract(manifest)
         self.check_track_goldens_absent(contract)
-        self.check_no_tracked_golden()
         self.check_no_golden_baseline_pair(contract)
         self.check_baseline_reference_commit(contract)
         self.check_scoring(manifest, contract)

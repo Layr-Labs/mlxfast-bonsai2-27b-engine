@@ -198,14 +198,6 @@ c["live_golden"] = ""
 c["timed_prompt_pool"] = []
 c["hidden_correctness_golden"] = {"sha256": "${SENTINEL}", "bytes": 0}
 c["live_golden_speculative"] = {}
-c["public_captures"] = {
-    role: {
-        "r2_path": "correctness_prompts/${TRACK_ID}/public-%s.golden.json" % role.replace("_", "-"),
-        "sha256": "${SENTINEL}",
-        "bytes": 0,
-    }
-    for role in ("local_iterate", "local_submit")
-}
 
 target = c.get("target", {})
 target["upstream_model_id"] = "${CKPT_REPO}"

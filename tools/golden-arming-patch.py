@@ -14,8 +14,11 @@ The directory holds these files, and nothing else:
                                   mtp_head.permitted_draft_depths.
   <live>.dflashN.golden.json      one per-depth oracle for every depth in
                                   dflash_drafter.permitted_draft_depths.
-  <basename of each public_captures r2_path>
-                                  the public captures for the local modes.
+  public-local-iterate.golden.json
+  public-local-submit.golden.json the two public captures for the local modes.
+                                  They are not uploads: they ship in git at
+                                  correctness_prompts/<track_id>/. The tool
+                                  checks them and prints where to copy them.
 
 THE PER-DEPTH SHAPE IS DECIDED BY THE BYTES. A per-depth oracle can differ from
 the serial tape (a speculative round verifies at M > 1, and MLX dispatches a
@@ -24,7 +27,8 @@ gets its own pin, but keys whose bytes are identical share ONE R2 object: a key
 whose oracle equals the serial live golden points at the live golden's pool
 key, and a key whose oracle equals an earlier key's points at that key's
 object. The organizer uploads each distinct object once. The upload list goes
-to stderr.
+to stderr, followed by one `ship:` line per public capture naming the
+repository path to copy it to.
 
 Usage:
   python3 tools/golden-arming-patch.py --dir DIR --live NAME
@@ -47,6 +51,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTRACT = os.path.join(ROOT, "fixtures", "bonsai2_27b_mlx_v1_track.json")
 POOL_SIZE = 8
+PUBLIC_ROLES = ("local_iterate", "local_submit")
 FORBIDDEN_BENCHMARK_KEYS = (
     "baseline_prefill_seconds_per_token",
     "baseline_decode_seconds_per_token",
@@ -76,7 +81,7 @@ def pin(path: str) -> dict:
     return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 
 
-def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[str]]:
+def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[str], list[str]]:
     track = contract["track_id"]
     prefix = f"correctness_prompts/{track}/"
     names = sorted(n for n in os.listdir(directory) if n.endswith(".golden.json"))
@@ -84,10 +89,7 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
     if others:
         raise Refusal(f"the directory holds files that are not *.golden.json: {', '.join(others)}")
 
-    public_captures = contract.get("public_captures") or {}
-    public_names = {
-        os.path.basename(entry["r2_path"]): role for role, entry in public_captures.items()
-    }
+    public_names = {f"public-{role.replace('_', '-')}.golden.json": role for role in PUBLIC_ROLES}
     depth_keys = [f"mtp{d}" for d in contract["mtp_head"]["permitted_draft_depths"]] + [
         f"dflash{d}" for d in contract["dflash_drafter"]["permitted_draft_depths"]
     ]
@@ -114,7 +116,7 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
     missing = [key for key in depth_keys if key not in depth_files]
     if missing:
         raise Refusal(f"no per-depth oracle for: {', '.join(missing)} (the measure script refuses a declared depth without one)")
-    missing = [role for role in public_captures if role not in public_files]
+    missing = [role for role in PUBLIC_ROLES if role not in public_files]
     if missing:
         raise Refusal(f"no public capture for: {', '.join(missing)}")
 
@@ -136,12 +138,12 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
         speculative[key] = {"r2_path": r2_path, **own}
 
     hidden_shas = {entry["sha256"] for entry in pool} | {entry["sha256"] for entry in speculative.values()}
-    public = {}
-    for role, entry in public_captures.items():
+    ships = []
+    for role in PUBLIC_ROLES:
         own = pin(os.path.join(directory, public_files[role]))
         if own["sha256"] in hidden_shas:
-            raise Refusal(f"the public capture {role} has the same bytes as a hidden tape or oracle; publishing it would publish that tape")
-        public[role] = {"r2_path": entry["r2_path"], **own}
+            raise Refusal(f"the public capture {role} has the same bytes as a hidden tape or oracle; shipping it would publish that tape")
+        ships.append(f"{public_files[role]} -> {prefix}{public_files[role]} ({own['sha256'][:12]}..., {own['bytes']} bytes)")
 
     patch = {
         "official_scoring_enabled": True,
@@ -149,22 +151,19 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
         "timed_prompt_pool": pool,
         "hidden_correctness_golden": {"sha256": live_entry["sha256"], "bytes": live_entry["bytes"]},
         "live_golden_speculative": speculative,
-        "public_captures": public,
     }
 
     uploads = []
     local_by_r2 = {entry["r2_path"]: f"{os.path.basename(entry['r2_path'])}" for entry in pool}
     for key in depth_keys:
         local_by_r2.setdefault(speculative[key]["r2_path"], depth_files[key])
-    for role in public:
-        local_by_r2[public[role]["r2_path"]] = public_files[role]
-    pins_by_r2 = {e["r2_path"]: e for e in pool + list(speculative.values()) + list(public.values())}
+    pins_by_r2 = {e["r2_path"]: e for e in pool + list(speculative.values())}
     for r2_path in sorted(local_by_r2):
         entry = pins_by_r2[r2_path]
         uploads.append(f"{local_by_r2[r2_path]} -> {r2_path} ({entry['sha256'][:12]}..., {entry['bytes']} bytes)")
     shared = sum(1 for key in depth_keys if speculative[key]["r2_path"] != f"{prefix}{depth_files[key]}")
     uploads.append(f"{len(local_by_r2)} distinct object(s); {shared} of {len(depth_keys)} per-depth key(s) share an earlier object")
-    return patch, uploads
+    return patch, uploads, ships
 
 
 def main() -> int:
@@ -178,13 +177,15 @@ def main() -> int:
     with open(args.contract, encoding="utf-8") as fh:
         contract = json.load(fh)
     try:
-        patch, uploads = build_patch(contract, args.dir, args.live)
+        patch, uploads, ships = build_patch(contract, args.dir, args.live)
     except Refusal as exc:
         print(f"REFUSE: {exc}", file=sys.stderr)
         return 1
 
     for line in uploads:
         print(f"upload: {line}", file=sys.stderr)
+    for line in ships:
+        print(f"ship: {line}", file=sys.stderr)
     if args.apply:
         contract.update(patch)
         with open(args.contract, "w", encoding="utf-8") as fh:

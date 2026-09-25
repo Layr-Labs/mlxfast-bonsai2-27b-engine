@@ -84,8 +84,8 @@ func aGemmaGoldenIsRefusedAgainstTheQwenTarget() throws {
 /// The pair under test is one document and the same document with that one
 /// block removed, so the only difference between the file that loads and the
 /// file that refuses is the field under test. It is built here rather than
-/// read from `correctness_prompts/`: no golden is in git, so no file there
-/// can serve as the control that must LOAD.
+/// read from `correctness_prompts/`, so the control that must LOAD is a
+/// document this test owns, not a shipped capture.
 @Test
 func aGoldenWithoutModelProvenanceIsRefusedByName() throws {
     let directory = try temporaryDirectory()
@@ -1475,4 +1475,48 @@ private func correctnessPromptJSON(_ token: Int = 1) -> String {
 
 private func arrayJSON(_ values: [Int]) -> String {
     "[\(values.map(String.init).joined(separator: ","))]"
+}
+
+/// THE SHIPPED PUBLIC CAPTURES LOAD. `--local-iterate` and `--local-submit`
+/// check correctness against the two captures under
+/// `correctness_prompts/bonsai2-27b-mlx-v1/`. The organizer recorded them on
+/// the track's box against the pinned target, so the strict loader must accept
+/// each one at the step count its mode demands, and the short capture must be
+/// the long capture truncated: they are one recording. The digests are
+/// measured from the tree (`shasum -a 256`, `wc -c`), so a re-recording
+/// replaces them here in the same commit as the files.
+@Test
+func theShippedPublicCapturesLoadThroughTheStrictLoader() throws {
+    let directory = "correctness_prompts/bonsai2-27b-mlx-v1/"
+    let localIteratePath = directory + "public-local-iterate.golden.json"
+    let localSubmitPath = directory + "public-local-submit.golden.json"
+
+    func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+    let localIterateData = try Data(contentsOf: URL(fileURLWithPath: localIteratePath))
+    #expect(digest(localIterateData) == "cc5952f782f6ddba1ff46abf173c3372704579d82d4d6a5a2c45d90cde42be9e")
+    #expect(localIterateData.count == 10_663)
+    let localSubmitData = try Data(contentsOf: URL(fileURLWithPath: localSubmitPath))
+    #expect(digest(localSubmitData) == "c1c42007bfd0989543c4b4d664483749bd3c278ec998915b80a294bd505122fd")
+    #expect(localSubmitData.count == 21_007)
+
+    // Each mode's golden must hold one more expected token than the mode
+    // decodes: 128 steps for --local-iterate, 1023 for --local-submit.
+    let short = try loadQwenGoldenFixture(
+        from: localIteratePath,
+        requiredSteps: MLXFastConstants.localIterateBenchmarkDecodeSteps + 1
+    )
+    let long = try loadQwenGoldenFixture(from: localSubmitPath, requiredSteps: 1_024)
+
+    #expect(short.cases.count == 1)
+    #expect(long.cases.count == 1)
+    let shortCase = try #require(short.cases.first)
+    let longCase = try #require(long.cases.first)
+    #expect(shortCase.name == longCase.name)
+    #expect(shortCase.promptTokens.count == MLXFastConstants.correctnessPromptTokens)
+    #expect(shortCase.promptTokens == longCase.promptTokens)
+    #expect(shortCase.expectedTokens.count == 256)
+    #expect(longCase.expectedTokens.count == 1_024)
+    #expect(Array(longCase.expectedTokens.prefix(256)) == shortCase.expectedTokens)
 }

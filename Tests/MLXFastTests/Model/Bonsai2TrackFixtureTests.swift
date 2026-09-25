@@ -99,37 +99,6 @@ struct Bonsai2TrackFixtureTests {
         #expect(oracles.values.allSatisfy(isPin))
     }
 
-    /// THE PUBLIC CAPTURES ARE R2 PINS. The goldens `--local-iterate` and
-    /// `--local-submit` check against are never in git:
-    /// `tools/fetch-goldens.sh --public` fetches each one to the path its
-    /// `r2_path` names. Each pin is either the exact pending sentinel with
-    /// zero bytes, or a real 64-hex digest with a positive byte count, and the
-    /// two captures travel together: they are one recording.
-    @Test("public_captures pins the two local captures in R2, pending or pinned together")
-    func publicCapturesArePinnedR2Objects() throws {
-        let object = try bonsai2TrackContractObject()
-        let captures = try #require(object["public_captures"] as? [String: Any])
-        #expect(Set(captures.keys) == ["local_iterate", "local_submit"])
-        let prefix = "correctness_prompts/bonsai2-27b-mlx-v1/"
-        var pending: [Bool] = []
-        for role in ["local_iterate", "local_submit"] {
-            let pin = try #require(captures[role] as? [String: Any])
-            let path = try #require(pin["r2_path"] as? String)
-            #expect(path.hasPrefix(prefix) && path.hasSuffix(".golden.json"))
-            let sha256 = try #require(pin["sha256"] as? String)
-            let bytes = try #require(pin["bytes"] as? Int)
-            if sha256 == Self.pendingOrganizerSentinel {
-                #expect(bytes == 0)
-                pending.append(true)
-            } else {
-                #expect(sha256.count == 64 && sha256.allSatisfy { "0123456789abcdef".contains($0) })
-                #expect(bytes > 0)
-                pending.append(false)
-            }
-        }
-        #expect(Set(pending).count == 1, "one capture is pinned and the other is pending")
-    }
-
     /// MODE FENCE. This track has TWO speculative arms, each a separate pinned
     /// export: the MTP head and the DFlash 2 block drafter. `serial` must be
     /// present because the baseline leg is pinned serial and is validated

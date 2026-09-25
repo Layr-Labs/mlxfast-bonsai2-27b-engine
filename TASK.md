@@ -164,14 +164,6 @@ stages both drafters beside it: `./setup-mtp-head.sh` for the MTP head, then
 This command writes the `weights/` tree that the engine loads.
 
 ```bash
-R2_BUCKET_ENDPOINT=... tools/fetch-goldens.sh --public
-```
-
-This command fetches the public captures from R2. Get the value of
-`R2_BUCKET_ENDPOINT` from the organizer. The command refuses until the
-organizer records the captures.
-
-```bash
 MLXFAST_ENGINE_BIN=.build/release/bench-worker \
 MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json \
   ./benchmark.sh --local-iterate

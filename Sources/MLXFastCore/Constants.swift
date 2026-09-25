@@ -24,9 +24,8 @@ public enum MLXFastConstants {
     // repository+revision, so a golden recorded against any other checkpoint
     // is REJECTED against these constants. That is the fail-closed direction:
     // the goldens are hardware-generated and are recorded on the ranked box.
-    // The public captures for local runs are R2 objects that the contract
-    // fixture pins in `public_captures`; `tools/fetch-goldens.sh --public`
-    // fetches them. They are never in git.
+    // The two public captures for the local modes are recorded there too and
+    // ship in this repository under correctness_prompts/bonsai2-27b-mlx-v1/.
     public static let referenceModelRepository =
         "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
     public static let referenceModelRevision =

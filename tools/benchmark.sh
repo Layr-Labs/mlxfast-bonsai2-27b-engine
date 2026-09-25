@@ -35,8 +35,8 @@
 #     conditions, same exit codes, same stream); the TEXT deliberately diverges --
 #     the upstream strings name Qwen artifacts and told a participant of THIS track
 #     to go find a "provisioned Qwen3.6 golden outside correctness_prompts/", which
-#     is wrong here. They now name this track's target and the R2 fetch of the
-#     public captures. Nothing diffs these two messages against the reference (the byte-parity
+#     is wrong here. They now name this track's target and the shipped public
+#     captures. Nothing diffs these two messages against the reference (the byte-parity
 #     bar applies to the no-mode STDOUT line at ref 75, noted below).
 #   - Score/integrity path derivation, ref lines 92-138.
 #   - The end-of-run human summary on STDERR: report_local_baseline_context
@@ -149,12 +149,7 @@ if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
 benchmark.sh: this track requires an explicit correctness golden.
 
 Set MLXFAST_CORRECTNESS_GOLDEN_PATH. There is no default: a golden is never
-selected implicitly. For a local run, use a public capture. The public
-captures are in R2, not in this repository. Fetch them once:
-
-  tools/fetch-goldens.sh --public
-
-It writes them, pin-verified, to these paths:
+selected implicitly. For a local run, use a shipped public capture:
 
   --local-iterate  correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json
   --local-submit   correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json
@@ -185,7 +180,6 @@ fi
 if [[ ! -f "${GOLDEN_PATH}" ]]; then
   echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
   echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH; there is no fallback golden." >&2
-  echo "benchmark.sh: the public captures come from R2: run tools/fetch-goldens.sh --public first." >&2
   exit 1
 fi
 

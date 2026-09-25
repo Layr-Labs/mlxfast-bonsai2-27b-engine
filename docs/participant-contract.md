@@ -778,7 +778,7 @@ sentinel. The sentinel is matched exactly; it is never a prefix test.
 
 | Object | Where it lives | Can you have it? |
 |---|---|---|
-| The public captures (`public_captures`) | R2, at the `r2_path` keys the fixture pins. `tools/fetch-goldens.sh --public` fetches them into `correctness_prompts/bonsai2-27b-mlx-v1/`. | **Yes.** They are pending today. See section 11.3. |
+| The public captures | This repository, under `correctness_prompts/bonsai2-27b-mlx-v1/`. | **Yes.** They are the local goldens. See section 11.3. |
 | `timed_prompt_pool[]` tapes | R2, at the `r2_path` keys the fixture pins. The ranked box stages them out of band into `MLXFAST_QWEN38_GOLDEN_DIR`. | **No.** They are organizer material and they are never in git. |
 | `live_golden_speculative{}` per-depth oracles | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
 | `hidden_correctness_golden` | The live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
@@ -795,10 +795,6 @@ objects. It reads the R2 base from the environment variable
 repository. The script verifies the byte count first, then the sha256, and
 deletes the file on either mismatch. It refuses to fetch anything the contract
 declares hidden, and that guard fails closed when it cannot read the contract.
-
-> **NOTE — this repository pins no golden for that tool to fetch yet.**
-> The pool is empty, so `--all` has nothing to stage today. The public
-> captures carry the pending sentinel, so `--public` refuses today.
 
 The organizer stages the whole pinned set on a ranked box with the same tool.
 `--all` reads the fixture, fetches every tape and every per-depth oracle, and
@@ -1135,32 +1131,20 @@ verified and what is still open.
 ### 11.3 The public captures
 
 The public captures are the goldens that `--local-iterate` and
-`--local-submit` check against. They are R2 objects under
-`correctness_prompts/bonsai2-27b-mlx-v1/`. No golden, capture or prompt file is
-in git: `tools/lint-benchmark-manifest.py` check 5a3 refuses a tracked file
-under `correctness_prompts/`.
+`--local-submit` check against. They ship in this repository under
+`correctness_prompts/bonsai2-27b-mlx-v1/`:
 
-The fixture pins each capture in `public_captures` as `{r2_path, sha256,
-bytes}`. `local_iterate` is the short capture and `local_submit` is the long
-one. The organizer records both on the track's box, in one recording, so the
-short capture is the long capture truncated. Both carry the pending sentinel
-today.
+| File | Mode |
+|---|---|
+| `public-local-iterate.golden.json` | `--local-iterate` |
+| `public-local-submit.golden.json` | `--local-submit` |
 
-Fetch the captures with this command:
-
-```bash
-R2_BUCKET_ENDPOINT=... tools/fetch-goldens.sh --public
-```
-
-The command writes each capture to its `r2_path` under the repository root. It
-verifies the byte count first, then the sha256. It refuses while a pin carries
-the pending sentinel. `R2_BUCKET_ENDPOINT` is secret-tier: get it from the
-organizer and keep it in your `.env`. The R2 credentials are optional for this
-mode.
-
-The ranked preflight refuses a contract that carries any pending sentinel, the
-public captures included. The track therefore does not open while participants
-have no local golden.
+The organizer recorded both on the track's box, against the pinned target, in
+one recording, so the short capture is the long capture truncated. Nothing
+fetches them and no environment variable is needed. The hidden goldens are
+different material (section 5.6): they live in R2 and on the ranked box, and
+`tools/lint-benchmark-manifest.py` refuses a pinned hidden golden in the
+checkout.
 
 **A GOLDEN MUST CARRY `model_provenance`.** The block names the repository and
 the revision of the pinned model. `loadQwenGoldenFixture` is the loader that
