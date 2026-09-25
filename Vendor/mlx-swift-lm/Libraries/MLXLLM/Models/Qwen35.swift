@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -336,6 +337,20 @@ final class Qwen35GatedDeltaNet: Module {
     /// The gated output norm with its `silu(gate) * x` tail fused into one
     /// kernel; the same FP32 arithmetic as `norm(out, gate:)`.
     private func gatedNorm(_ out: MLXArray, gate: MLXArray) -> MLXArray {
+        if let fused = Qwen35GdnT1Mega.gatedNorm(
+            out, gate: gate, weight: norm.weight, eps: norm.eps)
+        {
+            return fused
+        }
+        if let wide = Bonsai2GdnGnorm.apply(
+            out, gate: gate, weight: norm.weight, eps: norm.eps)
+        {
+            return wide
+        }
+        if Qwen35T1Compile.isArmed(), Qwen35T1Compile.isDecodeShape(out) {
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            return Qwen35T1Compile.gatedSilu(normed, gate)
+        }
         let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
         return Qwen35FusedElementwise.gatedNormTail(normed, gate).asType(out.dtype)
     }
@@ -347,6 +362,20 @@ final class Qwen35GatedDeltaNet: Module {
             return packed.forwardUnwidened(x)
         }
         return outProj(x)
+    }
+
+    /// Depthwise conv then SiLU. `BONSAI2_GDN_CONV=1` fuses them. `ALL=off`
+    /// stays on `silu(conv1d)`.
+    private func convThenSilu(_ convInput: MLXArray) -> MLXArray {
+        qwen35GdnConvSilu(convInput, weight: conv1d.weight, groups: conv1d.groups)
+    }
+
+    /// Dense `in_proj_b` and `in_proj_a`. `BONSAI2_GDN_AB=1` uses one matmul.
+    private func projectedBA(_ inputs: MLXArray) -> (MLXArray, MLXArray) {
+        if let pair = Bonsai2GdnAB.bAndA(b: inProjB, a: inProjA, x: inputs) {
+            return pair
+        }
+        return (inProjB(inputs), inProjA(inputs))
     }
 
     init(_ args: Qwen35TextConfiguration) {
@@ -594,18 +623,42 @@ final class Qwen35GatedDeltaNet: Module {
             // Packed qkv and z read the same activation through the same
             // transform; rotate it once. b and a stay full precision.
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+                let ba = projectedBA(inputs)
                 return (
                     shared[0],
                     shared[1].reshaped(B, S, numVHeads, headVDim),
-                    inProjB(inputs),
-                    inProjA(inputs)
+                    ba.0,
+                    ba.1
                 )
             }
+            if let (qkvY, zY) = Bonsai2GdnQkvzOnce.qkvAndZ(
+                qkv: inProjQKV, z: inProjZ, x: inputs, xIsHat: false)
+            {
+                let ba = projectedBA(inputs)
+                return (
+                    qkvY,
+                    zY.reshaped(B, S, numVHeads, headVDim),
+                    ba.0,
+                    ba.1
+                )
+            }
+            if let (qkvY, zY) = Bonsai2GdnQkvz.qkvAndZ(
+                qkv: inProjQKV, z: inProjZ, x: inputs, xIsHat: false)
+            {
+                let ba = projectedBA(inputs)
+                return (
+                    qkvY,
+                    zY.reshaped(B, S, numVHeads, headVDim),
+                    ba.0,
+                    ba.1
+                )
+            }
+            let ba = projectedBA(inputs)
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
+                ba.0,
+                ba.1
             )
         }
         let outFused = fusedInProj(inputs)
@@ -665,10 +718,27 @@ final class Qwen35GatedDeltaNet: Module {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
+        if S == 1, mask == nil,
+            let pref = Qwen35GdnT1Mega.prefix(
+                qkv: qkv, a: a, b: b, convState: convState,
+                convWeight: conv1d.weight, aLog: aLog, dtBias: dtBias,
+                numKHeads: numKHeads, numVHeads: numVHeads,
+                headKDim: headKDim, headVDim: headVDim,
+                convKernelSize: convKernelSize)
+        {
+            var state = ssmState ?? MLXArray.zeros(
+                [B, numVHeads, headVDim, headKDim], dtype: .float32)
+            if state.dtype != .float32 { state = state.asType(.float32) }
+            let (out, newSsm) = gatedDeltaKernel(
+                q: pref.q, k: pref.k, v: pref.v,
+                g: pref.g, beta: pref.beta, state: state)
+            return (out: out, newConvState: pref.newConv, newSsmState: newSsm)
+        }
+
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convThenSilu(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -676,9 +746,17 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
-        let qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
-        let kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        if let fused = Bonsai2QkRms.apply(q: q, k: k, invScale: invScale) {
+            qNormed = fused.0
+            kNormed = fused.1
+        } else {
+            let scales = derived.normScales(headKDim: headKDim, dtype: dtype)
+            qNormed = MLXFast.rmsNorm(q, weight: scales.q, eps: 1e-6)
+            kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
+        }
 
         let (out, newSsmState) = qwen35GatedDelta(
             q: qNormed,
@@ -713,7 +791,7 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convThenSilu(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -1057,7 +1135,7 @@ final class Qwen35GatedDeltaNet: Module {
                         0..., position ..< (position + convKernelSize), 0...])
                 }, axis: 1))
         } else {
-            convOut = silu(conv1d(convInput))
+            convOut = convThenSilu(convInput)
         }
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -1309,7 +1387,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35SigmoidGate(output, gate))
     }
 
     func cbv2Forward(
@@ -1358,7 +1436,7 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
+        let projectionInput = qwen35SigmoidGate(output, gate)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(oProj, projectionInput)
         }
@@ -1672,6 +1750,12 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
+        if let fused = Bonsai2AddRms.sumAndNorm(x, r, norm: postAttentionLayerNorm) {
+            if let dense = mlp as? Qwen3NextMLP {
+                return fused.0 + dense.qwen35Forward(fused.1)
+            }
+            return fused.0 + (mlp as! UnaryLayer)(fused.1)
+        }
         let h = x + r
         if let dense = mlp as? Qwen3NextMLP {
             return h + dense.qwen35Forward(postAttentionLayerNorm(h))
@@ -1962,6 +2046,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
+        Bonsai2QmvS16Phase.arm(sequenceLength: Bonsai2QmvS16Phase.sequenceLength(inputs))
         let hidden = model(inputs, cache: cache)
         var out = model.norm(hidden)
         if let lmHead {
@@ -2640,5 +2725,1512 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+}
+
+private func bonsai2ValveOff() -> Bool {
+    guard let raw = getenv("BONSAI2_VALVE") else { return false }
+    return String(cString: raw) == "ALL=off"
+}
+
+/// Full-attention `x * sigmoid(gate)` in one kernel. `ALL=off` keeps
+/// `sigmoidMultiply`.
+func qwen35SigmoidGate(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+    if let fused = Bonsai2AttnSigmoid.apply(x, gate) {
+        return fused
+    }
+    return sigmoidMultiply(x, gate)
+}
+
+private final class Bonsai2AttnSigmoidKernel: Sendable {
+    static let shared = Bonsai2AttnSigmoidKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_attn_sigmoid",
+            inputNames: ["x", "gate"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                float g = float(gate[i]);
+                float s;
+                if (g >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-g));
+                } else {
+                    float e = exp(g);
+                    s = e / (1.0f + e);
+                }
+                y[i] = static_cast<InT>(float(x[i]) * s);
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+enum Bonsai2AttnSigmoid {
+    nonisolated(unsafe) static var calls = 0
+    static func isArmed() -> Bool {
+        if bonsai2ValveOff() { return false }
+        guard let raw = getenv("BONSAI2_ATTN_SIGMOID") else { return false }
+        return String(cString: raw) == "1"
+    }
+    static func apply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray? {
+        guard isArmed(), x.shape == gate.shape, x.dtype == gate.dtype,
+            x.dtype == .float32 || x.dtype == .bfloat16
+        else { return nil }
+        let n = x.size
+        guard n > 0, n % 32 == 0 else { return nil }
+        calls += 1
+        return Bonsai2AttnSigmoidKernel.shared.kernel(
+            [x, gate],
+            template: [("InT", x.dtype)],
+            grid: (n, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [x.shape],
+            outputDTypes: [x.dtype])[0]
+    }
+}
+
+private final class Bonsai2GdnConvSiluKernel: Sendable {
+    static let shared = Bonsai2GdnConvSiluKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_conv_silu",
+            inputNames: ["x", "weight"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                uint c = i % uint(C);
+                uint t = (i / uint(C)) % uint(OutLen);
+                uint b = i / (uint(C) * uint(OutLen));
+                const device float* row = x + ((b * uint(InLen) + t) * uint(C) + c);
+                const device float* w = weight + c * 4;
+                float acc = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    acc += row[k * int(C)] * w[k];
+                }
+                float s;
+                if (acc >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-acc));
+                } else {
+                    float e = exp(acc);
+                    s = e / (1.0f + e);
+                }
+                y[i] = acc * s;
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+enum Bonsai2GdnConvSilu {
+    static func isArmed() -> Bool {
+        if bonsai2ValveOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_CONV") else { return false }
+        return String(cString: raw) == "1"
+    }
+    static func apply(_ input: MLXArray, weight: MLXArray, groups: Int) -> MLXArray? {
+        guard isArmed(),
+            input.ndim == 3, weight.ndim == 3,
+            input.dtype == .float32, weight.dtype == .float32
+        else { return nil }
+        let channels = input.dim(2)
+        let inLen = input.dim(1)
+        guard channels > 0, channels % 32 == 0, channels == groups,
+            weight.dim(0) == channels, weight.dim(1) == 4, weight.dim(2) == 1,
+            inLen >= 4
+        else { return nil }
+        let outLen = inLen - 3
+        let batch = input.dim(0)
+        guard batch > 0, outLen > 0 else { return nil }
+        return Bonsai2GdnConvSiluKernel.shared.kernel(
+            [input, weight],
+            template: [("C", channels), ("InLen", inLen), ("OutLen", outLen)],
+            grid: (batch * outLen * channels, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[batch, outLen, channels]],
+            outputDTypes: [.float32])[0]
+    }
+}
+
+func qwen35GdnConvSilu(_ input: MLXArray, weight: MLXArray, groups: Int) -> MLXArray {
+    if let fused = Bonsai2GdnConvSilu.apply(input, weight: weight, groups: groups) {
+        return fused
+    }
+    return silu(conv1d(input, weight, stride: 1, padding: 0, dilation: 1, groups: groups))
+}
+
+
+// Darkbloom serving fusions. ALL=off stands each one down.
+
+enum Bonsai2MlpCat {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_MLP_CAT") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func rows(_ x: MLXArray) -> Int {
+        if x.ndim >= 2 { return x.dim(x.ndim - 2) }
+        return 1
+    }
+
+    static func gateUp(
+        gate: HadamardQuantizedLinear, up: HadamardQuantizedLinear, hat: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard isArmed(), rows(hat) >= 64,
+            gate.groupSize == up.groupSize, gate.bits == up.bits,
+            gate.weight.dim(1) == up.weight.dim(1),
+            let gateBias = gate.biases, let upBias = up.biases
+        else { return nil }
+        let both = quantizedMM(
+            hat,
+            concatenated([gate.weight, up.weight], axis: 0),
+            scales: concatenated([gate.scales, up.scales], axis: 0),
+            biases: concatenated([gateBias, upBias], axis: 0),
+            transpose: true, groupSize: gate.groupSize, bits: gate.bits, mode: .affine)
+        let half = both.dim(-1) / 2
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var gateShape = both.shape
+        var upShape = both.shape
+        gateShape[gateShape.count - 1] = half
+        upShape[upShape.count - 1] = both.dim(-1) - half
+        return (
+            flat[0..., 0..<half].reshaped(gateShape),
+            flat[0..., half...].reshaped(upShape))
+    }
+}
+
+/// One prefill qmm for gate and up, with the concatenated weight built once.
+/// Decode rows stay on two qmv calls. Does not stack with `BONSAI2_MLP_CAT`.
+/// Opt-in. `ALL=off` restores the two matmuls. Set `BONSAI2_MLP_CAT_ONCE=1`.
+
+enum Bonsai2MlpCatOnce {
+    private struct Packed {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: Packed] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_MLP_CAT_ONCE") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func gateUp(
+        gate: HadamardQuantizedLinear, up: HadamardQuantizedLinear, hat: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard isArmed(), !Bonsai2MlpCat.isArmed(), Bonsai2MlpCat.rows(hat) >= 64,
+            gate.groupSize == up.groupSize, gate.bits == up.bits,
+            gate.weight.dim(1) == up.weight.dim(1),
+            let gateBias = gate.biases, let upBias = up.biases
+        else { return nil }
+        let key = ObjectIdentifier(gate)
+        let hit = lock.withLock { packed[key] }
+        let fused: Packed
+        if let hit {
+            fused = hit
+        } else {
+            let weight = concatenated([gate.weight, up.weight], axis: 0)
+            let scales = concatenated([gate.scales, up.scales], axis: 0)
+            let biases = concatenated([gateBias, upBias], axis: 0)
+            eval(weight, scales, biases)
+            let made = Packed(weight: weight, scales: scales, biases: biases)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            fused = lock.withLock { packed[key] ?? made }
+        }
+        let both = quantizedMM(
+            hat, fused.weight, scales: fused.scales, biases: fused.biases,
+            transpose: true, groupSize: gate.groupSize, bits: gate.bits, mode: .affine)
+        let half = both.dim(-1) / 2
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var gateShape = both.shape
+        var upShape = both.shape
+        gateShape[gateShape.count - 1] = half
+        upShape[upShape.count - 1] = both.dim(-1) - half
+        return (
+            flat[0..., 0..<half].reshaped(gateShape),
+            flat[0..., half...].reshaped(upShape))
+    }
+}
+
+/// Decode-only gate+up concat. One qmv keeps float16 scales when the fused
+/// row count is 34816. Prefill stays two matmuls. The lm_head stays on the
+/// cast. Opt-in. `ALL=off` restores the two matmuls. Set `BONSAI2_MLP_DEC_S16=1`.
+
+enum Bonsai2MlpCatBoth {
+    private struct Packed {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: Packed] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        if let raw = getenv("BONSAI2_MLP_CAT_BOTH"), String(cString: raw) == "1" {
+            return true
+        }
+        if let raw = getenv("BONSAI2_MLP_CAT_S16"), String(cString: raw) == "1" {
+            return true
+        }
+        return false
+    }
+
+    static func gateUp(
+        gate: HadamardQuantizedLinear, up: HadamardQuantizedLinear, hat: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let decodeOnly = Bonsai2MlpDecS16.isArmed() && Bonsai2MlpCat.rows(hat) == 1
+        guard isArmed() || decodeOnly, !Bonsai2MlpCat.isArmed(), !Bonsai2MlpCatOnce.isArmed(),
+            !Qwen35MlpGateUp.isArmed(), Bonsai2MlpCat.rows(hat) >= 1,
+            gate.groupSize == up.groupSize, gate.bits == up.bits, gate.mode == up.mode,
+            gate.weight.dim(0) == up.weight.dim(0),
+            gate.weight.dim(1) == up.weight.dim(1),
+            let gateBias = gate.biases, let upBias = up.biases
+        else { return nil }
+        let key = ObjectIdentifier(gate)
+        let hit = lock.withLock { packed[key] }
+        let fused: Packed
+        if let hit {
+            fused = hit
+        } else {
+            let weight = concatenated([gate.weight, up.weight], axis: 0)
+            let scales = concatenated([gate.scales, up.scales], axis: 0)
+            let biases = concatenated([gateBias, upBias], axis: 0)
+            eval(weight, scales, biases)
+            let made = Packed(weight: weight, scales: scales, biases: biases)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            fused = lock.withLock { packed[key] ?? made }
+        }
+        let both = quantizedMM(
+            hat, fused.weight, scales: fused.scales, biases: fused.biases,
+            transpose: true, groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        let half = both.dim(-1) / 2
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var gateShape = both.shape
+        var upShape = both.shape
+        gateShape[gateShape.count - 1] = half
+        upShape[upShape.count - 1] = both.dim(-1) - half
+        return (
+            flat[0..., 0..<half].reshaped(gateShape),
+            flat[0..., half...].reshaped(upShape))
+    }
+}
+
+/// One prefill qmm for GDN `in_proj_qkv` and `in_proj_z`. The concatenated
+/// weight is built once. Dense `in_proj_a` and `in_proj_b` stay separate.
+/// Decode rows stay on two qmv calls. Does not stack with `BONSAI2_GDN_FUSE`.
+/// Opt-in. `ALL=off` restores the two matmuls. Set `BONSAI2_GDN_QKVZ_ONCE=1`.
+
+enum Bonsai2GdnQkvzOnce {
+    private struct Packed {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: Packed] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_QKVZ_ONCE") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func qkvAndZ(
+        qkv qkvLinear: Linear, z zLinear: Linear, x: MLXArray, xIsHat: Bool
+    ) -> (MLXArray, MLXArray)? {
+        guard isArmed(), !Qwen35GdnInputFuse.isArmed(),
+            Bonsai2MlpCat.rows(x) >= 64,
+            let qkv = qkvLinear as? HadamardQuantizedLinear,
+            let z = zLinear as? HadamardQuantizedLinear,
+            ObjectIdentifier(type(of: qkv))
+                == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: z))
+                == ObjectIdentifier(HadamardQuantizedLinear.self),
+            qkv.gdnLayout == nil, z.gdnLayout == nil,
+            qkv.groupSize == z.groupSize, qkv.bits == z.bits, qkv.mode == z.mode,
+            qkv.weight.dim(1) == z.weight.dim(1),
+            qkv.transform.width == z.transform.width,
+            qkv.transform.blockSize == z.transform.blockSize,
+            let qkvBias = qkv.biases, let zBias = z.biases
+        else { return nil }
+        let key = ObjectIdentifier(qkv)
+        let hit = lock.withLock { packed[key] }
+        let fused: Packed
+        if let hit {
+            fused = hit
+        } else {
+            let weight = concatenated([qkv.weight, z.weight], axis: 0)
+            let scales = concatenated([qkv.scales, z.scales], axis: 0)
+            let biases = concatenated([qkvBias, zBias], axis: 0)
+            eval(weight, scales, biases)
+            let made = Packed(weight: weight, scales: scales, biases: biases)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            fused = lock.withLock { packed[key] ?? made }
+        }
+        let hat = xIsHat ? Bonsai2HatF32.share(x) : Bonsai2HatF32.share(qkv.preparedInput(x))
+        let both = quantizedMM(
+            hat, fused.weight, scales: fused.scales, biases: fused.biases,
+            transpose: true, groupSize: qkv.groupSize, bits: qkv.bits, mode: qkv.mode)
+        let qkvN = qkv.weight.dim(0)
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var qkvShape = both.shape
+        var zShape = both.shape
+        qkvShape[qkvShape.count - 1] = qkvN
+        zShape[zShape.count - 1] = both.dim(-1) - qkvN
+        return (
+            flat[0..., 0..<qkvN].reshaped(qkvShape),
+            flat[0..., qkvN...].reshaped(zShape))
+    }
+}
+
+/// Decode-only concat of GDN `in_proj_qkv` and `in_proj_z`. Prefill stays
+/// two projections. Dense `in_proj_a` and `in_proj_b` stay separate.
+/// Opt-in. `ALL=off` restores the two matmuls. Set `BONSAI2_GDN_QKVZ_DEC=1`.
+
+enum Bonsai2GdnQkvzDec {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        if Bonsai2GdnQkvz.isArmed() || Bonsai2GdnQkvzOnce.isArmed() { return false }
+        guard let raw = getenv("BONSAI2_GDN_QKVZ_DEC") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
+
+/// One qmm or qmv for GDN `in_proj_qkv` and `in_proj_z` at every row count.
+/// Prefill is one qmm. Decode is one qmv. The concatenated weight is built
+/// once. Dense `in_proj_a` and `in_proj_b` stay separate. Does not stack
+/// with `BONSAI2_GDN_FUSE` or `BONSAI2_GDN_QKVZ_ONCE`. Opt-in. `ALL=off`
+/// restores the two matmuls. Set `BONSAI2_GDN_QKVZ=1`.
+
+enum Bonsai2GdnQkvz {
+    private struct Packed {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: Packed] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_QKVZ") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func qkvAndZ(
+        qkv qkvLinear: Linear, z zLinear: Linear, x: MLXArray, xIsHat: Bool
+    ) -> (MLXArray, MLXArray)? {
+        let decodeOnly = Bonsai2GdnQkvzDec.isArmed() && Bonsai2MlpCat.rows(x) == 1
+        guard isArmed() || decodeOnly, !Qwen35GdnInputFuse.isArmed(),
+            !Bonsai2GdnQkvzOnce.isArmed(),
+            Bonsai2MlpCat.rows(x) >= 1,
+            let qkv = qkvLinear as? HadamardQuantizedLinear,
+            let z = zLinear as? HadamardQuantizedLinear,
+            ObjectIdentifier(type(of: qkv))
+                == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: z))
+                == ObjectIdentifier(HadamardQuantizedLinear.self),
+            qkv.gdnLayout == nil, z.gdnLayout == nil,
+            qkv.groupSize == z.groupSize, qkv.bits == z.bits, qkv.mode == z.mode,
+            qkv.weight.dim(1) == z.weight.dim(1),
+            qkv.transform.width == z.transform.width,
+            qkv.transform.blockSize == z.transform.blockSize,
+            let qkvBias = qkv.biases, let zBias = z.biases
+        else { return nil }
+        let key = ObjectIdentifier(qkv)
+        let hit = lock.withLock { packed[key] }
+        let fused: Packed
+        if let hit {
+            fused = hit
+        } else {
+            let weight = concatenated([qkv.weight, z.weight], axis: 0)
+            let scales = concatenated([qkv.scales, z.scales], axis: 0)
+            let biases = concatenated([qkvBias, zBias], axis: 0)
+            eval(weight, scales, biases)
+            let made = Packed(weight: weight, scales: scales, biases: biases)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            fused = lock.withLock { packed[key] ?? made }
+        }
+        let hat = xIsHat ? Bonsai2HatF32.share(x) : Bonsai2HatF32.share(qkv.preparedInput(x))
+        let both = quantizedMM(
+            hat, fused.weight, scales: fused.scales, biases: fused.biases,
+            transpose: true, groupSize: qkv.groupSize, bits: qkv.bits, mode: qkv.mode)
+        let qkvN = qkv.weight.dim(0)
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var qkvShape = both.shape
+        var zShape = both.shape
+        qkvShape[qkvShape.count - 1] = qkvN
+        zShape[zShape.count - 1] = both.dim(-1) - qkvN
+        return (
+            flat[0..., 0..<qkvN].reshaped(qkvShape),
+            flat[0..., qkvN...].reshaped(zShape))
+    }
+}
+
+/// Float16-scale qmv on decode steps only. Prefill leaves the live flag
+/// unset, so the 1024-token forward, including its one-row lm-head, keeps
+/// the float cast. Opt-in. `ALL=off` restores the cast. Set
+/// `BONSAI2_QMV_S16_PHASE=1`.
+
+enum Bonsai2QmvS16Phase {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_QMV_S16_PHASE") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func sequenceLength(_ inputs: MLXArray) -> Int {
+        if inputs.ndim >= 2 { return inputs.dim(1) }
+        return inputs.dim(0)
+    }
+
+    static func arm(sequenceLength: Int) {
+        if isArmed(), sequenceLength == 1 {
+            setenv("BONSAI2_QMV_S16_NOW", "1", 1)
+        } else {
+            unsetenv("BONSAI2_QMV_S16_NOW")
+        }
+    }
+}
+
+/// One snapshot of the C++ `BONSAI2_*` flags per forward.
+/// `getenv` stays the stock path. Opt-in. `ALL=off` clears the snapshot.
+/// Set `BONSAI2_ENV_CACHE=1`.
+
+enum Bonsai2Valve {
+    static func allOff() -> Bool {
+        guard let raw = getenv("BONSAI2_VALVE") else { return false }
+        return String(cString: raw) == "ALL=off"
+    }
+
+    static func envOff(_ name: String) -> Bool {
+        guard let raw = getenv(name) else { return false }
+        return String(cString: raw) == "0"
+    }
+}
+
+/// Slice hidden to the last token before the vocab GEMM.
+/// Default on; `ALL=off` or `BONSAI2_LAST_TOKEN_HEAD=0` restores full-row
+/// RMS + lm-head. CBv2 prefill already narrows via lastPositionLogits;
+/// this covers generate() and positionedForward when S>1. T=1 is a no-op.
+
+public enum Bonsai2B1RecurrentRow {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        return true
+    }
+
+    public static func row(_ state: MLXArray, index: Int, batch: Int) -> MLXArray {
+        if isArmed(), batch == 1 { return state }
+        return state[index ..< index + 1]
+    }
+}
+
+/// Same-input Hadamard (one FWHT then N qmm) for every sequence length.
+/// Default on; `ALL=off` or `BONSAI2_SHARED_HAT=0` restores split FWHT.
+
+public enum Bonsai2SharedHat {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        if Bonsai2Valve.envOff("BONSAI2_SHARED_HAT") { return false }
+        return true
+    }
+}
+
+/// Cmlx Kconst qmv_fast: prefetch next weight K-block while accumulating.
+/// Opt-in: quiet pair-sum P 0.94 D 0.81. Extra-template `_wp` plus
+/// extra registers. `ALL=off` restores the rolled K-loop.
+
+enum Qwen35GdnInputFuse {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_FUSE") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
+
+/// One dense matmul for GDN `in_proj_b` and `in_proj_a` at every row count.
+/// The concatenated weight is built once. Quantized `in_proj_qkv` and
+/// `in_proj_z` stay on their own path. Does not stack with `BONSAI2_GDN_FUSE`.
+/// Opt-in. `ALL=off` restores the two matmuls. Set `BONSAI2_GDN_AB=1`.
+
+enum Bonsai2GdnAB {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_AB") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func bAndA(b: Linear, a: Linear, x: MLXArray) -> (MLXArray, MLXArray)? {
+        guard isArmed(), !Qwen35GdnInputFuse.isArmed(), Bonsai2MlpCat.rows(x) >= 1,
+            !(b is QuantizedLinear), !(a is QuantizedLinear),
+            b.bias == nil, a.bias == nil,
+            b.weight.dim(1) == a.weight.dim(1),
+            b.weight.dtype == a.weight.dtype
+        else { return nil }
+        let key = ObjectIdentifier(b)
+        let hit = lock.withLock { packed[key] }
+        let weight: MLXArray
+        if let hit {
+            weight = hit
+        } else {
+            let made = concatenated([b.weight, a.weight], axis: 0)
+            eval(made)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            weight = lock.withLock { packed[key] ?? made }
+        }
+        let both = matmul(x, weight.T)
+        let bN = b.weight.dim(0)
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var bShape = both.shape
+        var aShape = both.shape
+        bShape[bShape.count - 1] = bN
+        aShape[aShape.count - 1] = both.dim(-1) - bN
+        return (
+            flat[0..., 0..<bN].reshaped(bShape),
+            flat[0..., bN...].reshaped(aShape))
+    }
+}
+
+/// Concatenate attention q/k/v Hadamard linears (Bonsai N=14336).
+/// Opt-in: quiet pair-sum P 0.91 D 0.96. ALL=off restores split projections.
+
+enum Bonsai2AttnKvDec {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        if Bonsai2AttnKV.isArmed() { return false }
+        if Qwen35AttnQkvFuse.isArmed() { return false }
+        guard let raw = getenv("BONSAI2_ATTN_KV_DEC") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
+
+/// One qmm or qmv for attention `k_proj` and `v_proj` at every row count.
+/// Prefill is one qmm. Decode is one qmv. The concatenated weight is built
+/// once. `q_proj` stays a separate matmul. Does not stack with
+/// `BONSAI2_ATTN_FUSE`. Opt-in. `ALL=off` restores the two matmuls.
+/// Set `BONSAI2_ATTN_KV=1`.
+
+enum Bonsai2AttnKV {
+    private struct Packed {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var packed: [ObjectIdentifier: Packed] = [:]
+    nonisolated(unsafe) static var buildCount = 0
+
+    static func reset() {
+        lock.withLock {
+            packed.removeAll()
+            buildCount = 0
+        }
+    }
+
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_ATTN_KV") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func kv(
+        k kLinear: HadamardQuantizedLinear, v vLinear: HadamardQuantizedLinear, hat: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let decodeOnly = Bonsai2AttnKvDec.isArmed() && Bonsai2MlpCat.rows(hat) == 1
+        guard isArmed() || decodeOnly, !Qwen35AttnQkvFuse.isArmed(),
+            Bonsai2MlpCat.rows(hat) >= 1,
+            kLinear.gdnLayout == nil, vLinear.gdnLayout == nil,
+            kLinear.groupSize == vLinear.groupSize, kLinear.bits == vLinear.bits,
+            kLinear.mode == vLinear.mode,
+            kLinear.weight.dim(1) == vLinear.weight.dim(1),
+            kLinear.transform.width == vLinear.transform.width,
+            kLinear.transform.blockSize == vLinear.transform.blockSize,
+            let kBias = kLinear.biases, let vBias = vLinear.biases
+        else { return nil }
+        let key = ObjectIdentifier(kLinear)
+        let hit = lock.withLock { packed[key] }
+        let fused: Packed
+        if let hit {
+            fused = hit
+        } else {
+            let weight = concatenated([kLinear.weight, vLinear.weight], axis: 0)
+            let scales = concatenated([kLinear.scales, vLinear.scales], axis: 0)
+            let biases = concatenated([kBias, vBias], axis: 0)
+            eval(weight, scales, biases)
+            let made = Packed(weight: weight, scales: scales, biases: biases)
+            lock.withLock {
+                if packed[key] == nil {
+                    packed[key] = made
+                    buildCount += 1
+                }
+            }
+            fused = lock.withLock { packed[key] ?? made }
+        }
+        let both = quantizedMM(
+            hat, fused.weight, scales: fused.scales, biases: fused.biases,
+            transpose: true, groupSize: kLinear.groupSize, bits: kLinear.bits,
+            mode: kLinear.mode)
+        let kN = kLinear.weight.dim(0)
+        let flat = both.reshaped([-1, both.dim(-1)])
+        var kShape = both.shape
+        var vShape = both.shape
+        kShape[kShape.count - 1] = kN
+        vShape[vShape.count - 1] = both.dim(-1) - kN
+        return (
+            flat[0..., 0..<kN].reshaped(kShape),
+            flat[0..., kN...].reshaped(vShape))
+    }
+}
+
+/// NSG=1 qmv_fast with 1 row/TG on large-N nconst kernels (N≥4096).
+/// Opt-in: quiet pair-sum P 0.92 D 0.73. Occupancy ladder is 4 > 2 > 1
+/// rows/TG on this pack. `ALL=off` restores 4 rows.
+
+public enum Bonsai2GdnBlocked {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_BLOCKED") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
+
+/// Prefill chunk size. The scored POC also sets `soloPrefillStripeTokens`
+/// to 4096, and that stripe wins whenever it is larger than this chunk.
+/// A 1024-token prompt is therefore one forward at chunk 512 and at chunk
+/// 1024. Opt-in. `ALL=off` keeps 512.
+/// Set `BONSAI2_PREFILL_CHUNK=1024`.
+
+public enum Bonsai2LayerAsync {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_LAYER_ASYNC") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    @discardableResult
+    public static func submit(_ hidden: MLXArray) -> MLXArray {
+        if isArmed(), hidden.ndim >= 2, hidden.dim(1) == 1 {
+            asyncEval(hidden)
+        }
+        return hidden
+    }
+}
+
+private final class Bonsai2AttnSigmoidKernel: Sendable {
+    static let shared = Bonsai2AttnSigmoidKernel()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_attn_sigmoid",
+            inputNames: ["x", "gate"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                float g = float(gate[i]);
+                float s;
+                if (g >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-g));
+                } else {
+                    float e = exp(g);
+                    s = e / (1.0f + e);
+                }
+                y[i] = static_cast<InT>(float(x[i]) * s);
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+private final class Bonsai2GdnConvSiluKernel: Sendable {
+    static let shared = Bonsai2GdnConvSiluKernel()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_conv_silu",
+            inputNames: ["x", "weight"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                uint c = i % uint(C);
+                uint t = (i / uint(C)) % uint(OutLen);
+                uint b = i / (uint(C) * uint(OutLen));
+                const device float* row = x + ((b * uint(InLen) + t) * uint(C) + c);
+                const device float* w = weight + c * 4;
+                float acc = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    acc += row[k * int(C)] * w[k];
+                }
+                float s;
+                if (acc >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-acc));
+                } else {
+                    float e = exp(acc);
+                    s = e / (1.0f + e);
+                }
+                y[i] = acc * s;
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+/// Depthwise conv (kernel 4, one group per channel, no padding) then SiLU,
+/// in one kernel. Float32 only. A channel count that is not a multiple of
+/// 32 stays on `silu(conv1d)`. Opt-in. `ALL=off` restores those two ops.
+/// Set `BONSAI2_GDN_CONV=1`.
+
+public enum Bonsai2AddRms {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_ADD_RMS") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    /// Residual sum and the RMSNorm of that sum. Nil keeps the stock pair.
+    public static func sumAndNorm(
+        _ x: MLXArray, _ residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard isArmed() else { return nil }
+        return evaluate(x, residual, norm: norm)
+    }
+
+    /// Same kernel as `sumAndNorm`, without the `BONSAI2_ADD_RMS` check.
+    static func evaluate(
+        _ x: MLXArray, _ residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard x.shape == residual.shape,
+            x.dtype == residual.dtype,
+            x.dtype == .float32 || x.dtype == .bfloat16,
+            norm.weight.dtype == .float32 || norm.weight.dtype == x.dtype,
+            x.ndim >= 1
+        else { return nil }
+        let axis = x.dim(-1)
+        guard axis > 4096, axis % 4 == 0, norm.weight.dim(0) == axis, axis > 0,
+            x.size % axis == 0
+        else { return nil }
+        let rows = x.size / axis
+        guard rows > 0 else { return nil }
+        let outType: DType = (x.dtype == .bfloat16 && norm.weight.dtype == .float32)
+            ? .float32 : x.dtype
+        let weight = norm.weight.asType(outType)
+        let outputs = Bonsai2AddRmsKernel.shared.kernel(
+            [x, residual, weight, MLXArray([norm.eps]), MLXArray([Int32(axis)])],
+            template: [("InT", x.dtype), ("OutT", outType)],
+            grid: (1024, rows, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [x.shape, x.shape],
+            outputDTypes: [x.dtype, outType])
+        return (outputs[0], outputs[1])
+    }
+}
+
+/// Fuse one decoder layer's `h + feedForward` with the next layer's input
+/// RMSNorm. Both the prefill rows and the decode row take the same kernel.
+/// `ALL=off` keeps the separate add and RMSNorm. Set `BONSAI2_OUT_ADD_RMS=1`.
+
+public enum Bonsai2OutAddRms {
+    public static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_OUT_ADD_RMS") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    nonisolated(unsafe) private static var stash: (MLXArray, MLXArray)?
+
+    public static func reset() {
+        stash = nil
+    }
+
+    public static func remember(_ h: MLXArray, _ feedForward: MLXArray) {
+        guard isArmed() else {
+            stash = nil
+            return
+        }
+        stash = (h, feedForward)
+    }
+
+    public static func take() -> (MLXArray, MLXArray)? {
+        guard isArmed() else {
+            stash = nil
+            return nil
+        }
+        let held = stash
+        stash = nil
+        return held
+    }
+
+    /// `(h + feedForward, rms(h + feedForward))`. Nil keeps the stock pair.
+    public static func boundary(
+        _ h: MLXArray, _ feedForward: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard isArmed() else { return nil }
+        return Bonsai2AddRms.evaluate(h, feedForward, norm: norm)
+    }
+}
+
+private final class Bonsai2AddRmsKernel: Sendable {
+    static let shared = Bonsai2AddRmsKernel()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_add_rms_looped",
+            inputNames: ["x", "res", "w", "eps", "axisBuf"],
+            outputNames: ["h", "out"],
+            source: bonsai2AddRmsLoopedSource,
+            ensureRowContiguous: true)
+    }
+}
+
+/// `rms_looped` with the residual add on the load. 1024 threads, 4-wide
+/// reads, 32 simdgroups. Squares use the rounded sum, then the same
+/// precise rsqrt and weight multiply as the stock kernel.
+private let bonsai2AddRmsLoopedSource = """
+    constexpr int N_READS = 4;
+    constexpr int SIMD_SIZE = 32;
+    uint gid = threadgroup_position_in_grid.y;
+    uint lid = thread_index_in_threadgroup;
+    uint lsize = threads_per_threadgroup.x;
+    uint simd_lane_id = thread_index_in_simdgroup;
+    uint simd_group_id = simdgroup_index_in_threadgroup;
+    uint axis = uint(axisBuf[0]);
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[SIMD_SIZE];
+
+    float acc = 0;
+    const device InT* xp = x + gid * size_t(axis) + lid * N_READS;
+    const device InT* rp = res + gid * size_t(axis) + lid * N_READS;
+    device InT* hp = h + gid * size_t(axis) + lid * N_READS;
+    for (uint r = 0; r < axis; r += lsize * N_READS) {
+      if (r + lid * N_READS + N_READS <= axis) {
+        for (int i = 0; i < N_READS; i++) {
+          InT hi = static_cast<InT>(float(xp[i + r]) + float(rp[i + r]));
+          hp[i + r] = hi;
+          float xi = float(hi);
+          acc += xi * xi;
+        }
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          if ((r + lid * N_READS + i) < axis) {
+            InT hi = static_cast<InT>(float(xp[i + r]) + float(rp[i + r]));
+            hp[i + r] = hi;
+            float xi = float(hi);
+            acc += xi * xi;
+          }
+        }
+      }
+    }
+    acc = simd_sum(acc);
+    if (simd_group_id == 0) {
+      local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+      local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+      acc = simd_sum(local_sums[simd_lane_id]);
+      if (simd_lane_id == 0) {
+        local_inv_mean[0] = metal::precise::rsqrt(acc / float(axis) + eps[0]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device OutT* op = out + gid * size_t(axis) + lid * N_READS;
+    const device OutT* wp = w + lid * N_READS;
+    for (uint r = 0; r < axis; r += lsize * N_READS) {
+      if (r + lid * N_READS + N_READS <= axis) {
+        for (int i = 0; i < N_READS; i++) {
+          op[r + i] = wp[r + i] * static_cast<OutT>(hp[r + i] * local_inv_mean[0]);
+        }
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          if ((r + lid * N_READS + i) < axis) {
+            op[r + i] = wp[r + i] * static_cast<OutT>(hp[r + i] * local_inv_mean[0]);
+          }
+        }
+      }
+    }
+    """
+
+/// Concatenate dense MLP gate+up Hadamard linears. ALL=off stands down.
+/// Default off: N=2×intermediate (34816) page-faults qmv on this pack.
+
+enum Qwen35GdnT1Mega {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        if Bonsai2Valve.envOff("BONSAI2_GDN_MEGA") { return false }
+        return true
+    }
+
+    static func prefix(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        convWeight: MLXArray,
+        aLog: MLXArray,
+        dtBias: MLXArray,
+        numKHeads: Int,
+        numVHeads: Int,
+        headKDim: Int,
+        headVDim: Int,
+        convKernelSize: Int
+    ) -> (
+        q: MLXArray, k: MLXArray, v: MLXArray, newConv: MLXArray,
+        g: MLXArray, beta: MLXArray
+    )? {
+        guard isArmed(),
+            qkv.ndim == 3, qkv.dim(1) == 1,
+            convKernelSize == 4,
+            headKDim >= 32, headKDim % 32 == 0, headKDim <= 128,
+            headVDim >= 4, headVDim % 4 == 0,
+            numVHeads > 0, numKHeads > 0, numVHeads % numKHeads == 0
+        else { return nil }
+
+        let B = qkv.dim(0)
+        let keyDim = headKDim * numKHeads
+        let valueDim = headVDim * numVHeads
+        let convDim = keyDim * 2 + valueDim
+        guard qkv.dim(2) == convDim,
+            qkv.dtype == convState.dtype,
+            convState.shape == [B, convKernelSize - 1, convDim],
+            convWeight.dim(0) == convDim, convWeight.dim(1) == convKernelSize
+        else { return nil }
+
+        let weight2 = convWeight.ndim >= 3 && convWeight.dim(2) == 1
+            ? convWeight.reshaped([convDim, convKernelSize]) : convWeight
+        let a2 = a.reshaped([B, numVHeads]).asType(.float32)
+        let b2 = b.reshaped([B, numVHeads]).asType(.float32)
+        let inType = qkv.dtype
+        let outputs = Qwen35GdnT1PrefixManager.shared.kernel(
+            [
+                qkv, convState, weight2, a2, b2,
+                aLog.asType(.float32), dtBias.asType(.float32),
+            ],
+            template: [
+                ("InT", inType),
+                ("Dk", headKDim),
+                ("Dv", headVDim),
+                ("Hk", numKHeads),
+                ("Hv", numVHeads),
+                ("Ksize", convKernelSize),
+            ],
+            grid: (128, numKHeads, B),
+            threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, 1, numKHeads, headKDim],
+                [B, 1, numKHeads, headKDim],
+                [B, 1, numVHeads, headVDim],
+                [B, convKernelSize - 1, convDim],
+                [B, 1, numVHeads],
+                [B, 1, numVHeads],
+            ],
+            outputDTypes: [inType, inType, inType, convState.dtype, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5])
+    }
+
+    static func gatedNorm(
+        _ out: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard isArmed(),
+            out.ndim == 4, out.dim(1) == 1,
+            gate.shape == out.shape,
+            weight.ndim == 1, weight.dim(0) == out.dim(3)
+        else { return nil }
+        let B = out.dim(0)
+        let Hv = out.dim(2)
+        let Dv = out.dim(3)
+        guard Dv >= 32, Dv % 32 == 0, Dv <= 128 else { return nil }
+        let outputs = Qwen35GdnT1GnormManager.shared.kernel(
+            [out, gate, weight.asType(.float32), MLXArray([eps])],
+            template: [("InT", out.dtype), ("Dv", Dv), ("Hv", Hv)],
+            grid: (32, B * Hv, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [out.shape],
+            outputDTypes: [out.dtype])
+        return outputs[0]
+    }
+
+    static func siluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray? {
+        guard isArmed(), gate.shape == up.shape, gate.dtype == up.dtype else { return nil }
+        if gate.ndim >= 3, gate.dim(gate.ndim - 2) != 1 { return nil }
+        if gate.ndim == 2, gate.dim(0) != 1 { return nil }
+        let n = gate.size
+        guard n > 0, n % 32 == 0 else { return nil }
+        let outputs = Qwen35T1SiluManager.shared.kernel(
+            [gate, up],
+            template: [("InT", gate.dtype)],
+            grid: (n, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [gate.shape],
+            outputDTypes: [gate.dtype])
+        return outputs[0]
+    }
+}
+
+private final class Qwen35GdnT1PrefixManager: Sendable {
+    static let shared = Qwen35GdnT1PrefixManager()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_t1_prefix_gates",
+            inputNames: ["qkv", "convState", "convW", "a", "b", "aLog", "dtBias"],
+            outputNames: ["q", "k", "v", "conv_out", "g", "beta"],
+            source: qwen35GdnT1PrefixSource,
+            ensureRowContiguous: true)
+    }
+}
+
+private final class Qwen35GdnT1GnormManager: Sendable {
+    static let shared = Qwen35GdnT1GnormManager()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_t1_gnorm",
+            inputNames: ["yIn", "gate", "normW", "eps"],
+            outputNames: ["yOut"],
+            source: qwen35GdnT1GnormSource,
+            ensureRowContiguous: true)
+    }
+}
+
+private final class Qwen35T1SiluManager: Sendable {
+    static let shared = Qwen35T1SiluManager()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_t1_silu_prod",
+            inputNames: ["gate", "up"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                float gv = float(gate[i]);
+                float uv = float(up[i]);
+                float silu = gv * (1.0f / (1.0f + exp(-gv)));
+                y[i] = static_cast<InT>(silu * uv);
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+/// One threadgroup per key-head. Depthwise T=1 conv+SiLU, QK RMS, and
+/// logaddexp GDN gates. Same mean-of-squares + precise rsqrt as rms_norm.
+private let qwen35GdnT1PrefixSource = """
+    constexpr int nKeep = Ksize - 1;
+    const int convDim = 2 * Hk * Dk + Hv * Dv;
+    const int keyDim = Hk * Dk;
+    const int repeat = Hv / Hk;
+
+    auto tid = thread_index_in_threadgroup;
+    auto hk = threadgroup_position_in_grid.y;
+    auto b_idx = threadgroup_position_in_grid.z;
+    auto simd_gid = simdgroup_index_in_threadgroup;
+    auto simd_lid = thread_index_in_simdgroup;
+
+    const size_t bConv = (size_t)b_idx * nKeep * convDim;
+    const size_t bQkv = (size_t)b_idx * convDim;
+
+    if (hk == 0) {
+      for (int c = tid; c < convDim; c += 128) {
+        for (int r = 0; r < nKeep - 1; r++) {
+          conv_out[bConv + (size_t)r * convDim + c] =
+              convState[bConv + (size_t)(r + 1) * convDim + c];
+        }
+        conv_out[bConv + (size_t)(nKeep - 1) * convDim + c] = qkv[bQkv + c];
+      }
+    }
+
+    threadgroup float q_s[128];
+    threadgroup float k_s[128];
+    threadgroup float rms_scratch[8];
+    threadgroup float qk_inv[2];
+
+    for (int i = tid; i < Dk; i += 128) {
+      int qch = int(hk) * Dk + i;
+      int kch = keyDim + int(hk) * Dk + i;
+      float qacc = 0.0f;
+      float kacc = 0.0f;
+      for (int t = 0; t < Ksize; t++) {
+        float qx = t < nKeep
+            ? float(convState[bConv + (size_t)t * convDim + qch])
+            : float(qkv[bQkv + qch]);
+        float kx = t < nKeep
+            ? float(convState[bConv + (size_t)t * convDim + kch])
+            : float(qkv[bQkv + kch]);
+        qacc += float(convW[(size_t)qch * Ksize + t]) * qx;
+        kacc += float(convW[(size_t)kch * Ksize + t]) * kx;
+      }
+      q_s[i] = qacc * (1.0f / (1.0f + exp(-qacc)));
+      k_s[i] = kacc * (1.0f / (1.0f + exp(-kacc)));
+    }
+    for (int r = 0; r < repeat; r++) {
+      int hv = int(hk) * repeat + r;
+      for (int d = tid; d < Dv; d += 128) {
+        int vch = 2 * keyDim + hv * Dv + d;
+        float vacc = 0.0f;
+        for (int t = 0; t < Ksize; t++) {
+          float vx = t < nKeep
+              ? float(convState[bConv + (size_t)t * convDim + vch])
+              : float(qkv[bQkv + vch]);
+          vacc += float(convW[(size_t)vch * Ksize + t]) * vx;
+        }
+        float silu = vacc * (1.0f / (1.0f + exp(-vacc)));
+        v[(size_t)b_idx * Hv * Dv + hv * Dv + d] = static_cast<InT>(silu);
+      }
+      if (tid == 0) {
+        float a_h = float(a[(size_t)b_idx * Hv + hv]);
+        float b_h = float(b[(size_t)b_idx * Hv + hv]);
+        float alog = float(aLog[hv]);
+        float dt = float(dtBias[hv]);
+        float xdt = a_h + dt;
+        float mx = xdt > 0.0f ? xdt : 0.0f;
+        float sp = mx + log(exp(xdt - mx) + exp(-mx));
+        g[(size_t)b_idx * Hv + hv] = exp(-exp(alog) * sp);
+        beta[(size_t)b_idx * Hv + hv] = 1.0f / (1.0f + exp(-b_h));
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float qacc = 0.0f;
+    float kacc = 0.0f;
+    for (int i = tid; i < Dk; i += 128) {
+      float qv = q_s[i];
+      float kv = k_s[i];
+      qacc += qv * qv;
+      kacc += kv * kv;
+    }
+    qacc = simd_sum(qacc);
+    kacc = simd_sum(kacc);
+    if (simd_lid == 0) {
+      rms_scratch[simd_gid] = qacc;
+      rms_scratch[simd_gid + 4] = kacc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      float qt = rms_scratch[0] + rms_scratch[1] + rms_scratch[2] + rms_scratch[3];
+      float kt = rms_scratch[4] + rms_scratch[5] + rms_scratch[6] + rms_scratch[7];
+      qk_inv[0] = metal::precise::rsqrt(qt / float(Dk) + 1e-6f);
+      qk_inv[1] = metal::precise::rsqrt(kt / float(Dk) + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_scale = qk_inv[0] / float(Dk);
+    float k_scale = qk_inv[1] * metal::precise::rsqrt(float(Dk));
+    for (int i = tid; i < Dk; i += 128) {
+      q[(size_t)b_idx * Hk * Dk + hk * Dk + i] =
+          static_cast<InT>(q_s[i] * q_scale);
+      k[(size_t)b_idx * Hk * Dk + hk * Dk + i] =
+          static_cast<InT>(k_s[i] * k_scale);
+    }
+    """
+
+/// T=1 gated RMSNorm + SiLU. One simdgroup per value-head. RMS over Dv
+/// matches mlx_fast.rms_norm (mean of squares, precise rsqrt, times weight).
+private let qwen35GdnT1GnormSource = """
+    auto tid = thread_index_in_threadgroup;
+    auto n = threadgroup_position_in_grid.y;
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    const size_t base = ((size_t)b_idx * Hv + hv_idx) * Dv;
+    threadgroup float inv[1];
+
+    float acc = 0.0f;
+    for (int d = tid; d < Dv; d += 32) {
+      float v = float(yIn[base + d]);
+      acc += v * v;
+    }
+    acc = simd_sum(acc);
+    if (tid == 0) {
+      inv[0] = metal::precise::rsqrt(acc / float(Dv) + float(eps[0]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = tid; d < Dv; d += 32) {
+      float yv = float(yIn[base + d]);
+      float nrm = yv * inv[0] * float(normW[d]);
+      float gz = float(gate[base + d]);
+      float silu = gz * (1.0f / (1.0f + exp(-gz)));
+      yOut[base + d] = static_cast<InT>(silu * nrm);
+    }
+    """
+
+/// Prefill gated RMSNorm + SiLU. One simdgroup per `[B, T, Hv]` row.
+/// Same mean-of-squares, precise rsqrt, weight, and SiLU as the T=1 kernel.
+/// T=1 stays on that kernel. Opt-in. `ALL=off` restores `norm(out, gate:)`.
+/// Set `BONSAI2_GDN_GNORM=1`.
+enum Bonsai2GdnGnorm {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_GNORM") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func apply(
+        _ out: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard isArmed(),
+            out.ndim == 4, out.dim(1) > 1,
+            gate.shape == out.shape,
+            weight.ndim == 1, weight.dim(0) == out.dim(3)
+        else { return nil }
+        let rows = out.dim(0) * out.dim(1) * out.dim(2)
+        let dv = out.dim(3)
+        guard dv >= 32, dv % 32 == 0, dv <= 128, rows > 0 else { return nil }
+        let outputs = Bonsai2GdnGnormManager.shared.kernel(
+            [out, gate, weight.asType(.float32), MLXArray([eps])],
+            template: [("InT", out.dtype), ("Dv", dv)],
+            grid: (32, rows, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [out.shape],
+            outputDTypes: [out.dtype])
+        return outputs[0]
+    }
+}
+
+/// Prefill GDN QK RMS. One simdgroup per `[B, S, Hk]` row. Same mean of
+/// squares and precise rsqrt as `mlx_fast.rms_norm`, then the Qwen3.5
+/// scales `Dk^-1` on q and `Dk^-0.5` on k. T=1 stays on the mega prefix.
+/// Opt-in. `ALL=off` restores the two RMS norms. Set `BONSAI2_QK_RMS=1`.
+enum Bonsai2QkRms {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_QK_RMS") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func apply(q: MLXArray, k: MLXArray, invScale: Float) -> (MLXArray, MLXArray)? {
+        guard isArmed(),
+            q.dtype == .float32, k.dtype == .float32,
+            q.ndim == 4, k.shape == q.shape, q.dim(1) > 1
+        else { return nil }
+        let rows = q.dim(0) * q.dim(1) * q.dim(2)
+        let d = q.dim(3)
+        guard d >= 32, d <= 128, d % 32 == 0, rows > 0, rows <= 65535 else { return nil }
+        let qScale = invScale * invScale
+        let outputs = Bonsai2QkRmsManager.shared.kernel(
+            [q, k, MLXArray([qScale, invScale]), MLXArray([Float(1e-6)])],
+            template: [("D", d)],
+            grid: (32, rows, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [q.shape, k.shape],
+            outputDTypes: [q.dtype, k.dtype])
+        return (outputs[0], outputs[1])
+    }
+}
+
+private final class Bonsai2QkRmsManager: Sendable {
+    static let shared = Bonsai2QkRmsManager()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_qk_rms",
+            inputNames: ["qIn", "kIn", "scales", "eps"],
+            outputNames: ["qOut", "kOut"],
+            source: """
+                auto tid = thread_index_in_threadgroup;
+                const size_t base = (size_t)threadgroup_position_in_grid.y * D;
+                threadgroup float inv[2];
+
+                float accQ = 0.0f;
+                float accK = 0.0f;
+                for (int d = tid; d < D; d += 32) {
+                  float qv = qIn[base + d];
+                  float kv = kIn[base + d];
+                  accQ += qv * qv;
+                  accK += kv * kv;
+                }
+                accQ = simd_sum(accQ);
+                accK = simd_sum(accK);
+                if (tid == 0) {
+                  inv[0] = metal::precise::rsqrt(accQ / float(D) + eps[0]);
+                  inv[1] = metal::precise::rsqrt(accK / float(D) + eps[0]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float qScale = scales[0];
+                float kScale = scales[1];
+                for (int d = tid; d < D; d += 32) {
+                  qOut[base + d] = qIn[base + d] * inv[0] * qScale;
+                  kOut[base + d] = kIn[base + d] * inv[1] * kScale;
+                }
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+private final class Bonsai2GdnGnormManager: Sendable {
+    static let shared = Bonsai2GdnGnormManager()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_gnorm_rows",
+            inputNames: ["yIn", "gate", "normW", "eps"],
+            outputNames: ["yOut"],
+            source: """
+                auto tid = thread_index_in_threadgroup;
+                const size_t base = (size_t)threadgroup_position_in_grid.y * Dv;
+                threadgroup float inv[1];
+
+                float acc = 0.0f;
+                for (int d = tid; d < Dv; d += 32) {
+                  float v = float(yIn[base + d]);
+                  acc += v * v;
+                }
+                acc = simd_sum(acc);
+                if (tid == 0) {
+                  inv[0] = metal::precise::rsqrt(acc / float(Dv) + float(eps[0]));
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int d = tid; d < Dv; d += 32) {
+                  float yv = float(yIn[base + d]);
+                  float nrm = yv * inv[0] * float(normW[d]);
+                  float gz = float(gate[base + d]);
+                  float silu = gz * (1.0f / (1.0f + exp(-gz)));
+                  yOut[base + d] = static_cast<InT>(silu * nrm);
+                }
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+enum Qwen35T1Compile {
+    static func isArmed() -> Bool {
+        if Bonsai2Valve.allOff() { return false }
+        guard let raw = getenv("BONSAI2_T1_COMPILE") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    static func isDecodeShape(_ x: MLXArray) -> Bool {
+        if x.ndim >= 3 { return x.dim(x.ndim - 2) == 1 }
+        if x.ndim == 2 { return x.dim(0) == 1 }
+        return true
+    }
+
+    static func siluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+        guard isArmed(), isDecodeShape(gate) else { return silu(gate) * up }
+        return siluProductCompiled(gate, up)
+    }
+
+    static func gatedSilu(_ normed: MLXArray, _ gate: MLXArray) -> MLXArray {
+        guard isArmed(), isDecodeShape(normed) else {
+            return (silu(gate.asType(.float32)) * normed.asType(.float32)).asType(normed.dtype)
+        }
+        return gatedSiluCompiled(normed, gate).asType(normed.dtype)
+    }
+
+    static func gdnGates(a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray)
+        -> (g: MLXArray, beta: MLXArray)
+    {
+        guard isArmed(), isDecodeShape(a) else {
+            return (
+                computeGatedDeltaG(aLog, a, dtBias),
+                sigmoid(b).asType(.float32))
+        }
+        let out = gdnGatesCompiled([a, b, aLog, dtBias])
+        return (out[0], out[1])
+    }
+
+    private static let siluProductCompiled: @Sendable (MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: false) { gate, up in
+            silu(gate) * up
+        }
+
+    private static let gatedSiluCompiled: @Sendable (MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: false) { normed, gate in
+            (silu(gate.asType(.float32)) * normed.asType(.float32)).asType(normed.dtype)
+        }
+
+    private static let gdnGatesCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        shapeless: false
+    ) { args in
+        let a = args[0]
+        let b = args[1]
+        let aLog = args[2]
+        let dtBias = args[3]
+        let beta = sigmoid(b).asType(.float32)
+        let g = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+        return [g, beta]
     }
 }
