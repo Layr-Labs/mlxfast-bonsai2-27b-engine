@@ -133,7 +133,7 @@
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml",
-    "maxConcurrentWorkflows": 1
+    "maxConcurrentWorkflows": 4
   },
   "scoreArtifact": "benchmark-results-<run_id>/score.json",
   "scorePath": "score.json",
