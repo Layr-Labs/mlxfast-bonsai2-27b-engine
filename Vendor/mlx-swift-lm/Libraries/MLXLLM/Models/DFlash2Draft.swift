@@ -874,6 +874,34 @@ final class DFlash2CandidateSelector: Module {
         super.init()
     }
 
+    private func topCandidates(_ logits: MLXArray) -> MLXArray {
+        let vocabularySize = logits.dim(-1)
+        let chunkSize = 512
+        guard logits.ndim == 3, topK == 16,
+            vocabularySize > chunkSize, vocabularySize % chunkSize == 0,
+            Device.defaultDevice().deviceType == .gpu
+        else {
+            return argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
+
+        // Metal argPartition currently fully sorts the vocabulary. Every
+        // global top-K entry is in its chunk's top-K, so merge only those.
+        // Both sorts are stable: equal values (including NaNs) retain token
+        // order across chunks and within each chunk, matching the full sort.
+        let batch = logits.dim(0)
+        let length = logits.dim(1)
+        let chunks = vocabularySize / chunkSize
+        let blocks = logits.reshaped(batch, length, chunks, chunkSize)
+        let local = argSort(blocks, axis: -1)[0..., 0..., 0..., (chunkSize - topK)...]
+        let values = takeAlong(blocks, local, axis: -1).reshaped(batch, length, -1)
+        let offsets = MLXArray((0 ..< chunks).map { UInt32($0 * chunkSize) })
+            .reshaped(1, 1, chunks, 1)
+        let ids = (local + offsets).reshaped(batch, length, -1)
+        let selected = argSort(values, axis: -1)[0..., 0..., (chunks * topK - topK)...]
+        return takeAlong(ids, selected, axis: -1)
+    }
+
     /// The greedy path.
     ///
     /// - Parameters:
@@ -882,9 +910,7 @@ final class DFlash2CandidateSelector: Module {
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
-        let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates = topCandidates(logits)
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
