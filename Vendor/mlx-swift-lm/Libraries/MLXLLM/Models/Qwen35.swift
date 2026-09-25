@@ -2140,9 +2140,25 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
+        let rows = hidden.dim(1)
+        if rows > Qwen35TextModel.promptProjectionMinimumRows {
+            // A prompt-sized forward is only ever read at its last row (the
+            // teacher-forced stepper and every engine prefill caller slice
+            // `[..., -1, ...]`), so project that row alone instead of all L
+            // rows through the 248320-wide head. RMSNorm is row-local, so
+            // norm-after-slice equals slice-after-norm for the surviving
+            // row; the returned shape `[B, 1, vocab]` slices identically.
+            // Verify windows (at most 17 rows) keep every row.
+            let last = model.norm(hidden[0..., (rows - 1)..., 0...])
+            return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
+        }
         let normalized = model.norm(hidden)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
+
+    /// Forwards wider than this are prompt chunks, never speculative verify
+    /// windows (DFlash 2 verifies at most 17 rows, the MTP head at most 8).
+    static let promptProjectionMinimumRows = 32
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
