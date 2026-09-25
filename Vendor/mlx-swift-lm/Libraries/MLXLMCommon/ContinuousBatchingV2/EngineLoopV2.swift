@@ -731,6 +731,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
+    /// An idle recheck is queued and no other step continuation is; the
+    /// generation retires that recheck when `wakeIdleLoop` steps early.
+    private var idleRecheckPending = false
+    private var idleRecheckGeneration: UInt64 = 0
     /// Nil in production. Configuration and records are engine-queue confined.
     var logitDiagnostic: CBv2LogitDiagnosticState?
     var attentionMetadata: CBv2AttentionMetadataState?
@@ -1015,7 +1019,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        for waiter in waiters { waiter.resume() }
+        // Settle before the shutdown barrier wakes. The worker's phase-close
+        // drain synchronizes `MLX.Stream()`, the calling thread's own C++
+        // default stream (its own command queue), not the global `Stream.gpu`
+        // every forward is encoded on; GPU work a round left in flight then
+        // frees its temporaries into the allocator cache AFTER that drain and
+        // benchd reads a non-zero `cache_memory`. A follow-up block on this
+        // serial queue also runs after the current block's locals are gone.
+        // Shutdown only: never inside a timed window.
+        engineQueue.async {
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+            for waiter in waiters { waiter.resume() }
+        }
     }
 
     // MARK: Submission (from EngineV2)
@@ -1470,6 +1486,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 } else if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
+                wakeIdleLoop()
             } catch let error as CBv2SchedulerError {
                 releaseAbandonedAdoption(prefixLookup.adoption)
                 // Contract violation (duplicate live request id) — surfaced
@@ -2306,10 +2323,29 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func scheduleIdleRecheck() {
+        idleRecheckPending = true
+        let generation = idleRecheckGeneration
         engineQueue.asyncAfter(deadline: .now() + config.idleRecheckInterval) { [weak self] in
-            self?.engineStep()
+            guard let self, self.idleRecheckGeneration == generation else { return }
+            self.idleRecheckPending = false
+            self.engineStep()
         }
     }
+
+    /// Work just arrived on an idle loop: run the step now rather than when
+    /// the idle recheck timer fires (a timer that, measured, picks a fresh
+    /// request up ~2 ms after submit). The pending recheck is retired by
+    /// generation, so the loop stays ONE chain of steps. Engine-queue only.
+    /// `MLXFAST_ENQUEUE_WAKE=0` restores timer-only pickup.
+    private func wakeIdleLoop() {
+        guard Self.enqueueWakeEnabled, idleRecheckPending else { return }
+        idleRecheckPending = false
+        idleRecheckGeneration &+= 1
+        engineQueue.async { [weak self] in self?.engineStep() }
+    }
+
+    static let enqueueWakeEnabled =
+        ProcessInfo.processInfo.environment["MLXFAST_ENQUEUE_WAKE"] != "0"
 
     /// Model protocols remain nonthrowing. A paged cache records a typed fault
     /// and returns shape-preserving placeholders so later model layers unwind

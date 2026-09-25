@@ -2,6 +2,7 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -14,6 +15,33 @@ extension EngineLoopV2 {
     /// production traffic (mass typically ≥0.99 at K=256) shortlisted while
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
+
+    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's event.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
+
+    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
+    static let submitsCommittedRecurrentStateEarly: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
+
+    /// Start the committed recurrent state on the GPU now.
+    ///
+    /// A partially accepted verify commits each recurrent layer by replaying
+    /// the accepted prefix from the pre-verify state. That replay is built
+    /// lazily here and would otherwise run inside the next round's target
+    /// verify, on the critical path. Submitting it now lets the GPU run it
+    /// while the host finishes this finalize and builds the next drafter
+    /// graph, a window in which the GPU is otherwise idle. The arrays and
+    /// their values are exactly the ones the next verify reads.
+    func submitCommittedRecurrentState(for id: CBv2RequestID) {
+        guard Self.submitsCommittedRecurrentStateEarly,
+            let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
+        else { return }
+        let arrays = snapshot.keys.sorted().flatMap { index in
+            [snapshot[index]!.conv, snapshot[index]!.ssm].compactMap { $0 }
+        }
+        if !arrays.isEmpty { asyncEval(arrays) }
+    }
 
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
@@ -84,6 +112,17 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        if Self.pollsAcceptancePacket {
+            // Poll the packet instead of sleeping on its completion event: the
+            // step thread wakes the instant the verify finishes and stays on a
+            // clocked-up core for the finalize and the next graph build, which
+            // are on the GPU's critical path. The read below then returns at
+            // once. `BONSAI_POLL_PACKET=0` restores the sleeping wait.
+            var available = false
+            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
+                !available
+            {}
+        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
@@ -308,6 +347,7 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
+                    submitCommittedRecurrentState(for: id)
                 } else {
                     precondition(
                         evaluations.count == 1 + k,
