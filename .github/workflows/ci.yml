@@ -215,12 +215,11 @@ jobs:
         # a good pair installs, a tampered binary is refused.
         run: tools/test-fetch-benchd.sh
 
-      - name: fetch-goldens verifies every pin and refuses pending captures
-        # A python3 http.server on 127.0.0.1 stands in for the R2 bucket. The
-        # public captures (--public), one object, and the whole pinned set
-        # (--all, through a stub signer) are fetched and pin-verified, and a
-        # pending pin, a short object and a hidden pin are refused. Hermetic:
-        # no credential, no R2, no network beyond loopback.
+      - name: fetch-goldens verifies every pin and refuses hidden material
+        # A python3 http.server on 127.0.0.1 stands in for the R2 bucket. One
+        # object and the whole pinned set (--all, through a stub signer) are
+        # fetched and pin-verified, and a short object and a hidden pin are
+        # refused. Hermetic: no credential, no R2, no network beyond loopback.
         run: tools/test-fetch-goldens.sh
 
       - name: golden-arming-patch pins every key and dedupes identical bytes

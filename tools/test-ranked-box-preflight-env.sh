@@ -116,13 +116,6 @@ else:
         pool_entry["sha256"], pool_entry["bytes"] = stage(pool_entry["r2_path"])
     for spec_entry in (contract.get("live_golden_speculative") or {}).values():
         spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
-# The public captures are not ranked inputs and are never staged on the box,
-# but an armed contract pins them too (the preflight refuses any pending
-# sentinel), so they get real digests over known bytes, like the hidden oracle.
-for role, pin in (contract.get("public_captures") or {}).items():
-    if str(pin.get("sha256", "")).endswith("PENDING-ORGANIZER"):
-        data = json.dumps({"synthetic_public_capture": role}).encode()
-        pin["sha256"], pin["bytes"] = hashlib.sha256(data).hexdigest(), len(data)
 with open(contract_path, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")

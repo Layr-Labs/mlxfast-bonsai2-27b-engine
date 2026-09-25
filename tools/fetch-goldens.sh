@@ -3,24 +3,18 @@
 # fetch-goldens.sh -- fetch pin-verified golden objects from the track's R2
 # bucket for track bonsai2-27b-mlx-v1.
 #
-# THE SCRIPT HAS THREE MODES.
+# THE SCRIPT HAS TWO MODES, both organizer-side. A participant never needs it:
+# the two public captures for --local-iterate and --local-submit ship in this
+# repository under correctness_prompts/bonsai2-27b-mlx-v1/.
 #
-#   1. THE PUBLIC CAPTURES, for participants:
-#        tools/fetch-goldens.sh --public
-#      It reads fixtures/bonsai2_27b_mlx_v1_track.json public_captures and
-#      fetches each capture to the path its r2_path names, under this
-#      repository (correctness_prompts/bonsai2-27b-mlx-v1/, which git ignores).
-#      These are the goldens --local-iterate and --local-submit check against.
-#      It refuses while the fixture carries the pending sentinel.
-#
-#   2. ONE OBJECT:
+#   1. ONE OBJECT:
 #        tools/fetch-goldens.sh --r2-path KEY --sha256 HEX --bytes N --out FILE
 #      It fetches one object and keeps it only when the bytes match the pin.
 #      A pin that fixtures/bonsai2_27b_mlx_v1_track.json declares hidden is
 #      refused, by key and by digest, so a pin copied out of the contract
 #      cannot pull organizer material onto a participant machine.
 #
-#   3. THE WHOLE PINNED SET, for the organizer staging a ranked box:
+#   2. THE WHOLE PINNED SET, for the organizer staging a ranked box:
 #        tools/fetch-goldens.sh --all --out DIR
 #      It reads the contract, then fetches every timed_prompt_pool tape and
 #      every live_golden_speculative oracle into DIR. DIR is the directory the
@@ -33,9 +27,7 @@
 # per-depth oracles are organizer material. They are published in R2 at the
 # r2_path keys the contract pins, and the ranked box stages them out of band.
 # They are never in git. The public captures are different material: they are
-# participant goldens for local runs. They are never in git either: they are
-# published in R2 beside the tapes, pinned in public_captures, and fetched by
-# --public.
+# participant goldens for local runs, and they ship in git.
 #
 # THE R2 CONVENTION THIS MIRRORS (do not re-derive it):
 #   * The base URL lives in the environment variable R2_BUCKET_ENDPOINT and
@@ -52,7 +44,6 @@
 #     names it precisely, where a bare hash mismatch does not.
 #
 # Usage:
-#   tools/fetch-goldens.sh --public
 #   tools/fetch-goldens.sh --r2-path KEY --sha256 HEX --bytes N --out FILE
 #   tools/fetch-goldens.sh --all --out DIR
 #
@@ -78,21 +69,10 @@ WANT_BYTES=""
 OUT_PATH=""
 ALLOW_HIDDEN=0
 FETCH_ALL=0
-FETCH_PUBLIC=0
 DEFAULT_DOWNLOADER="${SCRIPT_DIR}/tools/download-r2-object.sh"
 
 usage() {
   cat <<EOF
-Usage: tools/fetch-goldens.sh --public
-
-Fetch this track's public captures, the goldens that --local-iterate and
---local-submit check against. The script reads the {r2_path, sha256, bytes}
-pins in fixtures/bonsai2_27b_mlx_v1_track.json public_captures, and writes each
-capture, pin-verified, to its r2_path under this repository
-(correctness_prompts/bonsai2-27b-mlx-v1/). Git ignores that directory. A capture
-that already matches its pin is left alone. The mode needs R2_BUCKET_ENDPOINT
-(ask the organizer); the R2 credentials are optional.
-
 Usage: tools/fetch-goldens.sh --r2-path KEY --sha256 HEX --bytes N --out FILE
 
 Fetch one object from the track's R2 bucket and accept it only if it matches
@@ -113,7 +93,8 @@ THE R2 BASE URL COMES FROM THE ENVIRONMENT ONLY:
 It is secret-tier material. It is deliberately absent from this repository and
 must stay that way -- keep it in your .env, never in a file you commit.
 
-For the public captures, use --public: it reads their pins from the contract.
+The public captures for --local-iterate and --local-submit ship in this
+repository under correctness_prompts/bonsai2-27b-mlx-v1/; nothing here fetches them.
 
 THE HIDDEN GUARD: every pin in fixtures/bonsai2_27b_mlx_v1_track.json (the
 timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
@@ -146,7 +127,6 @@ while (( $# > 0 )); do
     --out)     OUT_PATH="${2:-}"; shift 2 ;;
     --allow-hidden) ALLOW_HIDDEN=1; shift ;;
     --all)     FETCH_ALL=1; shift ;;
-    --public)  FETCH_PUBLIC=1; shift ;;
     -h|--help|help) usage; exit 0 ;;
     *)
       echo "fetch-goldens.sh: unknown argument '$1'" >&2
@@ -156,12 +136,7 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ "${FETCH_PUBLIC}" == "1" ]]; then
-  if [[ "${FETCH_ALL}" == "1" || -n "${R2_PATH}" || -n "${WANT_SHA}" || -n "${WANT_BYTES}" || -n "${OUT_PATH}" || "${ALLOW_HIDDEN}" == "1" ]]; then
-    echo "fetch-goldens.sh: --public takes no other argument; it reads every pin and destination from the contract" >&2
-    exit 2
-  fi
-elif [[ "${FETCH_ALL}" == "1" ]]; then
+if [[ "${FETCH_ALL}" == "1" ]]; then
   if [[ -z "${OUT_PATH}" ]]; then
     echo "fetch-goldens.sh: --all needs --out DIR (the staging directory the box exports as MLXFAST_QWEN38_GOLDEN_DIR)" >&2
     exit 2
@@ -181,9 +156,9 @@ else
 fi
 
 # A pin is sha256 AND bytes together; neither alone is a pin. Reject malformed
-# input here rather than after spending a download on it. --all and --public
-# take their pins from the contract, so they validate them where they read them.
-if [[ "${FETCH_ALL}" == "0" && "${FETCH_PUBLIC}" == "0" ]]; then
+# input here rather than after spending a download on it. --all takes its pins
+# from the contract, so it validates them where it reads them.
+if [[ "${FETCH_ALL}" == "0" ]]; then
 if ! printf '%s' "${WANT_SHA}" | grep -Eq '^[0-9a-f]{64}$'; then
   echo "fetch-goldens.sh: --sha256 must be 64 lowercase hex characters, got: ${WANT_SHA}" >&2
   exit 2
@@ -240,7 +215,7 @@ hidden_pins() {
 }
 
 is_hidden=0
-if [[ "${FETCH_ALL}" == "0" && "${FETCH_PUBLIC}" == "0" ]]; then
+if [[ "${FETCH_ALL}" == "0" ]]; then
 while IFS= read -r pin; do
   [[ -n "${pin}" ]] || continue
   if [[ "${pin}" == "${R2_PATH}" || "${pin}" == "${WANT_SHA}" ]]; then
@@ -267,57 +242,11 @@ holds all eight.
 If you are the organizer staging a box, use --all --out DIR, which stages the
 whole pinned set (credentials are required as well); --allow-hidden lifts this
 refusal for one object. If you are looking for a golden to iterate against
-locally, run tools/fetch-goldens.sh --public: it fetches this track's public
-captures.
+locally, use the shipped public captures under
+correctness_prompts/bonsai2-27b-mlx-v1/.
 EOF
   exit 1
 fi
-fi
-
-# --- the public pins --------------------------------------------------------
-# Read BEFORE the endpoint check, so a participant who has no endpoint yet
-# still learns the real state: while the captures are not recorded, there is
-# nothing to fetch, and the endpoint is not the problem.
-PUBLIC_PINS=""
-if [[ "${FETCH_PUBLIC}" == "1" ]]; then
-  command -v jq >/dev/null 2>&1 \
-    || { echo "fetch-goldens.sh: --public reads the contract with jq, and jq is not on PATH" >&2; exit 1; }
-  PUBLIC_PINS="$(jq -r '
-    (.public_captures // {}) | to_entries[]
-    | [.key, (.value.r2_path // ""), (.value.sha256 // ""), ((.value.bytes // 0) | tostring)]
-    | @tsv' "${CONTRACT}")"
-  [[ -n "${PUBLIC_PINS}" ]] \
-    || { echo "fetch-goldens.sh: the contract declares no public_captures; there is nothing to fetch" >&2; exit 1; }
-  pending=""
-  while IFS=$'\t' read -r role key want_sha want_bytes; do
-    [[ -n "${role}" ]] || continue
-    if ! printf '%s' "${want_sha}" | grep -Eq '^[0-9a-f]{64}$' \
-      || ! printf '%s' "${want_bytes}" | grep -Eq '^[1-9][0-9]*$'; then
-      pending="${pending} ${role}"
-    fi
-    # The key is also the local destination, so it must stay a plain relative
-    # path inside correctness_prompts/.
-    if ! printf '%s' "${key}" | grep -Eq '^correctness_prompts/[A-Za-z0-9._/-]+\.golden\.json$' \
-      || [[ "${key}" == */../* ]]; then
-      echo "fetch-goldens.sh: public_captures.${role}.r2_path is not a plain correctness_prompts/ *.golden.json key: ${key}" >&2
-      exit 1
-    fi
-  done <<EOF
-${PUBLIC_PINS}
-EOF
-  if [[ -n "${pending}" ]]; then
-    cat >&2 <<EOF
-fetch-goldens.sh: the public captures for this track are not recorded yet.
-
-  pending:${pending}
-
-fixtures/bonsai2_27b_mlx_v1_track.json public_captures still carries the
-pending sentinel. The organizer records the captures on the track's box,
-publishes them in R2, and pins them in the contract. Until then there is no
-local correctness golden, and the local test cannot check correctness.
-EOF
-    exit 1
-  fi
 fi
 
 # --- endpoint ---------------------------------------------------------------
@@ -432,39 +361,6 @@ matches_pin() {
   got_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
   [[ "${got_sha}" == "${want_sha}" ]]
 }
-
-# ============================================================================
-# --public: the public captures, into this repository
-# ============================================================================
-if [[ "${FETCH_PUBLIC}" == "1" ]]; then
-  fetched=0
-  kept=0
-  while IFS=$'\t' read -r role key want_sha want_bytes; do
-    [[ -n "${role}" ]] || continue
-    dest="${SCRIPT_DIR}/${key}"
-    if matches_pin "${dest}" "${want_sha}" "${want_bytes}"; then
-      echo "fetch-goldens.sh: ${key} is already present and matches its pin" >&2
-      kept=$((kept + 1))
-    else
-      # Land the bytes beside the destination and move them in only after the
-      # pin holds, so a partial transfer is never visible as a capture.
-      partial="${dest}.partial"
-      rm -f "${partial}"
-      transport_fetch "${key}" "${partial}" || exit 1
-      verify_pin "${partial}" "${want_sha}" "${want_bytes}" "${key}" || exit 1
-      chmod 0444 "${partial}"
-      rm -f "${dest}"
-      mv "${partial}" "${dest}"
-      fetched=$((fetched + 1))
-    fi
-    echo "${role}: ${key}"
-  done <<EOF
-${PUBLIC_PINS}
-EOF
-  echo "fetch-goldens.sh: fetched ${fetched} capture(s), kept ${kept} already-pinned file(s)"
-  echo "fetch-goldens.sh: set MLXFAST_CORRECTNESS_GOLDEN_PATH to the local_iterate path for --local-iterate, and to the local_submit path for --local-submit"
-  exit 0
-fi
 
 # ============================================================================
 # --all: stage the whole pinned set

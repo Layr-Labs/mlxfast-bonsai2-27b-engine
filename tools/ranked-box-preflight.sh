@@ -201,11 +201,9 @@ ok "temperature reader is plausible and moving (samples: ${temps[*]})"
 # --- 3. the timed pool is armed ---------------------------------------------
 # "Armed" is a property of the CONTRACT, checked before anything on disk is
 # looked at: a sentinel entry has no digest to verify a staged file against, so
-# a staged file would be accepted on its name alone. The check reads the whole
-# contract, so the public captures (public_captures) must be pinned too: a
-# track does not open while participants have no local golden.
+# a staged file would be accepted on its name alone.
 if grep -q 'PENDING-ORGANIZER' "${CONTRACT}"; then
-  fail "the track contract still carries PENDING-ORGANIZER sentinels (the timed pool, the hidden oracle or the public captures); the track is unarmed and nothing can be pin-verified against it"
+  fail "the track contract still carries PENDING-ORGANIZER sentinels; the timed pool is unarmed and nothing can be pin-verified against it"
 fi
 
 pool_count="$(jq -r '.timed_prompt_pool | length' "${CONTRACT}")"

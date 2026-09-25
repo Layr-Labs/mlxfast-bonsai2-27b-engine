@@ -208,12 +208,6 @@ if [[ -f "${F}" ]]; then
   [[ "$(jqf "${F}" '["live_golden_speculative"]')" == "{}" ]] || fail "fixture live_golden_speculative is not empty"
   [[ "$(jqf "${F}" '["hidden_correctness_golden"]["sha256"]')" == '"DEMO1-0-9B-A1B-MLX-V1-PENDING-ORGANIZER"' ]] \
     || fail "fixture hidden_correctness_golden sentinel: $(jqf "${F}" '["hidden_correctness_golden"]["sha256"]')"
-  for role in local_iterate local_submit; do
-    [[ "$(jqf "${F}" "[\"public_captures\"][\"${role}\"][\"sha256\"]")" == '"DEMO1-0-9B-A1B-MLX-V1-PENDING-ORGANIZER"' ]] \
-      || fail "fixture public_captures.${role} sentinel: $(jqf "${F}" "[\"public_captures\"][\"${role}\"]")"
-    [[ "$(jqf "${F}" "[\"public_captures\"][\"${role}\"][\"r2_path\"]")" == "\"correctness_prompts/${NEW_TRACK}/public-${role//_/-}.golden.json\"" ]] \
-      || fail "fixture public_captures.${role} r2_path: $(jqf "${F}" "[\"public_captures\"][\"${role}\"][\"r2_path\"]")"
-  done
   [[ "$(jqf "${F}" '["target"]["upstream_model_id"]')" == "\"${CKPT_REPO}\"" ]] || fail "fixture target.upstream_model_id: $(jqf "${F}" '["target"]["upstream_model_id"]')"
   [[ "$(jqf "${F}" '["target"]["upstream_revision"]')" == "\"${CKPT_REV}\"" ]] || fail "fixture target.upstream_revision: $(jqf "${F}" '["target"]["upstream_revision"]')"
   group_ok "the new fixture carries the stamped values and the old one is gone"
@@ -263,9 +257,9 @@ else
 fi
 
 # the goldens
-# They are never in git: a track's goldens are published in R2 and staged on its
-# own box. So the stamped seed must carry NEITHER track's goldens, and there is
-# no directory for the tool to rename.
+# The hidden goldens are never in git. The source track's public captures are,
+# and they belong to the source track, so the tool drops them: the stamped seed
+# must carry NEITHER track's goldens directory.
 group
 if [[ -d "${SEED}/correctness_prompts/${NEW_TRACK}" || -d "${SEED}/correctness_prompts/${OLD_TRACK}" ]]; then
   fail "the stamped seed carries a track goldens directory: $(ls "${SEED}/correctness_prompts")"

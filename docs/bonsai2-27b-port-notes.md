@@ -305,24 +305,22 @@ against an unchanged 7,949,663 cap. No cap moved.
 
 ## 5. The goldens
 
-The track has none yet. No golden, capture or prompt file is in git. The
-three Nemotron-era files that the seed carried (a 1024-token prompt and its
-256-step and 1024-step captures) are removed: both loaders refused them, and
-this track's seed is 512 tokens.
+No hidden golden is in git. The three Nemotron-era files that the seed carried
+(a 1024-token prompt and its 256-step and 1024-step captures) are removed: both
+loaders refused them, and this track's seed is 512 tokens.
 
-A golden is hardware-generated. The track's goldens must be recorded on this
-track's own box, against this pack, A≡B double-generated, and published to R2
-under `correctness_prompts/bonsai2-27b-mlx-v1/`. That covers the ranked
-material (the 8 pool tapes, the per-depth oracles) and the two public captures
-for local runs. The fixture pins the public captures in `public_captures`, and
-`tools/fetch-goldens.sh --public` fetches them. The local public drift gate
-cannot pass until they are recorded, and it should not.
+A golden is hardware-generated. The track's goldens are recorded on this
+track's own box, against this pack, A≡B double-generated. The ranked material
+(the 8 pool tapes, the per-depth oracles) is published to R2 under
+`correctness_prompts/bonsai2-27b-mlx-v1/` and never enters git. The two public
+captures for local runs are recorded the same way and ship in this repository
+at the same path, so a participant's local test needs no R2 access.
 
 ### 5.1 The arming shape
 
 The arming commit fills these fixture keys from the recorded files:
 `timed_prompt_pool` (8 pins), `live_golden`, `hidden_correctness_golden` (the
-live golden's own pin), `live_golden_speculative`, `public_captures` and
+live golden's own pin), `live_golden_speculative` and
 `official_scoring_enabled`.
 
 `tools/bonsai2-27b-measure-and-score.sh` refuses a declared decoder and depth

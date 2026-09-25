@@ -6,8 +6,8 @@
 # The synthetic set has the shape the per-depth rule must handle: the seven
 # MTP oracles are identical to each other and differ from the serial tape,
 # dflash1 is byte-identical to the serial tape, and dflash2..16 are identical
-# to each other. So 23 keys need 2 new objects, and 8 tapes + 2 oracles + 2
-# public captures = 12 distinct uploads.
+# to each other. So 23 keys need 2 new objects, and 8 tapes + 2 oracles = 10
+# distinct uploads. The two public captures are not uploads: they ship in git.
 #
 # Usage: tools/test-golden-arming-patch.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)
@@ -60,9 +60,11 @@ if python3 "${TOOL}" --dir "${WORK}/set" --live alpha > "${WORK}/patch.json" 2> 
     || { fail "case 1: dflash1 (serial-identical) does not point at the live golden"; ok1=0; }
   [[ "$(q "${P}" 'd["live_golden_speculative"]["dflash16"]["r2_path"]')" == "${pre}/alpha.dflash2.golden.json" ]] \
     || { fail "case 1: dflash16 does not share the dflash2 object"; ok1=0; }
-  [[ "$(q "${P}" 'd["public_captures"]["local_submit"]["r2_path"]')" == "${pre}/public-local-submit.golden.json" ]] \
-    || { fail "case 1: the local_submit capture does not keep its r2_path"; ok1=0; }
-  grep -q "12 distinct object(s); 21 of 23 per-depth key(s) share an earlier object" "${WORK}/case1.err" \
+  [[ "$(q "${P}" '"public_captures" in d')" == "False" ]] \
+    || { fail "case 1: the patch carries public_captures; the captures ship in git, not in the fixture"; ok1=0; }
+  grep -q "ship: public-local-submit.golden.json -> ${pre}/public-local-submit.golden.json" "${WORK}/case1.err" \
+    || { fail "case 1: the local_submit capture is not listed to ship"; ok1=0; }
+  grep -q "10 distinct object(s); 21 of 23 per-depth key(s) share an earlier object" "${WORK}/case1.err" \
     || { fail "case 1: the upload summary is wrong ($(tail -1 "${WORK}/case1.err"))"; ok1=0; }
   if grep -q "${MARKER}" "${P}" "${WORK}/case1.err"; then
     fail "case 1: the output carries golden CONTENT"; ok1=0

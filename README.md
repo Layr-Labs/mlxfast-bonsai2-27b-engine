@@ -27,7 +27,9 @@ cost is measured in that same session. No file stores it.
 > because it is the fleet's contract with the runner service, not this track's
 > own name. `tools/ranked-box-preflight.sh` verifies every file there against
 > the contract's `{sha256, bytes}` and refuses an extra `*.json`. They are
-> never in git, so your clone does not carry them.
+> never in git, so your clone does not carry them. The two public captures for
+> the local modes are different material: they ship in this repository under
+> `correctness_prompts/bonsai2-27b-mlx-v1/`.
 >
 > This track has no goldens yet. Section [Current status](#current-status)
 > states what that blocks.
@@ -125,15 +127,6 @@ This command converts the downloaded checkpoint into the `weights/` tree that
 the engine loads.
 
 ```bash
-R2_BUCKET_ENDPOINT=... tools/fetch-goldens.sh --public
-```
-
-This command fetches the two public captures from R2 into
-`correctness_prompts/bonsai2-27b-mlx-v1/`. Get the value of
-`R2_BUCKET_ENDPOINT` from the organizer. See [The public
-captures](#the-public-captures).
-
-```bash
 MLXFAST_ENGINE_BIN=.build/release/bench-worker \
 MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json \
   ./benchmark.sh --local-iterate
@@ -159,29 +152,19 @@ exports](#the-speculative-decoders-are-separate-exports).
 ### The public captures
 
 The local test checks correctness against a public capture. The two public
-captures are R2 objects. They are not in this repository.
-`fixtures/bonsai2_27b_mlx_v1_track.json` pins each one in `public_captures`,
-with its R2 key (`r2_path`), its sha256 and its byte count.
+captures ship in this repository under
+`correctness_prompts/bonsai2-27b-mlx-v1/`. The organizer recorded them on the
+track's box against the pinned target, in one recording, so the short capture
+is the long capture truncated.
 
-| Capture | Local path after the fetch | Use |
+| Capture | Path | Use |
 |---|---|---|
-| `local_iterate` | `correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json` | `--local-iterate`. The drift tripwire. |
-| `local_submit` | `correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json` | `--local-submit`. The long capture. |
+| Short | `correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json` | `--local-iterate`. The drift tripwire. |
+| Long | `correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json` | `--local-submit`. The long capture. |
 
-`tools/fetch-goldens.sh --public` reads the pins, fetches each capture to its
-`r2_path` under the repository root, and verifies the byte count and then the
-sha256. It deletes a file that does not match. It keeps a file that already
-matches. Git ignores `correctness_prompts/`, so a fetched capture never goes
-into a commit.
-
-The fetch needs `R2_BUCKET_ENDPOINT`. Get the value from the organizer, and
-keep it in your `.env`. Do not put it in a file that you commit.
-
-> **WARNING — the public captures are not recorded yet.**
-> The fixture pins both captures with the pending sentinel
-> `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`. `tools/fetch-goldens.sh --public`
-> refuses until the organizer records the captures on the track's box and pins
-> them. Until then, the local test cannot check correctness.
+Nothing fetches them, and no environment variable is needed to use them. The
+hidden goldens are different material: they live in R2 and on the ranked box.
+See the note at the top of this file.
 
 > **NOTE — a golden must name the checkpoint it came from.**
 > Each `.json` golden must carry a `model_provenance` block. The block names
@@ -203,7 +186,7 @@ keep it in your `.env`. Do not put it in a file that you commit.
 | `tools/` | Setup, build, lint, and measurement scripts. | Trusted |
 | `benchd-bin/` | Where `./tools/fetch-benchd.sh` installs the verified binary. Git ignores it. | Fetched |
 | `mtp-head.manifest.json` | The speculative-decoder declaration. It names the decoder and the draft depth. It declares; it carries no weights. | Editable, optional |
-| `correctness_prompts/` | Not in git. `tools/fetch-goldens.sh --public` writes the public captures here. The goldens live in R2 and on the ranked box. | Fetched |
+| `correctness_prompts/` | The two public captures for the local modes. The hidden goldens live in R2 and on the ranked box, never here. | Trusted |
 | `weights/` | The transformed weights the engine loads. | Generated |
 | `benchmark.json` | The Yukon track manifest. It lists every editable path. | Trusted |
 
