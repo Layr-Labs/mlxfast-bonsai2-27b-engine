@@ -561,8 +561,81 @@ elif ! argv_pair "${WORK}/case15b.argv" --box "${CALIBRATION_BOX_NAME}"; then
   fail "case 15b: argv does not carry --box ${CALIBRATION_BOX_NAME} from the calibration file: $(tr '\n' ' ' < "${WORK}/case15b.argv")"
 fi
 
+# Case 16: --local-iterate with NO golden variable defaults to the shipped short
+# capture, anchored at this repository, so the default holds from any working
+# directory. run_facade sets the variable; the empty value here wins and the
+# facade treats empty as unset.
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 MLXFAST_CORRECTNESS_GOLDEN_PATH=)
+run_facade case16 "${FACADE}" --local-iterate
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 16: --local-iterate refused with no golden variable; output: $(cat "${WORK}/case16.out")"
+elif [[ ! -f "${WORK}/case16.argv" ]]; then
+  fail "case 16: benchd was never spawned"
+elif ! argv_pair "${WORK}/case16.argv" --golden "${REPO_ROOT}/correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json"; then
+  fail "case 16: argv does not carry the shipped local-iterate capture: $(tr '\n' ' ' < "${WORK}/case16.argv")"
+fi
+
+# Case 17: --local-submit defaults to the shipped long capture.
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 MLXFAST_CORRECTNESS_GOLDEN_PATH=)
+run_facade case17 "${FACADE}" --local-submit
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 17: --local-submit refused with no golden variable; output: $(cat "${WORK}/case17.out")"
+elif [[ ! -f "${WORK}/case17.argv" ]]; then
+  fail "case 17: benchd was never spawned"
+elif ! argv_pair "${WORK}/case17.argv" --golden "${REPO_ROOT}/correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json"; then
+  fail "case 17: argv does not carry the shipped local-submit capture: $(tr '\n' ' ' < "${WORK}/case17.argv")"
+fi
+
+# Case 18: --official has NO default golden. It refuses by name before benchd
+# is spawned: an official run never scores against a shipped capture.
+EXTRA_ENV=(MLXFAST_BENCHMARK_SKIP_TIMED=1 MLXFAST_BENCHMARK_CHECK_GATES=1 MLXFAST_CORRECTNESS_GOLDEN_PATH=)
+run_facade case18 "${FACADE}" --official
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 18: --official ran with no golden variable"
+elif ! grep -q -- "--official requires an explicit correctness golden" "${WORK}/case18.out"; then
+  fail "case 18: the refusal does not name --official; got: $(cat "${WORK}/case18.out")"
+fi
+if [[ -f "${WORK}/case18.argv" ]]; then
+  fail "case 18: benchd was spawned despite the missing official golden"
+fi
+
+# Case 19: with NO engine variable, the facade uses the engine ./setup.sh built
+# at .build/release/bench-worker, anchored at its own repository. A throwaway
+# tree carries the manifest, the fixture, the declaration and a stub at that
+# path, so the default is observed where the real build would be.
+mkdir -p "${WORK}/enginedefault/tools" "${WORK}/enginedefault/.build/release" "${WORK}/enginedefault/fixtures"
+cp "${FACADE}" "${WORK}/enginedefault/tools/benchmark.sh"
+cp "${REPO_ROOT}/benchmark.json" "${REPO_ROOT}/mtp-head.manifest.json" "${WORK}/enginedefault/"
+cp "${REPO_ROOT}"/fixtures/*.json "${WORK}/enginedefault/fixtures/"
+cp "${STUB}" "${WORK}/enginedefault/.build/release/bench-worker"
+chmod +x "${WORK}/enginedefault/.build/release/bench-worker"
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 MLXFAST_ENGINE_BIN=)
+run_facade case19 "${WORK}/enginedefault/tools/benchmark.sh" --local-iterate
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 19: --local-iterate refused with no engine variable and a built bench-worker; output: $(cat "${WORK}/case19.out")"
+elif [[ ! -f "${WORK}/case19.argv" ]]; then
+  fail "case 19: benchd was never spawned"
+elif ! argv_pair "${WORK}/case19.argv" --engine "${WORK}/enginedefault/.build/release/bench-worker"; then
+  fail "case 19: argv does not carry the built bench-worker as --engine: $(tr '\n' ' ' < "${WORK}/case19.argv")"
+fi
+
+# Case 20: with NO engine variable and NO build, the facade refuses by name.
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 MLXFAST_ENGINE_BIN=)
+mkdir -p "${WORK}/nobuild/tools"
+cp "${FACADE}" "${WORK}/nobuild/tools/benchmark.sh"
+cp "${REPO_ROOT}/benchmark.json" "${WORK}/nobuild/"
+run_facade case20 "${WORK}/nobuild/tools/benchmark.sh" --local-iterate
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 20: the facade ran with no engine variable and no built bench-worker"
+elif ! grep -q "MLXFAST_ENGINE_BIN" "${WORK}/case20.out"; then
+  fail "case 20: the refusal does not name MLXFAST_ENGINE_BIN; got: $(cat "${WORK}/case20.out")"
+fi
+if [[ -f "${WORK}/case20.argv" ]]; then
+  fail "case 20: benchd was spawned with no engine"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-benchmark-facade-env.sh: all 15 cases passed (trackId=${EXPECTED})"
+  echo "test-benchmark-facade-env.sh: all 20 cases passed (trackId=${EXPECTED})"
   exit 0
 fi
 echo "test-benchmark-facade-env.sh: ${failures} case(s) failed" >&2

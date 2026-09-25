@@ -164,13 +164,12 @@ stages both drafters beside it: `./setup-mtp-head.sh` for the MTP head, then
 This command writes the `weights/` tree that the engine loads.
 
 ```bash
-MLXFAST_ENGINE_BIN=.build/release/bench-worker \
-MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json \
-  ./benchmark.sh --local-iterate
+./benchmark.sh --local-iterate
 ```
 
-This command runs the local test against the public local-iterate capture, with
-no speculation.
+This command runs the local test against the shipped local-iterate capture,
+with no speculation. It needs no environment variable: the engine is the one
+`./setup.sh` built, and the golden is the shipped capture.
 
 ```bash
 ./benchmark.sh --local-iterate --mtp-depth 3

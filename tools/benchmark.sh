@@ -30,8 +30,9 @@
 #     --score-path shell-level rejection, --official / --local-cool-gate-only shell
 #     selectors, the --official+local and --local-iterate+--local-submit combination
 #     errors, and the "no mode given; defaulting to --local-iterate" STDOUT line.
-#   - Golden preflight, ref lines 81-106: the missing-MLXFAST_CORRECTNESS_GOLDEN_PATH
-#     heredoc and the golden-file-not-found two-liner. SHAPE is reproduced (same
+#   - Golden preflight, ref lines 81-106: the missing-golden heredoc (--official
+#     only here: the local modes default to the shipped public captures) and the
+#     golden-file-not-found two-liner. SHAPE is reproduced (same
 #     conditions, same exit codes, same stream); the TEXT deliberately diverges --
 #     the upstream strings name Qwen artifacts and told a participant of THIS track
 #     to go find a "provisioned Qwen3.6 golden outside correctness_prompts/", which
@@ -144,22 +145,32 @@ if [[ "${LOCAL_COOL_GATE_ONLY}" == "1" ]]; then
   exit 0
 fi
 
+# The local modes default to the shipped public captures: the short one for
+# --local-iterate, the long one for --local-submit. The paths are anchored at
+# this repository, so the default holds from any working directory.
+# MLXFAST_CORRECTNESS_GOLDEN_PATH overrides the default. --official has no
+# default: it takes the organizer-provisioned hidden golden.
+REPO_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
-  cat >&2 <<'EOF'
-benchmark.sh: this track requires an explicit correctness golden.
+  if [[ "${LOCAL_SUBMIT}" == "1" ]]; then
+    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json"
+  elif [[ "${LOCAL_ITERATE}" == "1" ]]; then
+    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT_DIR}/correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json"
+  else
+    cat >&2 <<'EOF'
+benchmark.sh: --official requires an explicit correctness golden.
 
-Set MLXFAST_CORRECTNESS_GOLDEN_PATH. There is no default: a golden is never
-selected implicitly. For a local run, use a shipped public capture:
-
-  --local-iterate  correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json
-  --local-submit   correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json
-
+Set MLXFAST_CORRECTNESS_GOLDEN_PATH to the organizer-provisioned hidden
+golden. An official run never defaults to a shipped capture. The local modes
+do: --local-iterate uses
+  correctness_prompts/bonsai2-27b-mlx-v1/public-local-iterate.golden.json
+and --local-submit uses
+  correctness_prompts/bonsai2-27b-mlx-v1/public-local-submit.golden.json
 Both are captures against the pinned target,
 prism-ml/Ternary-Bonsai-2-27B-mlx-2bit (model_type prism_hadamard_qwen35).
-Official (--official) runs take an organizer-provisioned hidden golden
-instead; those are not in this repository.
 EOF
-  exit 1
+    exit 1
+  fi
 fi
 
 if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_SCORE_PATH:-}" ]]; then
@@ -179,7 +190,7 @@ fi
 # run work (ref 100-106).
 if [[ ! -f "${GOLDEN_PATH}" ]]; then
   echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
-  echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH; there is no fallback golden." >&2
+  echo "benchmark.sh: check MLXFAST_CORRECTNESS_GOLDEN_PATH, or unset it: the local modes default to the shipped captures under correctness_prompts/bonsai2-27b-mlx-v1/." >&2
   exit 1
 fi
 
@@ -349,8 +360,13 @@ enforce_official_sandbox() {
 # ---- Dispatch to benchd -------------------------------------------------------
 # The MLX engine binary (Engine Protocol v1) benchd spawns. Facade-specific and
 # REQUIRED for a real run — the Swift binary was its own engine; benchd is not.
+# ./setup.sh builds it at .build/release/bench-worker, which is the default when
+# it exists. MLXFAST_ENGINE_BIN overrides the default.
+if [[ -z "${MLXFAST_ENGINE_BIN:-}" && -x "${REPO_ROOT_DIR}/.build/release/bench-worker" ]]; then
+  MLXFAST_ENGINE_BIN="${REPO_ROOT_DIR}/.build/release/bench-worker"
+fi
 if [[ -z "${MLXFAST_ENGINE_BIN:-}" ]]; then
-  echo "benchmark.sh: MLXFAST_ENGINE_BIN must point to the benchd engine binary" >&2
+  echo "benchmark.sh: MLXFAST_ENGINE_BIN must point to the benchd engine binary (./setup.sh builds .build/release/bench-worker, the default when it exists)" >&2
   exit 1
 fi
 
