@@ -2443,6 +2443,16 @@ public class Qwen35TextModelInner: Module {
     let faIdx: Int
     let exactTargetVerify: Bool
 
+    /// DFlash verify builds are submitted in sixteen-layer slices so the
+    /// device can evaluate a completed prefix while Swift constructs the
+    /// next slice. The default stays enabled; the switch is a diagnostic
+    /// escape hatch for cross-device comparisons.
+    private static let verifySlicesEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -2618,6 +2628,15 @@ public class Qwen35TextModelInner: Module {
                 captureRecurrentWindow: captureRecurrentWindow,
                 exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
                 lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex)
+            // The verify path has 64 layers. Four boundaries keep graph
+            // construction ahead of the GPU without changing layer order or
+            // hidden values; normal serial/prefill paths remain one graph.
+            if captureRecurrentWindow, Self.verifySlicesEnabled,
+                (modelLayerIndex + 1) % 16 == 0,
+                modelLayerIndex + 1 < layers.count
+            {
+                asyncEval([hiddenStates])
+            }
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
