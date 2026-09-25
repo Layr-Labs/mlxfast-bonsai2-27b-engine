@@ -12,6 +12,69 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Fused element-wise chains
+
+/// The gated-delta decay `g`, as one compiled shapeless kernel instead of the
+/// exp / negate / add / softplus / multiply / exp chain (six dispatches per
+/// recurrent layer). The body IS `computeGatedDeltaG`, so the traced graph is
+/// the same op sequence on the same FP32 values; the fused kernel applies the
+/// same unary/binary functors in the same order. Gated like the sibling
+/// fusions in `SwitchLayers.swift` by `MLX_COMPILED_DECODE` (default on).
+private let qwen35CompiledGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+        computeGatedDeltaG(aLog, a, dtBias)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// `x * sigmoid(gate)` (`sigmoidMultiply`) as one compiled shapeless kernel.
+/// The attention path feeds it the strided [B, L, H, D] views directly, so the
+/// two layout copies that the flattening reshapes used to force are absorbed
+/// into the same kernel.
+private let qwen35CompiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (x: MLXArray, gate: MLXArray) -> MLXArray in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// Same recurrence as `gatedDeltaUpdate` (GatedDelta.swift), with `g` computed
+/// by the fused kernel above. `gatedDeltaUpdate` always takes the Metal kernel
+/// path (its kernel factory returns `MLXFast.metalKernel` unconditionally), so
+/// this calls that same kernel with the same fp32 `g`, `beta` and state.
+private func qwen35GatedDeltaUpdate(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let beta = sigmoid(b).asType(.float32)
+    let g = qwen35CompiledGatedDeltaG(aLog, a, dtBias)
+
+    let B = q.dim(0)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+    return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
 // MARK: - Configuration
 
 private enum RopeParametersCodingKey: String, CodingKey {
@@ -540,6 +603,58 @@ final class Qwen35GatedDeltaNet: Module {
         return contiguous(tail)
     }
 
+    /// Split the activated convolution output into the recurrence inputs.
+    ///
+    /// The query and key heads are normalized by ONE rmsNorm over the whole
+    /// convolution row viewed as `headKDim`-wide heads. rmsNorm is row-local
+    /// (each `headKDim` row gets its own inverse RMS, same kernel, same axis
+    /// size), so every query and key row is bit-identical to normalizing the
+    /// split views one at a time; the value rows it also normalizes are not
+    /// read. For a multi-position window the split views are strided, so the
+    /// old per-view rmsNorm paid a layout copy each; here the input is the
+    /// contiguous convolution output and the scale multiply writes the
+    /// contiguous `q`/`k` the recurrence kernel reads. The scales are applied
+    /// exactly as before: `scale * rmsNorm(x)` on the same FP32 values.
+    private func normalizedQueryKeyValue(
+        _ convOut: MLXArray, B: Int, S: Int
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        let dtype = convOut.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        guard convDim % headKDim == 0 else {
+            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+            let qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            return (qNormed, kNormed, v)
+        }
+        let heads = MLXFast.rmsNorm(
+            convOut.reshaped(B, S, convDim / headKDim, headKDim),
+            weight: MLXArray.mlxNone, eps: 1e-6)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * heads[0..., 0..., 0 ..< numKHeads, 0...]
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * heads[0..., 0..., numKHeads ..< (2 * numKHeads), 0...]
+        return (qNormed, kNormed, v)
+    }
+
+    /// `norm(out, gate: z)` (`Qwen3NextRMSNormGated`) with the SiLU gate and
+    /// product in one compiled kernel (`compiledSiluProduct`, the same
+    /// `silu(gate) * x` order) instead of a compiled SiLU plus a multiply.
+    /// The casts are the module's own; on this FP32 pack they are no-ops.
+    private func gatedNorm(_ out: MLXArray, gate: MLXArray) -> MLXArray {
+        let x = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+        return compiledSiluProduct(gate.asType(.float32), x.asType(.float32))
+            .asType(out.dtype)
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -574,21 +689,9 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        let (qNormed, kNormed, v) = normalizedQueryKeyValue(convOut, B: B, S: S)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = qwen35GatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -623,21 +726,9 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        let (qNormed, kNormed, v) = normalizedQueryKeyValue(convOut, B: B, S: S)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-        let recurrence = gatedDeltaUpdate(
+        let recurrence = qwen35GatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -714,7 +805,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = gatedDeltaUpdate(
+        let boundarySsm = qwen35GatedDeltaUpdate(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -844,7 +935,7 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -896,7 +987,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -967,23 +1058,11 @@ final class Qwen35GatedDeltaNet: Module {
             convOut = silu(conv1d(convInput))
         }
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed, v) = normalizedQueryKeyValue(convOut, B: B, S: S)
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = gatedDeltaUpdate(
+            let recurrence = qwen35GatedDeltaUpdate(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1084,7 +1163,7 @@ final class Qwen35GatedDeltaNet: Module {
             ssmStates.reserveCapacity(S)
             var state = ssmState
             for s in 0 ..< S {
-                let (stepOut, next) = gatedDeltaUpdate(
+                let (stepOut, next) = qwen35GatedDeltaUpdate(
                     q: qNormed[0..., s ..< (s + 1)],
                     k: kNormed[0..., s ..< (s + 1)],
                     v: v[0..., s ..< (s + 1)],
@@ -1118,7 +1197,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(outProj, projectionInput)
@@ -1246,7 +1325,9 @@ final class Qwen35Attention: Module {
         let vProjection = projected.2
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        let gate = qSplit[1].reshaped(B, L, -1)
+        // Kept as the strided [B, L, H, D] view: the fused gate below reads it
+        // in place instead of paying a flattening copy first.
+        let gate = qSplit[1]
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
@@ -1268,8 +1349,10 @@ final class Qwen35Attention: Module {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
+        // `sigmoidMultiply(output, gate)` on the same [B, L, H, D] elements,
+        // one kernel; its row-contiguous result flattens without a copy.
+        let projectionInput = qwen35CompiledSigmoidMultiply(output, gate)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
             : oProj(projectionInput)
@@ -1496,11 +1579,13 @@ extension Qwen3NextMLP {
     }
 
     /// `callAsFunction` with gate and up sharing one packed input transform.
+    /// The SiLU and the product run as one compiled kernel
+    /// (`compiledSiluProduct`, LFM2MoE idiom): same `silu(gate) * up` order.
     func qwen35Forward(_ x: MLXArray) -> MLXArray {
         guard let shared = sharedHadamardProjections(x, [gateProj, upProj]) else {
-            return self(x)
+            return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
         }
-        return downProj(silu(shared[0]) * shared[1])
+        return downProj(compiledSiluProduct(shared[0], shared[1]))
     }
 }
 
