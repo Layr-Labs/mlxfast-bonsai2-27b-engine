@@ -1102,29 +1102,67 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+        // Aligned tiles with more than one K fragment (the host's BK=64,
+        // SK=32 qmm_nax launch): load the next activation fragment before
+        // the tensor-unit product. Same addresses as the serial load.
+        if constexpr (kAlignedM.value) {
+          if (kk_step < BK) {
+            NAXTile<T, TM, TK> Atile;
+            Atile.load(x + kk_first, K);
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
+              NAXTile<T, TN, TK> Btile;
+              const int kk_next = kk1 + kk_step;
+              NAXTile<T, TM, TK> AtileNext;
+              if (kk_next < BK) {
+                AtileNext.load(x + kk_next, K);
+              }
+              volatile int compiler_barrier;
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+              (void)compiler_barrier;
+              if (kk_next < BK) {
+                Atile = AtileNext;
+              }
+            }
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+              volatile int compiler_barrier;
+              Atile.load(x + kk1, K);
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+              (void)compiler_barrier;
+            }
           }
-
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
-
-          (void)compiler_barrier;
+        } else {
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+            volatile int compiler_barrier;
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+            (void)compiler_barrier;
+          }
         }
 
         x += BK;
