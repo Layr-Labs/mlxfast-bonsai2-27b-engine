@@ -592,8 +592,18 @@ final class Qwen35GatedDeltaNet: Module {
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
             // Packed qkv and z read the same activation through the same
-            // transform; rotate it once. b and a stay full precision.
+            // transform; rotate it once. b and a stay full precision: they
+            // share one rotation and one stacked narrow matmul of their own,
+            // so the pair keeps the FP32 split-K route it would take alone.
             if let shared = sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+                if let ba = sharedHadamardProjections(inputs, [inProjB, inProjA]) {
+                    return (
+                        shared[0],
+                        shared[1].reshaped(B, S, numVHeads, headVDim),
+                        ba[0],
+                        ba[1]
+                    )
+                }
                 return (
                     shared[0],
                     shared[1].reshaped(B, S, numVHeads, headVDim),
