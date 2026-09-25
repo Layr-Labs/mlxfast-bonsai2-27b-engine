@@ -298,7 +298,164 @@ func qwen35GatedDelta(
     if ssm.dtype != .float32 {
         ssm = ssm.asType(.float32)
     }
+    if Dk % 32 == 0, Dv % Qwen35GatedDeltaRows.rows == 0 {
+        return Qwen35GatedDeltaRows.run(
+            q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
+    }
     return gatedDeltaKernel(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm, mask: mask)
+}
+
+/// `gatedDeltaKernel` with each simdgroup carrying four value rows of the
+/// state. Each row keeps the same per-lane Kahan sum and `simd_sum`, so the
+/// outputs and state match that kernel bit for bit.
+enum Qwen35GatedDeltaRows {
+    static let rows = 4
+
+    private static func source(hasMask: Bool) -> String {
+        let active = hasMask ? "mask[b_idx * T + t]" : "true"
+        return """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+            constexpr int R = \(rows);
+
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv0 = thread_position_in_grid.y * R;
+
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            float state[R][n_per_t];
+            for (int r = 0; r < R; ++r) {
+              for (int i = 0; i < n_per_t; ++i) {
+                state[r][i] = static_cast<float>(
+                    state_in[(n * Dv + dv0 + r) * Dk + n_per_t * dk_idx + i]);
+              }
+            }
+
+            for (int t = 0; t < T; ++t) {
+              if (\(active)) {
+                float kk[n_per_t];
+                float qq[n_per_t];
+                for (int i = 0; i < n_per_t; ++i) {
+                  kk[i] = k_[n_per_t * dk_idx + i];
+                  qq[i] = q_[n_per_t * dk_idx + i];
+                }
+                auto gg = g_[hv_idx];
+                auto bb = beta_[hv_idx];
+                float kv_mem[R];
+                {
+                  // Preserve Kahan summation under Metal's default fast math.
+                  #pragma clang fp reassociate(off)
+                  #pragma clang fp contract(off)
+                  for (int r = 0; r < R; ++r) {
+                    float sum = 0.0f;
+                    float compensation = 0.0f;
+                    for (int i = 0; i < n_per_t; ++i) {
+                      state[r][i] = state[r][i] * gg;
+                      auto product = state[r][i] * kk[i];
+                      auto corrected = product - compensation;
+                      auto next_sum = sum + corrected;
+                      compensation = (next_sum - sum) - corrected;
+                      sum = next_sum;
+                    }
+                    kv_mem[r] = sum;
+                  }
+                }
+                float outs[R];
+                for (int r = 0; r < R; ++r) {
+                  float mem = simd_sum(kv_mem[r]);
+                  auto delta = (v_[dv0 + r] - mem) * bb;
+                  float out = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    state[r][i] = state[r][i] + kk[i] * delta;
+                    out += state[r][i] * qq[i];
+                  }
+                  outs[r] = simd_sum(out);
+                }
+                if (thread_index_in_simdgroup == 0) {
+                  for (int r = 0; r < R; ++r) {
+                    y[dv0 + r] = static_cast<InT>(outs[r]);
+                  }
+                }
+              } else if (thread_index_in_simdgroup == 0) {
+                for (int r = 0; r < R; ++r) {
+                  y[dv0 + r] = static_cast<InT>(0);
+                }
+              }
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+
+            for (int r = 0; r < R; ++r) {
+              for (int i = 0; i < n_per_t; ++i) {
+                state_out[(n * Dv + dv0 + r) * Dk + n_per_t * dk_idx + i] =
+                    static_cast<StT>(state[r][i]);
+              }
+            }
+            """
+    }
+
+    private static func make(hasMask: Bool) -> MLXFast.MLXFastKernel {
+        var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
+        if hasMask {
+            inputNames.append("mask")
+        }
+        return MLXFast.metalKernel(
+            name: hasMask ? "qwen35_gated_delta_rows4_mask" : "qwen35_gated_delta_rows4",
+            inputNames: inputNames,
+            outputNames: ["y", "state_out"],
+            source: source(hasMask: hasMask))
+    }
+
+    private static let kernel = make(hasMask: false)
+    private static let kernelMasked = make(hasMask: true)
+
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+        state: MLXArray, mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+        let selected: MLXFast.MLXFastKernel
+        if let mask {
+            inputs.append(mask)
+            selected = kernelMasked
+        } else {
+            selected = kernel
+        }
+        let outputs = selected(
+            inputs,
+            template: [
+                ("InT", q.dtype),
+                ("StT", state.dtype),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (32, Dv / rows, B * Hv),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [q.dtype, state.dtype])
+        return (outputs[0], outputs[1])
+    }
 }
 
 final class Qwen35GatedDeltaNet: Module {
