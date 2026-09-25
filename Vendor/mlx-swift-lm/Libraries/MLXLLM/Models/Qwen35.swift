@@ -222,6 +222,102 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+/// Early submission of a trunk forward: at chosen layer boundaries the
+/// forward `asyncEval`s its hidden state, so the GPU runs the front of the
+/// tower while the host is still building the rest. The same kernels run on
+/// the same inputs in the same order; only command-buffer boundaries move,
+/// so every value is bit-identical.
+///
+/// One mechanism, two plans, picked per forward:
+/// - VERIFY (a capture-verify forward). The drafter's block was submitted
+///   before this graph was built, so without slices the GPU idles from the
+///   drafter's last kernel until the host has built all 64 layers.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
+///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
+///   paces encoding against the GPU at 10 in-flight command buffers, so
+///   extra boundaries cost little, and a short first slice matters more as
+///   the GPU gets faster relative to the host build);
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
+///   prefill starts its first layers while the host builds the rest.
+///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
+/// Plain decode and short forwards are untouched. Never over paged KV: its
+/// write faults are checked only after the whole forward is built, before
+/// anything may be evaluated.
+///
+/// A plan is `N` (every N layers), `N@o` (every N layers, shifted so the
+/// first boundary falls after layer `o`), or an explicit list of layer
+/// counts (`4,16,32,48`; `;` also separates); `0`/`off` disables it.
+enum Qwen35TrunkSubmission {
+    static let promptMinimumRows = 128
+
+    struct Plan: Sendable {
+        let stride: Int
+        let offset: Int
+        let explicit: [Int]?
+
+        static let off = Plan(stride: 0, offset: 0, explicit: nil)
+
+        var isOff: Bool { explicit.map { $0.isEmpty } ?? (stride <= 0) }
+
+        /// True when the forward submits after `completedLayers` layers.
+        /// The last layer never splits: the caller's eval takes it.
+        @inline(__always)
+        func submits(after completedLayers: Int, of layerCount: Int) -> Bool {
+            guard completedLayers < layerCount else { return false }
+            if let explicit { return explicit.contains(completedLayers) }
+            return stride > 0 && completedLayers % stride == offset
+        }
+
+        static func parse(_ raw: String?, default fallback: Plan) -> Plan {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                !raw.isEmpty
+            else { return fallback }
+            if ["0", "off", "false", "no"].contains(raw) { return .off }
+            if raw.contains(",") || raw.contains(";") {
+                let counts = raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
+                    Int($0.trimmingCharacters(in: .whitespaces))
+                }.filter { $0 > 0 }
+                return Plan(stride: 0, offset: 0, explicit: counts)
+            }
+            let parts = raw.split(separator: "@")
+            guard let stride = Int(parts[0]), stride >= 0 else { return fallback }
+            let first = parts.count > 1 ? (Int(parts[1]) ?? stride) : stride
+            return Plan(stride: stride, offset: stride > 0 ? first % stride : 0, explicit: nil)
+        }
+    }
+
+    static let verify: Plan = {
+        let env = ProcessInfo.processInfo.environment
+        let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: .off)
+    }()
+
+    static let prompt: Plan = Plan.parse(
+        ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
+        default: .off)
+
+    /// The plan for one trunk forward, or nil for a single submission.
+    static func plan(
+        rows: Int, captureRecurrentWindow: Bool, caches: [any CBv2AttendingLayerCache]
+    ) -> Plan? {
+        let plan: Plan
+        if captureRecurrentWindow {
+            plan = verify
+        } else if rows >= promptMinimumRows {
+            plan = prompt
+        } else {
+            return nil
+        }
+        if plan.isOff || caches.contains(where: { $0 is PagedLayerCache }) { return nil }
+        return plan
+    }
+}
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -254,6 +350,34 @@ enum Qwen35FusedElementwise {
         compile(shapeless: true) { normed, gate in
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
+
+    /// On unless explicitly disabled: a packed projection whose input comes
+    /// out of a norm or an elementwise op receives that input with its
+    /// Hadamard signs already applied, and its rotation skips the multiply.
+    ///
+    /// Off by default on this branch: the fused signed rotations
+    /// (`SignedHadamardKernel`, from submission ade7529c) apply the signs
+    /// inside the rotation kernel itself, so a pre-signed activation would
+    /// only route around them. `DARKBLOOM_BONSAI_FOLD_SIGNS=1` turns the
+    /// fold back on.
+    static let foldsHadamardSigns: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FOLD_SIGNS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// `gatedNormTail` times the output projection's Hadamard signs.
+    static let gatedNormTailSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { normed, gate, signs in
+            (silu(gate.asType(.float32)) * normed.asType(.float32)) * signs
+        }
+
+    /// The attention output gate `x * sigmoid(gate)` times the output
+    /// projection's Hadamard signs, returned in the gate product's dtype.
+    static let sigmoidGateSigned: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { x, gate, signs in
+            ((x * sigmoid(gate)) * signs).asType(x.dtype)
+        }
 }
 
 /// Input-independent constants a GDN layer derives from its geometry, held
@@ -279,6 +403,40 @@ private final class Qwen35GDNDerived {
             qScale = q
             kScale = k
             return (q, k)
+        }
+    }
+}
+
+/// A norm gain with its consumer's Hadamard signs folded in, derived once from
+/// the loaded gain and held outside the parameter tree (a plain class, so
+/// Module reflection sees `.other`). The norm writes `w * y` per element; with
+/// `w * s` it writes `(w * s) * y`, which is `(w * y) * s` exactly: the signs
+/// are ±1, and negating a factor negates a rounded product without changing
+/// its magnitude.
+fileprivate final class Qwen35SignedGain {
+    private let lock = NSLock()
+    private var source: MLXArray?
+    private var signs: MLXArray?
+    private var folded: MLXArray?
+
+    func gain(_ source: MLXArray, signs: MLXArray) -> MLXArray {
+        lock.withLock {
+            if let folded, self.source === source, self.signs === signs {
+                return folded
+            }
+            let value = (source * signs).asType(source.dtype)
+            self.source = source
+            self.signs = signs
+            self.folded = value
+            return value
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            source = nil
+            signs = nil
+            folded = nil
         }
     }
 }
@@ -878,6 +1036,24 @@ final class Qwen35GatedDeltaNet: Module {
             return packed.forwardUnwidened(x)
         }
         return outProj(x)
+    }
+
+    /// `projectOut(gatedNorm(out, gate:))` with `out_proj`'s Hadamard signs
+    /// multiplied in by the gated tail's kernel, so the packed projection's
+    /// rotation skips its own sign multiply. Multiplying by ±1 is exact, so
+    /// the rotation reads the same values either way.
+    private func projectGatedOut(_ out: MLXArray, gate: MLXArray, B: Int, S: Int) -> MLXArray {
+        if Qwen35FusedElementwise.foldsHadamardSigns,
+            let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+            packed.transform.width == numVHeads * headVDim
+        {
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
+            let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
+                .asType(out.dtype)
+            return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+        }
+        return projectOut(gatedNorm(out, gate: gate).reshaped(B, S, -1))
     }
 
     init(_ args: Qwen35TextConfiguration) {
@@ -1774,9 +1950,10 @@ final class Qwen35GatedDeltaNet: Module {
         let normedOut = gatedNorm(out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(outProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(
+                outProj, gatedNorm(out, gate: z).reshaped(B, S, -1))
         }
-        return projectOut(projectionInput)
+        return projectGatedOut(out, gate: z, B: B, S: S)
     }
 }
 
@@ -1931,13 +2108,21 @@ final class Qwen35Attention: Module {
         }
         let projectionInput = sigmoidMultiply(output, gate)
         if exactTargetVerify {
-            return qwen35A3BExactW4G64Projection(oProj, projectionInput)
+            return qwen35A3BExactW4G64Projection(oProj, sigmoidMultiply(output, gate))
         }
         if let packed = oProj as? HadamardQuantizedLinear {
-            // The residual add widens the FP16 product itself.
-            return packed.forwardUnwidened(projectionInput)
+            // The output gate and the projection's Hadamard signs share one
+            // kernel; the residual add widens the FP16 product itself.
+            if Qwen35FusedElementwise.foldsHadamardSigns, packed.gdnLayout == nil,
+                output.dtype == gate.dtype
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    output, gate, packed.transform.signVector)
+                return packed.forwardPreSigned(signed, widenOutput: false)
+            }
+            return packed.forwardUnwidened(sigmoidMultiply(output, gate))
         }
-        return oProj(projectionInput)
+        return oProj(sigmoidMultiply(output, gate))
     }
 }
 
@@ -2185,6 +2370,31 @@ extension Qwen3NextMLP {
         }
         return downProj(silu(shared[0]) * shared[1])
     }
+
+    /// `qwen35Forward(norm(h))` with gate and up's Hadamard signs folded into
+    /// the norm's gain, so their shared rotation skips its sign multiply. The
+    /// signed gain yields the plain norm's output times the signs exactly (see
+    /// `Qwen35SignedGain`). Nil when the fold does not apply.
+    fileprivate func qwen35ForwardSignedNorm(
+        _ h: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+    ) -> MLXArray? {
+        guard Qwen35FusedElementwise.foldsHadamardSigns,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let transform = siblings.first?.transform,
+            norm.weight.ndim == 1, norm.weight.dim(0) == transform.width
+        else { return nil }
+        let signedInput = MLXFast.rmsNorm(
+            h, weight: gain.gain(norm.weight, signs: transform.signVector), eps: norm.eps)
+        guard
+            let shared = sharedHadamardProjectionsPreSigned(
+                signedInput, siblings, widenOutput: false)
+        else { return nil }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return down.forwardPreSigned(signed, widenOutput: false)
+    }
 }
 
 // MARK: - Decoder Layer
@@ -2199,6 +2409,28 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    /// The post-attention gain with the MLP's gate/up signs folded in.
+    private let signedGain = Qwen35SignedGain()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { signedGain.clear() }
+        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -2287,14 +2519,20 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: exactTargetVerify)
         }
         let h = x + r
-        let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
-                normalized, exactTargetVerify: exactTargetVerify)
+                postAttentionLayerNorm(h), exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            if !exactTargetVerify,
+                let folded = dense.qwen35ForwardSignedNorm(
+                    h, norm: postAttentionLayerNorm, gain: signedGain)
+            {
+                feedForward = folded
+            } else {
+                feedForward = dense.qwen35TargetVerify(
+                    postAttentionLayerNorm(h), exact: exactTargetVerify)
+            }
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
@@ -2442,6 +2680,13 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    /// Layers per verify submission slice (see `cbv2Forward`). Four slices
+    /// of sixteen: building one slice on the host must beat the drafter's
+    /// GPU time so the first slice is ready when the GPU frees, and each
+    /// later slice builds far faster than the GPU runs the one before it.
+    /// Four submissions clear both with margin at the fewest extra calls.
+    static let verifySubmitLayers = 16
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2457,6 +2702,10 @@ public class Qwen35TextModelInner: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        // Early-submission boundaries for this forward (`Qwen35TrunkSubmission`).
+        let submission = Qwen35TrunkSubmission.plan(
+            rows: inputs.dim(1), captureRecurrentWindow: captureRecurrentWindow,
+            caches: caches)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -2488,6 +2737,13 @@ public class Qwen35TextModelInner: Module {
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            // EARLY SUBMISSION (verify slices / prompt pipelining): hand
+            // the GPU the layers built so far. See `Qwen35TrunkSubmission`.
+            if let submission,
+                submission.submits(after: modelLayerIndex + 1, of: layers.count)
+            {
+                asyncEval([hiddenStates])
             }
         }
         if tapLayerIds == nil {
@@ -2718,24 +2974,19 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
         let rows = hidden.dim(1)
-        if rows > Qwen35TextModel.promptProjectionMinimumRows {
-            // A prompt-sized forward is only ever read at its last row (the
-            // teacher-forced stepper and every engine prefill caller slice
-            // `[..., -1, ...]`), so project that row alone instead of all L
-            // rows through the 248320-wide head. RMSNorm is row-local, so
-            // norm-after-slice equals slice-after-norm for the surviving
-            // row; the returned shape `[B, 1, vocab]` slices identically.
-            // Verify windows (at most 17 rows) keep every row.
-            let last = model.norm(hidden[0..., (rows - 1)..., 0...])
-            return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
-        }
-        let normalized = model.norm(hidden)
+        let output = Self.narrowPromptRows && rows > 32
+            ? hidden[0..., (rows - 1)..., 0...] : hidden
+        let normalized = model.norm(output)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 
-    /// Forwards wider than this are prompt chunks, never speculative verify
-    /// windows (DFlash 2 verifies at most 17 rows, the MTP head at most 8).
-    static let promptProjectionMinimumRows = 32
+    /// Prompt-width forwards through this seam are read at their final
+    /// position only.
+    static let narrowPromptRows: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_LAST_ROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
