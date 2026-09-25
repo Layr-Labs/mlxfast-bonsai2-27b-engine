@@ -181,6 +181,212 @@
 
 instantiate_quantized_all()
 
+// AOT 4-row NSG=1 qmv_fast (32 threads/TG). Same body as JIT _nsg1; host
+// loads these from mlx.metallib so decode does not JIT a second library.
+#define instantiate_qmv_fast_nsg1(type, group_size, bits)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_nsg1_batch_0", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false,                                                                   \
+      false,                                                                   \
+      4,                                                                       \
+      false,                                                                   \
+      false,                                                                   \
+      0,                                                                       \
+      1)                                                                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_nsg1_batch_1", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true,                                                                    \
+      false,                                                                   \
+      4,                                                                       \
+      false,                                                                   \
+      false,                                                                   \
+      0,                                                                       \
+      1)
+
+instantiate_qmv_fast_nsg1(float, 128, 2)
+instantiate_qmv_fast_nsg1(float16_t, 128, 2)
+instantiate_qmv_fast_nsg1(bfloat16_t, 128, 2)
+
+// AOT 4-row NSG=4 qmv_fast (128 threads/TG). Same body as JIT _nsg4.
+#define instantiate_qmv_fast_nsg4(type, group_size, bits)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_nsg4_batch_0", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false,                                                                   \
+      false,                                                                   \
+      4,                                                                       \
+      false,                                                                   \
+      false,                                                                   \
+      0,                                                                       \
+      4)                                                                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_nsg4_batch_1", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true,                                                                    \
+      false,                                                                   \
+      4,                                                                       \
+      false,                                                                   \
+      false,                                                                   \
+      0,                                                                       \
+      4)
+
+instantiate_qmv_fast_nsg4(float, 128, 2)
+instantiate_qmv_fast_nsg4(float16_t, 128, 2)
+instantiate_qmv_fast_nsg4(bfloat16_t, 128, 2)
+
+// AOT 8-row nsg=2 qmv_fast (64 threads/TG, 16 rows). Same body as JIT _r_8.
+#define instantiate_qmv_fast_rps8(type, group_size, bits)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_8_batch_0", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false,                                                                   \
+      false,                                                                   \
+      8)                                                                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_8_batch_1", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true,                                                                    \
+      false,                                                                   \
+      8)
+
+instantiate_qmv_fast_rps8(float, 128, 2)
+instantiate_qmv_fast_rps8(float16_t, 128, 2)
+instantiate_qmv_fast_rps8(bfloat16_t, 128, 2)
+
+// AOT 2-row nsg=2 qmv_fast (64 threads/TG, 4 rows). bn=4 divides this
+// pack's N. Distinct from NSG=1 RPS=2 (PB closed D 0.92) and RPS=8.
+#define instantiate_qmv_fast_rps2(type, group_size, bits)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_2_batch_0", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false,                                                                   \
+      false,                                                                   \
+      2)                                                                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_2_batch_1", \
+      affine_qmv_fast,                                                         \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true,                                                                    \
+      false,                                                                   \
+      2)
+
+instantiate_qmv_fast_rps2(float, 128, 2)
+instantiate_qmv_fast_rps2(float16_t, 128, 2)
+instantiate_qmv_fast_rps2(bfloat16_t, 128, 2)
+
+// AOT 64-thread occupancy-hint qmv_fast (stock nsg=2, 4 rows). Same body
+// as JIT _tg64; host loads these from mlx.metallib.
+#define instantiate_qmv_fast_tg64(type, group_size, bits)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_tg64_batch_0", \
+      affine_qmv_fast_tg64,                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false,                                                                   \
+      false,                                                                   \
+      4)                                                                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_tg64_batch_1", \
+      affine_qmv_fast_tg64,                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true,                                                                    \
+      false,                                                                   \
+      4)
+
+instantiate_qmv_fast_tg64(float, 128, 2)
+instantiate_qmv_fast_tg64(float16_t, 128, 2)
+instantiate_qmv_fast_tg64(bfloat16_t, 128, 2)
+
+// AOT 8-tile thread-private x-reuse qmv_fast (no smem). Host loads these
+// from mlx.metallib so decode does not JIT a second library.
+#define instantiate_qmv_fast_xr8(type, group_size, bits)                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr8_batch_0", \
+      affine_qmv_fast_xr8,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false)                                                                   \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr8_batch_1", \
+      affine_qmv_fast_xr8,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true)
+
+instantiate_qmv_fast_xr8(float, 128, 2)
+instantiate_qmv_fast_xr8(float16_t, 128, 2)
+instantiate_qmv_fast_xr8(bfloat16_t, 128, 2)
+
+#define instantiate_qmv_fast_xr2(type, group_size, bits)                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr2_batch_0", \
+      affine_qmv_fast_xr2,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false)                                                                   \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr2_batch_1", \
+      affine_qmv_fast_xr2,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true)
+
+instantiate_qmv_fast_xr2(float, 128, 2)
+instantiate_qmv_fast_xr2(float16_t, 128, 2)
+instantiate_qmv_fast_xr2(bfloat16_t, 128, 2)
+
+#define instantiate_qmv_fast_xr4(type, group_size, bits)                       \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr4_batch_0", \
+      affine_qmv_fast_xr4,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      false)                                                                   \
+  instantiate_kernel(                                                          \
+      "affine_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_xr4_batch_1", \
+      affine_qmv_fast_xr4,                                                     \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      true)
+
+instantiate_qmv_fast_xr4(float, 128, 2)
+instantiate_qmv_fast_xr4(float16_t, 128, 2)
+instantiate_qmv_fast_xr4(bfloat16_t, 128, 2)
+
 instantiate_kernel(
     "affine_gather_qmm_gemma4_expert_tiles_bfloat16_t_gs_64_b_4_alN_true_bm_32_bn_32_bk_32",
     affine_gather_qmm_gemma4_expert_tiles,

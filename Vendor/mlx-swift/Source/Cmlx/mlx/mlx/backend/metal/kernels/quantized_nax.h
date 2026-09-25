@@ -977,6 +977,12 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   (void)lid;
 
+  // One activation tile feeds four BN panels. Groups that are not the
+  // leader return before any barrier. y_col stays tid.x * BN.
+  if ((tid.x & 3) != 0) {
+    return;
+  }
+
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
@@ -1044,137 +1050,177 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   const short kk_step = k_half ? short(BK) : short(SK);
   const bool is_unaligned_sm = (sgp_sm != SM);
 
-  const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
-
   const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
   const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
 
   using AccumType = float;
 
-  NAXTile<AccumType, TM, TN> Dtile;
-  Dtile.clear();
+  constexpr int kPanels = 4;
+  NAXTile<AccumType, TM, TN> Dpanel[kPanels];
+#pragma unroll
+  for (int p = 0; p < kPanels; ++p) {
+    Dpanel[p].clear();
+  }
 
   x += tm * K;
 
-  // 2-bit: load the next K block of weights into registers before the MMAs.
-  // Same thread mapping and same Ws values as loader_w.
+  // 2-bit weight words use the same thread mapping as loader_w.
   constexpr bool kPrefetchW2 = (bits == 2) && (BN == 64) && (BK == 64) &&
       (WM * WN == 4) && (group_size >= BK) && (group_size % BK == 0);
   const int pf_thr = int(simd_gid) * 32 + int(simd_lid);
   const int pf_row = pf_thr >> 1;
-  const device uint32_t* pf_w =
-      w + (y_col + pf_row) * (K / 16) + (pf_thr & 1) * 2;
-  const device T* pf_s = scales + pf_row * K_g;
-  const device T* pf_b = biases + pf_row * K_g;
   threadgroup T* pf_dst = Ws + pf_row * BK_padded + (pf_thr & 1) * 32;
+
+  constexpr int kFragCap = BK / SK;
+  static_assert(kFragCap >= 1 && kFragCap <= 8, "K fragment cap");
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      uint32_t pf_w0 = 0;
-      uint32_t pf_w1 = 0;
-      T pf_scale = T(0);
-      T pf_bias = T(0);
-      if constexpr (kPrefetchW2 && kAlignedN.value) {
-        pf_w0 = pf_w[0];
-        pf_w1 = pf_w[1];
-        pf_scale = pf_s[0];
-        pf_bias = pf_b[0];
-      }
-
       for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if constexpr (kPrefetchW2 && kAlignedN.value) {
-          dequantize_2bit_word<T>(pf_w0, pf_scale, pf_bias, pf_dst);
-          dequantize_2bit_word<T>(pf_w1, pf_scale, pf_bias, pf_dst + 16);
-          if (k + BK < K) {
-            const int pf_k = k + BK;
-            const int pf_g = pf_k / group_size;
-            pf_w0 = pf_w[pf_k / 16];
-            pf_w1 = pf_w[pf_k / 16 + 1];
-            pf_scale = pf_s[pf_g];
-            pf_bias = pf_b[pf_g];
-          }
-        } else if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
-        } else {
-          loader_w.load_safe(short2(BK, tgp_bn));
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        STEEL_PRAGMA_NO_UNROLL
+        // One activation fragment per K step, reused by every panel.
+        NAXTile<T, TM, TK> ahold[kFragCap];
+        int nfrag = 0;
         for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
           if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+            ahold[nfrag].load(x + kk1, K);
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            ahold[nfrag].load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
-
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
-
-          (void)compiler_barrier;
+          nfrag++;
         }
 
+        for (int p = 0; p < kPanels; ++p) {
+          const int col = y_col + p * BN;
+          if (col >= N) {
+            continue;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kPrefetchW2 && kAlignedN.value) {
+            const device uint32_t* pw =
+                w + (col + pf_row) * (K / 16) + (pf_thr & 1) * 2;
+            const int g = k / group_size;
+            const device T* ps = scales + (p * BN + pf_row) * K_g;
+            const device T* pb = biases + (p * BN + pf_row) * K_g;
+            dequantize_2bit_word<T>(pw[k / 16], ps[g], pb[g], pf_dst);
+            dequantize_2bit_word<T>(
+                pw[k / 16 + 1], ps[g], pb[g], pf_dst + 16);
+          } else if constexpr (kAlignedN.value) {
+            loader_w_t loader_p(
+                wl + static_cast<int64_t>(p) * BN * K_w,
+                scales + p * BN * K_g,
+                biases + p * BN * K_g,
+                K,
+                Ws,
+                simd_gid,
+                simd_lid);
+            for (int adv = 0; adv < k; adv += BK) {
+              loader_p.next();
+            }
+            loader_p.load_unsafe();
+          } else {
+            const short cols_here = short(min(BN, N - col));
+            loader_w_t loader_p(
+                wl + static_cast<int64_t>(p) * BN * K_w,
+                scales + p * BN * K_g,
+                biases + p * BN * K_g,
+                K,
+                Ws,
+                simd_gid,
+                simd_lid);
+            for (int adv = 0; adv < k; adv += BK) {
+              loader_p.next();
+            }
+            loader_p.load_safe(short2(BK, cols_here));
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          int fi = 0;
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
+            NAXTile<T, TN, TK> Btile;
+            volatile int compiler_barrier;
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            tile_matmad_nax(
+                Dpanel[p],
+                ahold[fi],
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+            (void)compiler_barrier;
+            fi++;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         x += BK;
-        if constexpr (!(kPrefetchW2 && kAlignedN.value)) {
-          loader_w.next();
-        }
       }
 
-      // Store results to device memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kRowFitShape) {
         if (k_half) {
-          // Simdgroup row 1 hands its partial sums to row 0 (same tn, same
-          // lane layout); Ws is free after the barrier above.
           constexpr short kE = NAXTile<AccumType, TM, TN>::kElemsPerTile;
           static_assert(
               WN * 32 * kE * sizeof(AccumType) <= BN * BK_padded * sizeof(T),
               "k-half reduction must fit in Ws");
-          threadgroup AccumType* red = (threadgroup AccumType*)Ws +
-              (simd_gid % WN) * (32 * kE) + simd_lid;
-          if (k_row != 0) {
-            STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < kE; i++) {
-              red[i * 32] = Dtile.elems()[i];
+          for (int p = 0; p < kPanels; ++p) {
+            const int col = y_col + p * BN;
+            if (col >= N) {
+              continue;
             }
+            threadgroup AccumType* red = (threadgroup AccumType*)Ws +
+                (simd_gid % WN) * (32 * kE) + simd_lid;
+            if (k_row != 0) {
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < kE; i++) {
+                red[i * 32] = Dpanel[p].elems()[i];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (k_row == 0) {
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < kE; i++) {
+                Dpanel[p].elems()[i] += red[i * 32];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
           }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (k_row != 0) {
             return;
-          }
-          STEEL_PRAGMA_UNROLL
-          for (short i = 0; i < kE; i++) {
-            Dtile.elems()[i] += red[i * 32];
           }
         } else if (mma_idle) {
           return;
         }
       }
 
-      if constexpr (kAlignedM.value && kAlignedN.value) {
-        Dtile.store(y + tm * N + tn, N);
-      } else if (kAlignedM.value && sgp_sn == SN) {
-        Dtile.store(y + tm * N + tn, N);
-      } else {
-        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+      // Partial rows and partial panel columns use store_safe.
+      // M=100, BM=64, y_row=64 leaves 36 live rows. The simdgroup at
+      // tm=32 has sgp_sm=4 and must not store 32 rows from row 96.
+      for (int p = 0; p < kPanels; ++p) {
+        const int col = y_col + p * BN;
+        if (col >= N) {
+          continue;
+        }
+        const short sn =
+            aligned_N ? SN : short(min(int(SN), N - (col + tn)));
+        if (sgp_sm <= 0 || sn <= 0) {
+          continue;
+        }
+        device T* dst = y + tm * N + tn + p * BN;
+        if constexpr (kAlignedM.value) {
+          if (sn == SN) {
+            Dpanel[p].store(dst, N);
+          } else {
+            Dpanel[p].store_safe(dst, N, short2(sn, sgp_sm));
+          }
+        } else {
+          Dpanel[p].store_safe(dst, N, short2(sn, sgp_sm));
+        }
       }
     });
   });
 }
+
+
 
 template <
     typename T,
