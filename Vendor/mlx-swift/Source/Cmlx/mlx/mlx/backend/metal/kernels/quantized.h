@@ -1040,10 +1040,35 @@ METAL_FUNC void qmv_wide_impl(
 #pragma unroll
       for (int v = 0; v < vecs_per_tg; v++) {
         const device T* xc = xv[v] + k0;
+        // k0 is a multiple of `sub` and every vector starts a whole row, so `xc`
+        // is element-aligned. Packed vectors require only element alignment, so
+        // the eight activations can be fetched with two wide loads instead of
+        // eight scalar ones. The values, their order, and the accumulation below
+        // are all unchanged.
+        U xl[sub];
+        if (sizeof(T) == 4 && sub == 8) {
+          const device packed_float4* xc4 =
+              reinterpret_cast<const device packed_float4*>(xc);
+          const packed_float4 xa = xc4[0];
+          const packed_float4 xb = xc4[1];
+          xl[0] = xa.x;
+          xl[1] = xa.y;
+          xl[2] = xa.z;
+          xl[3] = xa.w;
+          xl[4] = xb.x;
+          xl[5] = xb.y;
+          xl[6] = xb.z;
+          xl[7] = xb.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < sub; i++) {
+            xl[i] = static_cast<U>(xc[i]);
+          }
+        }
         U acc = 0;
 #pragma unroll
         for (int i = 0; i < sub; i++) {
-          acc += static_cast<U>(xc[i]) * w_dq[i];
+          acc += xl[i] * w_dq[i];
         }
         result[v] += acc;
       }
