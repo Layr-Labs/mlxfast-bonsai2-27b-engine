@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -349,6 +350,12 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(x)
     }
 
+    /// Depthwise conv then SiLU. `BONSAI2_GDN_CONV=1` fuses them. `ALL=off`
+    /// stays on `silu(conv1d)`.
+    private func convThenSilu(_ convInput: MLXArray) -> MLXArray {
+        qwen35GdnConvSilu(convInput, weight: conv1d.weight, groups: conv1d.groups)
+    }
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -668,7 +675,7 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convThenSilu(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -713,7 +720,7 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convThenSilu(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -1057,7 +1064,7 @@ final class Qwen35GatedDeltaNet: Module {
                         0..., position ..< (position + convKernelSize), 0...])
                 }, axis: 1))
         } else {
-            convOut = silu(conv1d(convInput))
+            convOut = convThenSilu(convInput)
         }
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -1309,7 +1316,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35SigmoidGate(output, gate))
     }
 
     func cbv2Forward(
@@ -1358,7 +1365,7 @@ final class Qwen35Attention: Module {
             scale: scale, sinks: nil)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
+        let projectionInput = qwen35SigmoidGate(output, gate)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(oProj, projectionInput)
         }
@@ -2641,4 +2648,135 @@ extension Qwen35Model: MTPCapable {
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
     }
+}
+
+private func bonsai2ValveOff() -> Bool {
+    guard let raw = getenv("BONSAI2_VALVE") else { return false }
+    return String(cString: raw) == "ALL=off"
+}
+
+/// Full-attention `x * sigmoid(gate)` in one kernel. `ALL=off` keeps
+/// `sigmoidMultiply`.
+func qwen35SigmoidGate(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+    if let fused = Bonsai2AttnSigmoid.apply(x, gate) {
+        return fused
+    }
+    return sigmoidMultiply(x, gate)
+}
+
+private final class Bonsai2AttnSigmoidKernel: Sendable {
+    static let shared = Bonsai2AttnSigmoidKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_attn_sigmoid",
+            inputNames: ["x", "gate"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                float g = float(gate[i]);
+                float s;
+                if (g >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-g));
+                } else {
+                    float e = exp(g);
+                    s = e / (1.0f + e);
+                }
+                y[i] = static_cast<InT>(float(x[i]) * s);
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+enum Bonsai2AttnSigmoid {
+    nonisolated(unsafe) static var calls = 0
+    static func isArmed() -> Bool {
+        if bonsai2ValveOff() { return false }
+        guard let raw = getenv("BONSAI2_ATTN_SIGMOID") else { return false }
+        return String(cString: raw) == "1"
+    }
+    static func apply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray? {
+        guard isArmed(), x.shape == gate.shape, x.dtype == gate.dtype,
+            x.dtype == .float32 || x.dtype == .bfloat16
+        else { return nil }
+        let n = x.size
+        guard n > 0, n % 32 == 0 else { return nil }
+        calls += 1
+        return Bonsai2AttnSigmoidKernel.shared.kernel(
+            [x, gate],
+            template: [("InT", x.dtype)],
+            grid: (n, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [x.shape],
+            outputDTypes: [x.dtype])[0]
+    }
+}
+
+private final class Bonsai2GdnConvSiluKernel: Sendable {
+    static let shared = Bonsai2GdnConvSiluKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "bonsai2_gdn_conv_silu",
+            inputNames: ["x", "weight"],
+            outputNames: ["y"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                uint c = i % uint(C);
+                uint t = (i / uint(C)) % uint(OutLen);
+                uint b = i / (uint(C) * uint(OutLen));
+                const device float* row = x + ((b * uint(InLen) + t) * uint(C) + c);
+                const device float* w = weight + c * 4;
+                float acc = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    acc += row[k * int(C)] * w[k];
+                }
+                float s;
+                if (acc >= 0.0f) {
+                    s = 1.0f / (1.0f + exp(-acc));
+                } else {
+                    float e = exp(acc);
+                    s = e / (1.0f + e);
+                }
+                y[i] = acc * s;
+                """,
+            ensureRowContiguous: true)
+    }
+}
+
+enum Bonsai2GdnConvSilu {
+    static func isArmed() -> Bool {
+        if bonsai2ValveOff() { return false }
+        guard let raw = getenv("BONSAI2_GDN_CONV") else { return false }
+        return String(cString: raw) == "1"
+    }
+    static func apply(_ input: MLXArray, weight: MLXArray, groups: Int) -> MLXArray? {
+        guard isArmed(),
+            input.ndim == 3, weight.ndim == 3,
+            input.dtype == .float32, weight.dtype == .float32
+        else { return nil }
+        let channels = input.dim(2)
+        let inLen = input.dim(1)
+        guard channels > 0, channels % 32 == 0, channels == groups,
+            weight.dim(0) == channels, weight.dim(1) == 4, weight.dim(2) == 1,
+            inLen >= 4
+        else { return nil }
+        let outLen = inLen - 3
+        let batch = input.dim(0)
+        guard batch > 0, outLen > 0 else { return nil }
+        return Bonsai2GdnConvSiluKernel.shared.kernel(
+            [input, weight],
+            template: [("C", channels), ("InLen", inLen), ("OutLen", outLen)],
+            grid: (batch * outLen * channels, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[batch, outLen, channels]],
+            outputDTypes: [.float32])[0]
+    }
+}
+
+func qwen35GdnConvSilu(_ input: MLXArray, weight: MLXArray, groups: Int) -> MLXArray {
+    if let fused = Bonsai2GdnConvSilu.apply(input, weight: weight, groups: groups) {
+        return fused
+    }
+    return silu(conv1d(input, weight, stride: 1, padding: 0, dilation: 1, groups: groups))
 }

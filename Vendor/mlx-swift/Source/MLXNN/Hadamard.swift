@@ -658,3 +658,14 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             groupSize: groupSize, bits: bits)
     }
 }
+
+/// Darkbloom Hadamard-path valve. `ALL=off` stands down.
+public enum Bonsai2HadamardSigns {
+    public static func isArmed() -> Bool {
+        if let raw = getenv("BONSAI2_VALVE"), String(cString: raw) == "ALL=off" {
+            return false
+        }
+        guard let raw = getenv("BONSAI2_HADAMARD_SIGNS") else { return false }
+        return String(cString: raw) == "1"
+    }
+}
