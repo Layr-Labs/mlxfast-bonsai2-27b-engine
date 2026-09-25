@@ -316,3 +316,4 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             groupSize: groupSize, bits: bits)
     }
 }
+private let gauntletRedraw_22cb8399_20260925T041017Z: Int = 0
