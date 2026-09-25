@@ -1058,6 +1058,22 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   }
 #endif
 
+  // Prompt tiles (BM == 64): threadgroups pair up along M so that one
+  // dequantized weight block in Ws feeds two 64-row A tiles. An even-y group
+  // takes tiles y and y + 1 when both are full; the odd-y partner of a full
+  // tile exits before any barrier. Every output element keeps its own K
+  // accumulation order, so the results are the same bits as the unpaired
+  // kernel; only the weight decode and threadgroup traffic are shared.
+  constexpr bool kPairShape = (BM == 64) && (WM == 2);
+  // Pair by M-tile index (y_row / BM), which is what the tile remap above
+  // hands out, so a pair is always two adjacent M tiles of one N tile.
+  const int m_index = y_row / BM;
+  const bool pair_tiles =
+      kPairShape && ((m_index & 1) == 0) && (M - y_row >= 2 * BM);
+  if (kPairShape && ((m_index & 1) == 1) && (M - y_row >= BM)) {
+    return;
+  }
+
   auto wl = (const device uint8_t*)w;
 
   x += y_row * static_cast<int64_t>(K);
@@ -1113,6 +1129,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
+  // The paired tile's accumulator (unused unless pair_tiles).
+  NAXTile<AccumType, TM, TN> Dtile2;
+  Dtile2.clear();
 
   x += tm * K;
 
@@ -1184,6 +1203,18 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
               Btile,
               metal::bool_constant<transpose_b>{});
 
+          if (pair_tiles) {
+            // The next 64-row tile of A against the same decoded weights.
+            NAXTile<T, TM, TK> Atile2;
+            Atile2.load(x + BM * static_cast<int64_t>(K) + kk1, K);
+            tile_matmad_nax(
+                Dtile2,
+                Atile2,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+          }
+
           (void)compiler_barrier;
         }
 
@@ -1231,6 +1262,18 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         Dtile.store(y + tm * N + tn, N);
       } else {
         Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+      }
+
+      if (pair_tiles) {
+        // The paired tile is full by construction; only N may be ragged.
+        device T* y2 = y + BM * static_cast<int64_t>(N) + tm * N + tn;
+        if constexpr (kAlignedN.value) {
+          Dtile2.store(y2, N);
+        } else if (sgp_sn == SN) {
+          Dtile2.store(y2, N);
+        } else {
+          Dtile2.store_safe(y2, N, short2(sgp_sn, SM));
+        }
       }
     });
   });
