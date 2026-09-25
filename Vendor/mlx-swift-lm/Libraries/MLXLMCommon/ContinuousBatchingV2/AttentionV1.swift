@@ -699,7 +699,8 @@ enum CBv2AttentionV1 {
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
-    /// One query at a time — the pinned MTP serial-verification path.
+    /// The pinned MTP serial-verification path: every query's result is the
+    /// one a one-query call against the keys up to it would produce.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
@@ -708,7 +709,39 @@ enum CBv2AttentionV1 {
         attendQueryBlocks(
             queries: queries, keys: keys, values: values,
             newTokenCount: newTokenCount, window: window, scale: scale,
-            sinks: sinks, softcap: softcap, blockSize: 1, keepMask: keepMask)
+            sinks: sinks, softcap: softcap,
+            blockSize: serialEquivalentBlockSize(
+                queries: queries, keys: keys, window: window, sinks: sinks,
+                softcap: softcap, keepMask: keepMask),
+            keepMask: keepMask)
+    }
+
+    /// The widest query block whose every row is bit-identical to attending
+    /// that query alone.
+    ///
+    /// MLX's single-pass vector SDPA gives each (head, query) its own
+    /// threadgroup, hands key `i` to simdgroup `i % 32` in index order, and
+    /// under its causal mask skips every key past the query's own position.
+    /// A block of queries against the keys up to the block's end therefore
+    /// performs, for each query, exactly the updates the one-query call
+    /// performs against the keys up to that query. That holds on the
+    /// single-pass vector kernel only, so a block must:
+    ///   * stay on the vector kernel: rows ≤ 8 and rows × GQA factor ≤ 32
+    ///     (otherwise MLX takes its unfused path);
+    ///   * stay single-pass: fewer than 1024 keys (the two-pass kernel's
+    ///     split depends on the key count);
+    ///   * use the plain causal mask: no window, keep mask, softcap or sinks.
+    /// Anything else attends one query at a time, as before.
+    static func serialEquivalentBlockSize(
+        queries: MLXArray, keys: MLXArray, window: Int?, sinks: MLXArray?,
+        softcap: Float?, keepMask: MLXArray?
+    ) -> Int {
+        let queryHeads = queries.dim(1)
+        let keyHeads = keys.dim(1)
+        guard window == nil, sinks == nil, softcap == nil, keepMask == nil,
+            keys.dim(2) < 1024, keyHeads > 0, queryHeads % keyHeads == 0
+        else { return 1 }
+        return max(1, min(8, 32 / (queryHeads / keyHeads)))
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast
