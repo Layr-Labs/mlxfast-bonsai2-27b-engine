@@ -58,6 +58,39 @@ extension EngineLoopV2 {
             }
         }
 
+        // A BLOCK drafter's carry is only its anchor. `proposeBlock` reads the
+        // anchor token and the request's committed context rows; it never
+        // reads `carry.hidden` (the block branch of `mtpBuildVerifyGraph`),
+        // and it needs no history transition (`carryNeedsHistoryTransition`
+        // is false). So a committed target step that leaves the row exactly
+        // one unfed token past a drafter state that has already queued every
+        // computed position is itself the seed. The case that matters is the
+        // prompt's final prefill chunk: without this the planner finds no
+        // carry and spends one plain [1, 1] target forward (a seed step) that
+        // commits a single token before the first verify round.
+        if mtp.usesBlockDrafter, !mtp.carryNeedsHistoryTransition {
+            for observation in round.committedObservationRows {
+                let id = observation.id
+                guard !step.discard.contains(id),
+                    let rec = scheduler.record(for: id),
+                    let anchor = rec.tokens.last,
+                    mtpBasicEligible(rec),
+                    rec.generatedTokenCount > 0,
+                    rec.generatedTokenCount < rec.request.maxTokens,
+                    !rec.request.stopTokens.contains(anchor),
+                    rec.pendingSamples == 0,
+                    rec.numComputedTokens == rec.tokens.count - 1,
+                    !mtp.hasValidCarry(for: rec),
+                    mtp.assistantCommittedInputCount(for: id) == rec.numComputedTokens
+                else { continue }
+                mtp.storeCarry(
+                    id: id, token: anchor,
+                    hidden: MLXArray.zeros([1, 1, 1]),
+                    tokensCount: rec.tokens.count,
+                    kvOffset: rec.numComputedTokens)
+            }
+        }
+
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
@@ -199,39 +232,6 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
-            if let evaluations = verify.recurrentEvaluations[id] {
-                if evaluations.count == 1, evaluations[0].isCaptured {
-                    // Capture-verify: one transaction spans the window. The
-                    // accepted prefix commits by device-side selection of the
-                    // captured state at position `confirmed`; zero confirmed
-                    // tokens restore the pre-verify snapshot by rollback.
-                    do {
-                        if confirmed > 0 {
-                            try evaluations[0].commit(keepPositions: confirmed)
-                        } else {
-                            try evaluations[0].rollback()
-                        }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 captured MTP finalization failed for \(id): \(error)")
-                    }
-                } else {
-                    precondition(
-                        evaluations.count == 1 + k,
-                        "CBv2 recurrent MTP verification generation count mismatch")
-                    do {
-                        for evaluation in evaluations.suffix(rejected).reversed() {
-                            try evaluation.rollback()
-                        }
-                        for evaluation in evaluations.prefix(confirmed) {
-                            try evaluation.commit()
-                        }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP finalization failed for \(id): \(error)")
-                    }
-                }
-            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -241,7 +241,9 @@ extension EngineLoopV2 {
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
-                // Target KV/recurrent truth is committed first. The assistant
+                // Target KV truth is committed first (the recurrent commit
+                // follows the early block proposal below; the drafter never
+                // reads target recurrent state). The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
                 //
@@ -275,6 +277,70 @@ extension EngineLoopV2 {
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
+            }
+            // EARLY BLOCK PROPOSAL. Everything the next round's block drafter
+            // reads is final here: the anchor is the carry token stored below
+            // (`kept[confirmed - 1]`), the committed context was just queued
+            // by `finalizeRound`, and the drafter cache sits at this row's
+            // new committed length (`rec.numComputedTokens`, after the
+            // rollback above). Proposing NOW, before the recurrent commit
+            // below, the rest of finalize and the next step's planning, puts
+            // the drafter forward on the GPU while the host does that work
+            // instead of after it. The proposal is the same call on the same
+            // inputs the next verify build makes (`mtpBuildVerifyGraph`), so
+            // it is the same graph and the same draft; the target still
+            // decides every token. Only a fixed-depth block leg with a full
+            // next round ahead takes this path, so the next round's depth is
+            // the depth proposed here.
+            var earlyBlock: CBv2MTPEarlyBlockProposal?
+            if finishReason == nil, confirmed > 0, let block = mtp.blockDrafter,
+                let state = metadata.assistantState,
+                let fixedDepth = mtp.config.fixedDraftTokens, fixedDepth == k,
+                rec.request.maxTokens - rec.generatedTokenCount > k
+            {
+                let anchor = kept[confirmed - 1]
+                let kvOffset = rec.numComputedTokens
+                if let tokens = try? block.proposeBlock(
+                    anchor: anchor, depth: k, requestState: state)
+                {
+                    block.trimBlockState(state, toCommittedLength: kvOffset)
+                    asyncEval([tokens] + block.evaluationTargets(for: state))
+                    earlyBlock = CBv2MTPEarlyBlockProposal(
+                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                }
+            }
+            if let evaluations = verify.recurrentEvaluations[id] {
+                if evaluations.count == 1, evaluations[0].isCaptured {
+                    // Capture-verify: one transaction spans the window. The
+                    // accepted prefix commits by device-side selection of the
+                    // captured state at position `confirmed`; zero confirmed
+                    // tokens restore the pre-verify snapshot by rollback.
+                    do {
+                        if confirmed > 0 {
+                            try evaluations[0].commit(keepPositions: confirmed)
+                        } else {
+                            try evaluations[0].rollback()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 captured MTP finalization failed for \(id): \(error)")
+                    }
+                } else {
+                    precondition(
+                        evaluations.count == 1 + k,
+                        "CBv2 recurrent MTP verification generation count mismatch")
+                    do {
+                        for evaluation in evaluations.suffix(rejected).reversed() {
+                            try evaluation.rollback()
+                        }
+                        for evaluation in evaluations.prefix(confirmed) {
+                            try evaluation.commit()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 recurrent MTP finalization failed for \(id): \(error)")
+                    }
+                }
             }
             // The speculative suffix is now reconciled in BOTH the page tables
             // and scheduler record. Publish only the accepted frontier; doing
@@ -385,7 +451,8 @@ extension EngineLoopV2 {
                     previousTopTwoMargin: previousTopTwoMargin,
                     needsHistoryTransition: mtp.carryNeedsHistoryTransition,
                     tokensCount: rec.tokens.count,
-                    kvOffset: rec.numComputedTokens)
+                    kvOffset: rec.numComputedTokens,
+                    earlyBlock: earlyBlock)
             }
         }
 
