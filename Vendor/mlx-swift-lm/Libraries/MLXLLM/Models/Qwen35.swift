@@ -2205,7 +2205,12 @@ final class Qwen35MRoPE {
                     ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
                     : rotated
             }
-            return (applyDefault(queries), applyDefault(keys))
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotatedCombined = applyDefault(combined)
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
