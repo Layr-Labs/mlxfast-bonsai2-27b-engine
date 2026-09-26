@@ -2670,7 +2670,38 @@ final class Qwen35Attention: Module {
             Qwen35AttentionPrework.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
                 ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
+            Qwen35AttentionPreworkExplicit.prepare(
+                hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: mrope.rotaryDim,
+                epsQ: args.rmsNormEps, epsK: args.rmsNormEps, mrope: mrope)
         }
+    }
+
+    /// q/k RMSNorm, the head transpose and the table-driven partial rotary
+    /// embedding in one launch (`Qwen35AttentionPreworkExplicit`) for explicit
+    /// per-row positions; nil keeps the op chain.
+    private func fusedExplicitPrework(
+        _ q: MLXArray, _ k: MLXArray, positionIds: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+            ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+            let (cosine, sine) = mrope.defaultTables(
+                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+        else { return nil }
+        return Qwen35AttentionPreworkExplicit.run(
+            q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
+            epsQ: qNorm.eps, epsK: kNorm.eps,
+            cosine: cosine, sine: sine, ropeDims: ropeDims)
+    }
+
+    /// `positionIds` normalized to 3 planes, shared with `Qwen35MRoPE.apply`.
+    private func normalizedExplicitPositions(_ positionIds: MLXArray) -> MLXArray {
+        var positions = positionIds
+        if positions.ndim == 2 {
+            positions = broadcast(
+                positions[.newAxis, 0..., 0...],
+                to: [3, positions.dim(0), positions.dim(1)])
+        }
+        return positions
     }
 
     /// q/k RMSNorm, the head transpose and the partial rotary embedding in one
@@ -2791,6 +2822,14 @@ final class Qwen35Attention: Module {
                 offsets: cache.positionOffsets)
         {
             (queries, keys) = fused
+        } else if let positionIds, !exactTargetVerify,
+            let fused = fusedExplicitPrework(
+                qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
+                positionIds: positionIds, ropeDims: mrope.rotaryDim)
+        {
+            // Norms, transpose and table-driven rotation in one launch; the
+            // composed norms below are skipped, not computed and discarded.
+            (queries, keys) = fused
         } else {
             queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
             keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
@@ -2868,7 +2907,7 @@ final class Qwen35Attention: Module {
 /// inputs; the module retains configuration only.
 final class Qwen35MRoPE {
     private let rope: RoPELayer
-    private let rotaryDim: Int
+    let rotaryDim: Int
     private let defaultInvFreq: MLXArray?
     private let sections: [Int]
     // Which of the three position planes (t/h/w) owns each frequency,
@@ -2920,6 +2959,21 @@ final class Qwen35MRoPE {
         return 0
     }
 
+    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
+    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
+    /// the non-default (per-frequency) path applies. The fused explicit
+    /// prework kernel consumes these same arrays, so one builder serves both.
+    func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
+        guard let defaultInvFreq else { return nil }
+        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        let angles = concatenated([frequency, frequency], axis: -1)
+        return (
+            cos(angles).asType(dtype).expandedDimensions(axis: 1),
+            sin(angles).asType(dtype).expandedDimensions(axis: 1))
+    }
+
     func apply(
         queries: MLXArray, keys: MLXArray, positionIds: MLXArray
     ) -> (MLXArray, MLXArray) {
@@ -2932,13 +2986,7 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let defaultInvFreq {
-            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
-            let angles = concatenated([frequency, frequency], axis: -1)
-            let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
-            let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
             func applyDefault(_ value: MLXArray) -> MLXArray {
                 let rotating = value[.ellipsis, ..<rotaryDim]
                 let half = rotating.dim(-1) / 2
@@ -4288,6 +4336,259 @@ enum Qwen35AttentionPrework {
                     q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
                     ropeDims: geo.rd, ropeBase: ropeBase),
                 refQ.shape == newQ.shape, refK.shape == newK.shape,
+                refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
+            else { return false }
+            same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
+                .&& all(refK.view(dtype: .uint32) .== newK.view(dtype: .uint32))
+        }
+        return same.item(Bool.self)
+    }
+}
+
+// MARK: - Fused q/k norm + table-driven rotation for explicit positions
+
+/// q/k RMSNorm, the head transpose and the partial rotary embedding in one
+/// launch for forwards that carry explicit per-row positions (the speculative
+/// verify), driven by the same (cosine, sine) tables the op chain builds.
+///
+/// This mirrors `Qwen35AttentionPrework` exactly -- same grid, same
+/// `rms_single_row` replication with the same two roundings, same transposed
+/// outputs -- except the rotation reads the chain's own cosine/sine tables
+/// instead of deriving angles from a scalar offset, so it applies wherever
+/// `Qwen35MRoPE.apply` applies, with no consecutiveness assumption. The
+/// rotation math is the chain's `applyDefault` in the same order
+/// (`rotating * cosine + rotatedHalf * sine`, pair `(j, j + HALF)`), over the
+/// same table values, so a prepared geometry is bit-identical to the chain;
+/// anything else keeps the chain. Like the offset prework, one geometry is
+/// compiled and checked bit for bit at model construction, on the box that
+/// runs it, before any timed forward.
+enum Qwen35AttentionPreworkExplicit {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_QKROPE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // grid (TPG * (HQ + HK), L, B), threadgroup (TPG, 1, 1), TPG = D / 4.
+    // Inputs: q [B, L, HQ, D] and k [B, L, HK, D] (any strides, same dtype),
+    // wq/wk [D] FP32, cos/sin [B, 1, L, RD] (the chain's expanded tables, any
+    // strides, same dtype as q), epsq/epsk/axis (= D) FP32 scalars.
+    // Outputs qo [B, HQ, L, D], ko [B, HK, L, D] FP32.
+    private static let source = """
+        constexpr int NR = 4;
+        constexpr int HALF = RD / 2;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hh = threadgroup_position_in_grid.x;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint bb = threadgroup_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int Ln = int(q_shape[1]);
+        const bool isq = hh < uint(HQ);
+        const uint h = isq ? hh : hh - uint(HQ);
+
+        threadgroup float local_sums[32];
+        threadgroup float local_inv[1];
+        threadgroup float rot[RD];
+
+        // rms_single_row: lane lid holds channels NR*lid .. NR*lid+NR-1.
+        const int64_t base = isq
+            ? int64_t(bb) * q_strides[0] + int64_t(t) * q_strides[1] + int64_t(h) * q_strides[2]
+            : int64_t(bb) * k_strides[0] + int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
+        const int64_t cs = isq ? q_strides[3] : k_strides[3];
+        auto src = isq ? q : k;
+        float acc = 0;
+        float thread_x[NR];
+        for (int i = 0; i < NR; i++) {
+          thread_x[i] = static_cast<float>(src[base + int64_t(lid * NR + i) * cs]);
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) {
+          local_sums[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+          local_sums[sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          acc = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            const float eps = isq ? epsq : epsk;
+            local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto w = isq ? wq : wk;
+        auto dst = isq ? qo : ko;
+        const size_t obase =
+            ((size_t(bb) * size_t(isq ? HQ : HK) + size_t(h)) * size_t(Ln) + size_t(t)) * size_t(D);
+        const float inv = local_inv[0];
+        for (int i = 0; i < NR; i++) {
+          const uint c = lid * NR + uint(i);
+          const float n = w[c] * static_cast<float>(thread_x[i] * inv);
+          if (c < uint(RD)) {
+            rot[c] = n;
+          } else {
+            dst[obase + c] = n;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Table-driven rotation on channels [0, RD): pair (j, j + HALF), the
+        // chain's applyDefault in the same order.
+        if (lid < uint(HALF)) {
+          const size_t toff =
+              size_t(bb) * size_t(cos_table_strides[0]) + size_t(t) * size_t(cos_table_strides[2])
+              + size_t(lid) * size_t(cos_table_strides[3]);
+          const float c = static_cast<float>(cos_table[toff]);
+          const float s = static_cast<float>(sin_table[toff]);
+          const float x1 = rot[lid];
+          const float x2 = rot[lid + HALF];
+          dst[obase + lid] = x1 * c - x2 * s;
+          dst[obase + lid + HALF] = x1 * s + x2 * c;
+        }
+        """;
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_attn_qkrope_tables",
+        inputNames: ["q", "k", "wq", "wk", "cos_table", "sin_table", "epsq", "epsk", "axis"],
+        outputNames: ["qo", "ko"],
+        source: source,
+        ensureRowContiguous: false)
+
+    /// `(rope(qNorm(q).transposed(0, 2, 1, 3)), rope(kNorm(k).transposed(0, 2, 1,
+    /// 3)))` for explicit `positionIds`, in one launch; nil keeps the op chain.
+    static func run(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        cosine: MLXArray, sine: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, q.ndim == 4, k.ndim == 4,
+            verified(
+                Geometry(
+                    hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims,
+                    dtype: "\(q.dtype)"))
+        else { return nil }
+        return runUnchecked(
+            q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK,
+            cosine: cosine, sine: sine, ropeDims: ropeDims)
+    }
+
+    private static func runUnchecked(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        cosine: MLXArray, sine: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        let B = q.dim(0)
+        let L = q.dim(1)
+        let HQ = q.dim(2)
+        let HK = k.dim(2)
+        let D = q.dim(3)
+        guard k.dim(0) == B, k.dim(1) == L, k.dim(3) == D,
+            q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
+            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
+            cosine.dtype == q.dtype, sine.dtype == q.dtype,
+            cosine.shape == [B, 1, L, ropeDims], sine.shape == [B, 1, L, ropeDims],
+            L > 0, L < 65536
+        else { return nil }
+        let outputs = kernel(
+            [q, k, wq, wk, cosine, sine,
+             MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D))],
+            template: [
+                ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
+            ],
+            grid: ((D / 4) * (HQ + HK), L, B), threadGroup: (D / 4, 1, 1),
+            outputShapes: [[B, HQ, L, D], [B, HK, L, D]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private struct Geometry: Hashable {
+        let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static func verified(_ geometry: Geometry) -> Bool {
+        lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Compile the kernel and check it bit for bit against the op chain for one
+    /// attention geometry, once per process, at model construction (before
+    /// any timed forward). A geometry or dtype that was not prepared, or that
+    /// disagrees, keeps the op chain.
+    static func prepare(
+        hq: Int, hk: Int, d: Int, ropeDims rd: Int, epsQ: Float, epsK: Float,
+        mrope: Qwen35MRoPE
+    ) {
+        guard enabled, d % 128 == 0, d <= 4096, rd > 0, rd % 4 == 0, rd <= d,
+            rd / 2 <= d / 4
+        else { return }
+        lock.withLock {
+            for dtype in [DType.float32] {
+                let geometry = Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)")
+                if verdicts[geometry] != nil { continue }
+                let verdict = selfCheck(geometry, dtype: dtype, epsQ: epsQ, epsK: epsK, mrope: mrope)
+                verdicts[geometry] = verdict
+                if !verdict {
+                    FileHandle.standardError.write(
+                        "qwen35: table-driven attention prework disagrees with the op chain on this device (\(dtype)); using the op chain\n"
+                            .data(using: .utf8)!)
+                }
+            }
+        }
+    }
+
+    private static func selfCheck(
+        _ geo: Geometry, dtype: DType, epsQ: Float, epsK: Float, mrope: Qwen35MRoPE
+    ) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x716b_726f), into: 6)
+        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
+        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
+        // The op chain as `Qwen35Attention.cbv2Forward` composes it on the
+        // explicit-positions path (norms, transpose, `mrope.apply`).
+        func chain(_ x: MLXArray, _ other: MLXArray, _ positions: MLXArray)
+            -> (MLXArray, MLXArray)
+        {
+            let q = MLXFast.rmsNorm(x, weight: wq, eps: epsQ).transposed(0, 2, 1, 3)
+            let k = MLXFast.rmsNorm(other, weight: wk, eps: epsK).transposed(0, 2, 1, 3)
+            return mrope.apply(queries: q, keys: k, positionIds: positions)
+        }
+        var same = MLXArray(true)
+        // Consecutive blocks (the drafter's rectangles) and ragged positions
+        // (never taken on this track, covered anyway): wide magnitude spread
+        // so the reductions see real rounding.
+        for (index, (rows, base, stride)) in [(16, 611, 1), (1, 4093, 1), (16, 100, 3), (5, 200_003, 1)].enumerated() {
+            // The q|gate, k and v projections stacked as the verify produces
+            // them (q strided by the gate split, exactly as `cbv2Forward`
+            // hands them to the fused path); wide magnitude spread so the
+            // reductions see real rounding.
+            let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+            let wide = (MLXRandom.normal([1, rows, width], key: keys[2 + index % 4])
+                * exp(MLXRandom.normal([1, rows, width], key: keys[(3 + index) % 6])))
+                .asType(dtype)
+            let parts = MLX.split(
+                wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d],
+                axis: -1)
+            let q = parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0]
+            let k = parts[1].reshaped(1, rows, geo.hk, -1)
+            var planeValues = [Int32]()
+            for p in 0 ..< rows {
+                planeValues.append(Int32(base + p * stride))
+            }
+            // Scalar-equivalent text positions: all three planes identical.
+            let positions = MLXArray(planeValues + planeValues + planeValues)
+                .reshaped([3, 1, rows])
+            guard let (cosine, sine) = mrope.defaultTables(
+                    positions: positions, dtype: dtype),
+                let (newQ, newK) = runUnchecked(
+                    q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK,
+                    cosine: cosine, sine: sine, ropeDims: geo.rd)
+            else { return false }
+            let (refQ, refK) = chain(q, k, positions)
+            guard refQ.shape == newQ.shape, refK.shape == newK.shape,
                 refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
             else { return false }
             same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
