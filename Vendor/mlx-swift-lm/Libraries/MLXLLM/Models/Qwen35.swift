@@ -3670,12 +3670,14 @@ final class Qwen35Attention: Module {
     /// embedding in one launch (`Qwen35AttentionPreworkExplicit`) for explicit
     /// per-row positions; nil keeps the op chain.
     private func fusedExplicitPrework(
-        _ q: MLXArray, _ k: MLXArray, positionIds: MLXArray, ropeDims: Int
+        _ q: MLXArray, _ k: MLXArray, positionIds: MLXArray, ropeDims: Int,
+        tableScope: Qwen35MRoPEForwardTables?
     ) -> (MLXArray, MLXArray)? {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: tableScope?.positions ?? normalizedExplicitPositions(positionIds),
+                dtype: q.dtype, tableScope: tableScope)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3777,6 +3779,7 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
+        tableScope: Qwen35MRoPEForwardTables? = nil,
         exactTargetVerify: Bool = false,
         lastQueryOnly: Bool = false,
         quantizedInput: SignedBlockHadamard.Int8Activation? = nil,
@@ -3823,7 +3826,7 @@ final class Qwen35Attention: Module {
         } else if let positionIds, !exactTargetVerify,
             let fused = fusedExplicitPrework(
                 qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
-                positionIds: positionIds, ropeDims: mrope.rotaryDim)
+                positionIds: positionIds, ropeDims: mrope.rotaryDim, tableScope: tableScope)
         {
             // Norms, transpose and table-driven rotation in one launch; the
             // composed norms below are skipped, not computed and discarded.
@@ -3838,7 +3841,7 @@ final class Qwen35Attention: Module {
             // before the cache advances and use the array RoPE overload.
             if let positionIds {
                 (queries, keys) = mrope.apply(
-                    queries: queries, keys: keys, positionIds: positionIds)
+                    queries: queries, keys: keys, positionIds: positionIds, tableScope: tableScope)
             } else {
                 let offsets = cache.positionOffsets + 0
                 queries = rope(queries, offset: offsets)
@@ -3909,6 +3912,48 @@ final class Qwen35Attention: Module {
     }
 }
 
+/// Tables shared only while one CBv2 target forward builds its layers. The
+/// holder is a local variable, outside the Module tree; it never survives as
+/// a memo for the next forward. Position nodes are snapshotted without numeric
+/// operations, and each default-frequency configuration and dtype has its own
+/// entry. Concurrent forwards have separate holders and require no global lock.
+final class Qwen35MRoPEForwardTables {
+    struct Key: Hashable {
+        let rotaryDim: Int
+        let baseBits: UInt32
+        let sections: [Int]
+        let dtype: DType
+    }
+
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_MROPE_FORWARD_TABLES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    let positions: MLXArray
+    private var tables: [Key: (MLXArray, MLXArray)] = [:]
+
+    init?(_ positionIds: MLXArray) {
+        guard Self.enabled,
+            positionIds.ndim == 2 || (positionIds.ndim == 3 && positionIds.dim(0) == 3)
+        else { return nil }
+        // A fresh wrapper retains these graph nodes if the caller later
+        // replaces positionIds' backing array. This does not materialize them.
+        let snapshot = positionIds.reshaped(positionIds.shape)
+        self.positions = snapshot.ndim == 2
+            ? broadcast(snapshot[.newAxis, 0..., 0...],
+                to: [3, snapshot.dim(0), snapshot.dim(1)]) : snapshot
+    }
+
+    func get(_ key: Key, build: () -> (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
+        if let hit = tables[key] { return hit }
+        let value = build()
+        tables[key] = value
+        return value
+    }
+}
+
 /// Qwen3.5 interleaved 3-axis M-RoPE. Request positions arrive as function
 /// inputs; the module retains configuration only.
 final class Qwen35MRoPE {
@@ -3916,6 +3961,7 @@ final class Qwen35MRoPE {
     let rotaryDim: Int
     private let defaultInvFreq: MLXArray?
     private let sections: [Int]
+    private let baseBits: UInt32
     // Which of the three position planes (t/h/w) owns each frequency,
     // precomputed as [1, 1, 1, rotaryDim/2] so the default path interleaves
     // with one takeAlong instead of a per-frequency slice loop.
@@ -3927,6 +3973,7 @@ final class Qwen35MRoPE {
     ) {
         self.rope = rope
         self.rotaryDim = max(1, dim)
+        self.baseBits = base.bitPattern
         let ropeType: String = {
             if let value = scalingConfig?["type"] ?? scalingConfig?["rope_type"],
                 case .string(let type) = value
@@ -3969,8 +4016,18 @@ final class Qwen35MRoPE {
     /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
     /// the non-default (per-frequency) path applies. The fused explicit
     /// prework kernel consumes these same arrays, so one builder serves both.
-    func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
+    func defaultTables(
+        positions: MLXArray, dtype: DType, tableScope: Qwen35MRoPEForwardTables? = nil
+    ) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
+        if let tableScope {
+            let key = Qwen35MRoPEForwardTables.Key(
+                rotaryDim: rotaryDim, baseBits: baseBits, sections: sections, dtype: dtype)
+            return tableScope.get(key) {
+                // Re-enter without the holder to build the unchanged formula once.
+                self.defaultTables(positions: tableScope.positions, dtype: dtype)!
+            }
+        }
         let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
             * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
         let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
@@ -3981,9 +4038,10 @@ final class Qwen35MRoPE {
     }
 
     func apply(
-        queries: MLXArray, keys: MLXArray, positionIds: MLXArray
+        queries: MLXArray, keys: MLXArray, positionIds: MLXArray,
+        tableScope: Qwen35MRoPEForwardTables? = nil
     ) -> (MLXArray, MLXArray) {
-        var positions = positionIds
+        var positions = tableScope?.positions ?? positionIds
         if positions.ndim == 2 {
             positions = broadcast(
                 positions[.newAxis, 0..., 0...],
@@ -3992,7 +4050,9 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
+        if let (cosine, sine) = defaultTables(
+            positions: positions, dtype: queries.dtype, tableScope: tableScope)
+        {
             func applyDefault(_ value: MLXArray) -> MLXArray {
                 let rotating = value[.ellipsis, ..<rotaryDim]
                 let half = rotating.dim(-1) / 2
@@ -4370,6 +4430,7 @@ final class Qwen35DecoderLayer: Module {
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
+        tableScope: Qwen35MRoPEForwardTables? = nil,
         captureRecurrentWindow: Bool = false,
         exactTargetVerify: Bool = false,
         lastRowOnly: Bool = false
@@ -4416,6 +4477,7 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
+                tableScope: tableScope,
                 exactTargetVerify: exactTargetVerify)
         }
         // A verify window's post-attention boundary as one kernel.
@@ -4510,6 +4572,7 @@ final class Qwen35DecoderLayer: Module {
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?,
+        tableScope: Qwen35MRoPEForwardTables? = nil,
         lastRowOnly: Bool,
         captureRecurrentWindow: Bool = false
     ) -> (input: MLXArray, h: MLXArray, f: MLXArray?) {
@@ -4575,6 +4638,7 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 layerInput, cache: attentionCache, positionIds: positionIds,
+                tableScope: tableScope,
                 exactTargetVerify: false, quantizedInput: quantized, rotatedInput: rotated)
         }
         if let dense = mlp as? Qwen3NextMLP,
@@ -4777,6 +4841,7 @@ public class Qwen35TextModelInner: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        let tableScope = positionIds.flatMap { Qwen35MRoPEForwardTables($0) }
         // Early-submission boundaries for this forward (`Qwen35TrunkSubmission`).
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
@@ -4837,7 +4902,7 @@ public class Qwen35TextModelInner: Module {
                     modelLayerIndex: modelLayerIndex,
                     attentionCache: attentionCache,
                     recurrentState: recurrentState,
-                    positionIds: positionIds,
+                    positionIds: positionIds, tableScope: tableScope,
                     lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex,
                     captureRecurrentWindow: verifyPending)
                 if let slot = pendingTapSlot {
@@ -4869,7 +4934,7 @@ public class Qwen35TextModelInner: Module {
                 modelLayerIndex: modelLayerIndex,
                 attentionCache: attentionCache,
                 recurrentState: recurrentState,
-                positionIds: positionIds,
+                positionIds: positionIds, tableScope: tableScope,
                 captureRecurrentWindow: captureRecurrentWindow,
                 exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
                 lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex)
