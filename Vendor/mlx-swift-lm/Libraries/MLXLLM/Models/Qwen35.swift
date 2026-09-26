@@ -2176,6 +2176,15 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
+            // At verify width on the int8 route: the norm and the gated tail
+            // in one launch (`Qwen35GatedNormTail`), the same values.
+            if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
+                let signed = Qwen35GatedNormTail.apply(
+                    out, gate: gate, weight: norm.weight, eps: norm.eps,
+                    signs: packed.transform.signVector)
+            {
+                return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+            }
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
             let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
@@ -3544,6 +3553,22 @@ final class Qwen35Attention: Module {
             {
                 return y
             }
+            // The int8 verify route (neither form above takes it): the gate and
+            // the projection's signs in one elementwise launch that reads the
+            // head-transposed output and the gate half of each q|gate head
+            // through their strides, so neither is reshaped into a copy first.
+            // Same elements, same compiled program; its output is contiguous.
+            if !exactTargetVerify, Qwen35FusedElementwise.foldsHadamardSigns,
+                let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+                attended.dtype == qSplit[1].dtype, attended.shape == qSplit[1].shape,
+                attended.dim(2) * attended.dim(3) == packed.transform.width,
+                HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * L)
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    attended, qSplit[1],
+                    packed.transform.signVector.reshaped(attended.dim(2), attended.dim(3)))
+                return packed.forwardPreSigned(signed.reshaped(B, L, -1), widenOutput: false)
+            }
             output = attended.reshaped(B, L, -1)
             attendedGate = gate
         }
@@ -3850,6 +3875,34 @@ extension Qwen3NextMLP {
             return self(x)
         }
         return downProj(silu(shared[0]) * shared[1])
+    }
+
+    /// `h = x + r` and the MLP of `norm(h)` at verify width on the int8
+    /// verify route: the residual add and the norm (with gate|up's signs
+    /// folded into the gain, as `qwen35ForwardSignedNorm` folds them) in one
+    /// launch (`Qwen35FusedBoundaryQ8.applyAddNorm`), then exactly
+    /// `qwen35ForwardSignedNorm`'s tail. Same values as `h = x + r` followed
+    /// by `qwen35ForwardSignedNorm(h, ...)`. Nil when it does not apply.
+    fileprivate func qwen35ForwardAddNormVerify(
+        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+    ) -> (h: MLXArray, out: MLXArray)? {
+        guard Qwen35FusedElementwise.foldsHadamardSigns,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let transform = siblings.first?.transform,
+            norm.weight.ndim == 1, norm.weight.dim(0) == transform.width,
+            let boundary = Qwen35FusedBoundaryQ8.applyAddNorm(
+                x, r, gain: gain.gain(norm.weight, signs: transform.signVector), eps: norm.eps),
+            let shared = sharedHadamardProjectionsPreSigned(
+                boundary.normed, siblings, widenOutput: false)
+        else { return nil }
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return (boundary.h, y)
+        }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
     }
 
     /// `qwen35Forward(norm(h))` with gate and up's Hadamard signs folded into
@@ -4197,14 +4250,24 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?,
         lastRowOnly: Bool,
-        captureRecurrentWindow: Bool = false
+        captureRecurrentWindow: Bool = false,
+        addNormBoundary: Bool = false
     ) -> (input: MLXArray, h: MLXArray, f: MLXArray?) {
         var input = x
         var boundary: Qwen35FusedBoundaryQ8.Output? = nil
         // A verify window (`captureRecurrentWindow`) takes the verify boundary.
         var verifyBoundary: Qwen35FusedBoundaryQ8.VerifyOutput? = nil
+        var addNormed: MLXArray? = nil
         if let pending {
-            if captureRecurrentWindow {
+            if addNormBoundary,
+                ObjectIdentifier(type(of: inputLayerNorm)) == ObjectIdentifier(RMSNorm.self),
+                inputLayerNorm.weight.ndim == 1,
+                let fused = Qwen35FusedBoundaryQ8.applyAddNorm(
+                    x, pending, gain: inputLayerNorm.weight, eps: inputLayerNorm.eps)
+            {
+                input = fused.h
+                addNormed = fused.normed
+            } else if captureRecurrentWindow {
                 verifyBoundary = fusedInputBoundaryVerify(x, pending)
                 input = verifyBoundary?.h ?? (x + pending)
             } else {
@@ -4217,7 +4280,8 @@ final class Qwen35DecoderLayer: Module {
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
         // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed ?? addNormed ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -4256,6 +4320,12 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!.cbv2Forward(
                 layerInput, cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: false, quantizedInput: quantized, rotatedInput: rotated)
+        }
+        if addNormBoundary, let dense = mlp as? Qwen3NextMLP,
+            let fused = dense.qwen35ForwardAddNormVerify(
+                input, r, norm: postAttentionLayerNorm, gain: signedGain)
+        {
+            return (input, fused.h, fused.out)
         }
         if let dense = mlp as? Qwen3NextMLP,
             let fused = captureRecurrentWindow
@@ -4482,8 +4552,18 @@ public class Qwen35TextModelInner: Module {
             && Qwen35FusedBoundaryQ8.verifyMayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1))
             && !HadamardQuantizedLinear.tensorRouteTakesNarrowRows(
                 hiddenStates.dim(0) * hiddenStates.dim(1))
+        // Where the int8 verify route takes the window instead, the pending
+        // path still fuses each boundary's residual add into its norm
+        // (`Qwen35FusedBoundaryQ8.applyAddNorm`); the projections keep the
+        // route and their own quantizing rotations.
+        let verifyAddNorm =
+            captureRecurrentWindow && !exactTargetVerify && hiddenStates.ndim == 3
+            && !verifyPending
+            && Qwen35FusedBoundaryQ8.addNormMayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1))
+            && HadamardQuantizedLinear.tensorRouteTakesNarrowRows(
+                hiddenStates.dim(0) * hiddenStates.dim(1))
         let pendingPath =
-            verifyPending
+            verifyPending || verifyAddNorm
             || (!captureRecurrentWindow && hiddenStates.ndim == 3
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
@@ -4492,7 +4572,7 @@ public class Qwen35TextModelInner: Module {
         // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? (verifyPending
+            ? (verifyPending || verifyAddNorm
                 ? submission
                 : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
@@ -4516,7 +4596,8 @@ public class Qwen35TextModelInner: Module {
                     recurrentState: recurrentState,
                     positionIds: positionIds,
                     lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex,
-                    captureRecurrentWindow: verifyPending)
+                    captureRecurrentWindow: verifyPending || verifyAddNorm,
+                    addNormBoundary: verifyAddNorm)
                 if let slot = pendingTapSlot {
                     tapped[slot] = out.input
                     pendingTapSlot = nil
@@ -6514,6 +6595,395 @@ enum Qwen35FusedBoundaryQ8 {
         source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + source,
         header: header,
         ensureRowContiguous: true)
+}
+
+/// The verify window's decoder-layer boundary on the int8 verify route (the
+/// ranked box's verify-width route, where the fused verify boundary above
+/// declines) as ONE launch: the FP16 residual add `h = x + r` and the RMSNorm
+/// of `h` with its FP32 gain, the norm's output left in FP32 for the
+/// projections' own quantizing rotations. The composed path runs MLX's FP16
+/// `Add`, the `AsType` that `fast::rms_norm` inserts and `rms_looped`
+/// (5120 > 4096): three launches per boundary, two boundaries per layer.
+///
+/// The kernel is `Qwen35FusedBoundaryQ8`'s add and `rms_looped` replica, lane
+/// for lane (1024 lanes, four reads per lane per pass, the `acc += xi * xi`
+/// chain, `simd_sum`, 32 simdgroup partials, a second `simd_sum`,
+/// `precise::rsqrt(acc / axis_size + eps)`, the output `w * (x * inv)`), on
+/// `rms_looped`'s own grid: one 1024-lane threadgroup per row. The transform
+/// is NOT folded in: at verify width a fused transform runs one row per
+/// threadgroup and serializes its butterflies, which the box measured as a
+/// longer window; here every launch that remains keeps its grid, and only the
+/// add and the widen (two elementwise launches over 16 rows) disappear. It
+/// stores `h` (FP16) and the norm output (FP32).
+///
+/// Before first use a self-test on the running GPU compares both outputs bit
+/// for bit against the composed ops (`x + r`, `MLXFast.rmsNorm`) for both
+/// gains and 16 and 3 rows; a mismatch, or any MLX error, keeps the composed
+/// path. `BONSAI_VERIFY_ADDNORM=0` keeps it too.
+extension Qwen35FusedBoundaryQ8 {
+    static let addNormEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_ADDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    struct AddNormOutput {
+        let h: MLXArray
+        let normed: MLXArray
+    }
+
+    // grid (1024 * rows, 1, 1), threadgroup (1024, 1, 1): one threadgroup per
+    // row, as `rms_looped`. Inputs: xa, xb half [rows, W] (h = xa + xb), w
+    // float [W] (the gain), eps, axis_size. Template: W. Outputs: hout half
+    // [rows, W], nout float [rows, W].
+    private static let addNormSource = """
+        constexpr uint NR = 4;
+        constexpr uint LS = 1024;
+        constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+        static_assert(W % 4 == 0 && W > 4096 && W <= 8192, "rms_looped width");
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const size_t base = size_t(row) * size_t(W);
+
+        threadgroup float local_sums[32];
+        threadgroup float local_inv[1];
+
+        // The FP16 residual add, and rms_looped's sum of squares of the
+        // promoted row: pass p covers elements p * 4096 + 4 * lid + i.
+        float hv[NP * NR];
+        float acc = 0;
+        BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+          const uint r0 = p * LS * NR;
+          if (r0 + lid * NR + NR <= uint(W)) {
+            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+              const uint e = r0 + lid * NR + i;
+              const half s = xa[base + e] + xb[base + e];
+              hout[base + e] = s;
+              hv[p * NR + i] = float(s);
+              acc += hv[p * NR + i] * hv[p * NR + i];
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) {
+          local_sums[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+          local_sums[sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          const float t = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            local_inv[0] = metal::precise::rsqrt(t / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv = local_inv[0];
+
+        // rms_looped's output `w * (x * inv)`.
+        BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+          const uint r0 = p * LS * NR;
+          if (r0 + lid * NR + NR <= uint(W)) {
+            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+              const uint e = r0 + lid * NR + i;
+              nout[base + e] = w[e] * (hv[p * NR + i] * inv);
+            }
+          }
+        }
+        """
+
+    private static let addNormKernel = MLXFast.metalKernel(
+        name: "bonsai_boundary_add_rmsnorm",
+        inputNames: ["xa", "xb", "w", "eps", "axis_size"],
+        outputNames: ["hout", "nout"],
+        source: addNormSource,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// True when a verify window of `rows` rows may take the kernel: the
+    /// verify width, the switch on, and no failed self-test.
+    static func addNormMayApply(rows: Int) -> Bool {
+        guard addNormEnabled, rows >= 1, rows < BonsaiPromptWidth.minimumRows else { return false }
+        return addNormLock.withLock { addNormVerdict != false }
+    }
+
+    /// `(x + r, MLXFast.rmsNorm(x + r, weight: gain, eps: eps))` in one launch,
+    /// or nil when the kernel does not apply (the caller runs the composed ops).
+    static func applyAddNorm(
+        _ x: MLXArray, _ r: MLXArray, gain: MLXArray, eps: Float
+    ) -> AddNormOutput? {
+        guard addNormEnabled, x.dtype == .float16, r.dtype == .float16, x.shape == r.shape,
+            x.ndim >= 2, x.dim(-1) == width, addNormMayApply(rows: x.size / width),
+            gain.dtype == .float32, gain.shape == [width],
+            addNormVerified(eps: eps)
+        else { return nil }
+        return launchAddNorm(x, r, gain: gain, eps: eps)
+    }
+
+    private static let addNormLock = NSLock()
+    nonisolated(unsafe) private static var addNormVerdict: Bool?
+
+    private static func addNormVerified(eps: Float) -> Bool {
+        addNormLock.lock()
+        defer { addNormLock.unlock() }
+        if let addNormVerdict { return addNormVerdict }
+        let report = addNormSelfTest(eps: eps)
+        addNormVerdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify add+norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    private static func launchAddNorm(
+        _ x: MLXArray, _ r: MLXArray, gain: MLXArray, eps: Float
+    ) -> AddNormOutput {
+        let rows = x.size / width
+        let outs = addNormKernel(
+            [x, r, gain, MLXArray(eps), axisSize], template: [("W", width)],
+            grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape, x.shape],
+            outputDTypes: [.float16, .float32])
+        return AddNormOutput(h: outs[0], normed: outs[1])
+    }
+
+    /// Verify-width residual rows as production feeds them (FP16): per-row
+    /// scales from 0.05 to 30, outlier channels 100x larger (so the FP16 add
+    /// rounds), one row with `r = -x` (a zero row), against a unit-scale gain
+    /// and a gain with random signs and magnitudes.
+    static func addNormSelfTest(eps: Float) -> SelfTestReport {
+        var report = SelfTestReport()
+        do {
+            try withError { error in
+                let gainPlain = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [width], key: MLXRandom.key(UInt64(61)))
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(62))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let gainSigned = (gainPlain * signs).asType(.float32)
+                for (rows, seed) in [(16, 71), (3, 72)] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let outlier = MLXArray(
+                        (0 ..< width).map { $0 % 509 == 7 ? Float(100) : Float(1) })
+                    let x32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 100))) * scale * outlier
+                    var r32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 200))) * scale
+                        * Float(0.25)
+                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows / 3)))
+                        .reshaped(1, rows, 1)
+                    r32 = which(zeroRow, -x32, r32)
+                    let x = x32.asType(.float16)
+                    let r = r32.asType(.float16)
+                    let h0 = x + r
+                    for gain in [gainPlain.asType(.float32), gainSigned] {
+                        let n0 = MLXFast.rmsNorm(h0, weight: gain, eps: eps)
+                        let out = launchAddNorm(x, r, gain: gain, eps: eps)
+                        report.cases += 1
+                        for (a, b) in [(h0, out.h), (n0, out.normed)] {
+                            guard a.dtype == b.dtype, a.shape == b.shape else {
+                                report.passed = false
+                                report.error =
+                                    "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                                return
+                            }
+                            let bits: DType = a.dtype == .float16 ? .uint16 : .uint32
+                            let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
+                                .asType(.int32).sum()
+                            eval(differ)
+                            try error.check()
+                            let count = Int(differ.item(Int32.self))
+                            report.values += a.size
+                            report.mismatches += count
+                            if count != 0 { report.passed = false }
+                        }
+                    }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
+/// The GDN output's gated per-head RMSNorm and the output projection's
+/// Hadamard signs at verify width as ONE launch. The composed path runs
+/// `MLXFast.rmsNorm` over each 128-wide head (`rms_single_row`) and the
+/// compiled `gatedNormTailSigned` (`(z * sigmoid(z)) * normed * signs`): two
+/// launches per GDN layer. The arithmetic here is the int8 producer kernel's
+/// PROD 3 read, which already matches that composed chain bit for bit: per
+/// head, lane l squares elements 4l .. 4l + 3 in order, `simd_sum`,
+/// `precise::rsqrt(acc / 128 + eps)`, `w[d] * (x * inv)`, then `(z *
+/// sigmoid(z)) * xn` with MLX's `Sigmoid` and the signs. One simdgroup per
+/// (row, head), as `rms_single_row`: the launch keeps the norm's parallelism
+/// and the quantizing rotation stays its own launch. z is read through its
+/// strides (a slice of the qkv|z product), so it is not copied first.
+///
+/// Before first use a self-test on the running GPU compares the output bit for
+/// bit against the composed ops (FP32 and FP16 z, a strided z); a mismatch or
+/// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
+/// too.
+enum Qwen35GatedNormTail {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let header = """
+        // MLX `Sigmoid` (unary_ops.h), verbatim.
+        METAL_FUNC float bgn_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        // element (row, c) of a [B, L, heads, 128] view, through its strides
+        inline int64_t bgn_row(const constant int* shape, const constant int64_t* st, uint row) {
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        inline int64_t bgn_col(const constant int64_t* st, uint c) {
+          return int64_t(c / 128u) * st[2] + int64_t(c % 128u) * st[3];
+        }
+
+        """
+
+    // grid (32 * rows * H, 1, 1), threadgroup (256, 1, 1): one simdgroup per
+    // (row, head). Inputs: x float [B, L, H, 128], z float|half [B, L, H,
+    // 128] (any strides), w float [128], eps float [1], signs float [H * 128].
+    // Template: H, InZ. Output: out float [rows, H * 128].
+    private static let source = """
+        const uint gidx = thread_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint hr = gidx / 32u;
+        const uint row = hr / uint(H);
+        const uint head = hr % uint(H);
+        const int64_t xrow = bgn_row(x_shape, x_strides, row);
+        const int64_t zrow = bgn_row(z_shape, z_strides, row);
+        const uint c0 = head * 128u + lane * 4u;
+        float xv[4];
+        float acc = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          xv[r] = float(x[xrow + bgn_col(x_strides, c0 + uint(r))]);
+          acc += xv[r] * xv[r];
+        }
+        acc = simd_sum(acc);
+        const float inv = metal::precise::rsqrt(acc / float(128) + eps[0]);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const uint col = c0 + uint(r);
+          const float bv = float(z[zrow + bgn_col(z_strides, col)]);
+          const float xn = w[col % 128u] * (xv[r] * inv);
+          const float v = (bv * bgn_sigmoid(bv)) * xn;
+          out[size_t(row) * size_t(H * 128) + col] = v * signs[col];
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gdn_gated_norm_signed",
+        inputNames: ["x", "z", "w", "eps", "signs"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+
+    /// `gatedNormTailSigned(rmsNorm(x, weight, eps), z, signs)` flattened to
+    /// `[rows, H * 128]`, or nil when it does not apply.
+    static func apply(
+        _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray? {
+        guard enabled, x.dtype == .float32, z.dtype == .float32 || z.dtype == .float16,
+            x.ndim == 4, z.shape == x.shape, x.dim(3) == 128,
+            (x.dim(0) * x.dim(1) * x.dim(2)) % 8 == 0,
+            weight.dtype == .float32, weight.ndim == 1, weight.dim(0) == 128,
+            signs.dtype == .float32, signs.size == x.dim(2) * 128,
+            verified(eps: eps)
+        else { return nil }
+        return launch(x, z, weight: weight, eps: eps, signs: signs)
+    }
+
+    private static func launch(
+        _ x: MLXArray, _ z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray {
+        let rows = x.dim(0) * x.dim(1)
+        let heads = x.dim(2)
+        return kernel(
+            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            template: [("H", heads), ("InZ", z.dtype)],
+            grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    private static func verified(eps: Float) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict { return verdict }
+        let report = selfTest(eps: eps)
+        verdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify gated norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    static func selfTest(eps: Float) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        do {
+            try withError { error in
+                let rows = 16
+                let heads = 48
+                let width = heads * 128
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(121))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let weight = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [128], key: MLXRandom.key(122))
+                let scale = MLXRandom.uniform(
+                    Float(0.01) ..< Float(20), [1, rows, heads, 1], key: MLXRandom.key(123))
+                let x = MLXRandom.normal([1, rows, heads, 128], key: MLXRandom.key(124)) * scale
+                // z as the qkv|z product's slice: a strided view.
+                let wide = MLXRandom.normal([1, rows, 10240 + width], key: MLXRandom.key(125))
+                    * Float(3)
+                for zType in [DType.float32, .float16] {
+                    let z = wide.asType(zType)[0..., 0..., 10240...].reshaped(1, rows, heads, 128)
+                    let zw = z.dtype == x.dtype ? z : z.asType(x.dtype)
+                    let normed = MLXFast.rmsNorm(x, weight: weight, eps: eps)
+                    let reference = Qwen35FusedElementwise.gatedNormTailSigned(
+                        normed, zw, signs.reshaped(heads, 128)
+                    ).asType(x.dtype).reshaped(rows, width)
+                    let fused = launch(x, z, weight: weight, eps: eps, signs: signs)
+                    report.cases += 1
+                    guard fused.shape == reference.shape, fused.dtype == reference.dtype else {
+                        report.passed = false
+                        report.error = "output \(fused.dtype) \(fused.shape)"
+                        return
+                    }
+                    let differ = (fused.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    let count = Int(differ.item(Int32.self))
+                    report.values += fused.size
+                    report.mismatches += count
+                    if count != 0 { report.passed = false }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
 }
 
 /// The verify window's decoder-layer boundary on the matrix route as ONE
