@@ -6862,11 +6862,18 @@ enum Qwen35TensorPackedMatmul {
         // the reduction reuses the staging buffers, in simdgroup order
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float* red = (threadgroup float*)&bs[0][0][0];
+        // i = 0, 4, 8, 12. On each group the four partials of one lane are
+        // one float4 at (i >> 2) * 128 + lane * 4 inside that half's 512-float
+        // block. Last index is 511. Simdgroup 0 still folds acc, then red of
+        // simdgroup 0, 1, 2, one component at a time, and stores OutT scalar.
         if (sg > 0) {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+            for (int i = 0; i < CAP; i += 4) {
+              const int base = ((int(sg) - 1) * NH + h) * (CAP * 32) + (i >> 2) * 128 + int(lane) * 4;
+              *(threadgroup float4*)(red + base) = float4(acc[h][i], acc[h][i + 1], acc[h][i + 2], acc[h][i + 3]);
+            }
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6874,12 +6881,26 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) {
-              float v = acc[h][i];
+            for (int i = 0; i < CAP; i += 4) {
+              float v0 = acc[h][i];
+              float v1 = acc[h][i + 1];
+              float v2 = acc[h][i + 2];
+              float v3 = acc[h][i + 3];
               #pragma clang loop unroll(full)
-              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
+              for (int q = 0; q < 4 - 1; q++) {
+                const int base = (q * NH + h) * (CAP * 32) + (i >> 2) * 128 + int(lane) * 4;
+                const float4 part = *(threadgroup float4*)(red + base);
+                v0 += part.x;
+                v1 += part.y;
+                v2 += part.z;
+                v3 += part.w;
+              }
+              const int mh = (i >> 2) & 1;
+              const int nq = i >> 3;
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq] = OutT(v0);
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 1 + 16 * nq] = OutT(v1);
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 2 + 16 * nq] = OutT(v2);
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 3 + 16 * nq] = OutT(v3);
             }
           }
         }
