@@ -447,6 +447,30 @@ func qwen35GatedDelta(
     outputNeeded: Bool = true
 ) -> (MLXArray, MLXArray) {
     let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
+    return qwen35GatedDelta(
+        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: state, mask: mask,
+        outputNeeded: outputNeeded)
+}
+
+/// On unless explicitly disabled (`DARKBLOOM_QWEN35_REPLAY_REUSES_GATES=0`):
+/// the accepted-prefix replay of a verify window that ran the fused prework
+/// slices that window's `g` / `beta` instead of re-forming them from the
+/// taped `a` / `b` (idea: ercumentyildirim `f8565a2`).
+enum Qwen35ReplayGateReuse {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_REPLAY_REUSES_GATES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
+/// `qwen35GatedDelta` on gates already formed: the same kernel routing
+/// (chunked, register-resident, wide-window, stock) as the overload above.
+func qwen35GatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+    state: MLXArray?, mask: MLXArray?, outputNeeded: Bool = true
+) -> (MLXArray, MLXArray) {
+    let gates = [g, beta]
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
@@ -2094,24 +2118,42 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        gates: (g: MLXArray, beta: MLXArray)? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = qwen35GatedDelta(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] },
-            outputNeeded: false
-        ).1
+        let boundarySsm: MLXArray
+        if let gates, tape.mask == nil {
+            // The verify window's own gates, row-sliced: the gates are
+            // element-wise in (a, b), so rows [0, k) are the values a
+            // recompute from rows [0, k) of the taped a / b would form.
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                g: gates.g[0..., rows, 0...],
+                beta: gates.beta[0..., rows, 0...],
+                state: tape.ssmPre,
+                mask: nil,
+                outputNeeded: false
+            ).1
+        } else {
+            boundarySsm = qwen35GatedDelta(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] },
+                outputNeeded: false
+            ).1
+        }
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -2429,6 +2471,11 @@ final class Qwen35GatedDeltaNet: Module {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
                 let finalSSM = finalSsmState[rowRange]
+                // The prework formed this window's gates; the replay slices
+                // them (nil: the replay re-forms them from the taped a / b).
+                let replayGates: (g: MLXArray, beta: MLXArray)? =
+                    Qwen35ReplayGateReuse.enabled
+                    ? pre.map { (g: $0.g[rowRange], beta: $0.beta[rowRange]) } : nil
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
                     q: qNormed[rowRange],
@@ -2498,7 +2545,8 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                                tape: tape, committedRows: keepPositions,
+                                gates: replayGates)
                         })
                 } catch {
                     preconditionFailure(
@@ -5345,6 +5393,38 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The verify-width route on a toolchain without `uint2b_format` (the
+    /// 4-bit-staged kernel below). `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_STAGED`
+    /// = `0` keeps the record's verify-width kernels there; `wide` limits it to
+    /// the wide products (q|k|v, qkv|z, gate|up); `all` adds the narrow ones
+    /// (o/out, down). Default `0` (off): the kernel measured 0.855 (dependent
+    /// calls) to 0.93 (independent calls) of the record's verify matmul time
+    /// on an M5 Air, but polymorf measured the staged form about equal to the
+    /// record's kernels on the M5 Max, and no end-to-end round has been timed.
+    enum StagedVerifyScope { case off, wide, all }
+    static let stagedVerifyScope: StagedVerifyScope = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_STAGED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "0", "false", "no", "off": return .off
+        case "wide": return .wide
+        case "all", "1", "true", "yes", "on": return .all
+        default: return .off
+        }
+    }()
+
+    /// Whether the staged verify route takes an `n x k` product. The narrow
+    /// products are the ones whose output width is the hidden size (o/out,
+    /// down); in `wide` scope they keep the record's split-K kernel and its
+    /// fused-input rotation.
+    static func stagedVerifyTakes(n: Int, k: Int) -> Bool {
+        switch stagedVerifyScope {
+        case .off: return false
+        case .all: return true
+        case .wide: return n > k
+        }
+    }
+
     // MARK: - Packed-operand support on this box's Metal toolchain
 
     /// How the tensor unit reads the 2-bit codes: `native2b` as a
@@ -5451,9 +5531,8 @@ enum Qwen35TensorPackedMatmul {
     /// True when the toolchain takes `tensor` operands at all (either form).
     static var tensorOperandsAvailable: Bool { support != .none }
 
-    /// The verify-width route needs the native 2-bit operand: its staged
-    /// forms measured no faster than the record's verify kernels, so without
-    /// `uint2b_format` that route stays off. Probed separately (once).
+    /// The verify-width route prefers the native 2-bit operand. Probed
+    /// separately (once); without it `verifyStagedAvailable` decides.
     static let verifyNativeAvailable: Bool = {
         if support == .native2b { return true }
         let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PACKED"]?
@@ -5462,6 +5541,19 @@ enum Qwen35TensorPackedMatmul {
             return false
         }
         return probe("bonsai_probe_uint2b", probeSourceNative)
+    }()
+
+    /// Without `uint2b_format`, the verify width takes the 4-bit-staged kernel
+    /// when the toolchain compiles a threadgroup `uint4b_format` operand.
+    /// Measured on an M5 Air against the record's verify kernels (few-row
+    /// core, FP16 split-K); polymorf measured the staged form about equal on
+    /// an M5 Max.
+    static let verifyStagedAvailable: Bool = {
+        guard !verifyNativeAvailable, stagedVerifyScope != .off, support != .none else {
+            return false
+        }
+        if support == .staged4b { return true }
+        return probe("bonsai_probe_uint4b", probeSourceStaged)
     }()
 
     // The prompt-width kernel for a toolchain without `uint2b_format`: the
@@ -5653,84 +5745,93 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
-    // The verify-width kernel for the same toolchain: each simdgroup expands
-    // its own 32 x 128 tile per group into its threadgroup region
-    // (double-buffered, simdgroup-scoped sync). 32 columns, 4 simdgroups.
+    // The verify-width kernel for the same toolchain (polymorf's staged form,
+    // `5fbfa003`, retiled): each threadgroup owns 64 output columns; its four
+    // simdgroups split K into contiguous quarters, and each expands its own
+    // 64 x 128 tile of 2-bit codes per group into 4-bit codes in its
+    // threadgroup region (single-buffered, simdgroup-scoped sync) for one
+    // 16 x 64 x 128 op. The reduce scratch reuses the staging memory after a
+    // threadgroup barrier. Bit-identical to the 32-column double-buffered
+    // form (the per-column sums run in the same order). grid: (N / 64 * 128,
+    // 1, 1), threadgroup (128, 1, 1); inputs as `sourceNarrow`.
     private static let sourceNarrowStaged = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        constexpr int TN = 64;
+        constexpr int SG = 4;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
+        const int gper = Kg / SG;
         const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        constexpr int TW = TN * 128 / 8;
+        threadgroup uint32_t tgm[SG * TW];
+        threadgroup uint32_t* my = tgm + int(sg) * TW;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, TN, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
-        // per-simdgroup staged tile: 32 columns x 128 codes as nibbles = 2 KB; double-buffered
-        threadgroup uint32_t bs[4][2][32 * 128 / 8];
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)bs[sg][1], dextents<int, 2>(128, 32));
+        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)my, dextents<int, 2>(128, TN));
         auto tA0 = A.template slice<128, 16>(0, 0);
         auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, float>();
-        constexpr int CAP = 16;
+        constexpr int CAP = TN / 2;
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
         float acc[CAP];
         #pragma clang loop unroll(full)
         for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + n0 + fn);
-        const device half4* sp1 = (const device half4*)(scalesT + n0 + fn + 16);
-        const device half4* bp0 = (const device half4*)(biasesT + n0 + fn);
-        const device half4* bp1 = (const device half4*)(biasesT + n0 + fn + 16);
-        const int NQ = N / 4;
-        // staging: lane l -> column l (32 columns), all 128 codes of the group = 8 words -> 16 nibble words
-        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v0 = src[0]; const uint4 v1 = src[1];
-          threadgroup uint32_t* dst = bs[sg][buf] + int(lane) * 16;
+        // staging: lane l -> columns l and l + 32, all 128 codes of the group = 8 words -> 16 nibble words
+        auto stage = [&](int g) {
           #pragma clang loop unroll(full)
-          for (int j = 0; j < 8; j++) {
-            const uint32_t wv = (j < 4) ? v0[j] : v1[j - 4];
-            uint32_t lo = wv & 0xFFFFu; uint32_t hi = wv >> 16;
-            lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
-            hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
-            dst[2 * j] = lo; dst[2 * j + 1] = hi;
+          for (int cc = 0; cc < TN / 32; cc++) {
+            const int col = int(lane) + 32 * cc;
+            const device uint4* src = (const device uint4*)(w + (size_t)(n0 + col) * (K / 16) + g * 8);
+            const uint4 v0 = src[0]; const uint4 v1 = src[1];
+            threadgroup uint32_t* dst = my + col * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 8; j++) {
+              const uint32_t wv = (j < 4) ? v0[j] : v1[j - 4];
+              uint32_t lo = wv & 0xFFFFu; uint32_t hi = wv >> 16;
+              lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
+              hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
+              dst[2 * j] = lo; dst[2 * j + 1] = hi;
+            }
           }
         };
-        stage(g0, 0);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int g = g0; g < g0 + gper; g++) {
-          const int cur = (g - g0) & 1;
-          if (g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
+          stage(g);
+          simdgroup_barrier(mem_flags::mem_threadgroup);
           auto tA = A.template slice<128, 16>(g * 128, 0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
+          op.run(tA, B0, cT);
+          float4 sv[TN / 16], bv[TN / 16];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < TN / 16; q++) {
+            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
+            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+          }
           const float rs0 = rowsum[(size_t)fm * Kg + g];
           const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            acc[i] = fma(s, cT[i], fma(b, mh ? rs1 : rs0, acc[i]));
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            acc[i] = fma(sv[nq][c], cT[i], fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup float red[3][16 * 32];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)tgm;
         if (sg > 0) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
+          for (int i = 0; i < CAP; i++) { red[(int(sg) - 1) * CAP * 32 + i * 32 + int(lane)] = acc[i]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
-            const float v = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
+            float v = acc[i];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < SG - 1; q++) { v += red[q * CAP * 32 + i * 32 + int(lane)]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
           }
         }
         """
@@ -5780,9 +5881,11 @@ enum Qwen35TensorPackedMatmul {
         HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
             rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
         }
-        if verifyEnabled, verifyNativeAvailable {
+        if verifyEnabled, verifyNativeAvailable || verifyStagedAvailable {
+            let staged = !verifyNativeAvailable
             HadamardQuantizedLinear.tensorPackedMatmulNarrowApplies = { rows, n, k in
-                rows <= 16 && n % 32 == 0 && k % 512 == 0 && n < 65536
+                rows <= 16 && n % (staged ? 64 : 32) == 0 && k % 512 == 0 && n < 65536
+                    && (!staged || stagedVerifyTakes(n: n, k: k))
             }
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
@@ -5800,11 +5903,12 @@ enum Qwen35TensorPackedMatmul {
                 else { return nil }
                 let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
                 let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                if !verifyNativeAvailable {
+                if staged {
+                    guard n % 64 == 0 else { return nil }
                     return kernelNarrowStaged(
                         [rotated, weight, scalesT, biasesT, sums, dimsArray(k: k, m: m, n: n)],
                         template: [("OutT", outputDType)],
-                        grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                        grid: (n / 64 * 128, 1, 1), threadGroup: (128, 1, 1),
                         outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
                 }
                 let tn = (narrowTileColumns == 64 && n % 64 == 0) ? 64 : 32

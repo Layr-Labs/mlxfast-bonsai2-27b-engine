@@ -995,8 +995,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         {
             return nil
         }
+        // At verify width the same holds for the shapes the narrow form takes;
+        // a shape it declines keeps this fused-input rotation.
         if Self.tensorRouteEnabled, Self.tensorPackedMatmulNarrow != nil,
-            rows <= Self.tensorRouteMaximumNarrowRows
+            rows <= Self.tensorRouteMaximumNarrowRows,
+            Self.tensorPackedMatmulNarrowApplies?(rows, weight.dim(0), k) ?? true
         {
             return nil
         }
