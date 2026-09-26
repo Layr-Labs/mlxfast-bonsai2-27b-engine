@@ -219,7 +219,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0
-        for rows in [512, 513] + Array(1 ... block) {
+        // The pre-`3baf5cb4` warm set (`[513]`, as `d5c6433`/`bffba58` ship
+        // it). The 512-row entry arrived at `3baf5cb4`, the boundary after
+        // which no scored pair has read the fast verify window; this is the
+        // single-change form of Meganpark980320's `a0df8210` and newjordan's
+        // `679f1de8` probes, applied on the `f5960db` record.
+        for rows in [513] + Array(1 ... block) {
             let context = MLXArray.zeros([1, rows, width], dtype: drafter.dtype)
             guard
                 let tokens = try? drafter.propose(
