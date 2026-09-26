@@ -925,9 +925,10 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 /// the two matmuls.
 /// The drafter's BF16 projections at a block width (<= 16 rows) on the tensor
 /// unit with `tensor` operands (`bfloat x bfloat -> float`, MetalPerformance-
-/// Primitives `matmul2d`): each threadgroup owns 32 output columns, its four
-/// simdgroups take four contiguous K quarters (one 16 x 32 x 256 op per
-/// chunk) and their partials are summed through threadgroup memory. The
+/// Primitives `matmul2d`): each threadgroup owns 32 output columns. Wide
+/// projections use two simdgroups over contiguous K halves; smaller ones use
+/// four over K quarters. Each chunk is a 16 x 32 x 256 op, and the partials
+/// are summed through threadgroup memory. The
 /// weights are the layer's BF16 arrays read as stored; the result is the same
 /// FP32-accumulated product in a different summation order, rounded to BF16.
 /// The drafter only proposes. `DARKBLOOM_DFLASH2_TENSOR_MATMUL=0` keeps the
@@ -949,14 +950,15 @@ enum DFlash2TensorMatmul {
 
         """
 
-    // grid: (N / 32 * 128, 1, 1), threadgroup (128, 1, 1). Inputs: x bfloat
+    // grid: (N / 32 * (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1).
+    // Inputs: x bfloat
     // [16, K], w bfloat [N, K], ksz int32 [K, 16, N]. K % 1024 == 0.
     private static let source = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int kq = K / 4;
+        const int kq = K / SPLITS;
         const int k0 = int(sg) * kq;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
             16, 32, 256, false, true, false,
@@ -979,7 +981,7 @@ enum DFlash2TensorMatmul {
         // m = fm + 8 * ((i >> 2) & 1).
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        threadgroup float red[3][16 * 32];
+        threadgroup float red[SPLITS - 1][16 * 32];
         if (sg > 0) {
           #pragma clang loop unroll(full)
           for (int i = 0; i < 16; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
@@ -988,7 +990,12 @@ enum DFlash2TensorMatmul {
         if (sg == 0) {
           #pragma clang loop unroll(full)
           for (int i = 0; i < 16; i++) {
-            const float v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            float v;
+            if constexpr (SPLITS == 2) {
+              v = cT[i] + red[0][i * 32 + lane];
+            } else {
+              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            }
             const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
             out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
           }
@@ -1030,9 +1037,14 @@ enum DFlash2TensorMatmul {
             a = concatenated(
                 [a, MLXArray.zeros([rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
         }
+        // Wide projections expose enough output tiles to use fewer K partitions.
+        // Keep the accepted four-way route for the smaller projections.
+        let splits = n >= 16384 ? 2 : 4
+        let threads = splits * 32
         let y = kernel(
-            [a, weight, dimsArray(k: k, n: n)], template: [("OutT", DType.bfloat16)],
-            grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            [a, weight, dimsArray(k: k, n: n)],
+            template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
         let rowsOut = rows < rowsPerTile ? y[0 ..< rows] : y
         return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
