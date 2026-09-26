@@ -454,6 +454,9 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
+        // The comparison graph is the same for every layer of every later
+        // round with this geometry. Realize it once, here, so those rounds
+        // read the stored mask instead of replaying the graph.
         eval(made)
         key = requested
         cached = made
@@ -1574,10 +1577,11 @@ enum DFlash2GreedyWalk {
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// The mask columns of a proposal are not embedded (the bind-time mask
-    /// row is broadcast). `MLXFAST_DFLASH_ANCHOR_COLUMN=0` builds the full
-    /// token block again.
+    /// row is broadcast), so `propose` builds only the anchor column
+    /// (ercumentyildirim `6e19fe1`). `MLXFAST_RIDER_ANCHOR_COLUMN=0` builds
+    /// the full token block again.
     static let anchorColumnOnly: Bool = {
-        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ANCHOR_COLUMN"]?
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_RIDER_ANCHOR_COLUMN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(raw ?? "")
     }()
