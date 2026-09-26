@@ -5914,11 +5914,16 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Each thread's 32 results fall in eight contiguous groups of four
+        // (c = 0..3). nb is a multiple of four and N is a multiple of 64, so
+        // each group is one aligned vector store. Values and positions match
+        // the scalar stores.
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          *(device metal::vec<OutT, 4>*)(out + (size_t)mm * N + nb + 32 * nh) =
+              metal::vec<OutT, 4>(OutT(acc[i]), OutT(acc[i + 1]), OutT(acc[i + 2]), OutT(acc[i + 3]));
         }
         """
 
