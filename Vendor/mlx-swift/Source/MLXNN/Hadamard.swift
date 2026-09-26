@@ -197,16 +197,12 @@ public struct SignedBlockHadamard {
     }
 
     /// `self(x * sigmoid(gate))`, the attention output gate, fused the same way.
-    /// With strided inputs on, `[B, S, heads, headDim]` operands are read in
-    /// place (the result is `[B, S, width]`).
     public func rotatedSigmoidGate(
         _ x: MLXArray, gate: MLXArray, outputDType: DType = .float32
     ) -> MLXArray? {
         guard FusedInputHadamardKernel.gateEnabled, blockSize == 1024, width % 1024 == 0,
             x.dtype == .float32, gate.dtype == .float32, x.shape == gate.shape,
-            x.ndim > 0,
-            x.dim(-1) == width
-                || (HadamardStridedInputs.enabled && x.ndim == 4 && x.dim(2) * x.dim(3) == width)
+            x.ndim > 0, x.dim(-1) == width
         else { return nil }
         return FusedInputHadamardKernel.gated(
             x, gate, signs: signs, width: width, mode: 2, outputDType: outputDType)
@@ -414,7 +410,6 @@ public final class HadamardConstantLayoutCache {
     }
     private let lock = NSLock()
     private var entries: [Entry] = []
-    private var negativeBias: (scales: MLXArray, biases: MLXArray, matches: Bool)?
 
     public init() {}
 
@@ -434,30 +429,8 @@ public final class HadamardConstantLayoutCache {
         }
     }
 
-    /// Check the frozen FP16 affine constants once, including signed zero.
-    /// This cache is cleared by the owning projection on parameter updates.
-    public func biasesAreNegativeScales(_ scales: MLXArray, _ biases: MLXArray) -> Bool {
-        lock.withLock {
-            if let negativeBias, negativeBias.scales === scales,
-                negativeBias.biases === biases
-            {
-                return negativeBias.matches
-            }
-            guard scales.dtype == .float16, biases.dtype == .float16,
-                scales.shape == biases.shape
-            else { return false }
-            let flipped = scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))
-            let matches = (flipped .== biases.view(dtype: .uint16)).all().item(Bool.self)
-            negativeBias = (scales, biases, matches)
-            return matches
-        }
-    }
-
     public func clear() {
-        lock.withLock {
-            entries.removeAll()
-            negativeBias = nil
-        }
+        lock.withLock { entries.removeAll() }
     }
 }
 
@@ -837,31 +810,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             activation, siblings: siblings, n: n, outputDType: outputDType, leading: leading)
     }
 
-    /// Whether `tensorRouteForward` may take an FP32 activation of `rows` rows
-    /// for `siblings` (self first); false means the matrix route serves it.
-    /// At verify width either narrow form counts (`narrowRouteInstalled`: the
-    /// FP16-activation form or the int8-activation form), exactly as
-    /// `tensorRouteForward` itself admits them.
-    fileprivate func tensorRouteMayTake(rows: Int, siblings: [HadamardQuantizedLinear]) -> Bool {
-        guard Self.tensorRouteEnabled, !siblings.isEmpty, siblings[0] === self else { return false }
-        let promptWidth = rows >= Self.tensorRouteMinimumRows && rows % 64 == 0
-        let verifyWidth = rows <= Self.tensorRouteMaximumNarrowRows
-        guard transform.width % 128 == 0,
-            (promptWidth && Self.tensorPackedMatmul != nil && Self.tensorPackedMatmulApplies != nil)
-                || (verifyWidth && Self.narrowRouteInstalled)
-        else { return false }
-        return siblings.allSatisfy { tensorRouteTakes($0) }
-    }
-
-    /// True when the verify-width tensor route (either narrow form) is
-    /// installed and on and `rows` is a verify width: the tower's packed
-    /// projections at that width may then take the tensor route rather than
-    /// the matrix route (the per-projection guards still apply).
-    public static func tensorRouteTakesNarrowRows(_ rows: Int) -> Bool {
-        tensorRouteEnabled && narrowRouteInstalled && rows >= 1
-            && rows <= tensorRouteMaximumNarrowRows
-    }
-
     /// The prompt-width packed matmul of `tensorRouteForward` over an
     /// activation already quantized for the route: one matmul for one
     /// projection, or one over the stacked siblings split back per sibling.
@@ -1175,22 +1123,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard gdnLayout == nil, x.ndim == 4, x.shape == gate.shape else { return nil }
         return tensorRouteForwardProducer(
             .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
-    }
-
-    /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
-    /// through their strides by the fused-input rotation (the verify width's
-    /// matrix route): the head-transposed attention output and the gate half
-    /// of each q|gate head are not reshaped into copies first. Same elements,
-    /// same arithmetic. Nil when it does not apply (the caller then reshapes).
-    public func applyAfterSigmoidGateHeads(
-        _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
-    ) -> MLXArray? {
-        guard HadamardStridedInputs.enabled, gdnLayout == nil, x.ndim == 4,
-            x.shape == gate.shape, x.dim(2) * x.dim(3) == transform.width,
-            let store = fusedInputStoreDType(rows: x.dim(0) * x.dim(1)),
-            let rotated = transform.rotatedSigmoidGate(x, gate: gate, outputDType: store)
-        else { return nil }
-        return fusedInputForward(rotated, widenOutput: widenOutput)
     }
 
     /// The GDN output projection of `silu(z) * rmsNorm(x, weight, eps)` with the
@@ -1511,37 +1443,6 @@ public func sharedHadamardProjectionsPreSigned(
     return siblings.map { $0.applyRotated(rotated) }
 }
 
-/// The dtype `sharedHadamardProjections` (and its pre-signed form) rotates an
-/// FP32 activation of `rows` rows into when these siblings run as one stacked
-/// matrix-route matmul, or nil when that call takes another path (the tensor
-/// route, or one matmul per sibling). Siblings as `sharedHadamardSiblings`
-/// returns them.
-public func sharedHadamardMatrixStackInputDType(
-    _ siblings: [HadamardQuantizedLinear], rows: Int
-) -> DType? {
-    guard let first = siblings.first,
-        siblings.allSatisfy({ $0.sharesInputTransform(with: first) }),
-        !first.tensorRouteMayTake(rows: rows, siblings: siblings),
-        first.fusedSiblingsApply(siblings, rows: rows, k: first.transform.width)
-    else { return nil }
-    return first.fusedSiblingsInputDType(siblings, rows: rows, sourceDType: .float32)
-}
-
-/// The stacked matrix-route projections of an FP32 activation whose rotation
-/// (plain, or pre-signed) is already formed in the dtype
-/// `sharedHadamardMatrixStackInputDType` returned: the same matmul
-/// `sharedHadamardProjections` runs on the rotation it forms itself. Nil when
-/// the stack does not take it.
-public func sharedHadamardProjectionsRotated(
-    _ rotated: MLXArray, _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
-) -> [MLXArray]? {
-    guard let first = siblings.first,
-        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
-    else { return nil }
-    return first.fusedSiblingsForward(
-        rotated, siblings: siblings, widenOutput: widenOutput, sourceDType: .float32)
-}
-
 /// Packed folded embeddings with an inverse transform after lookup.
 ///
 /// `asLinear` applies the forward transform, allowing the same packed weights
@@ -1601,61 +1502,6 @@ public enum BonsaiPromptWidth {
     }()
 }
 
-/// Kernel inputs read in place through their strides. A fused-input rotation
-/// that consumes a column slice of a stacked projection (the gate|up halves,
-/// the GDN z of qkv|z) or a head-strided view (the attention output and its
-/// gate) would otherwise be launched row-contiguous, and MLX copies every such
-/// operand to a fresh buffer first (one copy launch each, at every verify
-/// window). The kernels that opt in index their inputs through the strides
-/// MLX passes instead: the same values, read where they already are.
-/// `BONSAI_FUSED_INPUT_STRIDED=0` keeps the row-contiguous launches (and the
-/// copies).
-public enum HadamardStridedInputs {
-    public static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_INPUT_STRIDED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Row addressing for an input whose leading `LEAD` dimensions (1 or 2)
-    /// index the rows and whose trailing `TRAIL` dimensions (1 or 2) make up
-    /// a row (the caller reshapes any other layout to `[rows, width]`, a view
-    /// when MLX can collapse it). A kernel takes one uniform branch per
-    /// threadgroup: packed rows (unit innermost stride, a two-dimensional row
-    /// contiguous) keep the plain loads at `row base + column`; anything else
-    /// forms each column's offset from the strides.
-    public static let header = """
-        template <int LEAD>
-        METAL_FUNC int64_t bonsai_row_base(
-            uint row, constant const int* shape, constant const int64_t* strides) {
-          if (LEAD == 1) {
-            return int64_t(row) * strides[0];
-          }
-          const uint n1 = uint(shape[1]);
-          return (row < n1) ? int64_t(row) * strides[1]
-                            : int64_t(row / n1) * strides[0] + int64_t(row % n1) * strides[1];
-        }
-        template <int LEAD, int TRAIL>
-        METAL_FUNC int64_t bonsai_col_off(
-            uint c, constant const int* shape, constant const int64_t* strides) {
-          if (TRAIL == 1) {
-            return int64_t(c) * strides[LEAD];
-          }
-          const uint n = uint(shape[LEAD + 1]);
-          return int64_t(c / n) * strides[LEAD] + int64_t(c % n) * strides[LEAD + 1];
-        }
-        template <int LEAD, int TRAIL>
-        METAL_FUNC bool bonsai_row_packed(constant const int* shape, constant const int64_t* strides) {
-          if (TRAIL == 1) {
-            return strides[LEAD] == 1;
-          }
-          return strides[LEAD + 1] == 1
-              && (shape[LEAD] == 1 || strides[LEAD] == int64_t(shape[LEAD + 1]));
-        }
-
-        """
-}
-
 /// ercumentyildirim's (`ade7529`) fused-INPUT rotations: the SwiGLU product,
 /// the attention output gate, or the GDN output's per-head RMSNorm and gated
 /// tail, formed in the read of MLX's `hadamard_n<float, 1024, 16, 4>` with the
@@ -1690,38 +1536,19 @@ enum FusedInputHadamardKernel {
         _ a: MLXArray, _ b: MLXArray, signs: MLXArray, width: Int, mode: Int,
         outputDType: DType = .float32
     ) -> MLXArray {
-        // Rows over the leading one or two dimensions, a row over the
-        // trailing one (`[..., width]`) or two (`[B, S, heads, headDim]`: the
-        // head-transposed attention output and the gate half of each q|gate
-        // head); any other layout is reshaped to `[rows, width]`.
-        var trail = a.dim(-1) == width ? 1 : 2
-        var lead = a.ndim - trail
-        var ra = a
-        var rb = b
-        if lead < 1 || lead > 2 || (trail == 2 && a.dim(-1) * a.dim(-2) != width)
-            || b.shape != a.shape
-        {
-            ra = a.reshaped(a.size / width, width)
-            rb = b.reshaped(a.size / width, width)
-            trail = 1
-            lead = 1
-        }
-        return gatedKernel(
-            [ra, rb, signs],
+        gatedKernel(
+            [a, b, signs],
             template: [
                 ("WIDTH", width), ("MODE", mode), ("InT", a.dtype), ("OutT", outputDType),
-                ("LEAD", lead), ("TRAIL", trail),
             ],
             grid: (64, a.size / 1024, 1),
             threadGroup: (64, 1, 1),
-            outputShapes: [Array(ra.shape.dropLast(trail)) + [width]],
+            outputShapes: [a.shape],
             outputDTypes: [outputDType])[0]
     }
 
     /// MODE 1: `(a * sigmoid(a)) * b` (SwiGLU, inputs FP32 or FP16 widened
-    /// exactly). MODE 2: `a * sigmoid(b)`. The inputs are read through their
-    /// strides (`HadamardStridedInputs`: rows over the leading LEAD dims, a
-    /// row over the trailing TRAIL dims).
+    /// exactly). MODE 2: `a * sigmoid(b)`.
     private static let gatedKernel = MLXFast.metalKernel(
         name: "bonsai_fused_input_gated_hadamard_1024",
         inputNames: ["a", "b", "signs"],
@@ -1733,21 +1560,15 @@ enum FusedInputHadamardKernel {
             uint blk = thread_position_in_grid.y;
             uint row_base = (blk / BLOCKS) * WIDTH;
             uint col0 = (blk % BLOCKS) * 1024;
-            const uint row = blk / BLOCKS;
-            const int64_t ra = bonsai_row_base<LEAD>(row, a_shape, a_strides);
-            const int64_t rb = bonsai_row_base<LEAD>(row, b_shape, b_strides);
 
             threadgroup float buf[1024];
 
-            // One uniform branch per threadgroup picks the loads (packed rows
-            // at row base + column, anything else through the strides).
-            auto fill = [&](auto load_a, auto load_b, auto load_s) {
             BONSAI_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
               BONSAI_UNROLL for (short r = 0; r < 4; r++) {
                 uint p = col0 + index + r;
-                float av = load_a(p);
-                float bv = load_b(p);
+                float av = static_cast<float>(a[row_base + p]);
+                float bv = static_cast<float>(b[row_base + p]);
                 float v;
                 if (MODE == 1) {
                   float t = av * bonsai_sigmoid(av);
@@ -1755,21 +1576,8 @@ enum FusedInputHadamardKernel {
                 } else {
                   v = av * bonsai_sigmoid(bv);
                 }
-                buf[index + r] = v * load_s(p);
+                buf[index + r] = v * signs[p];
               }
-            }
-            };
-            if (bonsai_row_packed<LEAD, TRAIL>(a_shape, a_strides)
-                && bonsai_row_packed<LEAD, TRAIL>(b_shape, b_strides) && signs_strides[0] == 1) {
-              const device InT* ap = a + ra;
-              const device InT* bp = b + rb;
-              fill([&](uint p) { return static_cast<float>(ap[p]); },
-                   [&](uint p) { return static_cast<float>(bp[p]); },
-                   [&](uint p) { return signs[p]; });
-            } else {
-              fill([&](uint p) { return static_cast<float>(a[ra + bonsai_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
-                   [&](uint p) { return static_cast<float>(b[rb + bonsai_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },
-                   [&](uint p) { return signs[int64_t(p) * signs_strides[0]]; });
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1836,8 +1644,7 @@ enum FusedInputHadamardKernel {
               return (x < 0) ? y : 1 - y;
             }
 
-            """ + HadamardStridedInputs.header,
-        ensureRowContiguous: !HadamardStridedInputs.enabled)
+            """)
 }
 
 extension FusedInputHadamardKernel {
@@ -1876,17 +1683,10 @@ extension FusedInputHadamardKernel {
             uint col0 = (blk % BLOCKS) * 1024;
             uint lane = thread_index_in_simdgroup;
             uint sg = simdgroup_index_in_threadgroup;
-            // x and z [B, S, heads, HEAD_DIM], read through their strides.
-            const uint row = blk / BLOCKS;
-            const int64_t rx = bonsai_row_base<2>(row, x_shape, x_strides);
-            const int64_t rz = bonsai_row_base<2>(row, z_shape, z_strides);
 
             threadgroup float buf[1024];
             threadgroup float inv_rms[HEADS_PER_BLOCK];
 
-            // One uniform branch per threadgroup picks the loads (packed rows
-            // at row base + column, anything else through the strides).
-            auto fill = [&](auto load_x, auto load_z, auto load_w, auto load_s) {
             // Per-head RMS as rms_single_row with 32 threads x 4 reads: lane l
             // sums elements 4l..4l+3 of the head in order, then simd_sum.
             BONSAI_UNROLL for (uint hh = sg; hh < HEADS_PER_BLOCK; hh += 2) {
@@ -1894,11 +1694,11 @@ extension FusedInputHadamardKernel {
               uint kh = p0 / (REPEATS * HEAD_DIM);
               uint rep = (p0 % (REPEATS * HEAD_DIM)) / HEAD_DIM;
               uint src_head = rep * KEY_HEADS + kh;
-              uint xh = src_head * HEAD_DIM + lane * 4;
+              const device float* xh = x + row_base + src_head * HEAD_DIM + lane * 4;
               float acc = 0;
               float tx[4];
               BONSAI_UNROLL for (int r = 0; r < 4; r++) {
-                tx[r] = load_x(xh + r);
+                tx[r] = xh[r];
                 acc += tx[r] * tx[r];
               }
               acc = simd_sum(acc);
@@ -1915,25 +1715,12 @@ extension FusedInputHadamardKernel {
                 uint kh = p / (REPEATS * HEAD_DIM);
                 uint rem = p % (REPEATS * HEAD_DIM);
                 uint src = ((rem / HEAD_DIM) * KEY_HEADS + kh) * HEAD_DIM + rem % HEAD_DIM;
-                float xn = load_w(src % HEAD_DIM) * (load_x(src) * inv_rms[(index + r) / HEAD_DIM]);
-                float zv = load_z(src);
+                float xn = w[src % HEAD_DIM] * (x[row_base + src] * inv_rms[(index + r) / HEAD_DIM]);
+                float zv = z[row_base + src];
                 float gz = zv * bonsai_sigmoid(zv);
                 float v = gz * xn;
-                buf[index + r] = v * load_s(p);
+                buf[index + r] = v * signs[p];
               }
-            }
-            };
-            if (bonsai_row_packed<2, 2>(x_shape, x_strides) && bonsai_row_packed<2, 2>(z_shape, z_strides)
-                && w_strides[0] == 1 && signs_strides[0] == 1) {
-              const auto xp = x + rx;
-              const auto zp = z + rz;
-              fill([&](uint c) { return float(xp[c]); }, [&](uint c) { return float(zp[c]); },
-                   [&](uint c) { return w[c]; }, [&](uint c) { return signs[c]; });
-            } else {
-              fill([&](uint c) { return float(x[rx + bonsai_col_off<2, 2>(c, x_shape, x_strides)]); },
-                   [&](uint c) { return float(z[rz + bonsai_col_off<2, 2>(c, z_shape, z_strides)]); },
-                   [&](uint c) { return w[int64_t(c) * w_strides[0]]; },
-                   [&](uint c) { return signs[int64_t(c) * signs_strides[0]]; });
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2000,6 +1787,5 @@ extension FusedInputHadamardKernel {
               return (x < 0) ? y : 1 - y;
             }
 
-            """ + HadamardStridedInputs.header,
-        ensureRowContiguous: !HadamardStridedInputs.enabled)
+            """)
 }
