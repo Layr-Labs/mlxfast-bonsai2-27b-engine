@@ -314,12 +314,17 @@ enum Qwen35TrunkSubmission {
     /// The prompt plan of a forward on the pending-residual path (the tensor
     /// route's fused layer boundaries, see `Qwen35FusedBoundaryQ8`), which
     /// builds each layer through `cbv2ForwardPending` and so never reaches
-    /// the plain loop's submissions: commit after layers 4, 16, 32 and 48, as
-    /// newjordan's `9024f66b` pending path does. `MLXFAST_PREFILL_PIPELINE_FUSED`
-    /// sets the plan (same syntax); `0` submits the forward as one graph.
+    /// the plain loop's submissions. Newjordan's `9024f66b` pending path
+    /// commits after layers 4, 16, 32 and 48; here the front is denser,
+    /// after layers 1, 2, 4, 8, 16, 32 and 48, so the GPU starts on the
+    /// first layer instead of waiting for the host to build four, and the
+    /// early command buffers stay short while the host is ahead of the GPU
+    /// by only a layer or two. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan
+    /// (same syntax, `4,16,32,48` restores the previous one); `0` submits the
+    /// forward as one graph.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [4, 16, 32, 48]))
+        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48]))
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
@@ -3675,7 +3680,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3965,19 +3970,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3992,18 +4021,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -6422,6 +6453,162 @@ enum Qwen35FusedHadamard {
     }
 }
 
+/// The verify window's producer chains on the int8 narrow route (16 rows):
+/// the SwiGLU product, the GDN output's gated norm and the attention output
+/// gate are formed in the quantizing rotation's read (the prompt route's
+/// `..._q8p`) instead of by their own launches ahead of
+/// `bonsai_signed_hadamard_1024_q8`. Per verify window of the 27B: 64
+/// compiled SwiGLU launches, 48 norms and 48 compiled gated tails, and 16
+/// compiled gates with the 32 copies that flattened their operands fewer.
+///
+/// Each kind is self-tested once per width and dtypes on the running GPU at
+/// 16 rows, bit for bit against the composed ops production runs (the
+/// compiled chain with the signs, then the pre-signed `forwardInt8`), on
+/// operands laid out as production lays them out; a mismatch keeps the
+/// composed path. `BONSAI_VERIFY_SWIGLU_Q8=0`, `BONSAI_VERIFY_GATED_NORM_Q8=0`
+/// and `BONSAI_VERIFY_ATTN_GATE_Q8=0` keep it per kind.
+enum Qwen35VerifyProducerQ8 {
+    private static func on(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }
+    static let swiglu = on("BONSAI_VERIFY_SWIGLU_Q8")
+    static let gatedNorm = on("BONSAI_VERIFY_GATED_NORM_Q8")
+    static let attentionGate = on("BONSAI_VERIFY_ATTN_GATE_Q8")
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+
+    /// `HadamardQuantizedLinear.narrowProducerApproves`: the kind's switch,
+    /// the operand dtypes the composed chain computes in FP32, and the kind's
+    /// verdict (its self-test runs on first use).
+    static func approves(
+        _ producer: SignedBlockHadamard.Int8Producer, _ transform: SignedBlockHadamard
+    ) -> Bool {
+        // The composed chains compared against carry the signs (the default fold).
+        guard Qwen35FusedElementwise.foldsHadamardSigns, transform.blockSize == 1024
+        else { return false }
+        let key: String
+        switch producer {
+        case .swiglu(let gate, let up):
+            guard swiglu, gate.dtype == up.dtype, [DType.float16, .float32].contains(gate.dtype)
+            else { return false }
+            key = "swiglu \(transform.width) \(gate.dtype)"
+        case .gatedRMSNorm(let x, let gate, let weight, _):
+            guard gatedNorm, x.dtype == .float32, x.ndim == 4, x.dim(3) == 128,
+                [DType.float16, .float32].contains(gate.dtype), weight.dtype == .float32
+            else { return false }
+            key = "gated norm \(transform.width) \(gate.dtype)"
+        case .sigmoidGate(let x, let gate):
+            guard attentionGate, x.dtype == .float32, gate.dtype == .float32, x.ndim == 4
+            else { return false }
+            key = "attention gate \(transform.width) \(x.dim(2))x\(x.dim(3))"
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict = verdicts[key] { return verdict }
+        let report = selfTest(producer, transform)
+        verdicts[key] = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify producer q8 (\(key)): " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    /// Sixteen rows with per-row scales from 0.05 to 30 (the sigmoid saturates
+    /// both ways) and one zero row (all-zero groups, the norm's `rsqrt(eps)`),
+    /// in production's layouts (SwiGLU's halves, the GDN gate and the attention
+    /// gate are column slices of a stacked product, the attention output is
+    /// head-transposed). Outputs compared as unsigned integers.
+    private static func selfTest(
+        _ producer: SignedBlockHadamard.Int8Producer, _ transform: SignedBlockHadamard
+    ) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        let rows = 16
+        let width = transform.width
+        let signs = transform.signVector
+        do {
+            try withError { error in
+                for seed in [61, 62] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                        * (MLXArray(0 ..< rows) .!= MLXArray(Int32(rows / 3)))
+                            .asType(.float32).reshaped(1, rows, 1)
+                    func normal(_ n: Int, _ salt: Int) -> MLXArray {
+                        MLXRandom.normal([1, rows, n], key: MLXRandom.key(UInt64(seed * 8 + salt)))
+                            * scale
+                    }
+                    let signed: MLXArray
+                    let fused: SignedBlockHadamard.Int8Producer
+                    switch producer {
+                    case .swiglu(let gate, _):
+                        let halves = split(normal(2 * width, 1).asType(gate.dtype), parts: 2, axis: -1)
+                        signed = Qwen35FusedElementwise.swigluSigned(halves[0], halves[1], signs)
+                        fused = .swiglu(gate: halves[0], up: halves[1])
+                    case .gatedRMSNorm(let x, let gate, let weight, let eps):
+                        let shape = [1, rows, x.dim(2), x.dim(3)]
+                        let out = normal(width, 2).reshaped(shape)
+                        let z = split(normal(2 * width, 3).asType(gate.dtype), parts: 2, axis: -1)[1]
+                            .reshaped(shape)
+                        let normed = MLXFast.rmsNorm(out, weight: weight, eps: eps)
+                        signed = Qwen35FusedElementwise.gatedNormTailSigned(
+                            normed, z.asType(.float32), signs.reshaped(x.dim(2), x.dim(3)))
+                        fused = .gatedRMSNorm(x: out, gate: z, weight: weight, eps: eps)
+                    case .sigmoidGate(let x, _):
+                        // The head-transposed attention output and the gate
+                        // half of each q|gate head.
+                        let (heads, dim) = (x.dim(2), x.dim(3))
+                        let xs = (MLXRandom.normal(
+                            [1, heads, rows, dim], key: MLXRandom.key(UInt64(seed * 8 + 4)))
+                            * scale.reshaped(1, 1, rows, 1)).transposed(0, 2, 1, 3)
+                        let gs = normal(2 * width, 5).reshaped(1, rows, heads, 2 * dim)
+                            .split(parts: 2, axis: -1)[1]
+                        signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                            xs.reshaped(1, rows, -1), gs.reshaped(1, rows, -1), signs)
+                        fused = .sigmoidGate(x: xs, gate: gs)
+                    }
+                    guard
+                        let a0 = transform.forwardInt8(
+                            signed.reshaped(rows, width), gdnLayout: nil, preSigned: true,
+                            groupSize: 128),
+                        let a1 = transform.forwardInt8(
+                            producer: fused, gdnLayout: nil, groupSize: 128)
+                    else {
+                        report.passed = false
+                        report.error = "a quantizing rotation is not installed"
+                        return
+                    }
+                    report.cases += 1
+                    for (a, b) in [
+                        (a0.codes, a1.codes), (a0.scales, a1.scales),
+                        (a0.scaledSums, a1.scaledSums),
+                    ] {
+                        guard a.dtype == b.dtype, a.shape == b.shape else {
+                            report.passed = false
+                            report.error = "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                            return
+                        }
+                        let bits: DType = a.dtype == .float32 ? .uint32 : a.dtype
+                        let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        let count = Int(differ.item(Int32.self))
+                        report.values += a.size
+                        report.mismatches += count
+                        if count != 0 { report.passed = false }
+                    }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
 /// A prompt-width decoder-layer boundary for the tensor route as ONE launch:
 /// the FP16 residual add `h = x + r`, the RMSNorm of `h` with its FP32 gain,
 /// the input transform's signs, the 1024-block Walsh-Hadamard transform and
@@ -7289,11 +7476,24 @@ enum Qwen35TensorPackedMatmul {
             acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
           }
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. Alignment holds
+        // under tip N/nb guards (N multiple of 64; nb 4-element aligned).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -7820,6 +8020,15 @@ enum Qwen35TensorPackedMatmul {
     /// fewer per output element and 128-group (1-1.5% on the prompt-width
     /// matmuls on an M5 Max). The values differ only by FP32 rounding.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE=0` keeps the unfactored form.
+    /// Vector stores in the int8-staged prompt kernel. The native kernel
+    /// already stores float4/half4. `DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC=0`
+    /// keeps the scalar stores.
+    static let staged8VectorStores: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static let factoredPromptEpilogue: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -8403,11 +8612,25 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. nb = n0 + 16*(sg&1)
+        // + fn with fn in {0,4,8,12} and N multiple of 64, so the base is
+        // 4-element aligned. Hot path: support==staged8 (signed + FACTORED).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -8518,11 +8741,32 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+        // Same grouping as the native kernel's store: four consecutive i share
+        // mm and nh, c = 0..3, consecutive columns at nb + 32*nh. nb is
+        // 4-aligned (fn in {0,4,8,12}, n0 and N multiples of 64).
+        if constexpr (VEC != 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            const float v0 = acc[i];
+            const float v1 = acc[i + 1];
+            const float v2 = acc[i + 2];
+            const float v3 = acc[i + 3];
+            const size_t base = (size_t)mm * N + nb + 32 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          }
         }
         """
 
@@ -9277,6 +9521,7 @@ enum Qwen35TensorPackedMatmul {
             }
         }
         if verifyEnabled, verifyForm == .staged8, signedCodes {
+            HadamardQuantizedLinear.narrowProducerApproves = Qwen35VerifyProducerQ8.approves
             HadamardQuantizedLinear.tensorPackedMatmulNarrowInt8 = {
                 activation, weight, scales, biases, groupSize, outputDType, cache in
                 let codes = activation.codes
@@ -9384,6 +9629,7 @@ enum Qwen35TensorPackedMatmul {
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
+                template.append(("VEC", staged8VectorStores ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
@@ -9822,15 +10068,51 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
-        // The drafter reads the head in FP16 and keeps the FP16 logits: its
-        // top-k reads them directly (see `HadamardQuantizedLinear.drafterHeadFloat16`).
+        // The drafter's hidden is its own dtype (BF16 on this pack). The
+        // verify-width int8 kernel already serves the target's head; this
+        // read takes that same kernel (Subflatus3 `aa6a540a`). FP16 logits,
+        // which the drafter's top-k reads directly.
+        // The frequency-ranked draft vocabulary (see below) is read through
+        // the same int8 kernel: the leading-rows module is a row prefix of
+        // this head, so the kernel streams about 40% of the head's bytes.
+        if let head = lmHead as? HadamardQuantizedLinear {
+            let prefix =
+                Self.drafterVocabularyRows > 0
+                ? (head.leadingRows(Self.drafterVocabularyRows) ?? head) : head
+            if let routed = prefix.forwardDrafterInt8(hidden) {
+                return routed
+            }
+        }
+        // The dequantizing head kernel, still FP16 logits
+        // (`HadamardQuantizedLinear.drafterHeadFloat16`).
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {
-            return head.forwardUnwidened(hidden)
+            // FREQUENCY-RANKED DRAFT VOCABULARY. Byte-level BPE ids follow the
+            // merge order, so low ids are the frequent tokens; the tail of
+            // this 248,320-entry vocabulary is mostly rare multilingual
+            // pieces. The drafter scores only the leading rows (the same rows
+            // of the same head, computed the same way), which cuts its head
+            // read and its top-k scan by about 60%. A token past the prefix is
+            // never proposed, so that draft position falls to the target's
+            // own token, as any wrong draft does: the target decides every
+            // emitted token. On the public captures 99.9% of the expected
+            // tokens sit below id 100,000. `MLXFAST_DFLASH_VOCAB_ROWS` sets
+            // the prefix; 0 restores the full head.
+            let reading =
+                Self.drafterVocabularyRows > 0
+                ? (head.leadingRows(Self.drafterVocabularyRows) ?? head) : head
+            return reading.forwardUnwidened(hidden)
         }
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
+
+    /// 100,352 = 98 x 1024: the leading rows the drafter scores (see above).
+    static let drafterVocabularyRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_VOCAB_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(0, raw.flatMap { Int($0) } ?? 100_352)
+    }()
 }
 
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
