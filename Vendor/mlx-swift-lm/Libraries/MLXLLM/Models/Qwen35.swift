@@ -5482,6 +5482,258 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    // MARK: - The vocabulary head at verify width
+
+    /// The vocabulary head (`n >= 65536`) at verify width (<= 16 rows): the
+    /// core's few-row packed matmul body (`qmm_m16_block`, half operands
+    /// dequantized straight into the tensor unit's right-operand fragment)
+    /// with an FP32 output store, so the logits keep their FP32 accumulation
+    /// instead of the core's FP16 rounding, and eight simdgroups per
+    /// threadgroup (four 32-column blocks, each split in two over K). The
+    /// head's rotated activation is read in FP16, the read every tower
+    /// projection already takes at this width. Needs no packed operand
+    /// format, so it runs on a toolchain without `uint2b_format`; probed once
+    /// at init against the core's own product and declined on any error.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD=0` keeps the core's dispatch.
+    private static let headEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// 32-column blocks per threadgroup (`DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB`,
+    /// 1 to 8) and simdgroups splitting K per block (`..._HEAD_KS`, 2 or 4).
+    private static let headColumnBlocks: Int = {
+        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 4
+        return min(max(value, 1), 8)
+    }()
+    private static let headKSplit: Int = {
+        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_KS"] ?? "") ?? 2
+        return value == 4 ? 4 : 2
+    }()
+
+    private static let headHeader = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace metal;
+
+        // The core's few-row packed matmul (quantized_utils.h qmm_m16_block):
+        // one 16 x 32 output block over the K partition [k0, k0 + Kp), KS
+        // simdgroups splitting the 128-groups round-robin, weights read as
+        // 16-byte lines and dequantized straight into the right-operand
+        // fragment, partials summed through threadgroup memory. Same
+        // arithmetic as the core's body; the store is OutT instead of T.
+        template <typename T, int KS, typename OutT>
+        METAL_FUNC void bonsai_head_block(
+            const device uint32_t* w, const device T* scales, const device T* biases,
+            const device T* x, device OutT* y, const int K, const int N, const int rows,
+            const int col0, const int k0, const int Kp, const uint ks, const uint simd_lid,
+            threadgroup float* red0, threadgroup float* red1) {
+          constexpr int GS = 128;
+          typedef vec<T, 8> frag_t;
+          typedef vec<float, 8> cfrag_t;
+          const int K_w = K / 16;
+          const int K_g = K / GS;
+          const short qid = simd_lid >> 2;
+          const short fm = ((qid & 4) | ((simd_lid >> 1) & 3));
+          const short fn = ((qid & 2) | (simd_lid & 1)) * 4;
+          const ushort bsh = ushort(8 * (fn >> 2));
+          int wrow[4];
+          #pragma unroll
+          for (int j = 0; j < 4; j++) { wrow[j] = min(col0 + int(fm) + 8 * j, N - 1); }
+          const device T* xa0 = x + min(int(fm), rows - 1) * K + fn;
+          const device T* xa1 = x + min(int(fm) + 8, rows - 1) * K + fn;
+          constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+              16, 32, 16, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+          auto ct_a = gemm_op.template get_left_input_cooperative_tensor<T, T, float>();
+          auto ct_b = gemm_op.template get_right_input_cooperative_tensor<T, T, float>();
+          auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(ct_a)>, metal::remove_addrspace_t<decltype(ct_b)>, float>();
+          #pragma unroll
+          for (short i = 0; i < 16; i++) { ct_c[i] = 0.0f; }
+          const int g_begin = k0 / GS;
+          const int n_groups = Kp / GS;
+          const ushort wq = ushort(fn >> 2);
+          ushort qlane[4];
+          #pragma unroll
+          for (int st = 0; st < 4; st++) {
+            qlane[st] = ushort((simd_lid & ~0x9u) | uint(st & 1) | (uint(st >> 1) << 3));
+          }
+          const int n_blocks_total = (n_groups + 1) / 2;
+          const int my_blocks = max((n_blocks_total - int(ks) + KS - 1) / KS, 0);
+          auto block_line = [&](int i, int j) -> uint4 {
+            const int gb = g_begin + 2 * (int(ks) + i * KS);
+            return *((const device uint4*)(w + wrow[j] * K_w + gb * 8) + wq);
+          };
+          uint4 ring[2][4];
+          #pragma unroll
+          for (int r = 0; r < 2; r++) {
+            if (r < my_blocks) {
+              #pragma unroll
+              for (int j = 0; j < 4; j++) { ring[r][j] = block_line(r, j); }
+            }
+          }
+          for (int i = 0; i < my_blocks; i++) {
+            const int gb = g_begin + 2 * (int(ks) + i * KS);
+            volatile int compiler_barrier;
+            #pragma unroll
+            for (int gh = 0; gh < 2; gh++) {
+              const int g = gb + gh;
+              if (g - g_begin >= n_groups) { break; }
+              float s0[4]; float s1[4]; float s2[4]; float s3[4]; float b[4];
+              #pragma unroll
+              for (int j = 0; j < 4; j++) {
+                const float s = float(scales[wrow[j] * K_g + g]);
+                b[j] = float(biases[wrow[j] * K_g + g]);
+                s0[j] = s; s1[j] = s * 0.25f; s2[j] = s * 0.0625f; s3[j] = s * 0.015625f;
+              }
+              #pragma unroll
+              for (int st8 = 0; st8 < 8; st8++) {
+                const int st = gh * 8 + st8;
+                const int k = g * GS + st8 * 16;
+                frag_t B0; frag_t B1;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                  const uint word = simd_shuffle(ring[0][j][st & 3], qlane[st >> 2]);
+                  const uint by = (word >> bsh) & 0xffu;
+                  const float v0 = s0[j] * float(by & 0x03u) + b[j];
+                  const float v1 = s1[j] * float(by & 0x0cu) + b[j];
+                  const float v2 = s2[j] * float(by & 0x30u) + b[j];
+                  const float v3 = s3[j] * float(by & 0xc0u) + b[j];
+                  if (j < 2) {
+                    B0[4 * j + 0] = T(v0); B0[4 * j + 1] = T(v1); B0[4 * j + 2] = T(v2); B0[4 * j + 3] = T(v3);
+                  } else {
+                    B1[4 * (j - 2) + 0] = T(v0); B1[4 * (j - 2) + 1] = T(v1); B1[4 * (j - 2) + 2] = T(v2); B1[4 * (j - 2) + 3] = T(v3);
+                  }
+                }
+                #pragma unroll
+                for (int q = 0; q < 4; q++) { ct_a[q] = xa0[k + q]; ct_a[4 + q] = xa1[k + q]; }
+                #pragma unroll
+                for (short q = 0; q < 8; q++) { ct_b[q] = B0[q]; ct_b[8 + q] = B1[q]; }
+                gemm_op.run(ct_a, ct_b, ct_c);
+              }
+            }
+            (void)compiler_barrier;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { ring[0][j] = ring[1][j]; }
+            if (i + 2 < my_blocks) {
+              #pragma unroll
+              for (int j = 0; j < 4; j++) { ring[1][j] = block_line(i + 2, j); }
+            }
+          }
+          cfrag_t C0; cfrag_t C1;
+          #pragma unroll
+          for (short i = 0; i < 8; i++) { C0[i] = ct_c[i]; C1[i] = ct_c[8 + i]; }
+          {
+            threadgroup float* red = (ks & 2) ? red1 : red0;
+            if (ks & 1) {
+              #pragma unroll
+              for (int i = 0; i < 8; i++) { red[i * 32 + simd_lid] = C0[i]; red[(8 + i) * 32 + simd_lid] = C1[i]; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (!(ks & 1)) {
+              #pragma unroll
+              for (int i = 0; i < 8; i++) { C0[i] += red[i * 32 + simd_lid]; C1[i] += red[(8 + i) * 32 + simd_lid]; }
+            }
+            if (KS == 4) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (ks == 2) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) { red0[i * 32 + simd_lid] = C0[i]; red0[(8 + i) * 32 + simd_lid] = C1[i]; }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (ks == 0) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) { C0[i] += red0[i * 32 + simd_lid]; C1[i] += red0[(8 + i) * 32 + simd_lid]; }
+              }
+            }
+          }
+          if (ks != 0) { return; }
+          #pragma unroll
+          for (int i = 0; i < 8; i++) {
+            const int v = int(fm) + (i / 4) * 8;
+            const int c = col0 + int(fn) + (i % 4);
+            if (v < rows) {
+              if (c < N) { y[v * N + c] = static_cast<OutT>(C0[i]); }
+              if (c + 16 < N) { y[v * N + c + 16] = static_cast<OutT>(C1[i]); }
+            }
+          }
+        }
+
+        """
+
+    // grid: (ceil(N / 32 / CB) * 32 * CB * KS, 1, 1), threadgroup (32 * CB * KS,
+    // 1, 1): CB 32-column blocks per threadgroup, KS simdgroups splitting K per
+    // block. Inputs: x half [16, K], w uint32 [N, K / 16], scales / biases half
+    // [N, K / 128], ksz int32 [K, M, N]. Template: OutT, KS, CB.
+    private static let sourceHead = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint cb = sg / KS;
+        const uint ks = sg % KS;
+        const int col0 = (int(threadgroup_position_in_grid.x) * CB + int(cb)) * 32;
+        threadgroup float red[CB][2][16 * 32];
+        if (col0 >= N) { return; }
+        bonsai_head_block<half, KS, OutT>(w, scales, biases, x, out, K, N, 16, col0, 0, K, ks, lane, red[cb][0], red[cb][1]);
+        """
+
+    private static let kernelHead = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_head",
+        inputNames: ["x", "w", "scales", "biases", "ksz"],
+        outputNames: ["out"],
+        source: sourceHead,
+        header: headHeader,
+        ensureRowContiguous: true)
+
+    private static func runHead(
+        _ x: MLXArray, _ weight: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
+        k: Int, n: Int, outputDType: DType
+    ) -> MLXArray {
+        let cb = headColumnBlocks
+        let ks = headKSplit
+        let blocks = (n / 32 + cb - 1) / cb
+        return kernelHead(
+            [x, weight, scales, biases, dimsArray(k: k, m: 16, n: n)],
+            template: [("OutT", outputDType), ("KS", ks), ("CB", cb)],
+            grid: (blocks * 32 * cb * ks, 1, 1), threadGroup: (32 * cb * ks, 1, 1),
+            outputShapes: [[16, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Compiles and runs the head kernel on a small random product and checks
+    /// it against the core's own matmul; false on a JIT error or a mismatch.
+    static let headAvailable: Bool = {
+        guard headEnabled, support != .none else { return false }
+        // `DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_PROBE_FAIL=1` compiles a broken
+        // kernel in place of the probe, to exercise the decline path.
+        if ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_PROBE_FAIL"] == "1" {
+            return probe("bonsai_probe_head_broken", "this is not a kernel;")
+        }
+        probeFailed = false
+        var ok = false
+        withErrorHandler({ _ in Qwen35TensorPackedMatmul.probeFailed = true }) {
+            let k = 512, n = 256
+            let x = MLXRandom.normal([16, k], key: MLXRandom.key(11)).asType(.float16)
+            let w = MLXRandom.randInt(low: 0, high: 1 << 30, [n, k / 16], key: MLXRandom.key(12)).asType(.uint32)
+            let s = MLXRandom.uniform(low: 0.002, high: 0.02, [n, k / 128], key: MLXRandom.key(13)).asType(.float16)
+            let b = MLXRandom.uniform(low: -0.02, high: 0.0, [n, k / 128], key: MLXRandom.key(14)).asType(.float16)
+            let reference = quantizedMM(
+                x.asType(.float32), w, scales: s.asType(.float32), biases: b.asType(.float32),
+                transpose: true, groupSize: 128, bits: 2)
+            let scale = abs(reference).max().item(Float.self)
+            // Both output forms the routes take, so the timed window compiles
+            // nothing: FP32 logits for the target's read, FP16 for the drafter's.
+            let y32 = runHead(x, w, s, b, k: k, n: n, outputDType: .float32)
+            let y16 = runHead(x, w, s, b, k: k, n: n, outputDType: .float16)
+            let error32 = abs(y32 - reference).max().item(Float.self)
+            let error16 = abs(y16.asType(.float32) - reference).max().item(Float.self)
+            ok = error32.isFinite && error32 <= 1e-2 * max(scale, 1e-3)
+                && error16.isFinite && error16 <= 2e-2 * max(scale, 1e-3)
+        }
+        return ok && !probeFailed
+    }()
+
     // MARK: - Packed-operand support on this box's Metal toolchain
 
     /// How the tensor unit reads the 2-bit codes: `native2b` as a
@@ -6064,6 +6316,22 @@ enum Qwen35TensorPackedMatmul {
         guard support != .none else { return }
         HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
             rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
+        }
+        if headAvailable {
+            HadamardQuantizedLinear.tensorPackedMatmulHead = {
+                rotated, weight, scales, biases, groupSize, outputDType in
+                guard groupSize == 128, rotated.dtype == .float16, rotated.ndim == 2,
+                    weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
+                    [DType.float16, .float32].contains(outputDType)
+                else { return nil }
+                let m = rotated.dim(0)
+                let k = rotated.dim(1)
+                let n = weight.dim(0)
+                guard m == 16, n >= 65536, n % 32 == 0, k % 256 == 0, weight.dim(1) == k / 16,
+                    scales.shape == [n, k / 128], biases.shape == [n, k / 128]
+                else { return nil }
+                return runHead(rotated, weight, scales, biases, k: k, n: n, outputDType: outputDType)
+            }
         }
         if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrowApplies = { rows, n, k in
