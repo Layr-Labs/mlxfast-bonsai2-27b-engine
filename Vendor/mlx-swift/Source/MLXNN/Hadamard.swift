@@ -1054,20 +1054,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return fusedInputForward(rotated, widenOutput: widenOutput)
     }
 
-    /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
-    /// through their strides, on the prompt-width tensor route only: its
-    /// producer reads the head-transposed attention output and the gate half
-    /// of each q|gate head in place (newjordan's `9024f66b`), so neither is
-    /// reshaped into a copy first. Nil when the route does not take them (the
-    /// caller then reshapes and calls `applyAfterSigmoidGate`).
-    public func applyAfterSigmoidGateHeadsOnRoute(
-        _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
-    ) -> MLXArray? {
-        guard gdnLayout == nil, x.ndim == 4, x.shape == gate.shape else { return nil }
-        return tensorRouteForwardProducer(
-            .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
-    }
-
     /// The GDN output projection of `silu(z) * rmsNorm(x, weight, eps)` with the
     /// norm, the gate, the value layout and the rotation in one kernel.
     public func applyAfterGatedRMSNorm(
