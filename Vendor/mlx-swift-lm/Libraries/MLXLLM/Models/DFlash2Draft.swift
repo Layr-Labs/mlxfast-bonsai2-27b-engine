@@ -1634,7 +1634,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         self.target = target
         let maskEmbedding = target.embedTokensForDFlash2(
-            MLXArray([Int32(config.maskTokenId)], [1, 1]))
+            MLXArray([Int32(config.maskTokenId)], [1, 1])).asType(dtype)
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
     }
@@ -1726,7 +1726,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // one-row case unchanged.
         let embeddedInputs: MLXArray
         if inputs.dim(1) > 1 {
-            let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
+            let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1]).asType(dtype)
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
             let batch = inputs.dim(0)
             let cols = inputs.dim(1) - 1
@@ -1746,9 +1746,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             }
             embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
-            embeddedInputs = target.embedTokensForDFlash2(inputs)
+            embeddedInputs = target.embedTokensForDFlash2(inputs).asType(dtype)
         }
-        var h = embeddedInputs.asType(dtype)
+        var h = embeddedInputs
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
