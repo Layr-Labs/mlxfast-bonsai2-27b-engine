@@ -212,6 +212,111 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         eval(targets)
         try? evaluation.commit()
+        warmTargetVerify(
+            adapter: adapter, caches: bank.layerCaches(rowStates: [rowState]),
+            recurrent: recurrent)
+    }
+
+    /// `MLXFAST_VERIFY_WARM=0` skips `warmTargetVerify`.
+    static let verifyWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_WARM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Runs the ENGINE's capture-verify forward once, at load, on the warm
+    /// prompt's throwaway state, and rolls it back.
+    ///
+    /// The window is a scored round's (one anchor plus the declared depth,
+    /// `warmBlockSize` rows, batch 1), with the tap armed and the caches'
+    /// rectangular-verify policy set as the round sets it, so every
+    /// verify-width kernel is built under the template keys the timed rounds
+    /// use: the GDN prework variants, the composed causal block, the strided
+    /// fused-input rotations and the verify boundary, whose bitwise self-test
+    /// runs here too. benchd serves each phase from a fresh worker whose
+    /// warm-up is prefill-only, so without this the first timed round paid
+    /// those compiles and the self-test's readback. The first-use paths stay
+    /// as the fallback: a process that skips this warm builds and self-tests
+    /// at its first verify, as before. Nothing is committed; the caller
+    /// releases the state and `warmSpeculativeShapes` drains the buffer cache.
+    private func warmTargetVerify(
+        adapter: CBv2SteppableLanguageModelAdapter, caches: [CBv2AttendingLayerCache],
+        recurrent: CBv2RecurrentRequestState
+    ) {
+        guard Self.verifyWarmEnabled, adapter.supportsCapturedVerifyWindow,
+            let evaluation = try? recurrent.bind()
+        else { return }
+        let serializing = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
+        for cache in serializing { cache.mtpSerializesRectangularAttention = true }
+        defer {
+            for cache in serializing { cache.mtpSerializesRectangularAttention = false }
+        }
+        let rows = Self.warmBlockSize
+        let ids = (0 ..< rows).map { Int32(100 + ($0 &* 104_729) % 20_000) }
+        // The round builds its window as the engine's one-column-per-token
+        // concatenation (`EngineLoopV2+MTPTargetVerification`); same ids.
+        let tokens =
+            Self.roundKernelWarmEnabled
+            ? concatenated(ids.map { MLXArray([$0]).reshaped([1, 1]) }, axis: 1)
+            : MLXArray(ids).reshaped([1, rows])
+        let forward = adapter.forwardWithHiddenCaptured(
+            tokens: tokens, caches: caches, recurrentState: [evaluation], positionIds: nil)
+        guard evaluation.isCaptured, let roots = try? evaluation.evaluate() else {
+            try? evaluation.rollback()
+            return
+        }
+        var targets = [argMax(forward.logits, axis: -1), forward.lastHidden] + roots
+        if let tapped = target.dFlash2TappedHidden {
+            targets.append(tapped.asType(drafter.dtype))
+            if Self.roundKernelWarmEnabled {
+                // A one-row committed crossing (`append`) casts through the
+                // small-size copy kernel, not the wide casts' kernel.
+                targets.append(tapped[0..., ..<1, 0...].asType(drafter.dtype))
+            }
+        }
+        if Self.roundKernelWarmEnabled {
+            targets += roundKernelWarmTargets(adapter: adapter, logits: forward.logits)
+        }
+        eval(targets)
+        try? evaluation.rollback()
+    }
+
+    /// `MLXFAST_ROUND_KERNEL_WARM=0` skips the round-kernel additions to
+    /// `warmTargetVerify`.
+    static let roundKernelWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_KERNEL_WARM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Key counts for the verify block's GEMM warm: every alignment state of
+    /// a power-of-two tile up to 128 (529 fills none, 640 fills all), plus
+    /// each residue mod 4, in the range a scored window's attention spans.
+    static let warmVerifyKeyLengths = [529, 530, 531, 532, 536, 544, 560, 576, 640]
+
+    /// The first-use pipelines a timed round still built after the warm
+    /// verify, on throwaway inputs: the policy top-2 over the verify logits
+    /// (as `EngineLoopV2+MTPTargetVerification` reads them) and the composed
+    /// causal block's FP32 GEMMs at the key-count alignments the warm
+    /// verify's own key count does not cover. Every result is evaluated and
+    /// dropped with the warm's; `warmSpeculativeShapes` drains the cache.
+    private func roundKernelWarmTargets(
+        adapter: CBv2SteppableLanguageModelAdapter, logits: MLXArray
+    ) -> [MLXArray] {
+        var targets: [MLXArray] = []
+        if logits.ndim == 3 {
+            let flat = logits.reshaped([1, logits.dim(0) * logits.dim(1), logits.dim(2)])
+            let topTwo = adapter.cbv2MTPTopTwo(flat)
+            targets += [topTwo.ids.asType(.int32), topTwo.values.asType(.float32)]
+        }
+        let configuration = target.configuration
+        let headDim =
+            configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads)
+        targets += CBv2PromptCausalAttention.warmVerifyBlock(
+            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads,
+            headDim: headDim, rows: Self.warmBlockSize, scale: pow(Float(headDim), -0.5),
+            keyLengths: Self.warmVerifyKeyLengths)
+        return targets
     }
 
     private func warmDrafter() {
@@ -229,24 +334,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             offset += rows
             drafter.trimCache(caches, toCommittedLength: offset)
         }
-        warmContextPrefetch()
-    }
-
-    /// The prefetch path's own shapes, on fresh throwaway caches: a prompt's
-    /// context absorbed without a block, then a block over the cache alone.
-    private func warmContextPrefetch() {
-        guard Self.contextPrefetchEnabled, let caches = try? drafter.makeCache() else { return }
-        let block = Self.warmBlockSize
-        let context = MLXArray.zeros(
-            [1, Self.warmPromptRows, drafter.config.targetHiddenSize], dtype: drafter.dtype)
-        guard (try? drafter.absorbContext(targetHidden: context, cache: caches)) == true
-        else { return }
-        eval(caches.flatMap { $0.innerState() })
-        guard
-            let tokens = try? drafter.propose(
-                anchor: [0], targetHidden: nil, cache: caches, blockSize: block)
-        else { return }
-        eval([tokens] + caches.flatMap { $0.innerState() })
     }
 
     private static func qwen35TextTarget(
@@ -289,9 +376,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// The caches start at the first pending row's position, which is not
         /// zero when the prompt was longer than the context window.
         var cacheSeeded = false
-        /// True when every committed row was absorbed into the caches ahead
-        /// of the next block (`prefetchCommittedContext`).
-        var contextPrefetched = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var isReleased = false
@@ -345,7 +429,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
             pendingRows = 0
-            contextPrefetched = false
             isReleased = true
         }
     }
@@ -397,78 +480,27 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
-        // A state whose committed rows were all absorbed ahead of this round
-        // (`prefetchCommittedContext`) proposes over its cache alone.
-        guard !state.pending.isEmpty || state.contextPrefetched else {
-            throw DFlash2Error.emptyBlockContext
+        guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
+        let context =
+            state.pending.count == 1
+            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        if !state.cacheSeeded {
+            // The cache must sit where the retained context actually starts.
+            // This is the reference's `cache.offset = prompt.size - rows`: a
+            // prompt longer than the context window leaves the first retained
+            // row at a positive position, and the block's rotations follow it.
+            for cache in state.caches {
+                guard let base = cache as? BaseKVCache else { continue }
+                base.offset = state.firstPendingPosition
+            }
+            state.cacheSeeded = true
         }
-        let context: MLXArray? =
-            state.pending.isEmpty
-            ? nil
-            : (state.pending.count == 1
-                ? state.pending[0] : concatenated(state.pending, axis: 1))
-        seedCacheOffsets(state)
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
             blockSize: depth + 1)
         state.absorbPending()
-        state.contextPrefetched = false
         state.roots.append(tokens)
         return tokens
-    }
-
-    /// The cache must sit where the retained context actually starts. This is
-    /// the reference's `cache.offset = prompt.size - rows`: a prompt longer
-    /// than the context window leaves the first retained row at a positive
-    /// position, and the block's rotations follow it.
-    private func seedCacheOffsets(_ state: RequestState) {
-        guard !state.cacheSeeded else { return }
-        for cache in state.caches {
-            guard let base = cache as? BaseKVCache else { continue }
-            base.offset = state.firstPendingPosition
-        }
-        state.cacheSeeded = true
-    }
-
-    // MARK: - Context prefetch
-
-    /// Kill switch for absorbing a prompt's context ahead of the first block
-    /// (default on): `MLXFAST_DFLASH_CONTEXT_PREFETCH=0`.
-    static let contextPrefetchEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONTEXT_PREFETCH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Only a prompt's worth of rows is worth a separate submission.
-    static let contextPrefetchMinimumRows = 64
-
-    /// Absorb the committed context rows this state holds into the drafter's
-    /// cache now, instead of inside the next block's forward.
-    ///
-    /// A layer's context keys and values are a function of the context rows
-    /// alone; only the block needs the anchor. The engine calls this right
-    /// after the prompt forward that produced the rows, and evaluates the
-    /// result in its own submission behind the prompt's, so the prompt's
-    /// sampled token never waits for it and the first round's block forward
-    /// covers the block rows only. Returns the arrays to evaluate, or nothing
-    /// when the rows stay pending for the block as before.
-    public func prefetchCommittedContext(
-        requestState: any CBv2MTPRequestState
-    ) -> [MLXArray] {
-        guard Self.contextPrefetchEnabled else { return [] }
-        let state = self.state(requestState)
-        guard !state.isReleased, state.pendingRows >= Self.contextPrefetchMinimumRows
-        else { return [] }
-        let context =
-            state.pending.count == 1
-            ? state.pending[0] : concatenated(state.pending, axis: 1)
-        seedCacheOffsets(state)
-        guard (try? drafter.absorbContext(targetHidden: context, cache: state.caches)) == true
-        else { return [] }
-        state.absorbPending()
-        state.contextPrefetched = true
-        return state.caches.flatMap { $0.innerState() }
     }
 
     public func trimBlockState(

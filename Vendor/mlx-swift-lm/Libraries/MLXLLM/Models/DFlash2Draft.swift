@@ -510,24 +510,22 @@ private final class DFlash2Attention: Module {
 
     /// - Parameters:
     ///   - x: the block, `[B, blockLength, hidden]`.
-    ///   - context: the projected target hidden state, `[B, contextLength, hidden]`,
-    ///     or nil when this round brings no new context rows (the cache already
-    ///     holds every committed row; see `absorbContext`).
+    ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
         masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
         var context = context
-        var contextLength = context?.dim(1) ?? 0
+        var contextLength = context.dim(1)
 
-        if let slidingWindow, let rows = context {
+        if let slidingWindow {
             let skip = DFlash2SlidingMask.contextSkip(
                 contextLength: contextLength, slidingWindow: slidingWindow)
             if skip > 0 {
-                context = rows[0..., skip..., 0...]
-                contextLength = context!.dim(1)
+                context = context[0..., skip..., 0...]
+                contextLength = context.dim(1)
                 // The dropped rows still happened, so the cache's notion of
                 // where the block sits has to move with them.
                 if let base = cache as? BaseKVCache {
@@ -535,9 +533,6 @@ private final class DFlash2Attention: Module {
                 }
             }
         }
-        precondition(
-            context != nil || (dflash2KVConcatEnabled && cache is DFlash2BlockKVCache),
-            "DFlash 2: a block without context rows needs the in-place block cache")
 
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
@@ -553,7 +548,7 @@ private final class DFlash2Attention: Module {
             // One K and one V projection over [context; block]. The block's
             // positions continue the context's, so one rope at the context's
             // offset rotates every row where the two separate ropes did.
-            let rows = context.map { concatenated([$0, x], axis: 1) } ?? x
+            let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
             let projectedQ: MLXArray
             let projectedK: MLXArray
@@ -595,7 +590,6 @@ private final class DFlash2Attention: Module {
                 values = concatenated([cachedValues, blockValues], axis: 2)
             }
         } else {
-            let context = context!
             queries = rope(
                 qNorm(qProj(x).reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
                 offset: blockOffset)
@@ -636,36 +630,6 @@ private final class DFlash2Attention: Module {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DFlash2TensorMatmul.linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
-    }
-}
-
-extension DFlash2Attention {
-    /// Write the keys and values of `context` (`[B, contextLength, hidden]`,
-    /// the projected target hidden state of committed positions) into this
-    /// layer's cache, exactly as a block forward over the same context would,
-    /// without a block. A layer's context keys and values depend on the
-    /// context alone (the block reads them through attention), so they can
-    /// enter the cache before the block's anchor is known. Returns false,
-    /// having written nothing, when the in-place cache cannot take them.
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) -> Bool {
-        let B = context.dim(0)
-        let contextLength = context.dim(1)
-        guard let block = cache as? DFlash2BlockKVCache,
-            block.canAbsorb(contextRows: contextLength)
-        else { return false }
-        if let slidingWindow {
-            guard
-                DFlash2SlidingMask.contextSkip(
-                    contextLength: contextLength, slidingWindow: slidingWindow) == 0
-            else { return false }
-        }
-        let keys = rope(
-            kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
-                .transposed(0, 2, 1, 3),
-            offset: cache.offset)
-        let values = vProj(context).reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 }
 
@@ -1169,12 +1133,8 @@ private final class DFlash2DecoderLayer: Module {
         super.init()
     }
 
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) -> Bool {
-        selfAttn.absorbContext(context, rope: rope, cache: cache)
-    }
-
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
         masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
@@ -1483,11 +1443,13 @@ enum DFlash2GreedyWalk {
                 if (c < K) {
                     const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
                     const uint succ_base = (i * K + c) * R;
+                    const device float* pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+                    const device float* proj_ptr = projected + i * R;
+                    const device float* succ_ptr = next + succ_base;
                     float edge = 0.0f;
+                    #pragma clang loop unroll(full)
                     for (uint d = 0; d < R; d++) {
-                        const float predecessor = i == 0
-                            ? anchor_predecessor[d] : previous[pred_base + d];
-                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
+                        edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
                     }
                     score = unary[i * K + c] + edge;
                 }
@@ -1619,7 +1581,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     ///   - logitsStart: how many leading block positions to drop before the head.
     func hiddenStates(
         _ inputs: MLXArray,
-        targetHidden: MLXArray?,
+        targetHidden: MLXArray,
         cache: [KVCache],
         logitsStart: Int
     ) throws -> MLXArray {
@@ -1627,7 +1589,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         guard cache.count == layers.count else {
             throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
         }
-        if let targetHidden, targetHidden.dim(-1) != config.targetHiddenSize {
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
             throw DFlash2Error.targetHiddenSizeMismatch(
                 expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
         }
@@ -1655,9 +1617,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = targetHidden.map {
-            hiddenNorm(DFlash2TensorMatmul.linear(fc, $0.asType(dtype)))
-        }
+        let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
 
         let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
@@ -1702,7 +1662,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// - Returns: the draft tokens, `[B, blockSize - 1]`.
     public func propose(
         anchor: [Int],
-        targetHidden: MLXArray?,
+        targetHidden: MLXArray,
         cache: [KVCache],
         blockSize: Int
     ) throws -> MLXArray {
@@ -1717,37 +1677,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             hidden: hidden,
             logits: try logits(hidden),
             anchor: MLXArray(anchor.map { Int32($0) }))
-    }
-
-    /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
-    /// positions' fused target hidden state) into every layer's cache without a
-    /// block: the context keys and values a block forward over the same rows
-    /// would write, computed from the context alone. The next `propose` then
-    /// passes no context rows. Returns false, having written nothing, when a
-    /// layer's cache cannot take the rows in place; the caller keeps the rows
-    /// and hands them to the next block as before.
-    public func absorbContext(targetHidden: MLXArray, cache: [KVCache]) throws -> Bool {
-        guard target != nil else { throw DFlash2Error.notBound }
-        guard cache.count == layers.count else {
-            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
-        }
-        guard targetHidden.dim(-1) == config.targetHiddenSize else {
-            throw DFlash2Error.targetHiddenSizeMismatch(
-                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
-        }
-        let rows = targetHidden.dim(1)
-        guard rows >= 1,
-            cache.allSatisfy({ ($0 as? DFlash2BlockKVCache)?.canAbsorb(contextRows: rows) ?? false }),
-            config.layerTypes.allSatisfy({ $0 == .slidingAttention }),
-            let slidingWindow = config.slidingWindow,
-            DFlash2SlidingMask.contextSkip(contextLength: rows, slidingWindow: slidingWindow) == 0
-        else { return false }
-        let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
-        for (index, layer) in layers.enumerated() {
-            let absorbed = layer.absorbContext(context, rope: rope, cache: cache[index])
-            precondition(absorbed, "DFlash 2: a checked cache refused its context rows")
-        }
-        return true
     }
 
     // MARK: Loading
