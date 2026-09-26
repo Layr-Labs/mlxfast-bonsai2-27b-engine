@@ -496,10 +496,9 @@ func qwen35GatedDelta(
 }
 
 /// The gated-delta recurrence with a register-resident state layout: each
-/// lane owns 16 consecutive dk of four dv rows (64 state floats), eight lanes
-/// cover a dv row, one 128-thread threadgroup covers 64 dv rows, and the grid
-/// is (128, Dv / 64, B * Hv). Rows never mix, so the rows per lane only
-/// change how many rows share each step's k and q loads, not the result. Per step the kv and out dot products run as
+/// lane owns 16 consecutive dk of two dv rows (32 state floats), eight lanes
+/// cover a dv row, one 128-thread threadgroup covers 32 dv rows, and the grid
+/// is (128, Dv / 32, B * Hv). Per step the kv and out dot products run as
 /// four independent FMA chains per row, reduced across the eight lanes with
 /// three simd_shuffle_xor steps; the state update is one FMA per element. The
 /// stock kernel (GatedDelta.swift) walks the same recurrence with each lane
@@ -518,7 +517,7 @@ enum Qwen35GatedDeltaV3 {
 
     private static let source = """
         constexpr int R = 16;
-        constexpr int DVPL = 4;
+        constexpr int DVPL = 2;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
         constexpr int DVPT = DVPS * 4;
@@ -659,7 +658,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        guard Dk == 128, Dv % 64 == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % 32 == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -672,7 +671,7 @@ enum Qwen35GatedDeltaV3 {
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("OUTPUT_NEEDED", outputNeeded),
             ],
-            grid: (128, Dv / 64, B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [outputNeeded ? [B, T, Hv, Dv] : [1], state.shape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
@@ -715,14 +714,14 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        guard Dk == 128, Dv % 64 == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % 32 == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, stateShape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
         let outputs = freshKernel(
             [q, k, v, g, beta, MLXArray(Int32(T))],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true)],
-            grid: (128, Dv / 64, B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], stateShape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])

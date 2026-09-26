@@ -47,10 +47,6 @@ struct CBv2MTPGraphBuild {
     /// Prompt rows that sampled their first token in this step and can carry
     /// straight into a block-drafter round (no seed forward).
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
-    /// Work submitted in its own command buffer AFTER `asyncEvalTargets`, so
-    /// the step's sampled tokens never wait for it: a block drafter's
-    /// absorption of a prompt's committed context.
-    let lateEvalTargets: [MLXArray]
 }
 
 extension EngineLoopV2 {
@@ -310,7 +306,6 @@ extension EngineLoopV2 {
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
         var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
-        var lateEvalTargets: [MLXArray] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -395,17 +390,6 @@ extension EngineLoopV2 {
             }
             if let observedHidden {
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
-                // A prompt row that carries into a block round: its drafter
-                // context is a function of the rows just observed, not of the
-                // token this step samples, so it is absorbed now and
-                // submitted behind the step (`lateEvalTargets`).
-                if row.samples, Self.mtpPrefillCarryEnabled, let block = mtp.blockDrafter,
-                    let observed = committedObservationRows.last, observed.id == rec.id
-                {
-                    lateEvalTargets.append(
-                        contentsOf: block.prefetchCommittedContext(
-                            requestState: observed.assistantState))
-                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -496,8 +480,7 @@ extension EngineLoopV2 {
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
-            prefillCarries: prefillCarries,
-            lateEvalTargets: lateEvalTargets)
+            prefillCarries: prefillCarries)
     }
 
     /// A BLOCK drafter's first block needs only the prompt's tapped context
