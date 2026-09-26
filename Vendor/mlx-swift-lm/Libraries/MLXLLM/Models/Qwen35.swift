@@ -2721,15 +2721,24 @@ final class Qwen35MRoPE {
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
         if let defaultInvFreq {
-            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+            let frequency: MLXArray
+            if positionIds.ndim == 2 {
+                frequency = positionIds.asType(.float32)[0..., 0..., .newAxis]
+                    * defaultInvFreq[.newAxis, .newAxis, 0...]
+            } else if positions.strides[0] == 0 {
+                frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                    * defaultInvFreq[.newAxis, .newAxis, 0...]
+            } else {
+                let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                    * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+                frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+            }
             let angles = concatenated([frequency, frequency], axis: -1)
             let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
             let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+            let half = rotaryDim / 2
             func applyDefault(_ value: MLXArray) -> MLXArray {
                 let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
                 let rotatedHalf = concatenated(
                     [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
                 let rotated = rotating * cosine + rotatedHalf * sine
@@ -2737,7 +2746,12 @@ final class Qwen35MRoPE {
                     ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
                     : rotated
             }
-            return (applyDefault(queries), applyDefault(keys))
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotatedCombined = applyDefault(combined)
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
