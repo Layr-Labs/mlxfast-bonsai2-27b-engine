@@ -683,6 +683,13 @@ private final class DFlash2QKVStack {
     }
 }
 
+/// Drafter submission slices (`MLXFAST_DFLASH_SLICES=0` submits one graph).
+private let dflash2SubmitSlices: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SLICES"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Kill switch for the one-projection context+block K/V (default on).
 private let dflash2KVConcatEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
@@ -1108,6 +1115,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
 
 private final class DFlash2DecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: DFlash2Attention
+
     @ModuleInfo var mlp: DFlash2MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
@@ -1157,6 +1165,21 @@ private final class DFlash2DecoderLayer: Module {
 /// not here.
 final class DFlash2CandidateSelector: Module {
     let topK: Int
+
+    /// The weight of the low-rank edge term against the unary logit in the
+    /// greedy walk (`MLXFAST_DFLASH_EDGE_SCALE`, default 0.5; 1 is the
+    /// reference selector exactly). The drafter was trained at block 8 and
+    /// runs at depth 15 here. Over eight 512-token windows of the public
+    /// capture, with this tree's drafter, the weight took 126 verify rounds
+    /// at 0.5 against the reference's 130 (0.6: 127, 0.7: 128, 0.8: 129;
+    /// on the previous drafter 0.5-0.7 took 125-127 vs 130, 1.5: 134, 0.0: 144),
+    /// and the emitted tokens were identical at every weight: the target
+    /// decides every token, the walk only proposes.
+    static let edgeScale: Float = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_EDGE_SCALE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.flatMap { Float($0) } ?? 0.5
+    }()
 
     @ParameterInfo(key: "predecessor_codebook") var predecessorCodebook: MLXArray
     @ParameterInfo(key: "successor_codebook") var successorCodebook: MLXArray
@@ -1213,7 +1236,8 @@ final class DFlash2CandidateSelector: Module {
                     * projected[0..., position, 0...].expandedDimensions(axis: 1)
                     * take(successorCodebook, positionCandidates, axis: 0))
                 .sum(axis: -1)
-            let selected = (unary[0..., position, 0...] + edges).argMax(axis: -1)
+            let selected =
+                (unary[0..., position, 0...] + Self.edgeScale * edges).argMax(axis: -1)
             predecessor = takeAlong(
                 positionCandidates, selected.expandedDimensions(axis: -1), axis: -1)[0..., 0]
             path.append(predecessor)
@@ -1401,7 +1425,7 @@ enum DFlash2GreedyWalk {
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
     ) -> MLXArray? {
         guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
-            unary.dtype == .float32
+            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
@@ -1420,7 +1444,8 @@ enum DFlash2GreedyWalk {
         let scores = unary[0].asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds,
+             MLXArray(DFlash2CandidateSelector.edgeScale)],
             template: [("L", length), ("K", k), ("R", rank)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
@@ -1432,7 +1457,7 @@ enum DFlash2GreedyWalk {
     private static let kernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_fused_greedy_walk",
         inputNames: [
-            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand", "alpha",
         ],
         outputNames: ["path"],
         source: """
@@ -1449,7 +1474,7 @@ enum DFlash2GreedyWalk {
                             ? anchor_predecessor[d] : previous[pred_base + d];
                         edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
                     }
-                    score = unary[i * K + c] + edge;
+                    score = unary[i * K + c] + alpha * edge;
                 }
                 float m = simd_max(score);
                 uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
@@ -1590,10 +1615,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
+        // Submission slices: when this forward starts behind an idle GPU (the
+        // early block at finalize), committing the context projection and the
+        // first layer lets the GPU start while the host builds the remaining
+        // layers, the head and the selector. Same kernels, same order.
+        if dflash2SubmitSlices { asyncEval([context, h]) }
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
+            if dflash2SubmitSlices, index == 0, layers.count > 2 { asyncEval([h]) }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]

@@ -149,7 +149,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0
-        for rows in [513] + Array(1 ... block) {
+        for rows in [512, 513] + Array(1 ... block) {
             let context = MLXArray.zeros([1, rows, width], dtype: drafter.dtype)
             guard
                 let tokens = try? drafter.propose(
