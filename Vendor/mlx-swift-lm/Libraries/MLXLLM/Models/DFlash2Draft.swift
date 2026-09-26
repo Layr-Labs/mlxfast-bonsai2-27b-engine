@@ -647,21 +647,6 @@ extension DFlash2Attention {
     /// context alone (the block reads them through attention), so they can
     /// enter the cache before the block's anchor is known. Returns false,
     /// having written nothing, when the in-place cache cannot take them.
-    ///
-    /// BIT-EXACT: the projections come from the stacked q|k|v weight the
-    /// block forward multiplies `[context; block]` by (`qkv.applyContext`),
-    /// not from `kProj`/`vProj`. MLX routes a separate `[512, 5120] x
-    /// [5120, 1024]` projection to its split-K GEMM (M4 Max: 32 x 64 output
-    /// tiles <= 2048 with K >= max(M, N); M5: the NAX split-K, K >= 3 max(M,
-    /// N)), whose partial sums round differently from the regular GEMM the
-    /// 6144-wide stack takes (N > K rules both split-K routes out), so the
-    /// absorbed rows were off by an ulp in ~130 of 524288 elements per layer
-    /// and the drafter's proposals drifted from the unprefetched path's. The
-    /// regular GEMM's rows do not depend on the row count, so a regular GEMM
-    /// over the context alone gives the rows the stack over `[context;
-    /// block]` gave. (With the stack switched off,
-    /// `DARKBLOOM_DFLASH2_STACK_QKV=0`, the separate projections remain and
-    /// carry no such guarantee.)
     func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) -> Bool {
         let B = context.dim(0)
         let contextLength = context.dim(1)
@@ -674,14 +659,11 @@ extension DFlash2Attention {
                     contextLength: contextLength, slidingWindow: slidingWindow) == 0
             else { return false }
         }
-        let (projectedK, projectedV) =
-            qkv.applyContext(context, q: qProj, k: kProj, v: vProj)
-            ?? (kProj(context), vProj(context))
         let keys = rope(
-            kNorm(projectedK.reshaped(B, contextLength, kvHeads, -1))
+            kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
                 .transposed(0, 2, 1, 3),
             offset: cache.offset)
-        let values = projectedV.reshaped(B, contextLength, kvHeads, -1)
+        let values = vProj(context).reshaped(B, contextLength, kvHeads, -1)
             .transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
@@ -711,61 +693,23 @@ private final class DFlash2QKVStack {
         kEnd = 0
     }
 
-    /// The stacked weight, concatenated on first use, or nil when the stack
-    /// does not apply to these projections.
-    private func stacked(q: Linear, k: Linear, v: Linear) -> MLXArray? {
+    /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
+    /// when the stack does not apply.
+    func apply(
+        _ rows: MLXArray, blockRows: Int, q: Linear, k: Linear, v: Linear
+    ) -> (MLXArray, MLXArray, MLXArray)? {
         guard Self.enabled, q.bias == nil, k.bias == nil, v.bias == nil,
             q.weight.ndim == 2, k.weight.ndim == 2, v.weight.ndim == 2,
             q.weight.dtype == k.weight.dtype, k.weight.dtype == v.weight.dtype,
-            q.weight.dim(1) == k.weight.dim(1), k.weight.dim(1) == v.weight.dim(1)
+            q.weight.dim(1) == k.weight.dim(1), k.weight.dim(1) == v.weight.dim(1),
+            rows.ndim == 3, blockRows <= rows.dim(1)
         else { return nil }
         if weight == nil {
             weight = concatenated([q.weight, k.weight, v.weight], axis: 0)
             qEnd = q.weight.dim(0)
             kEnd = qEnd + k.weight.dim(0)
         }
-        return weight
-    }
-
-    /// `(k(rows), v(rows))` with the bits `apply`'s stacked matmul gives the
-    /// same rows, for context rows that enter the cache ahead of their block
-    /// (`DFlash2Attention.absorbContext`), or nil when the stack does not
-    /// apply.
-    ///
-    /// Above `kvOnlyMinimumRows` rows the matmul runs over the stack's k|v
-    /// rows alone (a view, N = 2048), a third of the full stack's work: the
-    /// regular GEMM computes every output element from its own row and
-    /// column, so dropping the q columns changes no k or v bit. It stays
-    /// regular there on both routes MLX could split: the NAX split-K needs K
-    /// >= 3 max(M, N) or max(M, N) <= 1024 (K = 5120, N = 2048: never), and
-    /// the non-NAX split-K needs ceil(M/16) * ceil(N/16) <= 2048 (M <= 256
-    /// at N = 2048). At or below it the full 6144-wide stack runs (N > K:
-    /// neither split-K route applies at any M) and the q columns are dropped.
-    func applyContext(
-        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
-    ) -> (MLXArray, MLXArray)? {
-        guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
-        if rows.dim(1) > Self.kvOnlyMinimumRows {
-            let y = matmul(rows, weight[qEnd...].T)
-            let kWidth = kEnd - qEnd
-            return (y[.ellipsis, ..<kWidth], y[.ellipsis, kWidth...])
-        }
-        let y = matmul(rows, weight.T)
-        return (y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
-    }
-
-    /// The row count at or below which `applyContext` keeps the full stack.
-    static let kvOnlyMinimumRows = 256
-
-    /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
-    /// when the stack does not apply.
-    func apply(
-        _ rows: MLXArray, blockRows: Int, q: Linear, k: Linear, v: Linear
-    ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard rows.ndim == 3, blockRows <= rows.dim(1),
-            let weight = stacked(q: q, k: k, v: v)
-        else { return nil }
-        let y = matmul(rows, weight.T)
+        let y = matmul(rows, weight!.T)
         let n = rows.dim(1)
         return (
             y[0..., (n - blockRows)..., ..<qEnd],
@@ -1587,10 +1531,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
-    /// Retained broadcast of `maskTokenEmbedding` for the common single-stream
-    /// block shape `[1, blockSize-1, hidden]`. Rebuilding that broadcast every
-    /// propose round repeats an identical geometry graph.
-    private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1724,22 +1664,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if inputs.dim(1) > 1 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
-            let batch = inputs.dim(0)
-            let cols = inputs.dim(1) - 1
-            let repeatedMasks: MLXArray
-            if batch == 1,
-                let cached = cachedMaskEmbeddingBlock,
-                cached.cols == cols
-            {
-                repeatedMasks = cached.array
-            } else {
-                repeatedMasks = broadcast(
-                    maskEmbedding, to: [batch, cols, config.hiddenSize])
-                if batch == 1 {
-                    eval(repeatedMasks)
-                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
-                }
-            }
+            let repeatedMasks = broadcast(
+                maskEmbedding, to: [inputs.dim(0), inputs.dim(1) - 1, config.hiddenSize])
             embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
