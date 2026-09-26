@@ -229,11 +229,15 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). By default one boundary after the
-///   first 8 layers hands the GPU the leading graph while the host builds
-///   the remainder. Both trunk paths use this guarded plan.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` accepts another plan; `0` or
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` keeps a single submission.
+/// - VERIFY (a capture-verify forward). The drafter's block was submitted
+///   before this graph was built, so without slices the GPU idles from the
+///   drafter's last kernel until the host has built all 64 layers.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
+///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
+///   paces encoding against the GPU at 10 in-flight command buffers, so
+///   extra boundaries cost little, and a short first slice matters more as
+///   the GPU gets faster relative to the host build);
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -288,11 +292,9 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Submit the first 8 layers once while the host builds the rest.
-        // Keep explicit plans and both existing disable switches available.
-        return Plan.parse(
-            env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 0, offset: 0, explicit: [8]))
+        // Off by default here (the ranked box measured verify slices as a
+        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
+        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -545,7 +547,7 @@ func qwen35GatedDelta(
 /// recurrence contractive). `DARKBLOOM_QWEN35_GDN_KERNEL=v1` keeps the stock
 /// kernel; the masked (chain-verify) path always does.
 enum Qwen35GatedDeltaV3 {
-    private static let enabled: Bool = {
+    fileprivate static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_GDN_KERNEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
@@ -561,7 +563,7 @@ enum Qwen35GatedDeltaV3 {
         return value == "4" ? 4 : 2
     }()
 
-    private static let source = """
+    fileprivate static let source = """
         constexpr int R = 16;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
@@ -722,6 +724,90 @@ enum Qwen35GatedDeltaV3 {
         return (outputs[0], outputs[1])
     }
 
+    /// `source` cut into the text before the step loop (pointers and the
+    /// state load), the step loop itself, and the trailing state store; nil
+    /// when the stock text no longer ends in exactly that store after one
+    /// step loop. The derived kernels below reassemble these pieces.
+    fileprivate static let sourceParts: (head: String, loop: String, store: String)? = {
+        let text = source
+        let loopHead = "for (int t = 0; t < T; ++t) {"
+        guard text.components(separatedBy: loopHead).count == 2,
+            let start = text.range(of: loopHead)
+        else { return nil }
+        var depth = 1
+        var end: String.Index?
+        var index = start.upperBound
+        while index < text.endIndex {
+            let character = text[index]
+            if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    end = text.index(after: index)
+                    break
+                }
+            }
+            index = text.index(after: index)
+        }
+        guard let end else { return nil }
+        let store = String(text[end...])
+        let expectedStore = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < R; ++i) {
+                state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+              }
+            }
+            """
+        guard store.filter({ !$0.isWhitespace }) == expectedStore.filter({ !$0.isWhitespace })
+        else { return nil }
+        return (String(text[..<start.lowerBound]), String(text[start.lowerBound ..< end]), store)
+    }()
+
+    /// `source` without the trailing state store: the same step loop, whose
+    /// state lives in registers only. For a verify window whose final state
+    /// is never read (`Qwen35GDNVerifyStateSkip`).
+    private static let outputOnlyKernel: MLXFast.MLXFastKernel? = sourceParts.map { parts in
+        MLXFast.metalKernel(
+            name: "qwen35_gated_delta_v3_output_only",
+            inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+            outputNames: ["y"],
+            source: parts.head + parts.loop + "\n",
+            ensureRowContiguous: true)
+    }
+
+    /// `run(...).0` without the final state's store (FP32, `B * Hv * Dv * Dk`
+    /// floats); nil exactly when `run` would be, or when the derivation is.
+    static func runOutputOnly(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> MLXArray? {
+        guard enabled, let outputOnlyKernel, q.dtype == .float32, k.dtype == .float32,
+            v.dtype == .float32, g.dtype == .float32, beta.dtype == .float32,
+            state.dtype == .float32, q.ndim == 4, k.ndim == 4, v.ndim == 4
+        else { return nil }
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
+            q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
+            g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
+        else { return nil }
+        return outputOnlyKernel(
+            [q, k, v, g, beta, state, MLXArray(Int32(T))],
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
+                ("DVPL", rowsPerLane),
+            ],
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, Dv]],
+            outputDTypes: [.float32])[0]
+    }
+
     /// `kernel` for a state known to be the fresh zeros of a new request's
     /// first chunk (see `Qwen35GatedDeltaNet.freshPromptChunk`): the state
     /// registers start at 0.0f instead of loading a zeros array, which is
@@ -773,6 +859,787 @@ enum Qwen35GatedDeltaV3 {
             outputShapes: [[B, T, Hv, Dv], stateShape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
+    }
+}
+
+/// The strict-prefix commit replay of a verify round, batched across GDN
+/// layers (`MLXFAST_GDN_REPLAY_BATCH=0` keeps one replay per layer).
+///
+/// A partially accepted verify commits each GDN layer by replaying the
+/// accepted prefix from the pre-verify state (`replayedPrefixState`): per
+/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3` with
+/// `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows. That is
+/// three small dependent launches per layer, 144 per round on the 48 GDN
+/// layers, each built, encoded and dispatched on its own; the replay's bytes
+/// (each layer's state read once and written once) are the same either way,
+/// so what batching removes is that per-launch cost. Here one launch serves
+/// `layersPerLaunch` layers: every threadgroup of the stock V3 grid gains a
+/// layer index (the V3 kernel's batch index, the batch now being the
+/// layers), computes its step's gates in registers with MLX's own functors in
+/// the gate kernel's order, runs the V3 recurrence text unchanged (derived
+/// from `Qwen35GatedDeltaV3.source`), and copies its share of the layer's
+/// boundary conv rows. Layers never mix, and each layer's values go through
+/// the same operations in the same order as its own replay (the gates are
+/// the same FP32 expression, held in a register instead of stored and
+/// reloaded), so every committed bit is the per-layer replay's.
+///
+/// Metal binds at most 31 buffers per launch. A layer binds six (k, v, a, b,
+/// the pre-verify state and the conv input, all read in place); a launch adds
+/// six (the group's stacked A_log and dt_bias, the a/b row strides, the row
+/// count and the two pooled outputs): 6 * 4 + 6 = 30. The committed state and
+/// conv rows of the group's layers are views into those pooled outputs.
+///
+/// At model construction a self-test on the running GPU replays synthetic
+/// tapes (four layers, every committed row count of a 16-row window, extreme
+/// gate inputs included) both ways and compares every bit; a mismatch or any
+/// MLX error keeps the per-layer replay. A group that does not fit the
+/// kernel's shape, dtype and stride assumptions replays per layer too.
+enum Qwen35GDNReplayBatch {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_REPLAY_BATCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let layersPerLaunch = 4
+
+    /// The verify window the self-test replays: one anchor plus depth 15.
+    static let selfTestRows = 16
+
+    // MARK: Kernel
+
+    /// MLX's functors (`binary_ops.h` LogAddExp, `unary_ops.h` Sigmoid) as
+    /// `Qwen35FusedElementwise.gatedDeltaGates` evaluates them in FP32.
+    private static let header = """
+        inline float qwen35_replay_logaddexp(float x, float y) {
+          if (metal::isnan(x) || metal::isnan(y)) {
+            return metal::numeric_limits<float>::quiet_NaN();
+          }
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(x, y);
+          float minval = metal::min(x, y);
+          return (minval == -inf || maxval == inf)
+              ? maxval
+              : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        inline float qwen35_replay_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+
+        """
+
+    private static func perLayer(_ name: String) -> [String] {
+        (0 ..< layersPerLaunch).map { "\(name)\($0)" }
+    }
+
+    private static let layerInputs = ["k", "v", "a", "b", "s", "c"]
+
+    static let inputNames: [String] =
+        (0 ..< layersPerLaunch).flatMap { j in layerInputs.map { "\($0)\(j)" } }
+        + ["alog", "dtb", "ab_rows", "T"]
+
+    /// `Qwen35GatedDeltaV3.source` with the layer index taking the batch
+    /// index's place: the pointers come from the layer's own buffers, the
+    /// step's `g`/`beta` are formed in registers (the gate kernel's chain:
+    /// `Exp`, `Negative`, `Add`, `LogAddExp`, `Multiply`, `Exp`; `Sigmoid`),
+    /// and the layer's boundary conv rows are copied before the recurrence.
+    /// The recurrence itself is the stock text. Nil (batching off) if that
+    /// text no longer has the anchors this derivation replaces.
+    static let source: String? = {
+        func select(_ name: String) -> String {
+            let names = perLayer(name)
+            var expr = names[names.count - 1]
+            for j in stride(from: names.count - 2, through: 0, by: -1) {
+                expr = "b_idx == \(j) ? \(names[j]) : (\(expr))"
+            }
+            return expr
+        }
+        let prelude = """
+                const device float* k_ = (\(select("k"))) + hk_idx * Dk + dk0;
+                const device float* v_ = (\(select("v"))) + hv_idx * Dv + dvbase;
+                const device float* a_ = (\(select("a"))) + hv_idx;
+                const device float* b_ = (\(select("b"))) + hv_idx;
+                const device float* s_ = (\(select("s")));
+                const int a_rs = ab_rows[2 * b_idx];
+                const int b_rs = ab_rows[2 * b_idx + 1];
+                const float g_nexp = -metal::precise::exp(alog[n]);
+                const float g_dtb = dtb[n];
+                const device float* q_ = k_;
+                device float* y_ = state_out;
+                {
+                  // This layer's boundary conv rows T .. T + NK - 1, spread
+                  // over its threads.
+                  constexpr uint LANES = 128 * (Dv / DVPT) * Hv;
+                  const uint lin = (hv_idx * (Dv / DVPT) + threadgroup_position_in_grid.y) * 128
+                      + sg * 32 + lane;
+                  const device float* csrc = (\(select("c"))) + size_t(T) * size_t(CD);
+                  device float* cdst = conv_out + size_t(b_idx) * size_t(NK * CD);
+                  for (uint e = lin; e < uint(NK * CD); e += LANES) {
+                    cdst[e] = csrc[e];
+                  }
+                }
+
+        """
+        var text = Qwen35GatedDeltaV3.source
+        // Single-line anchors, each unique in the stock text.
+        let replacements: [(String, String)] = [
+            ("const device float* q_ = q;", prelude),
+            ("const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;", ""),
+            ("const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;", ""),
+            ("const device float* g_ = g + b_idx * T * Hv + hv_idx;", ""),
+            ("const device float* beta_ = beta + b_idx * T * Hv + hv_idx;", ""),
+            ("device float* y_ = y;", ""),
+            ("y[0] = 0.f;", "(void)0;"),
+            (
+                "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];",
+                "state[d][i] = s_[(hv_idx * Dv + dvbase + d) * Dk + dk0 + i];"
+            ),
+            (
+                "const float gt = g_[0];",
+                "const float g_sp = qwen35_replay_logaddexp(a_[0] + g_dtb, 0.0f);\n"
+                    + "const float gt = metal::precise::exp(g_nexp * g_sp);"
+            ),
+            ("const float bt = beta_[0];", "const float bt = qwen35_replay_sigmoid(b_[0]);"),
+            (
+                "k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;",
+                "k_ += Hk * Dk; v_ += Hv * Dv; a_ += a_rs; b_ += b_rs;"
+            ),
+        ]
+        for (target, replacement) in replacements {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        guard !text.contains("state_in"), !text.contains("g_["), !text.contains("beta"),
+            !text.contains(" y["), !text.contains("= y;")
+        else { return nil }
+        return text
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = source.map {
+        MLXFast.metalKernel(
+            name: "qwen35_gdn_replay_batch",
+            inputNames: inputNames,
+            outputNames: ["state_out", "conv_out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: false)
+    }
+
+    // MARK: Group launch
+
+    /// One layer's operands: its replay tape and its gate parameters.
+    struct Operand {
+        let tape: ArraysCache.PrefixReplayTape
+        let aLog: MLXArray
+        let dtBias: MLXArray
+    }
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, nk: Int, dvpl: Int
+    }
+
+    /// Row-major strides of `array`, ignoring its leading (size-1) axis.
+    @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
+    private static func rowContiguousAfterLeading(_ array: MLXArray) -> Bool {
+        let shape = array.shape
+        let strides = array.strides
+        guard shape.count == strides.count, shape.count >= 2 else { return false }
+        var expected = 1
+        for axis in stride(from: shape.count - 1, through: 1, by: -1) {
+            if shape[axis] != 1, strides[axis] != expected { return false }
+            expected *= shape[axis]
+        }
+        return true
+    }
+
+    /// The row stride of a `[1, S, Hv]` gate input read in place, or nil
+    /// when its last axis is not unit-stride.
+    @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
+    private static func gateRowStride(_ array: MLXArray) -> Int32? {
+        let shape = array.shape
+        let strides = array.strides
+        guard shape.count == 3, strides.count == 3, shape[2] == 1 || strides[2] == 1,
+            strides[1] >= 0, strides[1] <= Int(Int32.max)
+        else { return nil }
+        return Int32(strides[1])
+    }
+
+    /// The committed (conv, ssm) of each operand after `keep` rows, from one
+    /// launch; nil when the group does not fit the kernel (the caller then
+    /// replays each layer on its own). `alog`/`dtb` are the operands' gate
+    /// parameters stacked in operand order (`[G * Hv]`, FP32). `keep` may be
+    /// the whole window: the full-acceptance replay of a verify that stored
+    /// no final state (`Qwen35GDNVerifyStateSkip`, which self-tests it).
+    static func launch(
+        _ operands: [Operand], keep: Int, alog: MLXArray, dtb: MLXArray,
+        verifiedOnly: Bool = true
+    ) -> [CBv2RecurrentLayerState]? {
+        guard operands.count == layersPerLaunch, Qwen35GatedDeltaV3.enabled,
+            let kernel, let first = operands.first
+        else { return nil }
+        let tape0 = first.tape
+        guard tape0.q.ndim == 4, tape0.k.ndim == 4, tape0.v.ndim == 4, tape0.convInput.ndim == 3
+        else { return nil }
+        let S = tape0.rowCount
+        let Hk = tape0.k.dim(2)
+        let Dk = tape0.k.dim(3)
+        let Hv = tape0.v.dim(2)
+        let Dv = tape0.v.dim(3)
+        let CD = tape0.convInput.dim(2)
+        let NK = tape0.convStateRows
+        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let geometry = Geometry(hk: Hk, dk: Dk, hv: Hv, dv: Dv, cd: CD, nk: NK, dvpl: dvpl)
+        if verifiedOnly, !isVerified(geometry) { return nil }
+        // The per-layer replay's own routing: `qwen35GatedDelta` takes the
+        // chunked kernels from `minRows` rows and V3 only on these shapes.
+        guard keep >= 1, keep <= S,
+            !(Qwen35GatedDeltaChunked.enabled && keep >= Qwen35GatedDeltaChunked.minRows
+                && keep >= Qwen35GatedDeltaChunked.chunk),
+            Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, NK >= 1,
+            alog.dtype == .float32, dtb.dtype == .float32,
+            alog.shape == [layersPerLaunch * Hv], dtb.shape == [layersPerLaunch * Hv]
+        else { return nil }
+        var inputs: [MLXArray] = []
+        inputs.reserveCapacity(inputNames.count)
+        var rowStrides: [Int32] = []
+        for operand in operands {
+            let tape = operand.tape
+            guard let ssmPre = tape.ssmPre, tape.mask == nil, tape.rowCount == S,
+                tape.convStateRows == NK,
+                tape.k.shape == [1, S, Hk, Dk], tape.q.shape == [1, S, Hk, Dk],
+                tape.v.shape == [1, S, Hv, Dv],
+                tape.a.shape == [1, S, Hv], tape.b.shape == [1, S, Hv],
+                ssmPre.shape == [1, Hv, Dv, Dk],
+                tape.convInput.shape == [1, NK + S, CD],
+                tape.k.dtype == .float32, tape.q.dtype == .float32, tape.v.dtype == .float32,
+                tape.a.dtype == .float32, tape.b.dtype == .float32,
+                ssmPre.dtype == .float32, tape.convInput.dtype == .float32,
+                operand.aLog.dtype == .float32, operand.dtBias.dtype == .float32,
+                operand.aLog.shape == [Hv], operand.dtBias.shape == [Hv]
+            else { return nil }
+            inputs += [tape.k, tape.v, tape.a, tape.b, ssmPre, tape.convInput]
+        }
+        // The operands are read in place, so their strides must be final: a
+        // verify's tape is evaluated before its round finalizes (a no-op
+        // wait here); an unevaluated tape is waited for, never misread.
+        eval(inputs)
+        for operand in operands {
+            let tape = operand.tape
+            guard rowContiguousAfterLeading(tape.k), rowContiguousAfterLeading(tape.v),
+                rowContiguousAfterLeading(tape.ssmPre!),
+                rowContiguousAfterLeading(tape.convInput),
+                let aRows = gateRowStride(tape.a), let bRows = gateRowStride(tape.b)
+            else { return nil }
+            rowStrides += [aRows, bRows]
+        }
+        inputs += [alog, dtb, MLXArray(rowStrides), MLXArray(Int32(keep))]
+        let G = layersPerLaunch
+        let outputs = kernel(
+            inputs,
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", false),
+                ("DVPL", dvpl), ("CD", CD), ("NK", NK),
+            ],
+            grid: (128, Dv / (16 * dvpl), G * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[G, Hv, Dv, Dk], [G, NK, CD]],
+            outputDTypes: [.float32, .float32])
+        return (0 ..< G).map { j in
+            CBv2RecurrentLayerState(
+                conv: outputs[1][j ..< (j + 1)], ssm: outputs[0][j ..< (j + 1)])
+        }
+    }
+
+    // MARK: Gate parameter stacks
+
+    private final class StackCache {
+        var sources: [MLXArray] = []
+        var alog: MLXArray?
+        var dtb: MLXArray?
+    }
+
+    private static let stackLock = NSLock()
+    nonisolated(unsafe) private static var stacks: [[ObjectIdentifier]: StackCache] = [:]
+
+    /// The group's A_log and dt_bias stacked in layer order, concatenated once
+    /// and rebuilt only when a layer's parameter array changes.
+    private static func stackedGates(
+        _ layers: [Qwen35GatedDeltaNet]
+    ) -> (MLXArray, MLXArray) {
+        let key = layers.map { ObjectIdentifier($0) }
+        let sources = layers.flatMap { [$0.aLog, $0.dtBias] }
+        return stackLock.withLock {
+            let cache = stacks[key] ?? StackCache()
+            stacks[key] = cache
+            if let alog = cache.alog, let dtb = cache.dtb, cache.sources.count == sources.count,
+                zip(cache.sources, sources).allSatisfy({ $0 === $1 })
+            {
+                return (alog, dtb)
+            }
+            let alog = concatenated(layers.map { $0.aLog }, axis: 0)
+            let dtb = concatenated(layers.map { $0.dtBias }, axis: 0)
+            cache.sources = sources
+            cache.alog = alog
+            cache.dtb = dtb
+            return (alog, dtb)
+        }
+    }
+
+    // MARK: Rounds
+
+    /// The strict-prefix replays one verify forward staged for one request,
+    /// in layer order. The first replay the commit asks for runs the whole
+    /// round's launches; each layer then takes its own states.
+    final class Round {
+        struct Entry {
+            let layer: Qwen35GatedDeltaNet
+            let tape: ArraysCache.PrefixReplayTape
+        }
+
+        weak var owner: AnyObject?
+        private let lock = NSLock()
+        private var entries: [Entry] = []
+        private(set) var sealed = false
+        private var keep = 0
+        private var results: [CBv2RecurrentLayerState?] = []
+
+        init(owner: AnyObject) { self.owner = owner }
+
+        fileprivate func append(_ entry: Entry) -> Int? {
+            lock.withLock {
+                guard !sealed else { return nil }
+                entries.append(entry)
+                return entries.count - 1
+            }
+        }
+
+        /// Entry `index`'s committed state after `keep` rows, or nil when the
+        /// caller must replay that layer itself.
+        func state(index: Int, keep: Int) -> CBv2RecurrentLayerState? {
+            lock.withLock {
+                if !sealed {
+                    sealed = true
+                    self.keep = keep
+                    results = Qwen35GDNReplayBatch.replay(entries, keep: keep)
+                    entries = []
+                }
+                guard self.keep == keep, index < results.count, let state = results[index]
+                else { return nil }
+                results[index] = nil
+                return state
+            }
+        }
+    }
+
+    struct Slot {
+        let round: Round
+        let index: Int
+
+        func state(keep: Int) -> CBv2RecurrentLayerState? {
+            round.state(index: index, keep: keep)
+        }
+    }
+
+    private final class WeakRound {
+        weak var round: Round?
+        init(_ round: Round) { self.round = round }
+    }
+
+    private static let roundLock = NSLock()
+    nonisolated(unsafe) private static var rounds: [WeakRound] = []
+
+    /// Stage `tape` as `layer`'s entry in the round of `owner` (the request's
+    /// recurrent evaluation for this forward). Nil when batching is off or
+    /// its self-test did not pass on this geometry.
+    static func register(
+        owner: AnyObject, layer: Qwen35GatedDeltaNet, tape: ArraysCache.PrefixReplayTape
+    ) -> Slot? {
+        guard enabled, tape.convInput.ndim == 3, tape.v.ndim == 4, tape.k.ndim == 4,
+            isVerified(
+                Geometry(
+                    hk: tape.k.dim(2), dk: tape.k.dim(3), hv: tape.v.dim(2), dv: tape.v.dim(3),
+                    cd: tape.convInput.dim(2), nk: tape.convStateRows,
+                    dvpl: Qwen35GatedDeltaV3.rowsPerLane))
+        else { return nil }
+        return roundLock.withLock {
+            rounds.removeAll { $0.round == nil }
+            let round: Round
+            if let open = rounds.lazy.compactMap({ $0.round }).first(where: {
+                $0.owner === owner && !$0.sealed
+            }) {
+                round = open
+            } else {
+                round = Round(owner: owner)
+                rounds.append(WeakRound(round))
+            }
+            guard let index = round.append(Round.Entry(layer: layer, tape: tape)) else {
+                return nil
+            }
+            return Slot(round: round, index: index)
+        }
+    }
+
+    /// The round's committed states: consecutive groups of `layersPerLaunch`
+    /// entries in one launch each; nil for an entry replayed per layer.
+    private static func replay(_ entries: [Round.Entry], keep: Int) -> [CBv2RecurrentLayerState?] {
+        var results = [CBv2RecurrentLayerState?](repeating: nil, count: entries.count)
+        var start = 0
+        while start + layersPerLaunch <= entries.count {
+            let group = Array(entries[start ..< (start + layersPerLaunch)])
+            if group.allSatisfy({
+                $0.layer.canReplayPrefix(tape: $0.tape, committedRows: keep, fullWindow: true)
+            }) {
+                let (alog, dtb) = stackedGates(group.map(\.layer))
+                let operands = group.map {
+                    Operand(tape: $0.tape, aLog: $0.layer.aLog, dtBias: $0.layer.dtBias)
+                }
+                if let states = launch(operands, keep: keep, alog: alog, dtb: dtb) {
+                    for (j, state) in states.enumerated() { results[start + j] = state }
+                }
+            }
+            start += layersPerLaunch
+        }
+        return results
+    }
+
+    // MARK: Self-test
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    private static let verdictLock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static func isVerified(_ geometry: Geometry) -> Bool {
+        verdictLock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Whether `layer`'s geometry passed the self-test (batching serves it).
+    static func isVerified(layer: Qwen35GatedDeltaNet) -> Bool {
+        enabled
+            && isVerified(
+                Geometry(
+                    hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads,
+                    dv: layer.headVDim, cd: layer.convDim, nk: layer.convKernelSize - 1,
+                    dvpl: Qwen35GatedDeltaV3.rowsPerLane))
+    }
+
+    /// Run the bitwise self-test for `layer`'s geometry once per process, at
+    /// model construction (before any timed forward), compiling the batched
+    /// kernel and the per-layer replay's kernels on the way.
+    static func prepare(layer: Qwen35GatedDeltaNet) {
+        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
+        let geometry = Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            cd: layer.convDim, nk: layer.convKernelSize - 1,
+            dvpl: Qwen35GatedDeltaV3.rowsPerLane)
+        verdictLock.lock()
+        defer { verdictLock.unlock() }
+        guard verdicts[geometry] == nil else { return }
+        let (passed, detail) = selfTest(layer: layer)
+        verdicts[geometry] = passed
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN replay batch: self-test " + (passed ? "passed" : "FAILED") + " ("
+                + detail + ")" + (passed ? "; batched\n" : "; per-layer replay kept\n"))
+                .data(using: .utf8)!)
+    }
+
+    /// Four layers' synthetic tapes shaped as a verify window stages them
+    /// (`a`/`b` as column slices of one `[1, S, 2 Hv]` product, conv input
+    /// `[1, NK + S, CD]`), each with its own A_log and dt_bias, replayed at
+    /// every strict prefix both ways. The gate inputs span softplus's and
+    /// sigmoid's saturation and include +-inf; states and values have a wide
+    /// magnitude spread. Outputs are compared as unsigned integers.
+    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+        let G = layersPerLaunch
+        let S = selfTestRows
+        let Hk = layer.numKHeads
+        let Dk = layer.headKDim
+        let Hv = layer.numVHeads
+        let Dv = layer.headVDim
+        let CD = layer.convDim
+        let NK = layer.convKernelSize - 1
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6731_7270), into: 10 * G)
+        var operands: [Operand] = []
+        for j in 0 ..< G {
+            func key(_ i: Int) -> MLXArray { keys[10 * j + i] }
+            let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(0)))
+            let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(1)) * spread * 0.05
+            var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(2)) * 4
+            // Saturating and infinite gate inputs in the first rows.
+            let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+            let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+            let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
+                .reshaped([1, S, 1])
+            gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
+            let q = MLXRandom.normal([1, S, Hk, Dk], key: key(3)) * 0.09
+            let k = MLXRandom.normal([1, S, Hk, Dk], key: key(4)) * 0.09
+            let v = MLXRandom.normal([1, S, Hv, Dv], key: key(5))
+                * exp(MLXRandom.normal([1, S, Hv, Dv], key: key(6)))
+            let convInput = MLXRandom.normal([1, NK + S, CD], key: key(7))
+            let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(8)))
+            let dtBias = MLXRandom.normal([Hv], key: key(9))
+            eval(ssmPre, gatePair, q, k, v, convInput, aLog, dtBias)
+            let b = gatePair[0..., 0..., ..<Hv]
+            let a = gatePair[0..., 0..., Hv...]
+            eval(a, b)
+            let tape = ArraysCache.PrefixReplayTape(
+                convInput: convInput, q: q, k: k, v: v, a: a, b: b, ssmPre: ssmPre,
+                mask: nil, rowCount: S, convStateRows: NK)
+            operands.append(Operand(tape: tape, aLog: aLog, dtBias: dtBias))
+        }
+        let alog = concatenated(operands.map(\.aLog), axis: 0)
+        let dtb = concatenated(operands.map(\.dtBias), axis: 0)
+        var cases = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for keep in 1 ..< S {
+                    guard
+                        let batched = launch(
+                            operands, keep: keep, alog: alog, dtb: dtb, verifiedOnly: false)
+                    else { throw SelfTestFailure.message("no batched launch at \(keep) rows") }
+                    var differ: [MLXArray] = []
+                    for (j, operand) in operands.enumerated() {
+                        guard layer.canReplayPrefix(tape: operand.tape, committedRows: keep)
+                        else { throw SelfTestFailure.message("tape rejected at \(keep) rows") }
+                        let reference = layer.replayedPrefixState(
+                            tape: operand.tape, committedRows: keep,
+                            aLog: operand.aLog, dtBias: operand.dtBias)
+                        for (a, b) in [
+                            (reference.ssm, batched[j].ssm), (reference.conv, batched[j].conv),
+                        ] {
+                            guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
+                                a.dtype == .float32
+                            else {
+                                throw SelfTestFailure.message("output mismatch at \(keep) rows")
+                            }
+                            differ.append(
+                                (a.view(dtype: .uint32) .!= b.view(dtype: .uint32))
+                                    .asType(.int32).sum())
+                            values += a.size
+                        }
+                        cases += 1
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let passed = mismatches == 0 && cases == G * (S - 1)
+        return (
+            passed,
+            "\(cases) layer replays, \(values) values, \(mismatches) mismatches, "
+                + "\(G) layers per launch")
+    }
+}
+
+/// The verify window's recurrence without its final-state store
+/// (`MLXFAST_GDN_VERIFY_STATE_SKIP=0` keeps the store).
+///
+/// A capture verify runs the whole window through `Qwen35GatedDeltaV3` and
+/// stores the state after its last row, `B * Hv * Dv * Dk` FP32 per layer
+/// (3.1 MB here, ~150 MB a round over the 48 GDN layers). The commit reads
+/// that state only when every row is accepted; a strict prefix replays the
+/// accepted rows from the retained pre-verify state instead. Here the verify
+/// runs `Qwen35GatedDeltaV3.runOutputOnly` (the same step loop, no trailing
+/// store), and full acceptance replays the whole window from the same tape
+/// the strict prefix uses (the round's batched replay, or the per-layer
+/// replay), exactly as a strict prefix of every row would.
+///
+/// That replay is the verify's own final state bit for bit: the tape's k and
+/// v ARE the verify's inputs, the replay forms the gates from the tape's a/b
+/// with the prework kernel's formulas, and the state update is the same
+/// step text. At model construction a self-test runs the verify's prework and
+/// recurrence on synthetic windows (four layers, saturating and infinite gate
+/// inputs), then compares the stored final state with the per-layer and the
+/// batched full-window replays, and the output rows with the store-free
+/// kernel's, as unsigned integers; any mismatch or MLX error keeps the store.
+enum Qwen35GDNVerifyStateSkip {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_VERIFY_STATE_SKIP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The verify window the self-test runs: one anchor plus depth 15.
+    static let selfTestRows = 16
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, nk: Int, dvpl: Int
+    }
+
+    private static func geometry(_ layer: Qwen35GatedDeltaNet) -> Geometry {
+        Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            cd: layer.convDim, nk: layer.convKernelSize - 1,
+            dvpl: Qwen35GatedDeltaV3.rowsPerLane)
+    }
+
+    private static let verdictLock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    /// Whether `layer`'s verify may skip its final-state store.
+    static func applies(to layer: Qwen35GatedDeltaNet) -> Bool {
+        guard enabled, Qwen35GatedDeltaV3.enabled else { return false }
+        let key = geometry(layer)
+        return verdictLock.withLock { verdicts[key] ?? false }
+    }
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    /// Run the bitwise self-test for `layer`'s geometry once per process, at
+    /// model construction, after `Qwen35GDNReplayBatch.prepare` (its batched
+    /// full-window replay is part of the test when batching is verified).
+    static func prepare(layer: Qwen35GatedDeltaNet) {
+        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
+        let key = geometry(layer)
+        verdictLock.lock()
+        defer { verdictLock.unlock() }
+        guard verdicts[key] == nil else { return }
+        let (passed, detail) = selfTest(layer: layer)
+        verdicts[key] = passed
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN verify state skip: self-test " + (passed ? "passed" : "FAILED") + " ("
+                + detail + ")"
+                + (passed ? "; verify stores no final state\n" : "; final-state store kept\n"))
+                .data(using: .utf8)!)
+    }
+
+    /// Four synthetic verify windows shaped as the capture verify stages
+    /// them (qkv a column slice of a qkv|z product, a/b column slices of one
+    /// `[1, S, 2 Hv]` product), run through the verify's prework launch and
+    /// `Qwen35GatedDeltaV3.run`; each window's stored final state is compared
+    /// with the per-layer full-window replay of its tape and, when batching
+    /// is verified, the batched one; its output rows with `runOutputOnly`'s.
+    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+        let G = Qwen35GDNReplayBatch.layersPerLaunch
+        let S = selfTestRows
+        let Hk = layer.numKHeads
+        let Dk = layer.headKDim
+        let Hv = layer.numVHeads
+        let Dv = layer.headVDim
+        let CD = layer.convDim
+        let KS = layer.convKernelSize
+        let NK = KS - 1
+        guard KS == 4, Dk == 128, Dv == 128, Hv % Hk == 0, CD == 2 * Hk * Dk + Hv * Dv else {
+            return (false, "geometry outside the verify prework")
+        }
+        let batched = Qwen35GDNReplayBatch.isVerified(layer: layer)
+        let derived = Qwen35GDNDerived()
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5653_4b50), into: 8 * G)
+        var comparisons = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                var differ: [MLXArray] = []
+                func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
+                    guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
+                        a.dtype == .float32
+                    else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
+                    differ.append(
+                        (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
+                    values += a.size
+                    comparisons += 1
+                }
+                var operands: [Qwen35GDNReplayBatch.Operand] = []
+                var finals: [MLXArray] = []
+                var tails: [MLXArray] = []
+                for j in 0 ..< G {
+                    func key(_ i: Int) -> MLXArray { keys[8 * j + i] }
+                    let qkvz = MLXRandom.normal([1, S, CD + Hv * Dv], key: key(0))
+                    let qkv = qkvz[0..., 0..., ..<CD]
+                    let convState = MLXRandom.normal([1, NK, CD], key: key(1))
+                    let convWeight = MLXRandom.normal([CD, KS, 1], key: key(2)) * 0.5
+                    var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(3)) * 4
+                    let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+                    let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+                    let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
+                        .reshaped([1, S, 1])
+                    gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
+                    let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(4)))
+                    let dtBias = MLXRandom.normal([Hv], key: key(5))
+                    let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(6)))
+                    let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(7)) * spread * 0.05
+                    eval(qkvz, convState, convWeight, gatePair, aLog, dtBias, ssmPre)
+                    let b = gatePair[0..., 0..., ..<Hv]
+                    let a = gatePair[0..., 0..., Hv...]
+                    guard
+                        let pre = Qwen35GDNPrework.run(
+                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                            aDecay: derived.decay(aLog), dtBias: dtBias,
+                            normScales: derived.normScales(headKDim: Dk, dtype: .float32),
+                            keyHeads: Hk, valueHeads: Hv, headKDim: Dk, headVDim: Dv,
+                            writeConvInput: true,
+                            stridedReads: Qwen35GDNPrework.verifyStridedReads),
+                        let convInput = pre.convInput
+                    else { throw SelfTestFailure.message("no verify prework") }
+                    guard
+                        let (yStored, finalStored) = Qwen35GatedDeltaV3.run(
+                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                            state: ssmPre),
+                        let yOnly = Qwen35GatedDeltaV3.runOutputOnly(
+                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                            state: ssmPre)
+                    else { throw SelfTestFailure.message("no verify recurrence") }
+                    eval(pre.q, pre.k, pre.v, pre.g, pre.beta, convInput, yStored, finalStored, yOnly)
+                    let tape = ArraysCache.PrefixReplayTape(
+                        convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                    guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
+                    else { throw SelfTestFailure.message("tape rejected") }
+                    let replayed = layer.replayedPrefixState(
+                        tape: tape, committedRows: S, aLog: aLog, dtBias: dtBias,
+                        fullWindow: true)
+                    // The stored full-acceptance conv is the window's last NK
+                    // conv input rows.
+                    let tail = convInput[0..., S ..< (S + NK), 0...]
+                    try compare(yOnly, yStored, "output rows")
+                    try compare(replayed.ssm, finalStored, "per-layer final state")
+                    try compare(replayed.conv, tail, "per-layer conv tail")
+                    operands.append(
+                        Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
+                    finals.append(finalStored)
+                    tails.append(tail)
+                }
+                if batched {
+                    guard
+                        let states = Qwen35GDNReplayBatch.launch(
+                            operands, keep: S,
+                            alog: concatenated(operands.map(\.aLog), axis: 0),
+                            dtb: concatenated(operands.map(\.dtBias), axis: 0),
+                            verifiedOnly: false)
+                    else { throw SelfTestFailure.message("no batched full-window replay") }
+                    for j in 0 ..< G {
+                        try compare(states[j].ssm, finals[j], "batched final state")
+                        try compare(states[j].conv, tails[j], "batched conv tail")
+                    }
+                }
+                let count = stacked(differ).sum()
+                eval(count)
+                try error.check()
+                mismatches += Int(count.item(Int32.self))
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let expected = G * 3 + (batched ? G * 2 : 0)
+        let passed = mismatches == 0 && comparisons == expected
+        return (
+            passed,
+            "\(G) windows of \(S) rows, \(comparisons) comparisons, \(values) values, "
+                + "\(mismatches) mismatches" + (batched ? ", batched replay included" : ""))
     }
 }
 
@@ -1655,6 +2522,8 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GatedDeltaChunked.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35GDNReplayBatch.prepare(layer: self)
+        Qwen35GDNVerifyStateSkip.prepare(layer: self)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -2145,11 +3014,15 @@ final class Qwen35GatedDeltaNet: Module {
         return (recurrence.0, newConvState, recurrence.1, tape)
     }
 
-    private func canReplayPrefix(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    /// `fullWindow` also admits the whole window (`committedRows ==
+    /// rowCount`): the full-acceptance replay of a verify that stored no final
+    /// state (`Qwen35GDNVerifyStateSkip`).
+    fileprivate func canReplayPrefix(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int, fullWindow: Bool = false
     ) -> Bool {
         guard committedRows > 0,
-              committedRows < tape.rowCount,
+              committedRows < tape.rowCount
+                  || (fullWindow && committedRows == tape.rowCount),
               tape.convStateRows == convKernelSize - 1,
               tape.convInput.ndim == 3,
               tape.q.ndim == 4,
@@ -2189,11 +3062,15 @@ final class Qwen35GatedDeltaNet: Module {
         return canReplayPrefix(tape: tape, committedRows: committedRows)
     }
 
-    private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    /// `aLog`/`dtBias` stand in for the layer's own parameters in
+    /// `Qwen35GDNReplayBatch`'s self-test only.
+    fileprivate func replayedPrefixState(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil,
+        fullWindow: Bool = false
     ) -> CBv2RecurrentLayerState {
         precondition(
-            canReplayPrefix(tape: tape, committedRows: committedRows),
+            canReplayPrefix(tape: tape, committedRows: committedRows, fullWindow: fullWindow),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
         let boundarySsm = qwen35GatedDelta(
@@ -2202,8 +3079,8 @@ final class Qwen35GatedDeltaNet: Module {
             v: tape.v[0..., rows, 0...],
             a: tape.a[0..., rows, 0...],
             b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
+            aLog: aLogOverride ?? aLog,
+            dtBias: dtBiasOverride ?? dtBias,
             state: tape.ssmPre,
             mask: tape.mask.map { $0[0..., rows] },
             outputNeeded: false
@@ -2512,18 +3389,32 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence: (MLXArray, MLXArray)
+            // The window's final state; nil when the verify skips its store
+            // (`Qwen35GDNVerifyStateSkip`) and full acceptance replays the
+            // window from the tape instead.
+            let recurrence: (MLXArray, MLXArray?)
             if let pre {
-                recurrence =
-                    Qwen35GatedDeltaChunked.runVerify(
+                if let chunked = Qwen35GatedDeltaChunked.runVerify(
+                    q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
+                {
+                    recurrence = (chunked.0, chunked.1)
+                } else if Qwen35GDNVerifyStateSkip.applies(to: self),
+                    let y = Qwen35GatedDeltaV3.runOutputOnly(
                         q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
-                    ?? Qwen35GatedDeltaV3.run(
-                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
-                    ?? gatedDeltaKernel(
-                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState,
-                        mask: nil)
+                {
+                    recurrence = (y, nil)
+                } else {
+                    let stored =
+                        Qwen35GatedDeltaV3.run(
+                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                            state: ssmState)
+                        ?? gatedDeltaKernel(
+                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                            state: ssmState, mask: nil)
+                    recurrence = (stored.0, stored.1)
+                }
             } else {
-                recurrence = qwen35GatedDelta(
+                let stored = qwen35GatedDelta(
                     q: qNormed,
                     k: kNormed,
                     v: v,
@@ -2533,6 +3424,7 @@ final class Qwen35GatedDeltaNet: Module {
                     dtBias: dtBias,
                     state: ssmState,
                     mask: nil)
+                recurrence = (stored.0, stored.1)
             }
             out = recurrence.0
             let finalSsmState = recurrence.1
@@ -2540,7 +3432,7 @@ final class Qwen35GatedDeltaNet: Module {
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState[rowRange]
+                let finalSSM = finalSsmState?[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
                     q: qNormed[rowRange],
@@ -2587,9 +3479,18 @@ final class Qwen35GatedDeltaNet: Module {
                     }
                     return total
                 }
-                let materializedBytes = checkedByteCount(roots + [finalSSM])
+                // A strict-prefix commit replays this layer inside its round's
+                // batched launch when batching is on and verified.
+                let replaySlot = Qwen35GDNReplayBatch.register(
+                    owner: evaluation, layer: self, tape: tape)
+                // A skipped final state is still charged as if stored (the
+                // full-acceptance replay materializes one), and full acceptance
+                // then retains the replay's inputs as a strict prefix does.
+                let materializedBytes = checkedByteCount(roots + [finalSSM ?? tape.ssmPre!])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
-                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                let fullAcceptanceRetainedRoots =
+                    finalSSM == nil ? strictReplayRoots : [tape.convInput]
+                let fullAcceptanceRetainedBytes = checkedByteCount(fullAcceptanceRetainedRoots)
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -2601,16 +3502,25 @@ final class Qwen35GatedDeltaNet: Module {
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
                         strictReplayRetainedRoots: strictReplayRoots,
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
-                        fullAcceptanceRetainedRoots: [tape.convInput],
-                        fullAcceptance: {
+                        fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
+                        fullAcceptance: { [unowned self] in
+                            guard let finalSSM else {
+                                // Every row accepted: the whole window replayed
+                                // from the tape, bitwise the state the verify
+                                // did not store (self-tested at load).
+                                return replaySlot?.state(keep: S)
+                                    ?? self.replayedPrefixState(
+                                        tape: tape, committedRows: S, fullWindow: true)
+                            }
                             let detachedConv = finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
                         },
                         replay: { [unowned self] keepPositions in
-                            self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                            replaySlot?.state(keep: keepPositions)
+                                ?? self.replayedPrefixState(
+                                    tape: tape, committedRows: keepPositions)
                         })
                 } catch {
                     preconditionFailure(
@@ -3860,7 +4770,7 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary and uses the guarded verify submission plan.
+        // verify boundary (no early submission: its plan is prompt-only).
         // Where the verify-width tensor route is installed (the int8 form on
         // the ranked box), the projections take it instead, every verify
         // boundary declines, and the window keeps the composed per-layer path.
@@ -3876,13 +4786,10 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // A verify window uses the same guarded plan on either trunk path;
-        // a prompt retains its existing pending-residual submission plan.
+        // The pending path's own early-submission plan (prompt width only).
         let fusedSubmission =
             pendingPath
-            ? (verifyPending
-                ? submission
-                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
+            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -3918,7 +4825,7 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt or verify plan) on this path: hand the
+                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
                 // GPU the layers built so far, the layer output as `h` and its
                 // pending `f` (both of which the next boundary kernel reads).
                 if let fusedSubmission,
@@ -6990,21 +7897,28 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
-    // The verify int8 kernel software-pipelined through registers (K2): the
-    // same threadgroup (four simdgroups splitting K into contiguous quarters,
-    // one 16 x 32 x 128 int8 op per group and 32-column half, the partials
-    // summed in simdgroup order) and the same arithmetic in the same order, so
-    // the output is bitwise that of `sourceNarrowInt8` (self-tested at load).
-    // What changes is when the loads are issued: the 2-bit words of the next
-    // PD groups and the next group's epilogue constants are loaded into
-    // registers before the current group's op and epilogue run, so they are in
-    // flight while it computes, instead of the stage -> op -> epilogue chain
-    // waiting on each load in turn. The threadgroup staging buffer (4 KB per
-    // simdgroup and half) is unchanged, so the bytes in flight per core grow
-    // without costing occupancy. TN = 64 runs two 32-column halves per
-    // threadgroup (two ops per group, the known 16 x 32 destination layout).
-    // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD (1 or 2), TN (32
-    // or 64). grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
+    // The verify int8 kernel software-pipelined through registers (K2, K3):
+    // the same threadgroup (four simdgroups splitting K into contiguous
+    // quarters, the 16 x 32 int8 products of each group and 32-column half,
+    // the partials summed in simdgroup order) and the same arithmetic in the
+    // same order, so the output is bitwise that of `sourceNarrowInt8`
+    // (self-tested at load). What changes is when the loads are issued and how
+    // much threadgroup memory a threadgroup holds:
+    // - PD (1..4): a static register ring of the 2-bit words of the next PD
+    //   groups, refilled as each group is staged, and a matching ring of
+    //   epilogue constants (depth max(PD, 2), loaded that many groups minus
+    //   one ahead). The group loop is unrolled by the ring depth, so every ring
+    //   index is a constant; remainder groups are guarded (10 groups per
+    //   simdgroup at K = 5120, 34 at down_proj).
+    // - KH (128 or 64): K per tensor op. 64 stages each group in two halves
+    //   (stage -> barrier -> op 16 x 32 x 64, accumulating into the group's
+    //   zeroed int32 tile, twice) and runs the epilogue once per group: 2 KB of
+    //   staging per simdgroup and half, 8 KB per threadgroup at TN = 32 (four
+    //   threadgroups per core instead of two). The integer sum of a group is
+    //   exact under any split, so the FP32 sequence is unchanged.
+    // - TN (32 or 64): 32-column halves per threadgroup (two ops per step).
+    // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD, TN, KH.
+    // grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
     private static let sourceNarrowInt8Pipelined = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
@@ -7015,13 +7929,16 @@ enum Qwen35TensorPackedMatmul {
         const int g0 = int(sg) * gper;
         const int g1 = g0 + gper;
         constexpr int NH = TN / 32;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        constexpr int KW = KH / 16;           // 2-bit words per column per staged step
+        constexpr int NQ = KH / 64;           // uint4 word quads per staged step
+        constexpr int CD = PD < 2 ? 2 : PD;   // constants ring depth = group-loop unroll
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, KH, false, true, false, KH == 64 ? mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate : mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
-        threadgroup uint32_t bs[4][NH][32 * 128 / 4];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][NH - 1], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
+        threadgroup uint32_t bs[4][NH][32 * KH / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(KH, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][NH - 1], dextents<int, 2>(KH, 32));
+        auto tA0 = A.template slice<KH, 16>(0, 0);
         auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
         auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
         constexpr int CAP = 32 / 2;
@@ -7033,27 +7950,33 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
         }
-        // lane -> column lane of each 32-column half, all 8 words of a group
+        // lane -> column lane of each 32-column half, 8 words (two quads) per group
         const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
         const size_t hstride = (size_t)32 * (K / 16);
-        auto getw = [&](int g, thread uint32_t (&v)[NH][8]) {
+        // quads [q0, q1) of group gg's words into v
+        auto getw = [&](int gg, thread uint32_t (&v)[NH][8], int q0, int q1) {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
-            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)g * 8);
-            const uint4 u0 = src[0]; const uint4 u1 = src[1];
-            v[h][0] = u0.x; v[h][1] = u0.y; v[h][2] = u0.z; v[h][3] = u0.w;
-            v[h][4] = u1.x; v[h][5] = u1.y; v[h][6] = u1.z; v[h][7] = u1.w;
+            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)gg * 8);
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              if (q < q0 || q >= q1) { continue; }
+              const uint4 u = src[q];
+              v[h][4 * q + 0] = u.x; v[h][4 * q + 1] = u.y; v[h][4 * q + 2] = u.z; v[h][4 * q + 3] = u.w;
+            }
           }
         };
-        auto putw = [&](thread const uint32_t (&v)[NH][8]) {
+        // stages quads [q0, q1) of v: word j of the step at 4 * (j % KW) of its column
+        auto putw = [&](thread const uint32_t (&v)[NH][8], int q0, int q1) {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
-            threadgroup uint32_t* dst = bs[sg][h] + int(lane) * 32;
-            // As in the prompt kernel's staging: one uint4 store per word.
+            threadgroup uint32_t* dst = bs[sg][h] + int(lane) * (KH / 4);
             #pragma clang loop unroll(full)
             for (int j = 0; j < 8; j++) {
+              if (j < 4 * q0 || j >= 4 * q1) { continue; }
+              // As in the prompt kernel's staging: one uint4 store per word.
               const uint32_t wv = v[h][j];
-              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+              *(threadgroup uint4*)(dst + 4 * (j % KW)) = uint4(
                   wv & 0x03030303u, (wv >> 2) & 0x03030303u,
                   (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
             }
@@ -7075,55 +7998,85 @@ enum Qwen35TensorPackedMatmul {
           c[0] = ascale[(size_t)fm * Kg + g]; c[1] = ascale[(size_t)(fm + 8) * Kg + g];
           c[2] = rowsum[(size_t)fm * Kg + g]; c[3] = rowsum[(size_t)(fm + 8) * Kg + g];
         };
-        uint32_t wa[NH][8], wb[NH][8];
-        half4 sha[NH][2], shb[NH][2], bha[NH][2], bhb[NH][2];
-        float4 sfa[NH][2], sfb[NH][2];
-        float ca[4], cb[4];
-        auto body = [&](int g, thread uint32_t (&ws)[NH][8],
-                        thread half4 (&shc)[NH][2], thread half4 (&bhc)[NH][2], thread float4 (&sfc)[NH][2], thread float (&cc)[4],
-                        thread half4 (&shn)[NH][2], thread half4 (&bhn)[NH][2], thread float4 (&sfn)[NH][2], thread float (&cn)[4]) {
-          if (g + 1 < g1) { getc(g + 1, shn, bhn, sfn, cn); }
-          auto tA = A.template slice<128, 16>(g * 128, 0);
+        // Word ring: before group g runs, slot (g - g0 - 1) % PD holds group g + PD
+        // (KH = 64: its lower quad, the upper quad still holding group g's) and the
+        // other slots groups g + 1 .. g + PD - 1. Constants ring: slot (g - g0) % CD
+        // holds group g's, the next CD - 2 slots the following groups'.
+        uint32_t wr[PD][NH][8];
+        half4 shr[CD][NH][2], bhr[CD][NH][2];
+        float4 sfr[CD][NH][2];
+        float cr[CD][4];
+        // one K step of group g at offset ko: KH x 32 staged codes per half
+        auto mm = [&](int g, int ko) {
+          auto tA = A.template slice<KH, 16>(g * 128 + ko, 0);
           op.run(tA, B0, cT0);
           if constexpr (NH == 2) {
           op.run(tA, B1, cT1);
+          }
+        };
+        // group g at unrolled position j (a constant): ring slots are static
+        auto body = [&](int g, int j) {
+          const int cs = j % CD;
+          if (g + CD - 1 < g1) {
+            const int cn = (j + CD - 1) % CD;
+            getc(g + CD - 1, shr[cn], bhr[cn], sfr[cn], cr[cn]);
+          }
+          if constexpr (KH == 64) {
+            const int wp = (j + PD - 1) % PD;  // slot holding group g's upper quad
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { cT0[i] = 0; cT1[i] = 0; }
+            mm(g, 0);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            putw(wr[wp], 1, 2);
+            if (g + PD < g1) { getw(g + PD, wr[wp], 1, 2); }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            mm(g, 64);
+          } else {
+            mm(g, 0);
           }
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             float4 sv[2], bv[2];
             #pragma clang loop unroll(full)
             for (int q = 0; q < 2; q++) {
-              if constexpr (F32S) { sv[q] = sfc[h][q]; } else { sv[q] = float4(shc[h][q]); }
-              if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhc[h][q]); }
+              if constexpr (F32S) { sv[q] = sfr[cs][h][q]; } else { sv[q] = float4(shr[cs][h][q]); }
+              if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhr[cs][h][q]); }
             }
             #pragma clang loop unroll(full)
             for (int i = 0; i < CAP; i++) {
               const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
               const int32_t ci = (h == 0) ? cT0[i] : cT1[i];
-              acc[h][i] = fma(mh ? cc[1] : cc[0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cc[3] : cc[2], acc[h][i]));
+              acc[h][i] = fma(mh ? cr[cs][1] : cr[cs][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][3] : cr[cs][2], acc[h][i]));
             }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           if (g + 1 < g1) {
-            putw(ws);
-            if (g + 1 + PD < g1) { getw(g + 1 + PD, ws); }
+            const int wn = j % PD;             // slot holding group g + 1 (its lower quad at KH = 64)
+            putw(wr[wn], 0, NQ);
+            if (g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn], 0, NQ); }
             simdgroup_barrier(mem_flags::mem_threadgroup);
           }
         };
         {
           uint32_t w0[NH][8];
-          getw(g0, w0);
-          if (g0 + 1 < g1) { getw(g0 + 1, wa); }
-          if (PD == 2 && g0 + 2 < g1) { getw(g0 + 2, wb); }
-          getc(g0, sha, bha, sfa, ca);
-          putw(w0);
+          getw(g0, w0, 0, NQ);
+          #pragma clang loop unroll(full)
+          for (int i = 1; i < PD; i++) {
+            if (g0 + i < g1) { getw(g0 + i, wr[i - 1], 0, 2); }
+          }
+          if constexpr (KH == 64) { getw(g0, wr[PD - 1], 1, 2); }
+          if (g0 + PD < g1) { getw(g0 + PD, wr[PD - 1], 0, NQ); }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CD - 1; i++) {
+            if (g0 + i < g1) { getc(g0 + i, shr[i], bhr[i], sfr[i], cr[i]); }
+          }
+          putw(w0, 0, NQ);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g1; g += 2) {
-          body(g, wa, sha, bha, sfa, ca, shb, bhb, sfb, cb);
-          if (g + 1 < g1) {
-            if constexpr (PD == 2) { body(g + 1, wb, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
-            else { body(g + 1, wa, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
+        for (int g = g0; g < g1; g += CD) {
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < CD; j++) {
+            if (g + j < g1) { body(g + j, j); }
           }
         }
         // the reduction reuses the staging buffers, in simdgroup order
@@ -7138,15 +8091,35 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // As in `sourceNarrowInt8` (fkiene 98f554ad): i = 0, 4, 8, 12. mh
+          // and nq are constant on each group and c is 0, 1, 2, 3, so the four
+          // outputs are consecutive columns. The sum is still acc, then
+          // red[0], red[1], red[2], each folded on its own partial. OutT is
+          // half or float; both stores are 4-element aligned because fn, n0,
+          // 32 * h and N are multiples of 4.
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) {
-              float v = acc[h][i];
+            for (int i = 0; i < CAP; i += 4) {
+              const int mh = (i >> 2) & 1;
+              const int nq = i >> 3;
+              float v0 = acc[h][i];
+              float v1 = acc[h][i + 1];
+              float v2 = acc[h][i + 2];
+              float v3 = acc[h][i + 3];
               #pragma clang loop unroll(full)
-              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
+              for (int q = 0; q < 4 - 1; q++) {
+                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
+              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
+              if constexpr (sizeof(OutT) == sizeof(float)) {
+                *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+              } else {
+                *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+              }
             }
           }
         }
@@ -7537,16 +8510,41 @@ enum Qwen35TensorPackedMatmul {
         case negativeBiasF32Scales = 2
     }
 
-    /// The kernel body. `v0` is `sourceNarrowInt8` as recorded; `pd1` / `pd2`
-    /// are `sourceNarrowInt8Pipelined` with the next one / two groups' words
-    /// (and the next group's constants) loaded into registers ahead of the op;
-    /// `tn64` is the pipelined body over 64 columns per threadgroup (only on
-    /// request: it doubles the threadgroup memory). All bitwise identical.
-    enum NarrowVariant: Int {
+    /// The kernel body. `v0` is `sourceNarrowInt8` as recorded; `pdN` is
+    /// `sourceNarrowInt8Pipelined` with a register ring of the next N groups'
+    /// words (and a matching constants ring) loaded ahead of the op; `k64pdN`
+    /// is the same with each group staged and multiplied in two K = 64 halves
+    /// (half the threadgroup memory, twice the threadgroups per core); `tn64`
+    /// is `pd1` over 64 columns per threadgroup (twice the threadgroup
+    /// memory). All bitwise identical.
+    enum NarrowVariant: Int, CaseIterable {
         case v0 = 0
         case pd1 = 1
         case pd2 = 2
         case tn64 = 3
+        case pd3 = 4
+        case pd4 = 5
+        case k64pd1 = 6
+        case k64pd2 = 7
+        case k64pd3 = 8
+        case k64pd4 = 9
+
+        /// Words ring depth, columns per threadgroup, K per op.
+        var pd: Int {
+            switch self {
+            case .v0, .pd1, .tn64, .k64pd1: return 1
+            case .pd2, .k64pd2: return 2
+            case .pd3, .k64pd3: return 3
+            case .pd4, .k64pd4: return 4
+            }
+        }
+        var tn: Int { self == .tn64 ? 64 : 32 }
+        var kh: Int { [.k64pd1, .k64pd2, .k64pd3, .k64pd4].contains(self) ? 64 : 128 }
+
+        init?(name: String) {
+            guard let v = Self.allCases.first(where: { "\($0)" == name }) else { return nil }
+            self = v
+        }
     }
 
     struct NarrowKernel: Hashable, CustomStringConvertible {
@@ -7565,6 +8563,164 @@ enum Qwen35TensorPackedMatmul {
     nonisolated(unsafe) static var narrowNeedsProof = false
     nonisolated(unsafe) static var narrowNeedsF32 = false
 
+    /// One choice: a default kernel and per-shape kernels.
+    typealias NarrowChoice = (NarrowKernel, [[Int]: NarrowKernel])
+
+    /// The record's (dcaf489's) kernel bodies: its own autotune chooses among
+    /// these (and `original`), so the pick over them is the record's pick.
+    static let narrowRecordVariants: Set<NarrowVariant> = [.v0, .pd1, .pd2, .tn64]
+
+    /// Sets `narrowNeedsProof` / `narrowNeedsF32` for these choices.
+    static func setNarrowOperandNeeds(_ choices: [NarrowChoice]) {
+        let all = choices.flatMap { [$0.0] + Array($0.1.values) }
+        narrowNeedsProof = all.contains { $0.form != .base }
+        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
+    }
+
+    /// The in-situ choice of the verify int8 kernels: a few candidate choices
+    /// (shortlisted by the synthetic self-test and timing at load) run in turn
+    /// on real speculative rounds of the load-time engine warm, and a
+    /// candidate replaces the record's pick only when its median round beats
+    /// the record's pick's by more than 0.5 %. The synthetic timing streams
+    /// each kernel for 0.5-0.7 ms bursts in which the GPU never reaches the
+    /// clock state of the decode window, so it mispicks; a whole round does
+    /// reach it. Every candidate passed the bitwise self-test (FP16 and FP32
+    /// outputs), so the rounds and their tokens are the same whichever runs.
+    ///
+    /// `roundBoundary()` runs at the top of every block proposal (one static
+    /// bool check when no trial is active): round r's time is the host time
+    /// from its proposal to the next one, and the choice installed at a
+    /// boundary is what the next verify graph build reads. The first round
+    /// after the seed is discarded. Runs only inside the deferred load warm
+    /// (`Qwen35DFlash2Assistant`), never in a served request.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps the record's
+    /// pick without a trial.
+    enum NarrowInSituTrial {
+        nonisolated(unsafe) static var active = false
+        nonisolated(unsafe) static var sets: [NarrowChoice] = []
+        nonisolated(unsafe) static var roundTimes: [[UInt64]] = []
+        nonisolated(unsafe) static var roundIndex = 0
+        nonisolated(unsafe) static var lastBoundary: UInt64 = 0
+        nonisolated(unsafe) static var onEnough: (() -> Void)?
+
+        /// Timed rounds per candidate.
+        static let roundsPerSet = 8
+        /// A candidate must beat the record's pick by more than this.
+        static let adoptMargin = 0.005
+        /// Rounds above this multiple of their candidate's median are dropped.
+        static let outlierFactor = 1.5
+
+        static let enabled: Bool = {
+            let value = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }()
+
+        /// Whether a trial is set up (two or more distinct candidates; the
+        /// first is the record's pick).
+        static var armed: Bool { enabled && sets.count >= 2 }
+
+        /// Proposals the trial needs: the discarded round, the seed-side
+        /// boundary, then `roundsPerSet` per candidate.
+        static var roundsNeeded: Int { 2 + roundsPerSet * sets.count }
+
+        @inline(__always) static func roundBoundary() {
+            guard active else { return }
+            boundary()
+        }
+
+        private static func boundary() {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let count = sets.count
+            if roundIndex >= 2 {
+                roundTimes[(roundIndex - 1) % count].append(now - lastBoundary)
+            }
+            lastBoundary = now
+            let set = sets[roundIndex % count]
+            narrowDefault = set.0
+            narrowByShape = set.1
+            roundIndex += 1
+            if roundIndex >= roundsNeeded {
+                active = false
+                let enough = onEnough
+                onEnough = nil
+                enough?()
+            }
+        }
+
+        /// Arms the round hook. `onEnough` runs (on the engine's thread) once
+        /// every candidate has its rounds.
+        static func begin(onEnough: @escaping () -> Void) {
+            guard armed else { return }
+            roundTimes = Array(repeating: [], count: sets.count)
+            roundIndex = 0
+            lastBoundary = 0
+            self.onEnough = onEnough
+            active = true
+        }
+
+        private static func median(_ values: [UInt64]) -> Double? {
+            guard !values.isEmpty else { return nil }
+            let sorted = values.sorted()
+            let mid = sorted.count / 2
+            return sorted.count % 2 == 1
+                ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
+        }
+
+        private static func describe(_ set: NarrowChoice) -> String {
+            guard !set.1.isEmpty else { return "\(set.0)" }
+            return "\(set.0){"
+                + narrowTunedShapes.map { "\(set.1[[$0.0, $0.1]] ?? set.0)" }
+                .joined(separator: ",") + "}"
+        }
+
+        /// Ends the trial: installs the winner (or the record's pick), logs
+        /// one line and disarms. Safe to call when nothing ran.
+        static func finish(elapsedNanoseconds: UInt64) {
+            active = false
+            onEnough = nil
+            guard armed else { return }
+            if roundTimes.count != sets.count {
+                roundTimes = Array(repeating: [], count: sets.count)
+            }
+            let medians: [(Double?, Int, Int)] = roundTimes.map { times in
+                guard let first = median(times) else { return (nil, 0, 0) }
+                let kept = times.filter { Double($0) <= outlierFactor * first }
+                return (median(kept), kept.count, times.count)
+            }
+            var chosen = 0
+            if let record = medians[0].0 {
+                var best = record
+                for (index, entry) in medians.enumerated().dropFirst() {
+                    if let m = entry.0, m < best { best = m; chosen = index }
+                }
+                if chosen != 0, !(best < record * (1 - adoptMargin)) { chosen = 0 }
+            }
+            let set = sets[chosen]
+            narrowDefault = set.0
+            narrowByShape = set.1
+            setNarrowOperandNeeds([set])
+            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; median ms/round"
+            for (index, candidate) in sets.enumerated() {
+                let (m, kept, total) = medians[index]
+                log += (index == 0 ? " [record " : " | ") + describe(candidate) + " "
+                    + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
+            }
+            log += "]; "
+            if chosen == 0 {
+                log += "keeping the record's pick"
+            } else if let record = medians[0].0, let m = medians[chosen].0 {
+                log += "adopted " + describe(set)
+                    + String(format: " (%+.2f%%)", (m / record - 1) * 100)
+            }
+            log += String(format: "; %.0f ms\n", Double(elapsedNanoseconds) / 1e6)
+            FileHandle.standardError.write(log.data(using: .utf8)!)
+            sets = []
+            roundTimes = []
+        }
+    }
+
     /// The kernel for this projection: the chosen one for its shape when its
     /// constants pass the proof (or it needs none), else `original`.
     /// `materialize` evaluates the FP32 scales now (the prompt route's
@@ -7574,7 +8730,7 @@ enum Qwen35TensorPackedMatmul {
         k: Int, n: Int, materialize: Bool
     ) -> NarrowKernel {
         let choice = narrowByShape[[k, n]] ?? narrowDefault
-        if choice.variant == .tn64 && n % 64 != 0 { return .original }
+        if n % choice.variant.tn != 0 { return .original }
         guard choice.form != .base else { return choice }
         guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
         if choice.form == .negativeBiasF32Scales {
@@ -7622,11 +8778,11 @@ enum Qwen35TensorPackedMatmul {
                 inputs, template: template,
                 grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-        case .pd1, .pd2, .tn64:
-            let tn = kernel.variant == .tn64 ? 64 : 32
+        default:
+            let v = kernel.variant
             return kernelNarrowInt8Pipelined(
-                inputs, template: template + [("PD", kernel.variant == .pd2 ? 2 : 1), ("TN", tn)],
-                grid: (n / tn * 128, 1, 1), threadGroup: (128, 1, 1),
+                inputs, template: template + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
+                grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
     }
@@ -7687,43 +8843,60 @@ enum Qwen35TensorPackedMatmul {
     /// Chooses the verify int8 kernels once, at load, on the running GPU.
     ///
     /// Self-test: every candidate runs against `original` on synthetic
-    /// operands (gate-, down- and an odd-quarter width) and must match every
-    /// output bit (FP16 for all; FP32 as well for each kernel that is then
-    /// chosen); a mismatch or any MLX error drops it. Timing: the survivors
-    /// and `original` run alternately on the four production shapes, each
-    /// over distinct weight sets of >= 96 MB (so every launch streams its
-    /// weights), best of five trials; each shape keeps its fastest kernel and
-    /// every other shape takes the fastest in total. A deadline keeps the
-    /// whole choice near 2 s (a candidate not started by then is skipped).
-    /// Runs at model init, before any timed phase, and builds the chosen
-    /// pipelines, so the first verify round compiles nothing.
+    /// operands (gate-, down- and two odd-quarter widths, so every ring's
+    /// remainder guards run) and must match every output bit (FP16 for all;
+    /// FP32 as well for each kernel that is then chosen); a mismatch or any
+    /// MLX error (a body the toolchain cannot compile) drops it. Candidates:
+    /// every body (`v0` and each pipelined variant) in each epilogue form.
+    /// Timing: the survivors and `original` run alternately on the four
+    /// production shapes, each over distinct weight sets of >= 96 MB (so
+    /// every launch streams its weights), best of five trials. The record's
+    /// pick: over the record's bodies (`narrowRecordVariants`), each shape
+    /// keeps its fastest kernel and every other shape takes the fastest in
+    /// total. That is what is installed; the timing only shortlists the
+    /// in-situ candidates (`NarrowInSituTrial`): the record's pick, `v0` with
+    /// the negated offset, and the two fastest K3 bodies in total, each after
+    /// its FP32 self-test, and every candidate kernel is then launched once
+    /// per production shape with FP16 and FP32 outputs. A candidate not
+    /// started within 4 s of the self-test is skipped (load time is not
+    /// timed). Runs at model init, before any timed phase, and builds every
+    /// candidate's pipelines, so no verify round (nor any trial round)
+    /// compiles anything.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
     /// (master kill switch); `neg` / `f32` force that epilogue.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
-    /// body (`v0`); `pd1` / `pd2` / `tn64` force that body.
-    private static func chooseNarrowKernels() -> (NarrowKernel, [[Int]: NarrowKernel]) {
+    /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd4`,
+    /// `tn64`, `k64pd1` .. `k64pd4`) limits the pipelined candidates to those.
+    private static func chooseNarrowKernels() -> (NarrowChoice, [NarrowChoice]) {
         let environment = ProcessInfo.processInfo.environment
         func knob(_ name: String) -> String? {
             environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
         let forms: [NarrowEpilogue]
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
-        case "off", "0", "false", "no", "base": return (.original, [:])
+        case "off", "0", "false", "no", "base": return ((.original, [:]), [])
         case "neg": forms = [.negativeBias]
         case "f32": forms = [.negativeBiasF32Scales]
         default: forms = [.negativeBias, .negativeBiasF32Scales]
         }
-        let variants: [NarrowVariant]
+        // Default order = self-test order (what the deadline would cut last).
+        let defaultVariants: [NarrowVariant] = [
+            .pd1, .pd2, .k64pd1, .k64pd2, .pd3, .k64pd3, .pd4, .k64pd4, .tn64,
+        ]
+        var variants = defaultVariants
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
         case "off", "0", "false", "no", "v0": variants = []
-        case "pd1": variants = [.pd1]
-        case "pd2": variants = [.pd2]
-        case "tn64": variants = [.tn64]
-        default: variants = [.pd1, .pd2]
+        case .some(let value):
+            let named = value.split(separator: ",").map {
+                NarrowVariant(name: $0.trimmingCharacters(in: .whitespaces))
+            }
+            if !named.isEmpty, named.allSatisfy({ $0 != nil }) {
+                variants = named.compactMap { $0 }.filter { $0 != .v0 }
+            }
+        case nil: break
         }
-        let pipelinedForm = forms.contains(.negativeBias) ? NarrowEpilogue.negativeBias : forms[0]
         let candidates = forms.map { NarrowKernel(variant: .v0, form: $0) }
-            + variants.map { NarrowKernel(variant: $0, form: pipelinedForm) }
+            + variants.flatMap { v in forms.map { NarrowKernel(variant: v, form: $0) } }
 
         let start = DispatchTime.now().uptimeNanoseconds
         func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
@@ -7733,9 +8906,13 @@ enum Qwen35TensorPackedMatmul {
         var timings: [NarrowKernel: [Double]] = [:]
         var byShape: [[Int]: NarrowKernel] = [:]
         var fallback = NarrowKernel.original
+        var trial: [NarrowChoice] = []
         do {
             try withError { error in
-                let testShapes = [(5120, 4096, UInt64(71)), (17408, 1024, UInt64(72)), (2560, 512, UInt64(73))]
+                let testShapes = [
+                    (5120, 4096, UInt64(71)), (17408, 1024, UInt64(72)), (2560, 512, UInt64(73)),
+                    (3584, 512, UInt64(74)),
+                ]
                 let testOps = testShapes.map { NarrowOperands(k: $0.0, n: $0.1, seed: $0.2) }
                 func matches(_ kernel: NarrowKernel, _ outputDType: DType) throws -> Bool {
                     let bits: DType = outputDType == .float16 ? .uint16 : .uint32
@@ -7753,7 +8930,7 @@ enum Qwen35TensorPackedMatmul {
                 }
                 var skipped: [NarrowKernel] = []
                 for kernel in candidates {
-                    if elapsedMs() > 1200 { skipped.append(kernel); continue }
+                    if elapsedMs() > 4000 { skipped.append(kernel); continue }
                     if try matches(kernel, .float16) { passed.append(kernel) }
                 }
                 log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
@@ -7787,10 +8964,22 @@ enum Qwen35TensorPackedMatmul {
                 }
                 try error.check()
 
-                // Picks, then the FP32 self-test of each picked kernel; a
-                // kernel failing it is dropped and the picks redone.
+                // The record's picks, then the FP32 self-test of each picked
+                // kernel; a kernel failing it is dropped and the picks redone.
+                var checkedF32 = Set<NarrowKernel>()
+                func exactF32(_ kernel: NarrowKernel) throws -> Bool {
+                    if kernel == .original || checkedF32.contains(kernel) {
+                        return !failedF32.contains(kernel)
+                    }
+                    checkedF32.insert(kernel)
+                    if try matches(kernel, .float32) { return true }
+                    failedF32.insert(kernel)
+                    return false
+                }
                 while true {
-                    let usable = kernels.filter { !failedF32.contains($0) }
+                    let usable = kernels.filter {
+                        !failedF32.contains($0) && narrowRecordVariants.contains($0.variant)
+                    }
                     func fastest(_ cost: (NarrowKernel) -> Double) -> NarrowKernel {
                         usable.min { cost($0) < cost($1) } ?? .original
                     }
@@ -7802,18 +8991,52 @@ enum Qwen35TensorPackedMatmul {
                     let picked = Set([fallback] + Array(byShape.values)).subtracting([.original])
                     var clean = true
                     for kernel in picked {
-                        if try !matches(kernel, .float32) {
-                            failedF32.insert(kernel)
-                            clean = false
-                        }
+                        if try !exactF32(kernel) { clean = false }
                     }
                     if clean { break }
                 }
+
+                // The in-situ candidates: the record's pick, v0 with the
+                // negated offset, and the two fastest K3 bodies in total, each
+                // exact at FP32 as well. Choices equal on every shape collapse.
+                guard NarrowInSituTrial.enabled else { return }
+                var shortlist: [NarrowChoice] = [(fallback, byShape)]
+                let v0Negative = NarrowKernel(variant: .v0, form: .negativeBias)
+                if passed.contains(v0Negative), try exactF32(v0Negative) {
+                    shortlist.append((v0Negative, [:]))
+                }
+                let k3 = passed.filter { !narrowRecordVariants.contains($0.variant) }
+                    .sorted { timings[$0]!.reduce(0, +) < timings[$1]!.reduce(0, +) }
+                var survivors = 0
+                for kernel in k3 where survivors < 2 {
+                    if try exactF32(kernel) {
+                        shortlist.append((kernel, [:]))
+                        survivors += 1
+                    }
+                }
+                func effective(_ choice: NarrowChoice) -> [NarrowKernel] {
+                    [choice.0] + narrowTunedShapes.map { choice.1[[$0.0, $0.1]] ?? choice.0 }
+                }
+                for choice in shortlist
+                where !trial.contains(where: { effective($0) == effective(choice) }) {
+                    trial.append(choice)
+                }
+                guard trial.count >= 2 else { trial = []; return }
+                // Every candidate kernel once per production shape, FP16 and
+                // FP32 outputs, so no pipeline compiles inside a trial round.
+                let trialKernels = Set(trial.flatMap { [$0.0] + Array($0.1.values) })
+                for kernel in trialKernels {
+                    for outputDType in [DType.float16, .float32] {
+                        eval(sets.map { $0[0].run(kernel, outputDType) })
+                    }
+                }
+                try error.check()
             }
         } catch {
             passed = []
             byShape = [:]
             fallback = .original
+            trial = []
             log += " error \(error)"
         }
         if !timings.isEmpty {
@@ -7829,19 +9052,25 @@ enum Qwen35TensorPackedMatmul {
         Memory.clearCache()
         log += "; using default \(fallback), per shape ["
             + narrowTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
-            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
+            .joined(separator: " ") + "]"
+        if !trial.isEmpty {
+            log += "; in-situ candidates [record" + trial.dropFirst().map { " \($0.0)" }
+                .joined() + "]"
+        }
+        log += "; \(String(format: "%.0f", elapsedMs())) ms\n"
         FileHandle.standardError.write(log.data(using: .utf8)!)
-        return (fallback, byShape)
+        return ((fallback, byShape), trial)
     }
 
-    /// Installs the choice.
+    /// Installs the record's pick and sets up the in-situ trial. The operands
+    /// every candidate reads (the per-projection proof, the FP32 scales) are
+    /// prepared at the load-time prompt forward, before any trial round.
     private static func installNarrowChoice() {
-        let (fallback, byShape) = chooseNarrowKernels()
-        narrowDefault = fallback
-        narrowByShape = byShape
-        let all = [fallback] + Array(byShape.values)
-        narrowNeedsProof = all.contains { $0.form != .base }
-        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
+        let (choice, trial) = chooseNarrowKernels()
+        narrowDefault = choice.0
+        narrowByShape = choice.1
+        NarrowInSituTrial.sets = trial
+        setNarrowOperandNeeds([choice] + trial)
     }
 
     nonisolated(unsafe) private static var installed = false
