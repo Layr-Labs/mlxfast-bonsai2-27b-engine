@@ -1025,7 +1025,7 @@ enum DFlash2TopK {
     }()
 
     private static let chunks = 8
-    private static let threads = 128
+    private static let threads = 256
 
     static func select(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
         guard enabled, logits.ndim == 3, logits.dim(0) == 1, logits.dtype == .float32
