@@ -1047,45 +1047,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        // Settle before the shutdown barrier wakes. The worker's phase-close
-        // drain synchronizes `MLX.Stream()`, the calling thread's own C++
-        // default stream (its own command queue), not the global `Stream.gpu`
-        // every forward is encoded on; GPU work a round left in flight then
-        // frees its temporaries into the allocator cache AFTER that drain and
-        // benchd reads a non-zero `cache_memory`. A follow-up block on this
-        // serial queue also runs after the current block's locals are gone.
-        // Shutdown only: never inside a timed window.
-        engineQueue.async {
-            Stream.gpu.synchronize()
-            Stream.cpu.synchronize()
-            Self.awaitAllocatorQuiescence()
-            for waiter in waiters { waiter.resume() }
-        }
-    }
-
-    /// `synchronize()` returns once the stream's last command buffer has
-    /// COMPLETED, but Metal runs that buffer's completion handlers, which own
-    /// the input buffers of the stream's tail ops (`backend/metal/eval.cpp`
-    /// `eval`), on its own dispatch queue, possibly after the wait returns.
-    /// Their frees then land in the allocator cache after the worker's
-    /// phase-close drain (a [16, 5120] FP32 tail input is exactly the
-    /// 327680 bytes a ranked warmup leg reported). Wait until the
-    /// allocator's active and cache byte counts stop moving: about 2 ms,
-    /// bounded at about 32 ms, shutdown only, never inside a timed window.
-    private static func awaitAllocatorQuiescence() {
-        var last = (Memory.activeMemory, Memory.cacheMemory)
-        var stable = 0
-        for _ in 0 ..< 64 {
-            usleep(500)
-            let now = (Memory.activeMemory, Memory.cacheMemory)
-            if now == last {
-                stable += 1
-                if stable >= 4 { return }
-            } else {
-                stable = 0
-                last = now
-            }
-        }
+        for waiter in waiters { waiter.resume() }
     }
 
     // MARK: Submission (from EngineV2)
