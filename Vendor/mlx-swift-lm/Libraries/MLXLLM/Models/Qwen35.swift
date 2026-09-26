@@ -2186,10 +2186,9 @@ final class Qwen35GatedDeltaNet: Module {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
-        let convInput = concatenated([convState, qkv], axis: 1)
         // The fused prework kernel (conv, SiLU, split, q/k norms, gates, tail)
-        // serves the wide verify window too; the replay tape keeps the lazy
-        // concatenated conv input for its boundary rows.
+        // serves the wide verify window too. Capture its input history in
+        // the same launch for the replay tape's exact boundary rows.
         let pre: Qwen35GDNPrework.Outputs? =
             (!exactTargetVerify && S >= 3 && convKernelSize == 4)
             ? Qwen35GDNPrework.run(
@@ -2197,8 +2196,9 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog, dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim)
+                headVDim: headVDim, captureInput: true)
             : nil
+        let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
@@ -3318,6 +3318,7 @@ enum Qwen35GDNPrework {
         let g: MLXArray
         let beta: MLXArray
         let tail: MLXArray
+        let convInput: MLXArray?
     }
 
     private static let enabled: Bool = {
@@ -3405,28 +3406,51 @@ enum Qwen35GDNPrework {
           const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
           beta[grow] = (bv < 0.0f) ? by : 1.0f - by;
         }
-        // Next convolution tail: rows S-NK..S-1 of the concatenated input.
-        #pragma clang loop unroll(full)
-        for (int r = 0; r < NK; r++) {
-          const int src = Sn + r - NK; // chunk row feeding tail row r (< 0: from cs)
-          if (src >= 0 && int(t) == src) {
-            const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
-            tail[trow + colq] = float(qkv[rowbase + size_t(t) * size_t(CD) + colq]);
-            tail[trow + colk] = float(qkv[rowbase + size_t(t) * size_t(CD) + colk]);
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GRP; i++) {
-              const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
-              tail[trow + colv] = float(qkv[rowbase + size_t(t) * size_t(CD) + colv]);
+        if constexpr (CAPTURE_INPUT) {
+          // Exact FP32 concatenation of the existing history and this qkv
+          // window. Each (head, channel, token) owns disjoint destinations.
+          const size_t row = (size_t(bb) * size_t(Sn + NK) + size_t(NK + t)) * size_t(CD);
+          const size_t qrow = rowbase + size_t(t) * size_t(CD);
+          auto capture_col = [&](uint col) {
+            tail[row + col] = float(qkv[qrow + col]);
+            if (t == 0) {
+              #pragma clang loop unroll(full)
+              for (int r = 0; r < NK; ++r) {
+                const size_t dst = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+                tail[dst + col] = cs[csbase + size_t(r) * size_t(CD) + col];
+              }
             }
-          } else if (src < 0 && t == 0) {
-            const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
-            const size_t crow = csbase + size_t(src + NK) * size_t(CD);
-            tail[trow + colq] = cs[crow + colq];
-            tail[trow + colk] = cs[crow + colk];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GRP; i++) {
-              const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
-              tail[trow + colv] = cs[crow + colv];
+          };
+          capture_col(colq);
+          capture_col(colk);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GRP; ++i) {
+            capture_col(VOFF + (h * GRP + uint(i)) * DV + c);
+          }
+        } else {
+          // Next convolution tail: rows S-NK..S-1 of the concatenated input.
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < NK; r++) {
+            const int src = Sn + r - NK; // chunk row feeding tail row r (< 0: from cs)
+            if (src >= 0 && int(t) == src) {
+              const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
+              tail[trow + colq] = float(qkv[rowbase + size_t(t) * size_t(CD) + colq]);
+              tail[trow + colk] = float(qkv[rowbase + size_t(t) * size_t(CD) + colk]);
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < GRP; i++) {
+                const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+                tail[trow + colv] = float(qkv[rowbase + size_t(t) * size_t(CD) + colv]);
+              }
+            } else if (src < 0 && t == 0) {
+              const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
+              const size_t crow = csbase + size_t(src + NK) * size_t(CD);
+              tail[trow + colq] = cs[crow + colq];
+              tail[trow + colk] = cs[crow + colk];
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < GRP; i++) {
+                const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+                tail[trow + colv] = cs[crow + colv];
+              }
             }
           }
         }
@@ -3442,7 +3466,8 @@ enum Qwen35GDNPrework {
     static func run(
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
-        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
+        captureInput: Bool = false
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3 else { return nil }
         let B = qkv.dim(0)
@@ -3469,17 +3494,19 @@ enum Qwen35GDNPrework {
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ("CAPTURE_INPUT", captureInput),
             ],
             grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
             outputShapes: [
                 [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
                 [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
-                [B, KS - 1, CD],
+                [B, captureInput ? S + KS - 1 : KS - 1, CD],
             ],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
         return Outputs(
             q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
-            tail: outputs[5])
+            tail: captureInput ? outputs[5][0..., S ..< (S + KS - 1), 0...] : outputs[5],
+            convInput: captureInput ? outputs[5] : nil)
     }
 }
 
