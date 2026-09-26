@@ -121,6 +121,7 @@ public struct SignedBlockHadamard {
         keepNormed: Bool = false
     ) -> (h: MLXArray, normed: MLXArray?, rotated: MLXArray)? {
         guard FusedInputHadamardKernel.residualNormEnabled, blockSize == 1024, width == 5120,
+            x.size / width >= FusedInputHadamardKernel.promptMinimumRows,
             x.dtype == .float16, r.dtype == .float16, x.shape == r.shape,
             x.ndim >= 2, x.dim(-1) == width, weight.dtype == .float32, weight.ndim == 1,
             weight.dim(0) == width,
@@ -154,6 +155,7 @@ public struct SignedBlockHadamard {
     ) -> MLXArray? {
         guard FusedInputHadamardKernel.stackedReads, blockSize == 1024, width % 1024 == 0,
             wide.dtype == .float32 || wide.dtype == .float16, wide.ndim >= 2,
+            wide.size / max(1, wide.dim(-1)) >= FusedInputHadamardKernel.promptMinimumRows,
             gateOffset >= 0, upOffset >= 0,
             wide.dim(-1) >= max(gateOffset, upOffset) + width
         else { return nil }
@@ -183,7 +185,8 @@ public struct SignedBlockHadamard {
         guard FusedInputHadamardKernel.gateEnabled, FusedInputHadamardKernel.gateHeadsEnabled,
             blockSize == 1024, width % 1024 == 0,
             x.dtype == .float32, gate.dtype == .float32, x.shape == gate.shape,
-            x.ndim == 4, x.dim(2) * x.dim(3) == width
+            x.ndim == 4, x.dim(2) * x.dim(3) == width,
+            x.dim(0) * x.dim(1) >= FusedInputHadamardKernel.promptMinimumRows
         else { return nil }
         return FusedInputHadamardKernel.gatedHeads(
             x, gate, signs: signs, width: width, headDim: x.dim(3), outputDType: outputDType)
@@ -1101,6 +1104,19 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
 /// order, so the stored values equal the chain's FP32 rotation cast to that
 /// dtype. (polymorf's plain rotation keeps the name
 /// `bonsai_signed_hadamard_1024`; these kernels use their own names.)
+/// The residual-norm rotation, the stacked gate|up reads, the head-strided
+/// gate reads and the FP16 qkv|z stack run for prompt-width forwards only (the
+/// timed prefill and the seed prefill). The 16-row verify keeps the composed
+/// ops of `8369b5da`: on the ranked M5 Max the verify-width versions lengthened
+/// the decode window. `BONSAI_PROMPT_MIN_ROWS` overrides.
+public enum BonsaiPromptWidth {
+    public static let minimumRows: Int = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_MIN_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.flatMap { Int($0) } ?? 64
+    }()
+}
+
 enum FusedInputHadamardKernel {
     private static func flag(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
@@ -1121,6 +1137,8 @@ enum FusedInputHadamardKernel {
 
     /// The fused residual add + RMSNorm + rotation (`BONSAI_FUSED_RESNORM=0` off).
     static let residualNormEnabled = enabled && flag("BONSAI_FUSED_RESNORM")
+
+    static var promptMinimumRows: Int { BonsaiPromptWidth.minimumRows }
 
     /// One threadgroup of 1024 threads per 5120-wide row. See
     /// `SignedBlockHadamard.residualNormRotated`.

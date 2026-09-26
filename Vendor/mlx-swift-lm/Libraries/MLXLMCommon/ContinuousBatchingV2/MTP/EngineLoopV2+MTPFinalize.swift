@@ -9,11 +9,11 @@ import MLX
 extension EngineLoopV2 {
     /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
     /// event instead of polling it (ercumentyildirim `cc0895d`).
-    static let pollsAcceptancePacket: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
+    /// Off by default here: every ranked ticket that polled (cc0895d6,
+    /// 94da3f58, 5123445c) lengthened the decode window on the M5 Max.
+    /// `BONSAI_POLL_PACKET=1` polls.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] == "1"
 
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
@@ -24,9 +24,12 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
-    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
+    /// Off by default: on the ranked M5 Max the early submission made the
+    /// decode window longer on this tree lineage (polymorf measured 1404 ->
+    /// 1427 ms), so the committed recurrent state is left lazy and runs inside
+    /// the next verify. `BONSAI_EARLY_REPLAY=1` submits it at finalize.
     static let submitsCommittedRecurrentStateEarly: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] == "1"
 
     /// Start the committed recurrent state on the GPU now (ercumentyildirim,
     /// `080cb21`). A partially accepted verify commits each recurrent layer by

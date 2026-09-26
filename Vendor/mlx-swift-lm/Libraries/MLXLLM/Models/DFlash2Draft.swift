@@ -432,9 +432,10 @@ public enum DFlash2SlidingMask {
 /// its mask inputs are equal and the mask is the same array. Building it per
 /// layer re-ran the same comparison graph once per layer. The memo is keyed on
 /// every input of ``DFlash2SlidingMask/make(contextLength:blockLength:slidingWindow:isCausal:)``,
-/// so a layer whose inputs differ still gets its own mask. It lives for one
-/// forward only and is a plain class, off the module tree (see
-/// ``DFlash2TapSlot``).
+/// so a layer whose inputs differ still gets its own mask. It lives with the
+/// drafter across forwards and is a plain class, off the module tree (see
+/// ``DFlash2TapSlot``), so repeated geometries reuse the lazy graph instead of
+/// rebuilding it for every request.
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
@@ -460,6 +461,36 @@ final class DFlash2SlidingMaskMemo {
     }
 }
 
+/// The DFlash K/V projections have the same input rows and no bias. Their
+/// weights can therefore be concatenated along the output axis and evaluated
+/// by one matmul without changing any output channel's reduction order. The
+/// cache is a plain class, outside the module tree, and is cleared whenever
+/// the layer's parameters are updated.
+private final class DFlash2KVStack {
+    private var weight: MLXArray?
+    private var boundary = 0
+
+    func clear() {
+        weight = nil
+        boundary = 0
+    }
+
+    func apply(_ x: MLXArray, k: Linear, v: Linear) -> (MLXArray, MLXArray) {
+        guard dflash2KVStackEnabled, k.bias == nil, v.bias == nil,
+            k.weight.dtype == v.weight.dtype, k.weight.ndim == 2, v.weight.ndim == 2,
+            k.weight.dim(1) == v.weight.dim(1)
+        else {
+            return (k(x), v(x))
+        }
+        if weight == nil {
+            weight = concatenated([k.weight, v.weight], axis: 0)
+            boundary = k.weight.dim(0)
+        }
+        let y = matmul(x, weight!.T)
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -476,6 +507,7 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    private let kvStack = DFlash2KVStack()
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -496,6 +528,15 @@ private final class DFlash2Attention: Module {
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         super.init()
+    }
+
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        kvStack.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     /// - Parameters:
@@ -541,10 +582,11 @@ private final class DFlash2Attention: Module {
             // offset rotates every row where the two separate ropes did.
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
+            let (keyRows, valueRows) = kvStack.apply(rows, k: kProj, v: vProj)
             let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                kNorm(keyRows.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
                 offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let values = valueRows.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
@@ -593,6 +635,13 @@ private final class DFlash2Attention: Module {
 /// Kill switch for the one-projection context+block K/V (default on).
 private let dflash2KVConcatEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Kill switch for stacking the DFlash K/V projection weights (default on).
+private let dflash2KVStackEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_KV"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -1251,6 +1300,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
+    // Sliding masks depend only on block geometry. Keep the memo with the
+    // drafter so repeated speculative forwards can reuse the same graph.
+    private let masks: DFlash2SlidingMaskMemo
     private var target: (any DFlash2Target)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
@@ -1275,6 +1327,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             traditional: false,
             scalingConfig: nil,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
+        self.masks = DFlash2SlidingMaskMemo()
         super.init()
     }
 
@@ -1368,7 +1421,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
 
-        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
         }

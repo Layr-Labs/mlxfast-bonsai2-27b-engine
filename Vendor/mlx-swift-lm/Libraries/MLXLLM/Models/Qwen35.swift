@@ -1467,11 +1467,8 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     /// `BONSAI_REPLAY_REUSES_GATES=0` recomputes the replay's gates from the tape.
-    static let replayReusesGates: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_REPLAY_REUSES_GATES"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
+    static let replayReusesGates: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_REPLAY_REUSES_GATES"] == "1"
 
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
     /// from the exact pre-verify state and transformed recurrence inputs.
@@ -1601,7 +1598,8 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
         let (qkv, z, b, a) = projectInputs(
-            inputs, B: B, S: S, preRotated: preRotated, narrowStack: Self.narrowStackEnabled)
+            inputs, B: B, S: S, preRotated: preRotated,
+            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows)
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
@@ -1672,7 +1670,8 @@ final class Qwen35GatedDeltaNet: Module {
             // Preserve main's fused GDN projection construction and graph.
             (qkv, z, b, a) = projectInputs(
                 inputs, B: B, S: S, preRotated: preRotated,
-                narrowStack: Self.narrowStackEnabled)
+                narrowStack: Self.narrowStackEnabled
+                    && B * S >= BonsaiPromptWidth.minimumRows)
         }
 
         var convRows: [MLXArray] = []
@@ -2866,7 +2865,8 @@ public class Qwen35TextModelInner: Module {
     /// of it) lets the GPU run the front while the host builds the rest. Same
     /// kernels, same inputs, same order; only command-buffer boundaries move
     /// (Meganpark980320 `72b3b48`, DPZZxlz `5f72492`, DrCleverHans `db2d22e`).
-    static let verifySlices = sliceFlag("BONSAI_VERIFY_SLICES")
+    static let verifySlices =
+        ProcessInfo.processInfo.environment["BONSAI_VERIFY_SLICES"] == "1"
     static let promptSlices = sliceFlag("BONSAI_PROMPT_SLICES")
 
     private static func sliceFlag(_ name: String) -> Bool {
