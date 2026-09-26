@@ -907,6 +907,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             && rows >= tensorRouteMinimumRows && rows % 64 == 0
     }
 
+    /// True when the int8-activation verify-width route is installed and on
+    /// and `rows` is a full verify window (16 rows: the narrow route pads
+    /// nothing, so a quantized rotation formed elsewhere for these rows is
+    /// exactly the one `tensorRouteForwardNarrowInt8` would form). The
+    /// per-projection guards of `sharedHadamardTensorRouteTakesNarrowInt8`
+    /// still apply.
+    public static func tensorRouteTakesNarrowInt8Rows(_ rows: Int) -> Bool {
+        tensorRouteEnabled && tensorPackedMatmulNarrowInt8 != nil
+            && tensorPackedMatmulNarrowApplies != nil
+            && SignedBlockHadamard.fusedTransformInt8 != nil
+            && rows == tensorRouteMaximumNarrowRows
+    }
+
     /// True when `tensorRouteForward` takes `siblings` (self first) at prompt
     /// width for an FP32 `[rows, transform.width]` activation: every guard of
     /// its prompt branch, including the installed quantizing rotation that
@@ -936,6 +949,57 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return applies(rows, n, k)
     }
 
+    /// True when `tensorRouteForward` takes `siblings` (self first) through its
+    /// int8-activation narrow branch for an FP32 `[rows, transform.width]`
+    /// activation of a full verify window (no padding rows): every guard of
+    /// that branch (`tensorRouteForwardNarrowInt8`), with self's input read
+    /// in the plain layout (no GDN layout), so the branch's `forwardInt8`
+    /// is the plain quantizing rotation of the activation.
+    fileprivate func tensorRouteTakesNarrowInt8(
+        rows: Int, siblings: [HadamardQuantizedLinear]
+    ) -> Bool {
+        guard Self.tensorRouteTakesNarrowInt8Rows(rows), !siblings.isEmpty,
+            siblings[0] === self, gdnLayout == nil,
+            let applies = Self.tensorPackedMatmulNarrowApplies
+        else { return false }
+        let k = transform.width
+        guard k % 128 == 0 else { return false }
+        var n = 0
+        for sibling in siblings {
+            guard tensorRouteTakes(sibling) else { return false }
+            if sibling !== self {
+                guard sibling.sharesInputTransform(with: self) else { return false }
+            }
+            n += sibling.weight.dim(0)
+        }
+        return applies(rows, n, k)
+    }
+
+    /// `tensorRouteForwardNarrowInt8`'s matmul on an activation that is
+    /// exactly what its `forwardInt8` would have returned for the unpadded
+    /// `[rows, k]` input (rows == 16): the same matmul, the result shaped
+    /// `leading + [n]` and split per sibling.
+    private func tensorRouteNarrowInt8Matmul(
+        _ activation: SignedBlockHadamard.Int8Activation, n: Int,
+        siblings: [HadamardQuantizedLinear], outputDType: DType, leading: [Int]
+    ) -> [MLXArray]? {
+        guard let matmul = Self.tensorPackedMatmulNarrowInt8 else { return nil }
+        if siblings.count == 1 {
+            guard let y = matmul(
+                activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+            else { return nil }
+            return [y.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                activation, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        return MLX.split(
+            wide.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
     /// `tensorRouteForward`'s prompt branch on an activation that is exactly
     /// what `forwardInt8` would have returned for the `[rows, k]` input: the
     /// same guards, the same matmul, the result shaped `leading + [n]` and
@@ -945,7 +1009,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         siblings: [HadamardQuantizedLinear], widenOutput: Bool
     ) -> [MLXArray]? {
         let k = transform.width
-        guard tensorRouteTakesPrompt(rows: rows, siblings: siblings),
+        // A full verify window on the int8-activation narrow route reads the
+        // activation through that route's matmul instead.
+        let narrow = tensorRouteTakesNarrowInt8(rows: rows, siblings: siblings)
+        guard narrow || tensorRouteTakesPrompt(rows: rows, siblings: siblings),
             leading.reduce(1, *) == rows,
             activation.codes.dtype == .uint8 || activation.codes.dtype == .int8,
             activation.codes.shape == [rows, k],
@@ -954,6 +1021,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             activation.scaledSums.shape == [rows, k / 128]
         else { return nil }
         let n = siblings.reduce(0) { $0 + $1.weight.dim(0) }
+        if narrow {
+            return tensorRouteNarrowInt8Matmul(
+                activation, n: n, siblings: siblings,
+                outputDType: widenOutput ? .float32 : .float16, leading: leading)
+        }
         return tensorRoutePromptMatmul(
             activation, siblings: siblings, n: n,
             outputDType: widenOutput ? .float32 : .float16, leading: leading)
@@ -1485,6 +1557,21 @@ public func sharedHadamardTensorRouteTakesPrompt(
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
     else { return false }
     return first.tensorRouteTakesPrompt(rows: rows, siblings: siblings)
+}
+
+/// True when `sharedHadamardProjections` (or its pre-signed form) over an FP32
+/// activation of a full verify window (`rows` == 16) would run these siblings
+/// on the int8-activation narrow tensor route, quantizing the unpadded
+/// activation with `forwardInt8` (no GDN layout). A quantized rotation formed
+/// elsewhere for these rows then reaches the same matmul through
+/// `sharedHadamardProjectionsQuantized`.
+public func sharedHadamardTensorRouteTakesNarrowInt8(
+    _ siblings: [HadamardQuantizedLinear], rows: Int
+) -> Bool {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return false }
+    return first.tensorRouteTakesNarrowInt8(rows: rows, siblings: siblings)
 }
 
 /// `sharedHadamardProjections` for an input whose quantized rotation is

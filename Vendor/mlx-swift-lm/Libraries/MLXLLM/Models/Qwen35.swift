@@ -229,15 +229,23 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block was submitted
-///   before this graph was built, so without slices the GPU idles from the
-///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - VERIFY (a capture-verify forward). The drafter's block is on the GPU
+///   while the host builds this graph, and the verify's first command buffer
+///   is committed only once all 64 layers are built. When the drafter's GPU
+///   time is shorter than the host's path from the acceptance readback to
+///   that commit (finalize, the leading draft submission, the committed
+///   recurrent state, the rest of the draft, then the ~3 ms verify build),
+///   the GPU idles in between. The default plan is ONE boundary after the
+///   first 8 layers (a LEADING verify submission, the verify's first ~5
+///   command buffers): the GPU gets the front of the verify as soon as it is
+///   built, and the host builds the other 48 layers while it runs. One
+///   boundary rather than periodic slices, because every extra command
+///   buffer at verify width has measured as a cost on the ranked box (slices
+///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
+///   again. Both trunk paths honour it: the plain per-layer loop and the
+///   pending-residual path a verify window takes on the matrix route.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // One leading submission after layer 8 (pochita0's `11cb04a`; see the type's comment);
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [8]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -3290,7 +3300,8 @@ final class Qwen35GatedDeltaNet: Module {
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
         exactTargetVerify: Bool = false,
-        rotatedInput: MLXArray? = nil
+        rotatedInput: MLXArray? = nil,
+        quantizedInput: SignedBlockHadamard.Int8Activation? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -3310,7 +3321,8 @@ final class Qwen35GatedDeltaNet: Module {
             a = exact.3
         } else {
             // Preserve main's fused GDN projection construction and graph.
-            (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, rotated: rotatedInput)
+            (qkv, z, b, a) = projectInputs(
+                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
         }
 
         var convRows: [MLXArray] = []
@@ -4197,6 +4209,8 @@ extension Qwen3NextMLP {
             norm.weight.ndim == 1, norm.weight.dim(0) == transform.width,
             x.ndim >= 2, x.dim(-1) == transform.width,
             sharedHadamardTensorRouteTakesPrompt(siblings, rows: x.size / transform.width)
+                || sharedHadamardTensorRouteTakesNarrowInt8(
+                    siblings, rows: x.size / transform.width)
         else { return nil }
         let folds = Qwen35FusedElementwise.foldsHadamardSigns
         let weight = folds ? gain.gain(norm.weight, signs: transform.signVector) : norm.weight
@@ -4452,6 +4466,8 @@ final class Qwen35DecoderLayer: Module {
             x.ndim >= 2, x.dim(-1) == transform.width,
             inputLayerNorm.weight.ndim == 1, inputLayerNorm.weight.dim(0) == transform.width,
             sharedHadamardTensorRouteTakesPrompt(siblings, rows: x.size / transform.width)
+                || sharedHadamardTensorRouteTakesNarrowInt8(
+                    siblings, rows: x.size / transform.width)
         else { return nil }
         return Qwen35FusedBoundaryQ8.apply(
             x, pending, gain: inputLayerNorm.weight, unsignedGain: inputLayerNorm.weight,
@@ -4504,7 +4520,12 @@ final class Qwen35DecoderLayer: Module {
         if let pending {
             if captureRecurrentWindow {
                 verifyBoundary = fusedInputBoundaryVerify(x, pending)
-                input = verifyBoundary?.h ?? (x + pending)
+                // On the int8-activation narrow route the verify window's
+                // boundary is the quantizing one (`fusedInputBoundary`).
+                if verifyBoundary == nil {
+                    boundary = fusedInputBoundary(x, pending)
+                }
+                input = verifyBoundary?.h ?? boundary?.h ?? (x + pending)
             } else {
                 boundary = fusedInputBoundary(x, pending)
                 input = boundary?.h ?? (x + pending)
@@ -4541,7 +4562,8 @@ final class Qwen35DecoderLayer: Module {
             if captureRecurrentWindow {
                 r = linearAttn!.cbv2ForwardCaptured(
                     layerInput, modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState, rotatedInput: rotated)
+                    recurrentState: recurrentState, rotatedInput: rotated,
+                    quantizedInput: quantized)
             } else {
                 r = linearAttn!.cbv2Forward(
                     layerInput, modelLayerIndex: modelLayerIndex,
@@ -4556,10 +4578,10 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: false, quantizedInput: quantized, rotatedInput: rotated)
         }
         if let dense = mlp as? Qwen3NextMLP,
-            let fused = captureRecurrentWindow
+            let fused = (captureRecurrentWindow
                 ? dense.qwen35ForwardBoundaryVerify(
-                    input, r, norm: postAttentionLayerNorm, gain: signedGain)
-                : dense.qwen35ForwardBoundaryQ8(
+                    input, r, norm: postAttentionLayerNorm, gain: signedGain) : nil)
+                ?? dense.qwen35ForwardBoundaryQ8(
                     input, r, norm: postAttentionLayerNorm, gain: signedGain)
         {
             return (input, fused.h, fused.out)
@@ -4770,26 +4792,32 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary (no early submission: its plan is prompt-only).
+        // verify boundary, and submits early per the verify plan.
         // Where the verify-width tensor route is installed (the int8 form on
-        // the ranked box), the projections take it instead, every verify
-        // boundary declines, and the window keeps the composed per-layer path.
+        // the ranked box), the projections take it instead and every verify
+        // boundary declines; a full window on its int8 form then takes the
+        // pending path with the quantizing boundary (`Qwen35FusedBoundaryQ8`
+        // at 16 rows), and any other window keeps the composed per-layer path.
+        let windowRows = hiddenStates.dim(0) * hiddenStates.dim(1)
         let verifyPending =
             captureRecurrentWindow && !exactTargetVerify && hiddenStates.ndim == 3
             && Qwen35FusedBoundaryQ8.verifyPendingEnabled
-            && Qwen35FusedBoundaryQ8.verifyMayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1))
-            && !HadamardQuantizedLinear.tensorRouteTakesNarrowRows(
-                hiddenStates.dim(0) * hiddenStates.dim(1))
+            && ((Qwen35FusedBoundaryQ8.verifyMayApply(rows: windowRows)
+                && !HadamardQuantizedLinear.tensorRouteTakesNarrowRows(windowRows))
+                || Qwen35FusedBoundaryQ8.narrowMayApply(rows: windowRows))
         let pendingPath =
             verifyPending
             || (!captureRecurrentWindow && hiddenStates.ndim == 3
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // The pending path's early-submission plan: the verify plan for a
+        // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -4825,9 +4853,10 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
-                // GPU the layers built so far, the layer output as `h` and its
-                // pending `f` (both of which the next boundary kernel reads).
+                // EARLY SUBMISSION (prompt pipelining, leading verify) on this
+                // path: hand the GPU the layers built so far, the layer output
+                // as `h` and its pending `f` (both of which the next boundary
+                // kernel reads).
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
@@ -6464,12 +6493,21 @@ enum Qwen35FusedBoundaryQ8 {
         _ x: MLXArray, _ r: MLXArray, gain: MLXArray, unsignedGain: MLXArray, eps: Float,
         transform: SignedBlockHadamard, gainSigned: Bool, writeNormed: Bool
     ) -> Output? {
+        // A full verify window on the int8-activation narrow route (16 rows)
+        // takes the kernel too, under its own 16-row self-test.
+        let narrow = x.size / max(width, 1) < BonsaiPromptWidth.minimumRows
         guard enabled, transform.blockSize == 1024, transform.width == width,
             x.dtype == .float16, r.dtype == .float16, x.shape == r.shape, x.ndim >= 2,
-            x.dim(-1) == width, x.size / width >= BonsaiPromptWidth.minimumRows,
+            x.dim(-1) == width,
+            narrow
+                ? narrowEnabled
+                    && HadamardQuantizedLinear.tensorRouteTakesNarrowInt8Rows(x.size / width)
+                : x.size / width >= BonsaiPromptWidth.minimumRows,
             gain.dtype == .float32, gain.shape == [width],
             unsignedGain.dtype == .float32, unsignedGain.shape == [width],
-            verified(unsignedGain: unsignedGain, eps: eps, transform: transform)
+            narrow
+                ? narrowVerified(unsignedGain: unsignedGain, eps: eps, transform: transform)
+                : verified(unsignedGain: unsignedGain, eps: eps, transform: transform)
         else { return nil }
         return launch(
             x, r, gain: gain, signs: transform.signVector, eps: eps, gainSigned: gainSigned,
@@ -6479,6 +6517,43 @@ enum Qwen35FusedBoundaryQ8 {
     private static let lock = NSLock()
     /// nil until the self-test has run; then whether it passed.
     nonisolated(unsafe) private static var verdict: Bool?
+    /// The verify window on the int8-activation narrow route (16 rows) takes
+    /// the kernel unless `BONSAI_VERIFY_BOUNDARY_Q8=0`: its four composed
+    /// launches (the FP16 add, the norm's cast, `rms_looped`, the quantizing
+    /// rotation) become one, with the same values.
+    static let narrowEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_BOUNDARY_Q8"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    /// True when a verify window of `rows` rows can take the kernel at every
+    /// boundary: a full window on the int8-activation narrow route, and no
+    /// failed 16-row self-test.
+    static func narrowMayApply(rows: Int) -> Bool {
+        guard enabled, narrowEnabled,
+            HadamardQuantizedLinear.tensorRouteTakesNarrowInt8Rows(rows)
+        else { return false }
+        return lock.withLock { narrowVerdict != false }
+    }
+    /// The 16-row verdict, kept apart from the prompt's: 16 rows store the
+    /// codes in the unpermuted row order (`MPERM` off), which the prompt's
+    /// 128- and 512-row cases do not reach when the row tiling is on.
+    nonisolated(unsafe) private static var narrowVerdict: Bool?
+    private static func narrowVerified(
+        unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let narrowVerdict { return narrowVerdict }
+        let report = selfTest(
+            unsignedGain: unsignedGain, eps: eps, transform: transform,
+            cases: [(16, 43), (16, 44)])
+        narrowVerdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai fused boundary q8 (verify window): " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
 
     private static func verified(
         unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard
@@ -6552,7 +6627,8 @@ enum Qwen35FusedBoundaryQ8 {
     /// own entry points on the same inputs; every compared output is viewed
     /// as unsigned integers, so signed zeros and NaN payloads count.
     static func selfTest(
-        unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard
+        unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard,
+        cases: [(Int, Int)] = [(128, 41), (512, 42)]
     ) -> SelfTestReport {
         var report = SelfTestReport()
         do {
@@ -6560,7 +6636,7 @@ enum Qwen35FusedBoundaryQ8 {
                 let signs = transform.signVector
                 // The signed post-attention gain, formed as `Qwen35SignedGain` does.
                 let signedGain = (unsignedGain * signs).asType(unsignedGain.dtype)
-                for (rows, seed) in [(128, 41), (512, 42)] {
+                for (rows, seed) in cases {
                     let scale = MLXRandom.uniform(
                         Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
                     let outlier = MLXArray(
@@ -8236,25 +8312,11 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. nb = n0 + 16*(sg&1)
-        // + fn with fn in {0,4,8,12} and N multiple of 64, so the base is
-        // 4-element aligned. Hot path: support==staged8 (signed + FACTORED).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i++) {
+          const int c = i & 3; const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-          }
+          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
         }
         """
 

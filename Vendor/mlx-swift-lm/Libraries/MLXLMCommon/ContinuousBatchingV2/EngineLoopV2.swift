@@ -2343,6 +2343,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
+        // A step that finalized nothing (the prompt step of a request that
+        // arrived on an idle engine) has no readback to wait for, so its host
+        // work, the prompt forward's graph build and encoding, starts here and
+        // joins the work interval like a round's does. After a readback this is
+        // a no-op: `finalize` already started the interval, so a round's start
+        // is unchanged. Idle steps return above and never start it.
+        if joinedWorkInterval {
+            engineWorkInterval.hostWorkBegan()
+        }
+
         beginMTPPlan()
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
         // plan moves waiting→running) are distinguishable from continuing
