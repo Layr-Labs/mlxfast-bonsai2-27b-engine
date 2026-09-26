@@ -630,9 +630,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private let engineQueue = DispatchQueue(
         label: "com.eigen.cbv2.engine", qos: .userInitiated)
-    /// Keeps each round's host work on a performance core
-    /// (`CBv2EngineWorkInterval`). Engine-queue only.
-    let engineWorkInterval = CBv2EngineWorkInterval()
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -2175,8 +2172,6 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: The step loop
 
     private func engineStep() {
-        let joinedWorkInterval = engineWorkInterval.stepBegan()
-        defer { if joinedWorkInterval { engineWorkInterval.stepEnded() } }
         guard running else { return }
         if let suspendedAt = suspendStepExecutionAtCountForTesting,
             stepCount >= suspendedAt
@@ -3597,7 +3592,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             eval(step.evalTargets)
             CBv2CoreInstrumentation.recordHostSync()
         }
-        engineWorkInterval.hostWorkBegan()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
