@@ -1531,10 +1531,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
-    /// Retained broadcast of `maskTokenEmbedding` for the common single-stream
-    /// block shape `[1, blockSize-1, hidden]`. Rebuilding that broadcast every
-    /// propose round repeats an identical geometry graph.
-    private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1668,22 +1664,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if inputs.dim(1) > 1 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
-            let batch = inputs.dim(0)
-            let cols = inputs.dim(1) - 1
-            let repeatedMasks: MLXArray
-            if batch == 1,
-                let cached = cachedMaskEmbeddingBlock,
-                cached.cols == cols
-            {
-                repeatedMasks = cached.array
-            } else {
-                repeatedMasks = broadcast(
-                    maskEmbedding, to: [batch, cols, config.hiddenSize])
-                if batch == 1 {
-                    eval(repeatedMasks)
-                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
-                }
-            }
+            let repeatedMasks = broadcast(
+                maskEmbedding, to: [inputs.dim(0), inputs.dim(1) - 1, config.hiddenSize])
             embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
