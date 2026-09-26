@@ -1247,6 +1247,12 @@ final class DFlash2CandidateSelector: Module {
         }
         let projected = hiddenProjection(hidden)
 
+        if let path = DFlash2BeamWalk.select(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        {
+            return path
+        }
         if let path = DFlash2GreedyWalk.select(
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
             predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
@@ -1513,6 +1519,179 @@ enum DFlash2GreedyWalk {
             """)
 }
 
+/// A chunk-weighted beam over the same candidate lists and the same scores.
+///
+/// The selector's score of a path is a chain: each position's unary logit
+/// plus the low-rank edge from the token before it. The greedy walk commits
+/// one position at a time, so it can take a token whose best continuation is
+/// poor. The target accepts a block only as a prefix, so what matters is the
+/// chance that the FIRST positions are right together. This walk keeps the
+/// `width` best partial paths at every position and returns the best complete
+/// one, with every position's score weighted by `decay^(position / chunk)`:
+/// the first chunk is chosen jointly and dominates, and each later chunk
+/// weighs in at a fraction, so the front of the block is not traded away for
+/// the back. The per-position normalizer of the logits is the same for every
+/// path, so raw logits compare paths exactly as log-probabilities would.
+///
+/// `width = 1` is the greedy walk's path. `MLXFAST_DFLASH_BEAM=0` restores
+/// the greedy walk; `MLXFAST_DFLASH_BEAM_WIDTH` (16), `_CHUNK` (4) and
+/// `_DECAY` (0.65) set the search. The default chunk is the drafter's
+/// trained depth (block 8, depth 7): its first seven positions are chosen
+/// jointly at full weight, and the positions past its training weigh less.
+enum DFlash2BeamWalk {
+    private static let environment = ProcessInfo.processInfo.environment
+
+    static let enabled: Bool = {
+        let value = environment["MLXFAST_DFLASH_BEAM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    static let width: Int = min(32, max(1, Int(environment["MLXFAST_DFLASH_BEAM_WIDTH"] ?? "") ?? 16))
+    static let chunk: Int = max(1, Int(environment["MLXFAST_DFLASH_BEAM_CHUNK"] ?? "") ?? 7)
+    static let decay: Float = min(1, max(0.05, Float(environment["MLXFAST_DFLASH_BEAM_DECAY"] ?? "") ?? 0.65))
+
+    static func weights(length: Int) -> [Float] {
+        (0 ..< length).map { Float(pow(Double(decay), Double($0 / chunk))) }
+    }
+
+    static func select(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray? {
+        guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
+            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
+        else { return nil }
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(-1)
+        // The edge table lives in threadgroup memory: (L - 1) * K * K floats.
+        guard length >= 2, length <= 64, k >= 1, k <= 32, rank > 0,
+            (length - 1) * k * k <= 4096
+        else { return nil }
+        let c = candidates[0]
+        let anchorPredecessor = take(predecessorCodebook, anchor, axis: 0)
+            .asType(.float32).reshaped([-1])
+        let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            .asType(.float32).reshaped([-1])
+        let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
+        let projectedRows = projected[0].asType(.float32).reshaped([-1])
+        let scores = unary[0].asType(.float32).reshaped([-1])
+        let candidateIds = c.asType(.uint32).reshaped([-1])
+        let positionWeights = MLXArray(weights(length: length), [length])
+        let path = kernel(
+            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds,
+             positionWeights],
+            // One thread per expansion: at most 256 live expansions per step.
+            template: [("L", length), ("K", k), ("R", rank), ("B", min(width, 256 / k))],
+            grid: (256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+        return path.reshaped([1, length])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_chunk_beam_walk",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand", "weights",
+        ],
+        outputNames: ["path"],
+        source: """
+            const uint t = thread_index_in_threadgroup;
+            constexpr uint NT = 256;
+            // Weighted position scores: S0[b] for position 0 (edge from the
+            // anchor), E[((i - 1) * K + a) * K + b] for position i >= 1 (edge
+            // from slot a of position i - 1), each unary + edge, times the
+            // position's weight. Same products and order as the greedy walk.
+            threadgroup float S0[K];
+            threadgroup float E[(L - 1) * K * K];
+            threadgroup float beam_score[2][B];
+            threadgroup ushort beam_path[2][B][L];
+            for (uint b = t; b < uint(K); b += NT) {
+                float edge = 0.0f;
+                const device float* succ_ptr = next + b * R;
+                for (uint d = 0; d < uint(R); d++) {
+                    edge += (anchor_predecessor[d] * projected[d]) * succ_ptr[d];
+                }
+                S0[b] = (unary[b] + edge) * weights[0];
+            }
+            for (uint e = t; e < uint((L - 1) * K * K); e += NT) {
+                const uint i1 = e / uint(K * K);
+                const uint a = (e / uint(K)) % uint(K);
+                const uint b = e % uint(K);
+                const uint i = i1 + 1;
+                const device float* pred_ptr = previous + (i1 * K + a) * R;
+                const device float* proj_ptr = projected + i * R;
+                const device float* succ_ptr = next + (i * K + b) * R;
+                float edge = 0.0f;
+                for (uint d = 0; d < uint(R); d++) {
+                    edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                }
+                E[e] = (unary[i * K + b] + edge) * weights[i];
+            }
+            threadgroup float cand_score[NT];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Beam step, all threads at once: thread t holds the expansion
+            // (beam j = t / K, slot b = t % K); its rank is the number of
+            // expansions that score higher, or equal with a lower index, so
+            // ties keep the lower beam and slot as the greedy walk does.
+            // Ranks below B become the next beams.
+            uint cur = 0;
+            uint nb = 1;
+            {
+                const float s = t < uint(K) ? S0[t] : -INFINITY;
+                cand_score[t] = s;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (t < uint(K)) {
+                    uint rank = 0;
+                    for (uint u = 0; u < uint(K); u++) {
+                        const float o = cand_score[u];
+                        rank += (o > s || (o == s && u < t)) ? 1u : 0u;
+                    }
+                    if (rank < uint(B)) {
+                        beam_score[0][rank] = s;
+                        beam_path[0][rank][0] = ushort(t);
+                    }
+                }
+                nb = min(uint(B), uint(K));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (uint i = 1; i < uint(L); i++) {
+                const uint live = nb * uint(K);
+                const uint j = t / uint(K);
+                const uint b = t % uint(K);
+                float s = -INFINITY;
+                if (t < live) {
+                    const uint last = uint(beam_path[cur][j][i - 1]);
+                    s = beam_score[cur][j] + E[((i - 1) * K + last) * K + b];
+                }
+                cand_score[t] = s;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint nxt = cur ^ 1u;
+                if (t < live) {
+                    uint rank = 0;
+                    for (uint u = 0; u < live; u++) {
+                        const float o = cand_score[u];
+                        rank += (o > s || (o == s && u < t)) ? 1u : 0u;
+                    }
+                    if (rank < uint(B)) {
+                        beam_score[nxt][rank] = s;
+                        for (uint p = 0; p < i; p++) {
+                            beam_path[nxt][rank][p] = beam_path[cur][j][p];
+                        }
+                        beam_path[nxt][rank][i] = ushort(b);
+                    }
+                }
+                nb = min(uint(B), live);
+                cur = nxt;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (t < uint(L)) {
+                path[t] = int(cand[t * K + uint(beam_path[cur][0][t])]);
+            }
+            """)
+}
+
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
@@ -1531,6 +1710,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
+    /// Retained broadcast of `maskTokenEmbedding` for the common single-stream
+    /// block shape `[1, blockSize-1, hidden]`. Rebuilding that broadcast every
+    /// propose round repeats an identical geometry graph.
+    private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1664,8 +1847,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if inputs.dim(1) > 1 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
-            let repeatedMasks = broadcast(
-                maskEmbedding, to: [inputs.dim(0), inputs.dim(1) - 1, config.hiddenSize])
+            let batch = inputs.dim(0)
+            let cols = inputs.dim(1) - 1
+            let repeatedMasks: MLXArray
+            if batch == 1,
+                let cached = cachedMaskEmbeddingBlock,
+                cached.cols == cols
+            {
+                repeatedMasks = cached.array
+            } else {
+                repeatedMasks = broadcast(
+                    maskEmbedding, to: [batch, cols, config.hiddenSize])
+                if batch == 1 {
+                    eval(repeatedMasks)
+                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
+                }
+            }
             embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
