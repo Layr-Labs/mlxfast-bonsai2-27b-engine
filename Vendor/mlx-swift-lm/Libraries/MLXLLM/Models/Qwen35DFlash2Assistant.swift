@@ -219,7 +219,13 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0
-        for rows in [512, 513] + Array(1 ... block) {
+        // EXPERIMENT (single change): back to `[513]`, the pre-`5fbfa003`
+        // warm set. The 512-row entry is mine, and it is one of four items
+        // that entered at `3baf5cb4` — the boundary where the fast verify
+        // window stops appearing. It is the only one of the four whose
+        // removal costs nothing on the prompt path, so it is the cheapest
+        // way to test whether any of them is the cause.
+        for rows in [513] + Array(1 ... block) {
             let context = MLXArray.zeros([1, rows, width], dtype: drafter.dtype)
             guard
                 let tokens = try? drafter.propose(
