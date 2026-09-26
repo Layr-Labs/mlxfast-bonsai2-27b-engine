@@ -659,11 +659,17 @@ extension DFlash2Attention {
                     contextLength: contextLength, slidingWindow: slidingWindow) == 0
             else { return false }
         }
+        // The prompt's committed rows need K and V but no Q.  Project them
+        // together from the K/V slice of the existing QKV stack, avoiding a
+        // second BF16 GEMM without evaluating and throwing away prompt Q.
+        let projected = qkv.applyKV(context, q: qProj, k: kProj, v: vProj)
+        let rawKeys = projected?.keys ?? kProj(context)
+        let rawValues = projected?.values ?? vProj(context)
         let keys = rope(
-            kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+            kNorm(rawKeys.reshaped(B, contextLength, kvHeads, -1))
                 .transposed(0, 2, 1, 3),
             offset: cache.offset)
-        let values = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+        let values = rawValues.reshaped(B, contextLength, kvHeads, -1)
             .transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
@@ -683,6 +689,11 @@ private final class DFlash2QKVStack {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    private static let absorbKVEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_ABSORB_KV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
     private var weight: MLXArray?
     private var qEnd = 0
     private var kEnd = 0
@@ -691,6 +702,31 @@ private final class DFlash2QKVStack {
         weight = nil
         qEnd = 0
         kEnd = 0
+    }
+
+    /// Use the K/V rows of the already-stacked QKV weights when absorbing
+    /// committed context.  The slice is contiguous and excludes Q entirely.
+    /// The normal two-projection path remains available for other dtypes,
+    /// checkpoint layouts, and A/B timing (`DARKBLOOM_DFLASH2_ABSORB_KV=0`).
+    func applyKV(
+        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
+    ) -> (keys: MLXArray, values: MLXArray)? {
+        guard Self.enabled, Self.absorbKVEnabled,
+            q.bias == nil, k.bias == nil, v.bias == nil,
+            q.weight.ndim == 2, k.weight.ndim == 2, v.weight.ndim == 2,
+            q.weight.dtype == k.weight.dtype, k.weight.dtype == v.weight.dtype,
+            q.weight.dim(1) == k.weight.dim(1), k.weight.dim(1) == v.weight.dim(1),
+            rows.ndim == 3, rows.dim(1) > 0, rows.dim(2) == k.weight.dim(1),
+            rows.dtype == k.weight.dtype
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([q.weight, k.weight, v.weight], axis: 0)
+            qEnd = q.weight.dim(0)
+            kEnd = qEnd + k.weight.dim(0)
+        }
+        let output = matmul(rows, weight![qEnd..., 0...].T)
+        let keyWidth = kEnd - qEnd
+        return (output[.ellipsis, ..<keyWidth], output[.ellipsis, keyWidth...])
     }
 
     /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
