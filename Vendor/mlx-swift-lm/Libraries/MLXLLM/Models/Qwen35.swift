@@ -232,12 +232,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// - VERIFY (a capture-verify forward). The drafter's block was submitted
 ///   before this graph was built, so without slices the GPU idles from the
 ///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default off: on the ranked
+///   box the verify round is GPU-bound end to end and the sliced tree's
+///   window read slower than the single-submission tree's; `2` restores the
+///   every-two-layers plan); `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns
+///   it off.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +291,7 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        return Plan.parse(
-            env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 2, offset: 0, explicit: nil))
+        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -736,11 +733,13 @@ enum Qwen35GatedDeltaChunked {
     /// and inputs), which is exactly what `chunks` returns. A window that is
     /// not a whole number of chunks stays on the sequential kernel: a
     /// sequential tail costs more than it saves at these widths.
-    /// `MLXFAST_GDN_CHUNKED_VERIFY=0` keeps verify on the sequential kernel.
+    /// Default off (the register-resident sequential kernel is bit-identical
+    /// to the replay and was the faster verify on the ranked box);
+    /// `MLXFAST_GDN_CHUNKED_VERIFY=1` takes the chunked kernels at verify.
     static let verifyEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED_VERIFY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
+        return enabled && ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     static func runVerify(

@@ -1728,9 +1728,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 }
 
 /// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
-/// Default: after the first layer, so the GPU starts the block (it has been
-/// idle since the verify readback) while the host builds the other layers and
-/// the head; measured locally ~0.2-0.4% decode. `MLXFAST_DRAFT_SLICE_LAYERS`
+/// Default: none (one submission, as the promoted drafter ran on the ranked
+/// box); `1` submits after the first layer. `MLXFAST_DRAFT_SLICE_LAYERS`
 /// overrides it with a `,`/`;` list of counts (a count equal to the layer
 /// count submits the trunk before the head); `0`/`off` turns it off.
 enum DFlash2DraftSubmission {
@@ -1738,7 +1737,7 @@ enum DFlash2DraftSubmission {
         guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             !raw.isEmpty
-        else { return [1] }
+        else { return [] }
         if ["0", "off", "false", "no"].contains(raw) { return [] }
         return raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
             Int($0.trimmingCharacters(in: .whitespaces))
