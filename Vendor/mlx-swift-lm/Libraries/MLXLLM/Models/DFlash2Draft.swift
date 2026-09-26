@@ -1477,6 +1477,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
+    /// Retained mask-token id row for the active block size. At fixed ranked
+    /// depth the mask ids are identical every round; only the anchor column
+    /// changes. Held as a plain property (same pattern as `maskTokenEmbedding`),
+    /// never a `@Parameter`, so reflection cannot add it to the weight tree.
+    private var cachedMaskTokenIds: (blockSize: Int, ids: MLXArray)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1658,6 +1663,20 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     ///   - targetHidden: the fused target hidden state of the positions the
     ///     target has already consumed, `[B, contextLength, targetHiddenSize]`.
     /// - Returns: the draft tokens, `[B, blockSize - 1]`.
+    /// Mask-token id row `[1, blockSize - 1]` reused across propose rounds.
+    /// Ranked DFlash depth is fixed, so reconstructing this host Int32 vector
+    /// and a fresh `MLXArray` every round is redundant.
+    private func maskTokenIdRow(blockSize: Int) -> MLXArray {
+        if let cached = cachedMaskTokenIds, cached.blockSize == blockSize {
+            return cached.ids
+        }
+        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+        let ids = MLXArray(masks, [1, blockSize - 1])
+        eval(ids)
+        cachedMaskTokenIds = (blockSize: blockSize, ids: ids)
+        return ids
+    }
+
     public func propose(
         anchor: [Int],
         targetHidden: MLXArray,
@@ -1665,16 +1684,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         blockSize: Int
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
-        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
-        let rows = anchor.flatMap { [Int32($0)] + masks }
-        let block = MLXArray(rows, [anchor.count, blockSize])
+        // Anchor column is round-specific; mask columns are constant at fixed
+        // depth. Reuse the retained mask-id row and concatenate instead of
+        // rebuilding the full host Int32 block every round.
+        let anchorIds = MLXArray(anchor.map { Int32($0) }, [anchor.count, 1])
+        let maskIds = maskTokenIdRow(blockSize: blockSize)
+        let masks =
+            anchor.count == 1
+            ? maskIds : broadcast(maskIds, to: [anchor.count, blockSize - 1])
+        let block = concatenated([anchorIds, masks], axis: 1)
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: MLXArray(anchor.map { Int32($0) }))
+            anchor: anchorIds.reshaped([anchor.count]))
     }
 
     // MARK: Loading
