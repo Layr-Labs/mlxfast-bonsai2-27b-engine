@@ -747,6 +747,13 @@ private let dflash2NoMaskEnabled: Bool = {
 /// state between blocks: a block is a fresh sequence, and context reaches the
 /// block through attention only.
 final class DFlash2GroupedDynamicCausalConv: Module {
+    private static let tensorProjectionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_TENSOR_PROJECTION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
     let kernelSize: Int
     let groupSize: Int
     let groups: Int
@@ -841,7 +848,8 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic-tap
     /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let projection = kernelProjection(hidden)
+        let projection = Self.tensorProjectionEnabled
+            ? DFlash2TensorMatmul.linear(kernelProjection, hidden) : kernelProjection(hidden)
         if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
             return (fused, projection)
         }
