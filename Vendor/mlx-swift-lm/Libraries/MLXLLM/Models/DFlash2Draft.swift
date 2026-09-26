@@ -454,6 +454,10 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
+        // The comparison graph is the same for every layer of every later
+        // round with this geometry. Realize it once, here, so those rounds
+        // read the stored mask instead of replaying the graph.
+        eval(made)
         key = requested
         cached = made
         return made
