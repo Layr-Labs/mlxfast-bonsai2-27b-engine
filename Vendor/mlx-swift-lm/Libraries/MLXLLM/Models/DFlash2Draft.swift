@@ -454,6 +454,7 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
+        eval(made)
         key = requested
         cached = made
         return made

@@ -229,15 +229,23 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block was submitted
-///   before this graph was built, so without slices the GPU idles from the
-///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - VERIFY (a capture-verify forward). The drafter's block is on the GPU
+///   while the host builds this graph, and the verify's first command buffer
+///   is committed only once all 64 layers are built. When the drafter's GPU
+///   time is shorter than the host's path from the acceptance readback to
+///   that commit (finalize, the leading draft submission, the committed
+///   recurrent state, the rest of the draft, then the ~3 ms verify build),
+///   the GPU idles in between. The default plan is ONE boundary after the
+///   first 16 layers (a LEADING verify submission, the verify's first ~10
+///   command buffers): the GPU gets the front of the verify as soon as it is
+///   built, and the host builds the other 48 layers while it runs. One
+///   boundary rather than periodic slices, because every extra command
+///   buffer at verify width has measured as a cost on the ranked box (slices
+///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
+///   again. Both trunk paths honour it: the plain per-layer loop and the
+///   pending-residual path a verify window takes on the matrix route.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // One leading submission after layer 16 (see the type's comment);
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [16]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -3663,7 +3673,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3953,19 +3963,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3980,18 +4014,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -4770,7 +4806,7 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary (no early submission: its plan is prompt-only).
+        // verify boundary, and submits early per the verify plan.
         // Where the verify-width tensor route is installed (the int8 form on
         // the ranked box), the projections take it instead, every verify
         // boundary declines, and the window keeps the composed per-layer path.
@@ -4786,10 +4822,13 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // The pending path's early-submission plan: the verify plan for a
+        // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -4825,9 +4864,10 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
-                // GPU the layers built so far, the layer output as `h` and its
-                // pending `f` (both of which the next boundary kernel reads).
+                // EARLY SUBMISSION (prompt pipelining, leading verify) on this
+                // path: hand the GPU the layers built so far, the layer output
+                // as `h` and its pending `f` (both of which the next boundary
+                // kernel reads).
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
@@ -8381,6 +8421,462 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // `sourceStaged8` over a TM x TN output tile (TM, TN in {64, 128}):
+    // TM / 64 x TN / 64 ops of 64 x 64 x 128 per group. Every column tile
+    // re-reads the whole activation, so the two ops of a 128-column tile
+    // reading one A slice halve that traffic; the two ops of a 128-row tile
+    // share each staged weight slice (half the 2-bit staging). DB = 2
+    // double-buffers the staged slices as `sourceStaged8` does; DB = 1 keeps
+    // one buffer (half the threadgroup memory, so a 128-column tile still fits
+    // two threadgroups per core) and holds the next group's words in registers
+    // across the ops. Each output element is still the same 64 x 64 x 128 op
+    // over the same codes, then the same epilogue in the same group order:
+    // bitwise identical to `sourceStaged8`, which the load-time self-test
+    // checks per variant (`choosePromptTiles`). grid: (N / TN * 128, M / TM,
+    // 1), threadgroup (128, 1, 1); same inputs and templates plus TM, TN, DB.
+    private static let sourceStaged8Tiled = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        constexpr int MT = TM / 64;
+        constexpr int NT = TN / 64;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const int m0 = int(threadgroup_position_in_grid.y) * TM;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        // staged B: TN columns x 128 codes as int8 bytes, k inner; column half
+        // h (64 columns, one op's operand) at word 2048 * h of a buffer
+        threadgroup uint32_t bs[DB][TN * 32];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B00((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B01((threadgroup CodeT*)(bs[0] + 2048 * (NT - 1)), dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B10((threadgroup CodeT*)bs[DB - 1], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B11((threadgroup CodeT*)(bs[DB - 1] + 2048 * (NT - 1)), dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        // cT<r><h>: the op over row tile r and column half h
+        auto cT00 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT01 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT10 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT11 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[MT * NT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        // Row-tiled constants: this lane's four rows of row tile r are adjacent
+        // in 64-row tile m0 / 64 + r.
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        // staging: thread t -> column t >> 1 of each column half, K half t & 1
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        const size_t wstep = (size_t)64 * (size_t)(K / 16);
+        uint4 wq[NT];
+        auto fetch = [&](int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) { wq[h] = *(const device uint4*)(wrow + h * wstep + g * 8); }
+        };
+        auto put = [&](int buf) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            threadgroup uint32_t* dst = bs[buf] + 2048 * h + sc * 32 + sh * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const uint32_t wv = wq[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        fetch(0);
+        put(0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < Kg; g++) {
+          const int cur = DB == 2 ? (g & 1) : 0;
+          if (g + 1 < Kg) {
+            fetch(g + 1);
+            if (DB == 2) { put(cur ^ 1); }
+          }
+          auto tAr0 = A.template slice<128, 64>(g * 128, m0);
+          auto tAr1 = A.template slice<128, 64>(g * 128, m0 + 64 * (MT - 1));
+          if (cur == 0) {
+            op.run(tAr0, B00, cT00);
+            if (NT == 2) { op.run(tAr0, B01, cT01); }
+            if (MT == 2) { op.run(tAr1, B00, cT10); }
+            if (MT == 2 && NT == 2) { op.run(tAr1, B01, cT11); }
+          } else {
+            op.run(tAr0, B10, cT00);
+            if (NT == 2) { op.run(tAr0, B11, cT01); }
+            if (MT == 2) { op.run(tAr1, B10, cT10); }
+            if (MT == 2 && NT == 2) { op.run(tAr1, B11, cT11); }
+          }
+          float4 s0[NT], s1[NT], b0[NT], b1[NT], u0[NT], u1[NT];
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            s0[h] = float4(sp0[g * NQ + 16 * h]); s1[h] = float4(sp1[g * NQ + 16 * h]);
+            if constexpr (NEGATIVE_SCALE_BIAS) {
+              b0[h] = -s0[h]; b1[h] = -s1[h];
+            } else {
+              b0[h] = float4(bp0[g * NQ + 16 * h]); b1[h] = float4(bp1[g * NQ + 16 * h]);
+            }
+            u0[h] = 0.0f; u1[h] = 0.0f;
+            if (!SIGNED) { u0[h] = up0[g * NQ + 16 * h]; u1[h] = up1[g * NQ + 16 * h]; }
+          }
+          float as[MT][4], rb[MT][4];
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < MT; r++) {
+            if (MPERM) {
+              const size_t tb = tbase + (size_t)r * (size_t)Kg * 64 + (size_t)g * 64;
+              const float4 as4 = *(const device float4*)(ascale + tb);
+              const float4 rb4 = *(const device float4*)(rsb + tb);
+              as[r][0] = as4.x; as[r][1] = as4.y; as[r][2] = as4.z; as[r][3] = as4.w;
+              rb[r][0] = rb4.x; rb[r][1] = rb4.y; rb[r][2] = rb4.z; rb[r][3] = rb4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4; q++) {
+                as[r][q] = ascale[(mrow[q] + 64 * r) * Kg + g]; rb[r][q] = rsb[(mrow[q] + 64 * r) * Kg + g];
+              }
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < MT * NT; t++) {
+            const int r = t / NT; const int h = t % NT;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+              const int ci = r == 0 ? (h == 0 ? cT00[i] : cT01[i]) : (h == 0 ? cT10[i] : cT11[i]);
+              const float s = nh ? s1[h][c] : s0[h][c];
+              const float b = nh ? b1[h][c] : b0[h][c];
+              const float u = nh ? u1[h][c] : u0[h][c];
+              const float tv = SIGNED ? s * float(ci) : fma(s, float(ci), u);
+              acc[t][i] = fma(b, rb[r][mh], fma(as[r][mh], tv, acc[t][i]));
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (DB == 1 && g + 1 < Kg) {
+            put(0);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mm = mb + 64 * r + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            out[(size_t)mm * N + nb + 64 * h + c + 32 * nh] = OutT(acc[t][i]);
+          }
+        }
+        """
+
+    private static let kernelStaged8Tiled = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_tiled",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Tiled,
+        header: header,
+        ensureRowContiguous: true)
+
+    // MARK: - Prompt int8 kernel tile choice
+
+    /// A prompt-width int8-staged kernel: `original` is `sourceStaged8` (64 x
+    /// 64, double-buffered); any other value is `sourceStaged8Tiled` over a
+    /// `tm` x `tn` output tile with `db` staging buffers.
+    struct PromptTile: Hashable, CustomStringConvertible {
+        var tm: Int, tn: Int, db: Int
+        static let original = PromptTile(tm: 64, tn: 64, db: 0)
+        var description: String { self == .original ? "base" : "\(tm)x\(tn)x\(db)" }
+        /// True when this is a tiled kernel whose tile divides `[m, n]`.
+        func takes(m: Int, n: Int) -> Bool { self != .original && m % tm == 0 && n % tn == 0 }
+    }
+
+    /// The candidates, in the order the self-test tries them under its
+    /// deadline: the 128-column tile first (half the activation traffic), with
+    /// one buffer (two threadgroups per core) and with two (overlapped
+    /// staging); then the 128-row tile, the 128 x 128 tile and the one-buffer
+    /// 64 x 64 tile. `128x128x2` (32 KB of staging) runs only on request.
+    static let promptTileCandidates: [PromptTile] = [
+        PromptTile(tm: 64, tn: 128, db: 1), PromptTile(tm: 64, tn: 128, db: 2),
+        PromptTile(tm: 128, tn: 64, db: 2), PromptTile(tm: 128, tn: 64, db: 1),
+        PromptTile(tm: 128, tn: 128, db: 1), PromptTile(tm: 64, tn: 64, db: 1),
+    ]
+
+    /// The prompt window's production shapes `(k, n)`, timed at 512 rows:
+    /// qkv|z, attention qkv, o, gate|up, down.
+    static let promptTunedShapes = [
+        (5120, 16384), (5120, 14336), (6144, 5120), (5120, 34816), (17408, 5120),
+    ]
+
+    /// The load-time choice (see `choosePromptTiles`): per production shape
+    /// `[k, n]`, and a default for every other shape. `original` until then,
+    /// and everywhere under `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE=off`.
+    nonisolated(unsafe) static var promptTileDefault = PromptTile.original
+    nonisolated(unsafe) static var promptTileByShape: [[Int]: PromptTile] = [:]
+
+    /// The kernel for an `[m, k] x [k, n]` prompt matmul: the choice for its
+    /// shape (else the default) where its tile divides `[m, n]`, else `original`.
+    static func promptTile(k: Int, n: Int, m: Int) -> PromptTile {
+        let tile = promptTileByShape[[k, n]] ?? promptTileDefault
+        return tile.takes(m: m, n: n) ? tile : .original
+    }
+
+    /// One launch of the int8-staged prompt kernel `tile`. `template` carries
+    /// OutT, MPERM, SIGNED and NEGATIVE_SCALE_BIAS; the tiled kernel appends
+    /// its tile. `kernelStaged8` wherever the tile does not divide `[m, n]`.
+    static func launchStaged8(
+        _ inputs: [MLXArray], template: [(String, any KernelTemplateArg)], m: Int, n: Int,
+        outputDType: DType, tile: PromptTile
+    ) -> MLXArray {
+        if tile.takes(m: m, n: n),
+            let y = kernelStaged8Tiled(
+                inputs, template: template + [("TM", tile.tm), ("TN", tile.tn), ("DB", tile.db)],
+                grid: (n / tile.tn * 128, m / tile.tm, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType]
+            ).first
+        {
+            return y
+        }
+        return kernelStaged8(
+            inputs, template: template,
+            grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Synthetic operands for the prompt kernel choice: `m` rows of codes in
+    /// the route's form (signed int8 when `signedCodes`), random 2-bit words,
+    /// FP16 scales of both signs (zeros and signed zeros included) with
+    /// offsets that are their FP16 negations bit for bit (the pattern
+    /// NEGATIVE_SCALE_BIAS = 1 relies on), independent offsets for
+    /// NEGATIVE_SCALE_BIAS = 0, folded code sums, and FP32 activation scales
+    /// and scaled sums (read row-tiled when `rowTiledConstants`, so every
+    /// 64-row tile's constants differ). Nothing depends on a request.
+    private struct PromptOperands {
+        let k: Int, n: Int, m: Int
+        let codes: MLXArray, weight: MLXArray
+        let scalesT: MLXArray, negatedT: MLXArray, biasesT: MLXArray, foldedSums: MLXArray
+        let ascale: MLXArray, rsb: MLXArray
+
+        init(k: Int, n: Int, m: Int, seed: UInt64) {
+            self.k = k
+            self.n = n
+            self.m = m
+            let kg = k / 128
+            func key(_ i: UInt64) -> MLXArray { MLXRandom.key(seed &* 16 &+ i) }
+            codes =
+                signedCodes
+                ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: key(0)).asType(.int8)
+                : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: key(0)).asType(.uint8)
+            weight = MLXRandom.randInt(Int32(0) ..< Int32(65536), [n, k / 8], key: key(1))
+                .asType(.uint16).view(dtype: .uint32)
+            var s = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [n, kg], key: key(2))
+            let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [n, kg], key: key(3))
+            s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+            s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+            let scales = s.asType(.float16)
+            scalesT = scales.transposed(1, 0).contiguous()
+            negatedT = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000)))
+                .view(dtype: .float16).transposed(1, 0).contiguous()
+            biasesT = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(4))
+                .asType(.float16)
+            foldedSums = MLXRandom.normal([kg, n], key: key(5)) * Float(100)
+            ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: key(6))
+            rsb = MLXRandom.normal([m, kg], key: key(7)) * Float(50)
+            eval(codes, weight, scalesT, negatedT, biasesT, foldedSums, ascale, rsb)
+        }
+
+        func run(_ tile: PromptTile, _ outputDType: DType, negativeScaleBias: Bool) -> MLXArray {
+            let template: [(String, any KernelTemplateArg)] = [
+                ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                ("SIGNED", signedCodes ? 1 : 0),
+                ("NEGATIVE_SCALE_BIAS", negativeScaleBias ? 1 : 0),
+            ]
+            return launchStaged8(
+                [codes, weight, scalesT, negativeScaleBias ? negatedT : biasesT, foldedSums,
+                 ascale, rsb, dimsArray(k: k, m: m, n: n)],
+                template: template, m: m, n: n, outputDType: outputDType, tile: tile)
+        }
+    }
+
+    /// Chooses the prompt int8 kernel once, at load, on the running GPU.
+    ///
+    /// Self-test: each candidate runs against `original` on synthetic 512-row
+    /// operands (three shapes, see `PromptOperands`) and must match every
+    /// output bit in the production form (FP16 output, NEGATIVE_SCALE_BIAS =
+    /// 1); a mismatch or any MLX error (a failed compile included) drops it,
+    /// and a candidate not started within 1.5 s is skipped. Timing: the
+    /// survivors and `original` run alternately on the five production shapes
+    /// at 512 rows, best of five; each shape keeps its fastest kernel and every
+    /// other shape takes the fastest in total. Each picked kernel must then
+    /// also match in the remaining forms (FP32 output; NEGATIVE_SCALE_BIAS = 0
+    /// with independent offsets, both outputs), or it is dropped and the picks
+    /// redone. Runs at model init, before any timed phase, and builds the
+    /// chosen pipelines. `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE=off` keeps
+    /// `original` everywhere (kill switch); a comma list of `TMxTNxDB` (for
+    /// example `64x128x1,128x64x2`) replaces the candidates.
+    private static func choosePromptTiles() -> (PromptTile, [[Int]: PromptTile]) {
+        let raw =
+            ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        // Off unless asked for (`on` or a tile list): carried onto the record
+        // with the wider verify set, the tiles came with seed and prefill legs
+        // no shorter than the record's on the ranked box.
+        if raw.isEmpty || ["off", "0", "false", "no", "base"].contains(raw) { return (.original, [:]) }
+        let requested = raw.split(separator: ",").compactMap { item -> PromptTile? in
+            let v = item.split(separator: "x").compactMap { Int($0) }
+            guard v.count == 3, [64, 128].contains(v[0]), [64, 128].contains(v[1]),
+                [1, 2].contains(v[2])
+            else { return nil }
+            return PromptTile(tm: v[0], tn: v[1], db: v[2])
+        }
+        let candidates = requested.isEmpty ? promptTileCandidates : requested
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+        var log = "bonsai prompt int8 tiles:"
+        var passed: [PromptTile] = []
+        var failed: [PromptTile] = []
+        var skipped: [PromptTile] = []
+        var failedLate = Set<PromptTile>()
+        var timings: [PromptTile: [Double]] = [:]
+        var byShape: [[Int]: PromptTile] = [:]
+        var fallback = PromptTile.original
+        do {
+            try withError { error in
+                let testOps = [(5120, 1024, UInt64(91)), (17408, 256, UInt64(92)), (1536, 384, UInt64(93))]
+                    .map { PromptOperands(k: $0.0, n: $0.1, m: 512, seed: $0.2) }
+                try error.check()
+                // True when `tile` matches `original` bit for bit in every
+                // `(output dtype, NEGATIVE_SCALE_BIAS)` form; false on a
+                // mismatch or on any MLX error inside (scoped to this call).
+                func matches(_ tile: PromptTile, _ forms: [(DType, Bool)]) -> Bool {
+                    do {
+                        return try withError { scoped in
+                            for (outputDType, negative) in forms {
+                                let bits: DType = outputDType == .float16 ? .uint16 : .uint32
+                                for ops in testOps {
+                                    let reference = ops.run(.original, outputDType, negativeScaleBias: negative)
+                                    let y = ops.run(tile, outputDType, negativeScaleBias: negative)
+                                    let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                                        .asType(.int32).sum()
+                                    eval(differ)
+                                    try scoped.check()
+                                    if differ.item(Int32.self) != 0 { return false }
+                                }
+                            }
+                            return true
+                        }
+                    } catch {
+                        return false
+                    }
+                }
+                for tile in candidates {
+                    if elapsedMs() > 1500 { skipped.append(tile); continue }
+                    if matches(tile, [(.float16, true)]) { passed.append(tile) } else { failed.append(tile) }
+                }
+                guard !passed.isEmpty else { return }
+
+                let kernels = [PromptTile.original] + passed
+                let sets = promptTunedShapes.enumerated().map { (index, shape) in
+                    PromptOperands(k: shape.0, n: shape.1, m: 512, seed: 100 + UInt64(index))
+                }
+                for kernel in kernels {
+                    eval(sets.map { $0.run(kernel, .float16, negativeScaleBias: true) })
+                }
+                try error.check()
+                for kernel in kernels { timings[kernel] = Array(repeating: .infinity, count: sets.count) }
+                for _ in 0 ..< 5 {
+                    for (index, ops) in sets.enumerated() {
+                        for kernel in kernels {
+                            let outs = (0 ..< 2).map { _ in
+                                ops.run(kernel, .float16, negativeScaleBias: true)
+                            }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
+                                / Double(outs.count)
+                            timings[kernel]![index] = min(timings[kernel]![index], us)
+                        }
+                    }
+                }
+                try error.check()
+
+                // Picks, then the remaining forms for each picked kernel; a
+                // kernel failing them is dropped and the picks redone.
+                var verified = Set<PromptTile>()
+                while true {
+                    let usable = kernels.filter { !failedLate.contains($0) }
+                    func fastest(_ cost: (PromptTile) -> Double) -> PromptTile {
+                        usable.min { cost($0) < cost($1) } ?? .original
+                    }
+                    fallback = fastest { timings[$0]!.reduce(0, +) }
+                    byShape = [:]
+                    for (index, shape) in promptTunedShapes.enumerated() {
+                        byShape[[shape.0, shape.1]] = fastest { timings[$0]![index] }
+                    }
+                    var clean = true
+                    for tile in Set([fallback] + Array(byShape.values)).subtracting([.original])
+                    where !verified.contains(tile) {
+                        if matches(tile, [(.float32, true), (.float16, false), (.float32, false)]) {
+                            verified.insert(tile)
+                        } else {
+                            failedLate.insert(tile)
+                            clean = false
+                        }
+                    }
+                    if clean { break }
+                }
+            }
+        } catch {
+            byShape = [:]
+            fallback = .original
+            log += " error \(error);"
+        }
+        log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
+        if !failed.isEmpty { log += " failed [" + failed.map(\.description).joined(separator: " ") + "]" }
+        if !skipped.isEmpty { log += " skipped [" + skipped.map(\.description).joined(separator: " ") + "]" }
+        if !failedLate.isEmpty {
+            log += " failed FP32/offset forms [" + failedLate.map(\.description).joined(separator: " ") + "]"
+        }
+        if !timings.isEmpty {
+            log += "; us/launch per shape (qkv|z attn-qkv o gate|up down):"
+            for kernel in [PromptTile.original] + passed {
+                guard let row = timings[kernel] else { continue }
+                log += " \(kernel)=" + row.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            }
+        }
+        Memory.clearCache()
+        log += "; using default \(fallback), per shape ["
+            + promptTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
+            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
+        FileHandle.standardError.write(log.data(using: .utf8)!)
+        return (fallback, byShape)
+    }
+
+    /// Installs the choice (the int8-staged form only).
+    private static func installPromptTileChoice() {
+        let (fallback, byShape) = choosePromptTiles()
+        promptTileDefault = fallback
+        promptTileByShape = byShape
+    }
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -9227,10 +9723,16 @@ enum Qwen35TensorPackedMatmul {
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
-                packedKernel = kernelStaged8
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
+                // The tile chosen at load for this shape; `kernelStaged8`
+                // where none is or the tile does not divide [m, n].
+                return launchStaged8(
+                    [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
+                     activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                    template: template, m: m, n: n, outputDType: outputDType,
+                    tile: promptTile(k: k, n: n, m: m))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
@@ -9240,6 +9742,7 @@ enum Qwen35TensorPackedMatmul {
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
+        if support == .staged8 { installPromptTileChoice() }
     }
 }
 
