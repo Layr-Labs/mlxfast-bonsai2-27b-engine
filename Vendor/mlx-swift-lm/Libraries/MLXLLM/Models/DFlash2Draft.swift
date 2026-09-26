@@ -1401,7 +1401,7 @@ enum DFlash2GreedyWalk {
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
     ) -> MLXArray? {
         guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
-            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
+            unary.dtype == .float32
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
@@ -1471,10 +1471,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
-    // Sliding masks depend only on block geometry. Keep the memo with the
-    // drafter so repeated speculative forwards can reuse the same graph
-    // (ercumentyildirim / terrapinelf `ff96d1e`).
-    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1617,6 +1613,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
 
+        let masks = DFlash2SlidingMaskMemo()
         let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)

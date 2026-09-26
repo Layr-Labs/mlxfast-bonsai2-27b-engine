@@ -2331,16 +2331,37 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
   }
 
   // B rows are weight rows row0 + fm + 8 * j (j = 0, 1 -> Bn0; 2, 3 -> Bn1).
-  const device uint8_t* wr[4];
+  // A 128-group of a 2-bit weight row is 32 bytes, eight 32-bit words: word
+  // st holds the 16 k of K step st, this lane's four values in byte fn / 4.
+  // The four lanes of a fragment quad (same fm, fn = 0, 4, 8, 12) read the
+  // group as four consecutive 8-byte words, one load per row and group
+  // instead of one byte load per row and K step; at step st this lane takes
+  // word st from the quad lane that holds it (simd_shuffle). The byte, its
+  // four dequantized values and every product are the ones the byte-wise
+  // read formed. The words of this simdgroup's next group are in flight
+  // while the current group is consumed.
+  static_assert(
+      bits == 2 && group_size == 128,
+      "the split-K NAX body reads 2-bit, 128-group weight words");
+  constexpr int kWordsPerGroup = group_size * bits / 64; // uint2 per row group
+  const device uint2* wr[4];
   const device T* sr[4];
   const device T* br[4];
 #pragma unroll
   for (int j = 0; j < 4; j++) {
     const int rr = min(row0 + fm + 8 * j, N - 1);
-    wr[j] = (const device uint8_t*)w + rr * K_w + fn * bits / 8;
+    wr[j] = (const device uint2*)((const device uint8_t*)w + rr * K_w) +
+        (fn >> 2);
     sr[j] = scales + rr * K_g;
     br[j] = biases + rr * K_g;
   }
+  // Quad lane t (fn / 4 == t) holds words 2t and 2t + 1 of the group.
+  ushort qlane[4];
+#pragma unroll
+  for (int t = 0; t < 4; t++) {
+    qlane[t] = ushort((simd_lid & ~0x9u) | uint(t & 1) | (uint(t >> 1) << 3));
+  }
+  const uint bsh = uint(8 * (fn >> 2));
 
   splitk_nax_frag_t<U> C[2 * kHalves];
 #pragma unroll
@@ -2348,46 +2369,186 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
     C[h] = splitk_nax_frag_t<U>(0);
   }
 
-  for (int g = simd_gid; g < n_groups; g += kSimd) {
-    U s[4];
-    U b[4];
+  uint2 ring[2][4];
 #pragma unroll
-    for (int j = 0; j < 4; j++) {
-      s[j] = static_cast<U>(sr[j][g]);
-      b[j] = static_cast<U>(br[j][g]);
-    }
-    for (int kk = 0; kk < group_size; kk += kStep) {
-      const int k = g * group_size + kk;
-      splitk_nax_frag_t<U> B0;
-      splitk_nax_frag_t<U> B1;
-
-      volatile int compiler_barrier;
-
-      U w_dq[4][4];
+  for (int r = 0; r < 2; r++) {
+    const int gr = int(simd_gid) + r * kSimd;
+    if (gr < n_groups) {
 #pragma unroll
       for (int j = 0; j < 4; j++) {
-        dequantize<U, 4, bits>(wr[j] + k * bits / 8, s[j], b[j], w_dq[j]);
+        ring[r][j] = wr[j][gr * kWordsPerGroup];
       }
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-        B0[i] = w_dq[0][i];
-        B0[4 + i] = w_dq[1][i];
-        B1[i] = w_dq[2][i];
-        B1[4 + i] = w_dq[3][i];
-      }
+    }
+  }
 
+  // 16-row verify tile: the destination cooperative tensor stays live for
+  // the whole K partition. The 32-row tile reloads it per matmul2d.
+  if constexpr (kHalves == 1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        false,
+        true,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<U, U, U>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<U, U, U>();
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
+        U>();
 #pragma unroll
-      for (int hh = 0; hh < kHalves; hh++) {
-        splitk_nax_frag_t<U> A;
+    for (short i = 0; i < 16; i++) {
+      ct_c[i] = U(0);
+    }
+    for (int g = simd_gid; g < n_groups; g += kSimd) {
+      volatile int compiler_barrier;
+    float sc[4][4];
+    float bf[4];
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-          A[i] = static_cast<U>(xa[2 * hh][k + i]);
-          A[4 + i] = static_cast<U>(xa[2 * hh + 1][k + i]);
+    for (int j = 0; j < 4; j++) {
+      const float s = float(static_cast<U>(sr[j][g]));
+      bf[j] = float(static_cast<U>(br[j][g]));
+      sc[j][0] = s;
+      sc[j][1] = s / 4.0f;
+      sc[j][2] = s / 16.0f;
+      sc[j][3] = s / 64.0f;
+    }
+#pragma unroll
+    for (int st = 0; st < group_size / kStep; st++) {
+      const int k = g * group_size + st * kStep;
+      splitk_nax_frag_t<U> B0;
+      splitk_nax_frag_t<U> B1;
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const uint word = simd_shuffle(ring[0][j][st & 1], qlane[st >> 1]);
+        const uint by = (word >> bsh) & 0xffu;
+        const U v0 = static_cast<U>(sc[j][0] * (by & 0x03u) + bf[j]);
+        const U v1 = static_cast<U>(sc[j][1] * (by & 0x0cu) + bf[j]);
+        const U v2 = static_cast<U>(sc[j][2] * (by & 0x30u) + bf[j]);
+        const U v3 = static_cast<U>(sc[j][3] * (by & 0xc0u) + bf[j]);
+        if (j < 2) {
+          B0[4 * j + 0] = v0;
+          B0[4 * j + 1] = v1;
+          B0[4 * j + 2] = v2;
+          B0[4 * j + 3] = v3;
+        } else {
+          B1[4 * (j - 2) + 0] = v0;
+          B1[4 * (j - 2) + 1] = v1;
+          B1[4 * (j - 2) + 2] = v2;
+          B1[4 * (j - 2) + 3] = v3;
         }
-        splitk_nax_mma<U>(C[2 * hh], C[2 * hh + 1], A, B0, B1);
       }
 
+        if constexpr (kHalves == 1) {
+#pragma unroll
+          for (short i = 0; i < 4; i++) {
+            ct_a[i] = static_cast<U>(xa[0][k + i]);
+            ct_a[4 + i] = static_cast<U>(xa[1][k + i]);
+          }
+#pragma unroll
+          for (short i = 0; i < 8; i++) {
+            ct_b[i] = B0[i];
+            ct_b[8 + i] = B1[i];
+          }
+          gemm_op.run(ct_a, ct_b, ct_c);
+        } else {
+#pragma unroll
+          for (int hh = 0; hh < kHalves; hh++) {
+            splitk_nax_frag_t<U> A;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              A[i] = static_cast<U>(xa[2 * hh][k + i]);
+              A[4 + i] = static_cast<U>(xa[2 * hh + 1][k + i]);
+            }
+            splitk_nax_mma<U>(C[2 * hh], C[2 * hh + 1], A, B0, B1);
+          }
+        }
+      }
       (void)compiler_barrier;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      ring[0][j] = ring[1][j];
+    }
+      const int g2 = g + 2 * kSimd;
+      if (g2 < n_groups) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          ring[1][j] = wr[j][g2 * kWordsPerGroup];
+        }
+      }
+    }
+    if constexpr (kHalves == 1) {
+#pragma unroll
+      for (short i = 0; i < 8; i++) {
+        C[0][i] = ct_c[i];
+        C[1][i] = ct_c[8 + i];
+      }
+    }
+  } else {
+    for (int g = simd_gid; g < n_groups; g += kSimd) {
+      volatile int compiler_barrier;
+      float sc[4][4];
+      float bf[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const float s = float(static_cast<U>(sr[j][g]));
+        bf[j] = float(static_cast<U>(br[j][g]));
+        sc[j][0] = s;
+        sc[j][1] = s / 4.0f;
+        sc[j][2] = s / 16.0f;
+        sc[j][3] = s / 64.0f;
+      }
+#pragma unroll
+      for (int st = 0; st < group_size / kStep; st++) {
+        const int k = g * group_size + st * kStep;
+        splitk_nax_frag_t<U> B0;
+        splitk_nax_frag_t<U> B1;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const uint word = simd_shuffle(ring[0][j][st & 1], qlane[st >> 1]);
+          const uint by = (word >> bsh) & 0xffu;
+          const U v0 = static_cast<U>(sc[j][0] * (by & 0x03u) + bf[j]);
+          const U v1 = static_cast<U>(sc[j][1] * (by & 0x0cu) + bf[j]);
+          const U v2 = static_cast<U>(sc[j][2] * (by & 0x30u) + bf[j]);
+          const U v3 = static_cast<U>(sc[j][3] * (by & 0xc0u) + bf[j]);
+          if (j < 2) {
+            B0[4 * j + 0] = v0;
+            B0[4 * j + 1] = v1;
+            B0[4 * j + 2] = v2;
+            B0[4 * j + 3] = v3;
+          } else {
+            B1[4 * (j - 2) + 0] = v0;
+            B1[4 * (j - 2) + 1] = v1;
+            B1[4 * (j - 2) + 2] = v2;
+            B1[4 * (j - 2) + 3] = v3;
+          }
+        }
+#pragma unroll
+        for (int hh = 0; hh < kHalves; hh++) {
+          splitk_nax_frag_t<U> A;
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            A[i] = static_cast<U>(xa[2 * hh][k + i]);
+            A[4 + i] = static_cast<U>(xa[2 * hh + 1][k + i]);
+          }
+          splitk_nax_mma<U>(C[2 * hh], C[2 * hh + 1], A, B0, B1);
+        }
+      }
+      (void)compiler_barrier;
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        ring[0][j] = ring[1][j];
+      }
+      const int g2 = g + 2 * kSimd;
+      if (g2 < n_groups) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          ring[1][j] = wr[j][g2 * kWordsPerGroup];
+        }
+      }
     }
   }
 

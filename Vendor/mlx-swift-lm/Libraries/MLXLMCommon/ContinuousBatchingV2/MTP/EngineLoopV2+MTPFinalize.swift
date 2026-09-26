@@ -16,13 +16,8 @@ extension EngineLoopV2 {
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
     /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
-    /// Default OFF (`BONSAI_EARLY_REPLAY=1` submits the committed recurrent
-    /// state at finalize). polymorf measured the early submission at +1.5% of
-    /// the decode window on the M5 Max (1404 -> 1427 ms); with the verify
-    /// committed in slices, the lazy replay rides in the verify's first slice
-    /// and overlaps the host's build of the rest (newjordan `f807f4e`).
     static let submitsCommittedRecurrentStateEarly: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] == "1"
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
 
     /// Start the committed recurrent state on the GPU now (ercumentyildirim,
     /// `080cb21`). A partially accepted verify commits each recurrent layer by

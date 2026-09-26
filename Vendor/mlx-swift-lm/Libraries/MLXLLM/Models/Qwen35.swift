@@ -443,8 +443,7 @@ fileprivate final class Qwen35SignedGain {
 /// prompt-sized window (see `Qwen35GatedDeltaChunked`) takes the chunked form.
 func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?,
-    outputNeeded: Bool = true
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
 ) -> (MLXArray, MLXArray) {
     let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
     let B = q.dim(0)
@@ -463,8 +462,7 @@ func qwen35GatedDelta(
     }
     if mask == nil,
         let fast = Qwen35GatedDeltaV3.run(
-            q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm,
-            outputNeeded: outputNeeded)
+            q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssm)
     {
         return fast
     }
@@ -509,18 +507,12 @@ enum Qwen35GatedDeltaV3 {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint dk0 = (lane % LPD) * R;
         const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
-        const device float* q_ = q;
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
         const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
         const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
         const device float* g_ = g + b_idx * T * Hv + hv_idx;
         const device float* beta_ = beta + b_idx * T * Hv + hv_idx;
-        device float* y_ = y;
-        if constexpr (OUTPUT_NEEDED) {
-          q_ += (b_idx * T * Hk + hk_idx) * Dk + dk0;
-          y_ += (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-        } else if (n == 0 && dvbase == 0 && lane == 0) {
-          y[0] = 0.f;
-        }
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -538,10 +530,8 @@ enum Qwen35GatedDeltaV3 {
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((const device float4*)k_)[j];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            if constexpr (OUTPUT_NEEDED) {
-              const float4 q4 = ((const device float4*)q_)[j];
-              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
-            }
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
           }
           float kv[DVPL];
           float vt[DVPL];
@@ -578,35 +568,27 @@ enum Qwen35GatedDeltaV3 {
               state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
               state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
               state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              if constexpr (OUTPUT_NEEDED) {
-                o0 = fma(state[d][4 * j], qr[4 * j], o0);
-                o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-                o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-                o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
-              }
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
             }
-            if constexpr (OUTPUT_NEEDED) {
-              out[d] = (o0 + o1) + (o2 + o3);
-            }
+            out[d] = (o0 + o1) + (o2 + o3);
           }
-          if constexpr (OUTPUT_NEEDED) {
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
             #pragma clang loop unroll(full)
-            for (int o = LPD / 2; o > 0; o >>= 1) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                out[d] += simd_shuffle_xor(out[d], o);
-              }
+            for (int d = 0; d < DVPL; ++d) {
+              out[d] += simd_shuffle_xor(out[d], o);
             }
-            if (lane % LPD == 0) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                y_[d] = out[d];
-              }
-            }
-            q_ += Hk * Dk;
-            y_ += Hv * Dv;
           }
-          k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+          if (lane % LPD == 0) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              y_[d] = out[d];
+            }
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -625,8 +607,7 @@ enum Qwen35GatedDeltaV3 {
         ensureRowContiguous: true)
 
     static func run(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
-        outputNeeded: Bool = true
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
     ) -> (MLXArray, MLXArray)? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
             g.dtype == .float32, beta.dtype == .float32, state.dtype == .float32,
@@ -642,17 +623,11 @@ enum Qwen35GatedDeltaV3 {
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
-        // Prefix replay consumes only state_out. Avoid copying its sliced q
-        // input or allocating a full y tensor when no output row is needed.
-        // The unused q slot aliases the already-contiguous gate buffer.
         let outputs = kernel(
-            [outputNeeded ? q : g, k, v, g, beta, state, MLXArray(Int32(T))],
-            template: [
-                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
-                ("OUTPUT_NEEDED", outputNeeded),
-            ],
+            [q, k, v, g, beta, state, MLXArray(Int32(T))],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [outputNeeded ? [B, T, Hv, Dv] : [1], state.shape],
+            outputShapes: [[B, T, Hv, Dv], state.shape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
     }
@@ -1979,8 +1954,7 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] },
-            outputNeeded: false
+            mask: tape.mask.map { $0[0..., rows] }
         ).1
         let boundaryConvView = tape.convInput[
             0...,
@@ -5738,3 +5712,4 @@ extension Qwen35Model: MTPCapable {
         languageModel.makeMTPCache()
     }
 }
+private let gauntletRedraw_19798571_20260926T025244Z: Int = 0
