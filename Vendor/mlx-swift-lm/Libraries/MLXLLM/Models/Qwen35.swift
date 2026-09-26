@@ -9669,8 +9669,17 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
-        // The drafter reads the head in FP16 and keeps the FP16 logits: its
-        // top-k reads them directly (see `HadamardQuantizedLinear.drafterHeadFloat16`).
+        // The drafter's hidden is its own dtype (BF16 on this pack). The
+        // verify-width int8 kernel already serves the target's head; this
+        // read takes that same kernel (Subflatus3 `aa6a540a`). FP16 logits,
+        // which the drafter's top-k reads directly.
+        if let head = lmHead as? HadamardQuantizedLinear,
+            let routed = head.forwardDrafterInt8(hidden)
+        {
+            return routed
+        }
+        // The dequantizing head kernel, still FP16 logits
+        // (`HadamardQuantizedLinear.drafterHeadFloat16`).
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {

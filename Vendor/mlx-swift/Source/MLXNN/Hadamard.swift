@@ -680,6 +680,49 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// On unless explicitly disabled: the drafter's shared-head read (a BF16
+    /// or FP16 activation, at most 16 rows) takes the verify-width int8
+    /// kernel the target's own head already uses. `MLXFAST_DFLASH_HEAD_INT8=0`
+    /// keeps `forwardUnwidened`.
+    public static let drafterHeadInt8: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_HEAD_INT8"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// On unless explicitly disabled: the zero rows that pad a verify-width
+    /// activation up to 16 are one resident buffer per shape, not a fresh
+    /// zeros kernel on every projection. `MLXFAST_NARROW_ZERO_PAD=0` allocates
+    /// them again each call.
+    private static let narrowZeroPad: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_NARROW_ZERO_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private struct NarrowPadKey: Hashable {
+        var rows: Int
+        var cols: Int
+        var dtype: DType
+    }
+    private static let narrowPadLock = NSLock()
+    private static var narrowPads: [NarrowPadKey: MLXArray] = [:]
+
+    /// Zeros of `[rows, cols]` in `dtype`. The same buffer is reused across
+    /// projections; it is never written.
+    static func cachedNarrowZeros(rows: Int, cols: Int, dtype: DType) -> MLXArray {
+        guard narrowZeroPad, rows > 0, cols > 0 else {
+            return MLXArray.zeros([rows, cols], dtype: dtype)
+        }
+        let key = NarrowPadKey(rows: rows, cols: cols, dtype: dtype)
+        narrowPadLock.lock()
+        defer { narrowPadLock.unlock() }
+        if let hit = narrowPads[key] { return hit }
+        let made = MLXArray.zeros([rows, cols], dtype: dtype)
+        if narrowPads.count > 12 { narrowPads.removeAll(keepingCapacity: true) }
+        narrowPads[key] = made
+        return made
+    }
+
     private let matrixRoute = HadamardMatrixRouteOperands()
 
     @discardableResult
@@ -1019,8 +1062,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         var g = sums
         let padded = Self.tensorRouteMaximumNarrowRows
         if rows < padded {
-            a = concatenated([a, MLXArray.zeros([padded - rows, k], dtype: .float16)], axis: 0)
-            g = concatenated([g, MLXArray.zeros([padded - rows, k / 128], dtype: .float32)], axis: 0)
+            a = concatenated(
+                [a, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16)], axis: 0)
+            g = concatenated(
+                [g, Self.cachedNarrowZeros(rows: padded - rows, cols: k / 128, dtype: .float32)],
+                axis: 0)
         }
         if siblings.count == 1 {
             guard let y = matmul(
@@ -1054,7 +1100,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let padded = Self.tensorRouteMaximumNarrowRows
         let input =
             rows < padded
-            ? concatenated([x, MLXArray.zeros([padded - rows, k], dtype: x.dtype)], axis: 0) : x
+            ? concatenated(
+                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
+            : x
         guard
             let activation = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
@@ -1082,6 +1130,29 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// as is instead of being widened first. The consumer's promotion widens
     /// the same values exactly, so the arithmetic is unchanged and one cast
     /// dispatch per call is saved.
+    /// The drafter's vocabulary-head read on the verify-width int8 kernel.
+    /// The tower's `tensorRouteForward` admits only FP32, so a BF16 or FP16
+    /// head activation (the drafter's dtype) was falling through to the
+    /// dequantizing head kernel. Nil when that kernel is not installed or
+    /// the shape is not a verify-width vocabulary head; the caller keeps
+    /// `forwardUnwidened`. The quantizer already accepts these dtypes, and
+    /// the matmul is the one the target's own head uses. Logits stay FP16,
+    /// which is what the drafter's top-k reads.
+    public func forwardDrafterInt8(_ x: MLXArray) -> MLXArray? {
+        guard Self.drafterHeadInt8, Self.tensorRouteEnabled, x.ndim >= 2,
+            x.dtype == .bfloat16 || x.dtype == .float16 || x.dtype == .float32
+        else { return nil }
+        let k = x.dim(-1)
+        let rows = x.size / k
+        guard rows >= 1, rows <= Self.tensorRouteMaximumNarrowRows,
+            weight.dim(0) >= Self.vocabularyHeadMinimumRows, tensorRouteTakes(self),
+            let y = tensorRouteForwardNarrow(
+                x.reshaped(rows, k), rows: rows, k: k, n: weight.dim(0), siblings: [self],
+                preSigned: false, outputDType: .float16, leading: Array(x.shape.dropLast()))
+        else { return nil }
+        return y[0]
+    }
+
     public func forwardUnwidened(_ x: MLXArray) -> MLXArray {
         if let routed = tensorRouteForward(x, siblings: [self], preSigned: false, widenOutput: false) {
             return routed[0]
@@ -1295,7 +1366,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let padded = tensorRouteMaximumNarrowRows
             if rows < padded {
                 headInput = concatenated(
-                    [headInput, MLXArray.zeros([padded - rows, k], dtype: .float16)], axis: 0)
+                    [headInput, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16)],
+                    axis: 0)
             }
             let plainDType: DType = sourceDType == .bfloat16 ? .float32 : sourceDType
             let headOutputDType: DType = widenOutput ? plainDType : .float16
