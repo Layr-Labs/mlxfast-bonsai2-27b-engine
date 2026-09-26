@@ -410,7 +410,6 @@ public final class HadamardConstantLayoutCache {
     }
     private let lock = NSLock()
     private var entries: [Entry] = []
-    private var negativeBias: (scales: MLXArray, biases: MLXArray, matches: Bool)?
 
     public init() {}
 
@@ -430,30 +429,8 @@ public final class HadamardConstantLayoutCache {
         }
     }
 
-    /// Check the frozen FP16 affine constants once, including signed zero.
-    /// This cache is cleared by the owning projection on parameter updates.
-    public func biasesAreNegativeScales(_ scales: MLXArray, _ biases: MLXArray) -> Bool {
-        lock.withLock {
-            if let negativeBias, negativeBias.scales === scales,
-                negativeBias.biases === biases
-            {
-                return negativeBias.matches
-            }
-            guard scales.dtype == .float16, biases.dtype == .float16,
-                scales.shape == biases.shape
-            else { return false }
-            let flipped = scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))
-            let matches = (flipped .== biases.view(dtype: .uint16)).all().item(Bool.self)
-            negativeBias = (scales, biases, matches)
-            return matches
-        }
-    }
-
     public func clear() {
-        lock.withLock {
-            entries.removeAll()
-            negativeBias = nil
-        }
+        lock.withLock { entries.removeAll() }
     }
 }
 
