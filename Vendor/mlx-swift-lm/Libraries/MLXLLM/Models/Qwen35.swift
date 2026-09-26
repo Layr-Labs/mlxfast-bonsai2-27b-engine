@@ -222,6 +222,102 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+/// Early submission of a trunk forward: at chosen layer boundaries the
+/// forward `asyncEval`s its hidden state, so the GPU runs the front of the
+/// tower while the host is still building the rest. The same kernels run on
+/// the same inputs in the same order; only command-buffer boundaries move,
+/// so every value is bit-identical.
+///
+/// One mechanism, two plans, picked per forward:
+/// - VERIFY (a capture-verify forward). The drafter's block was submitted
+///   before this graph was built, so without slices the GPU idles from the
+///   drafter's last kernel until the host has built all 64 layers.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
+///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
+///   paces encoding against the GPU at 10 in-flight command buffers, so
+///   extra boundaries cost little, and a short first slice matters more as
+///   the GPU gets faster relative to the host build);
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
+///   prefill starts its first layers while the host builds the rest.
+///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
+/// Plain decode and short forwards are untouched. Never over paged KV: its
+/// write faults are checked only after the whole forward is built, before
+/// anything may be evaluated.
+///
+/// A plan is `N` (every N layers), `N@o` (every N layers, shifted so the
+/// first boundary falls after layer `o`), or an explicit list of layer
+/// counts (`4,16,32,48`; `;` also separates); `0`/`off` disables it.
+enum Qwen35TrunkSubmission {
+    static let promptMinimumRows = 128
+
+    struct Plan: Sendable {
+        let stride: Int
+        let offset: Int
+        let explicit: [Int]?
+
+        static let off = Plan(stride: 0, offset: 0, explicit: nil)
+
+        var isOff: Bool { explicit.map { $0.isEmpty } ?? (stride <= 0) }
+
+        /// True when the forward submits after `completedLayers` layers.
+        /// The last layer never splits: the caller's eval takes it.
+        @inline(__always)
+        func submits(after completedLayers: Int, of layerCount: Int) -> Bool {
+            guard completedLayers < layerCount else { return false }
+            if let explicit { return explicit.contains(completedLayers) }
+            return stride > 0 && completedLayers % stride == offset
+        }
+
+        static func parse(_ raw: String?, default fallback: Plan) -> Plan {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                !raw.isEmpty
+            else { return fallback }
+            if ["0", "off", "false", "no"].contains(raw) { return .off }
+            if raw.contains(",") || raw.contains(";") {
+                let counts = raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
+                    Int($0.trimmingCharacters(in: .whitespaces))
+                }.filter { $0 > 0 }
+                return Plan(stride: 0, offset: 0, explicit: counts)
+            }
+            let parts = raw.split(separator: "@")
+            guard let stride = Int(parts[0]), stride >= 0 else { return fallback }
+            let first = parts.count > 1 ? (Int(parts[1]) ?? stride) : stride
+            return Plan(stride: stride, offset: stride > 0 ? first % stride : 0, explicit: nil)
+        }
+    }
+
+    static let verify: Plan = {
+        let env = ProcessInfo.processInfo.environment
+        let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 2, offset: 0, explicit: nil))
+    }()
+
+    static let prompt: Plan = Plan.parse(
+        ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
+        default: Plan(stride: 4, offset: 0, explicit: nil))
+
+    /// The plan for one trunk forward, or nil for a single submission.
+    static func plan(
+        rows: Int, captureRecurrentWindow: Bool, caches: [any CBv2AttendingLayerCache]
+    ) -> Plan? {
+        let plan: Plan
+        if captureRecurrentWindow {
+            plan = verify
+        } else if rows >= promptMinimumRows {
+            plan = prompt
+        } else {
+            return nil
+        }
+        if plan.isOff || caches.contains(where: { $0 is PagedLayerCache }) { return nil }
+        return plan
+    }
+}
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -255,9 +351,12 @@ enum Qwen35FusedElementwise {
             silu(gate.asType(.float32)) * normed.asType(.float32)
         }
 
-    /// On unless explicitly disabled: a packed projection whose input comes
-    /// out of a norm or an elementwise op receives that input with its
-    /// Hadamard signs already applied, and its rotation skips the multiply.
+    /// On unless explicitly disabled (`DARKBLOOM_BONSAI_FOLD_SIGNS=0`, fkiene
+    /// `74bd8112`): a packed projection whose input comes out of a norm or an
+    /// elementwise op receives that input with its Hadamard signs already
+    /// applied, and its rotation skips the multiply. On this tree the fused
+    /// boundary, gate and SwiGLU rotations apply the signs in-kernel first,
+    /// so the fold is only a fallback.
     static let foldsHadamardSigns: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FOLD_SIGNS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -340,7 +439,8 @@ fileprivate final class Qwen35SignedGain {
 }
 
 /// The gated delta recurrence with its gates formed by one fused kernel and
-/// the state kept in FP32, matching `gatedDeltaUpdate` op for op.
+/// the state kept in FP32, matching `gatedDeltaUpdate` op for op. A
+/// prompt-sized window (see `Qwen35GatedDeltaChunked`) takes the chunked form.
 func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
     aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
@@ -366,6 +466,12 @@ func qwen35GatedDelta(
     var ssm = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if ssm.dtype != .float32 {
         ssm = ssm.asType(.float32)
+    }
+    if mask == nil,
+        let chunked = Qwen35GatedDeltaChunked.run(
+            q: q, k: k, v: v, g: g, beta: beta, state: ssm)
+    {
+        return chunked
     }
     if mask == nil,
         let fast = Qwen35GatedDeltaV3.run(
@@ -538,6 +644,470 @@ enum Qwen35GatedDeltaV3 {
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
     }
+}
+
+/// The gated-delta recurrence of a prompt-sized window in chunkwise-parallel
+/// (WY) form, FP32 throughout. The window is cut into chunks of `C` rows; per
+/// value head and chunk, with `gam_i` the in-chunk prefix sum of `log g`:
+///
+///     A_ij  = beta_i (k_i . k_j) exp(gam_i - gam_j)     (i > j)
+///     T'    = (I + A)^-1 diag(beta)
+///     P_ij  = (q_i . k_j) exp(gam_i - gam_j)            (i >= j)
+///     Z     = V - diag(exp gam) K S^T
+///     Delta = T' Z                                     (the per-row deltas)
+///     Y     = diag(exp gam) Q S^T + P Delta
+///     S^T  <- exp(gam_C) S^T + K^T diag(exp(gam_C - gam)) Delta
+///
+/// which is the sequential recurrence regrouped exactly; only the rounding
+/// differs (FP32 8x8 simdgroup MMAs instead of per-step dot products), so it
+/// is not bit-identical to `Qwen35GatedDeltaV3`. `prep` forms K K^T and Q K^T
+/// once per (key head, chunk) and builds T', P and the decay factors of the
+/// value heads sharing that key head; `scan` carries the state across the
+/// chunks, one simdgroup per 8 state rows with its slice of the state held in
+/// registers, the threadgroup sharing each chunk's K, Q, T' and P through
+/// threadgroup memory. Both are ordinary lazy graph ops, evaluated with the
+/// forward. Other windows under `minRows` (replay, decode) never take this
+/// path; a capture-verify window of whole chunks does (`runVerify`). A prompt
+/// window that is not a whole number of chunks runs its remainder rows on the
+/// sequential kernel from the chunked state. `MLXFAST_GDN_CHUNKED=0` turns
+/// the path off; `MLXFAST_GDN_CHUNK` picks the chunk (8, the default, or 16).
+enum Qwen35GatedDeltaChunked {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let chunk: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let raw, let value = Int(raw), [8, 16].contains(value) { return value }
+        return 8
+    }()
+
+    /// Shortest window that takes the chunked path.
+    static let minRows = 64
+
+    /// Simdgroups per scan threadgroup (each owns 8 state rows of one head).
+    static let scanSimdgroups = 4
+
+    static func supports(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> Bool {
+        guard q.ndim == 4, k.ndim == 4, v.ndim == 4, q.shape == k.shape else { return false }
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        return k.dim(3) == 128 && Dv % 8 == 0 && Hv % Hk == 0 && v.dim(1) == T
+            && g.shape == [B, T, Hv] && beta.shape == [B, T, Hv]
+            && state.shape == [B, Hv, Dv, 128]
+            && q.dtype == .float32 && k.dtype == .float32 && v.dtype == .float32
+            && g.dtype == .float32 && beta.dtype == .float32 && state.dtype == .float32
+    }
+
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let T = k.dim(1)
+        guard enabled, T >= minRows, T >= chunk,
+            supports(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        else { return nil }
+        return window(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
+
+    /// Capture-verify windows (the DFlash block, 16 rows) of at least two
+    /// whole chunks also take the chunked kernels. The verify only needs the
+    /// rows' outputs and the window's final state (the replay of a strict
+    /// prefix re-runs the sequential kernel from the retained pre-verify state
+    /// and inputs), which is exactly what `chunks` returns. A window that is
+    /// not a whole number of chunks stays on the sequential kernel: a
+    /// sequential tail costs more than it saves at these widths.
+    /// `MLXFAST_GDN_CHUNKED_VERIFY=0` keeps verify on the sequential kernel.
+    static let verifyEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func runVerify(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let T = k.dim(1)
+        guard verifyEnabled, T >= 2 * chunk, T % chunk == 0,
+            supports(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        else { return nil }
+        return chunks(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
+
+    /// Whole chunks on the chunked kernels, any remainder on the sequential one.
+    private static func window(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let T = k.dim(1)
+        let head = (T / chunk) * chunk
+        if head == T {
+            return chunks(q: q, k: k, v: v, g: g, beta: beta, state: state)
+        }
+        let rows = 0 ..< head
+        let (yHead, sHead) = chunks(
+            q: q[0..., rows], k: k[0..., rows], v: v[0..., rows], g: g[0..., rows],
+            beta: beta[0..., rows], state: state)
+        let tq = q[0..., head...]
+        let tk = k[0..., head...]
+        let tv = v[0..., head...]
+        let tg = g[0..., head...]
+        let tb = beta[0..., head...]
+        let tail =
+            Qwen35GatedDeltaV3.run(q: tq, k: tk, v: tv, g: tg, beta: tb, state: sHead)
+            ?? gatedDeltaKernel(q: tq, k: tk, v: tv, g: tg, beta: tb, state: sHead, mask: nil)
+        return (concatenated([yHead, tail.0], axis: 1), tail.1)
+    }
+
+    private static func chunks(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let C = chunk
+        let NC = T / C
+        let rowCount = MLXArray(Int32(T))
+        let prepared = prepKernel(
+            [q, k, g, beta, rowCount],
+            template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, NC, B * Hk),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
+            outputDTypes: [.float32, .float32, .float32])
+        let outputs = scanKernel(
+            [q, k, v, prepared[0], prepared[1], prepared[2], state, rowCount],
+            template: [
+                ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("NS", scanSimdgroups),
+            ],
+            grid: (32, Dv / 8, B * Hv),
+            threadGroup: (32, scanSimdgroups, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var prepared = Set<[Int]>()
+
+    /// Builds both kernels' pipelines (and the remainder path's) for this
+    /// geometry once per process, on throwaway inputs, so the first prompt
+    /// window does not pay their compiles. Called from the layer's init.
+    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard enabled, hk > 0, hv % hk == 0 else { return }
+        lock.withLock {
+            guard prepared.insert([hk, dk, hv, dv]).inserted else { return }
+            let rows = chunk + 3
+            let q = MLXArray.zeros([1, rows, hk, dk], dtype: .float32)
+            let v = MLXArray.zeros([1, rows, hv, dv], dtype: .float32)
+            let g = MLXArray.ones([1, rows, hv], dtype: .float32)
+            let beta = MLXArray.zeros([1, rows, hv], dtype: .float32)
+            let state = MLXArray.zeros([1, hv, dv, dk], dtype: .float32)
+            guard supports(q: q, k: q, v: v, g: g, beta: beta, state: state) else { return }
+            let (y, s) = window(q: q, k: q, v: v, g: g, beta: beta, state: state)
+            eval(y, s)
+        }
+    }
+
+    private static let prepKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_chunk_prep",
+        inputNames: ["q", "k", "g", "beta", "T"],
+        outputNames: ["tp", "pm", "gf"],
+        source: prepSource)
+
+    private static let scanKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_chunk_scan",
+        inputNames: ["q", "k", "v", "tp", "pm", "gf", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: scanSource)
+
+    // BEGIN GENERATED CHUNKED GDN SOURCES
+    private static let prepSource = """
+            // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
+            // Q K^T are formed once and serve the Hv / Hk value heads of this key
+            // head, which run side by side in lane groups of C lanes (lane = head
+            // group * C + row), GP heads per pass.
+            constexpr int HR = Hv / Hk;
+            constexpr int GP = (32 / C) < HR ? (32 / C) : HR;
+            constexpr int CT = C / 8;
+            constexpr int LD = C + 1;
+            threadgroup float KK[C * LD];
+            threadgroup float QK[C * LD];
+            threadgroup float Ah[GP * C * LD];
+            threadgroup float Th[GP * C * LD];
+            const uint lane = thread_index_in_simdgroup;
+            const int T_ = T;
+            const int NC = T_ / C;
+            const int n = int(thread_position_in_grid.y);
+            const int bk = int(thread_position_in_grid.z);
+            const int b_idx = bk / Hk;
+            const int hk = bk % Hk;
+            const int t0 = n * C;
+            const int ks = Hk * Dk;
+            const device float* k_ = k + ((size_t)b_idx * T_ + t0) * ks + hk * Dk;
+            const device float* q_ = q + ((size_t)b_idx * T_ + t0) * ks + hk * Dk;
+
+            // lower tiles of K K^T and Q K^T
+            _Pragma("clang loop unroll(full)")
+            for (int ti = 0; ti < CT; ++ti) {
+              _Pragma("clang loop unroll(full)")
+              for (int tj = 0; tj <= ti; ++tj) {
+                simdgroup_float8x8 akk = simdgroup_float8x8(0);
+                simdgroup_float8x8 aqk = simdgroup_float8x8(0);
+                _Pragma("clang loop unroll(full)")
+                for (int d = 0; d < Dk / 8; ++d) {
+                  simdgroup_float8x8 ka, qa, kb;
+                  simdgroup_load(ka, k_ + (ti * 8) * ks + d * 8, ks);
+                  simdgroup_load(qa, q_ + (ti * 8) * ks + d * 8, ks);
+                  simdgroup_load(kb, k_ + (tj * 8) * ks + d * 8, ks, ulong2(0, 0), true);
+                  simdgroup_multiply_accumulate(akk, ka, kb, akk);
+                  simdgroup_multiply_accumulate(aqk, qa, kb, aqk);
+                }
+                simdgroup_store(akk, KK + (ti * 8) * LD + tj * 8, LD);
+                simdgroup_store(aqk, QK + (ti * 8) * LD + tj * 8, LD);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int grp = int(lane) / C;
+            const int row = int(lane) % C;
+            const int gbase = grp * C;
+            for (int h0 = 0; h0 < HR; h0 += GP) {
+              const int h = h0 + grp;
+              const bool live = grp < GP && h < HR;
+              const int hv = hk * HR + (live ? h : 0);
+              const size_t slot = ((size_t)b_idx * Hv + hv) * NC + n;
+              // in-chunk inclusive prefix of log g within each lane group. A row
+              // whose g underflowed (g == 0, or subnormal) has no finite log: it
+              // zeroes every decay product spanning it, so it adds 0 to the prefix
+              // and `zr` (the group's underflowed rows, one bit per row) masks
+              // the products that span it.
+              float gam = 0.0f;
+              float bet = 0.0f;
+              bool zero = false;
+              if (live) {
+                const float gv = g[((size_t)b_idx * T_ + t0 + row) * Hv + hv];
+                zero = !(gv >= FLT_MIN);
+                gam = zero ? 0.0f : metal::precise::log(zero ? 1.0f : gv);
+                bet = beta[((size_t)b_idx * T_ + t0 + row) * Hv + hv];
+              }
+              const uint zr = uint(static_cast<simd_vote::vote_t>(simd_ballot(zero)) >> gbase) & ((1u << C) - 1u);
+              _Pragma("clang loop unroll(full)")
+              for (int off = 1; off < C; off <<= 1) {
+                const float up = simd_shuffle_up(gam, ushort(off));
+                gam += row >= off ? up : 0.0f;
+              }
+              const float gam_last = simd_shuffle(gam, ushort(gbase + C - 1));
+              // rows (j, i] as a bit mask: ((2 << i) - 1) & ~((2 << j) - 1)
+              const uint upto = (2u << row) - 1u;
+              // decay factors for the scan: exp(gam_i), exp(gam_last - gam_i)
+              if (live) {
+                device float* gf_ = gf + slot * 2 * C;
+                gf_[row] = (zr & upto) == 0u ? metal::precise::exp(gam) : 0.0f;
+                gf_[C + row] = (zr & ~upto) == 0u ? metal::precise::exp(gam_last - gam) : 0.0f;
+              }
+              // P row (lower incl. diagonal) to device; A row (strict lower) to Ah
+              threadgroup float* A_ = Ah + grp * C * LD;
+              threadgroup float* M_ = Th + grp * C * LD;
+              device float* pm_ = pm + slot * C * C;
+              _Pragma("clang loop unroll(full)")
+              for (int j = 0; j < C; ++j) {
+                const float gj = simd_shuffle(gam, ushort(gbase + j));
+                if (live) {
+                  float pv = 0.0f;
+                  float av = 0.0f;
+                  if (j <= row) {
+                    const uint span = upto & ~((2u << j) - 1u);
+                    const float e = (zr & span) == 0u ? metal::precise::exp(gam - gj) : 0.0f;
+                    pv = QK[row * LD + j] * e;
+                    if (j < row) av = bet * KK[row * LD + j] * e;
+                  }
+                  pm_[row * C + j] = pv;
+                  A_[row * LD + j] = av;
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              // T = (I + A)^-1, column m = row per lane, stored transposed in M_[m][i]
+              if (live) {
+                const int m = row;
+                for (int i = 0; i < C; ++i) M_[m * LD + i] = (i == m) ? 1.0f : 0.0f;
+                for (int i = m + 1; i < C; ++i) {
+                  float s0 = 0.0f, s1 = 0.0f;
+                  int j = m;
+                  for (; j + 1 < i; j += 2) {
+                    s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+                    s1 = metal::fma(A_[i * LD + j + 1], M_[m * LD + j + 1], s1);
+                  }
+                  if (j < i) s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+                  M_[m * LD + i] = -(s0 + s1);
+                }
+                // T' = T diag(beta): T'[i][m] = T[i][m] * beta_m
+                device float* tp_ = tp + slot * C * C;
+                for (int i = 0; i < C; ++i) tp_[i * C + m] = M_[m * LD + i] * bet;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        """
+
+    private static let scanSource = """
+            // grid: (32, Dv / 8, B * Hv), threadgroup (32, NS, 1). One simdgroup per
+            // 8 state rows (its S^T columns held in registers across the chunks); the
+            // threadgroup shares each chunk's K, Q, T' and P through threadgroup
+            // memory.
+            constexpr int CT = C / 8;
+            constexpr int DT = Dk / 8;
+            constexpr int LK = Dk + 8;
+            constexpr int LC = C + 8;
+            constexpr int NT = 32 * NS;
+            constexpr int KQ4 = C * (Dk / 4);        // float4s of one chunk of K (or Q)
+            constexpr int TP4 = C * (C / 4);         // float4s of one chunk of T' (or P)
+            threadgroup float Ksh[C * LK];
+            threadgroup float Qsh[C * LK];
+            threadgroup float TPsh[2 * C * LC];
+            const uint lane = thread_index_in_simdgroup;
+            const int tid = int(thread_index_in_threadgroup);
+            const int T_ = T;
+            const int NC = T_ / C;
+            const int r0 = int(thread_position_in_grid.y) * 8;
+            const int bh = int(thread_position_in_grid.z);
+            const int b_idx = bh / Hv;
+            const int hv = bh % Hv;
+            const int hk = hv / (Hv / Hk);
+            const int ks = Hk * Dk;
+            const int vs = Hv * Dv;
+            const short qid = lane / 4;
+            const short fm = (qid & 4) + ((lane / 2) % 4);
+            const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+            const device float* kbase = k + (size_t)b_idx * T_ * ks + hk * Dk;
+            const device float* qbase = q + (size_t)b_idx * T_ * ks + hk * Dk;
+            const device float* tbase = tp + (size_t)bh * NC * C * C;
+            const device float* pbase = pm + (size_t)bh * NC * C * C;
+
+            simdgroup_float8x8 St[DT];
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < DT; ++d)
+              simdgroup_load(St[d], state_in + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
+
+            for (int n = 0; n < NC; ++n) {
+              const int t0 = n * C;
+              const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              device float* y_ = y + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              const device float* gf_ = gf + ((size_t)bh * NC + n) * 2 * C;
+              // stage this chunk's K, Q, T', P (the previous chunk's readers are done)
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int e = tid; e < KQ4; e += NT) {
+                const int row = e / (Dk / 4);
+                const int c4 = (e % (Dk / 4)) * 4;
+                const size_t src = (size_t)(t0 + row) * ks + c4;
+                *(threadgroup float4*)(Ksh + row * LK + c4) = *(const device float4*)(kbase + src);
+                *(threadgroup float4*)(Qsh + row * LK + c4) = *(const device float4*)(qbase + src);
+              }
+              for (int e = tid; e < 2 * TP4; e += NT) {
+                const int which = e / TP4;
+                const int f = e % TP4;
+                const int row = f / (C / 4);
+                const int c4 = (f % (C / 4)) * 4;
+                const device float* src = (which == 0 ? tbase : pbase) + (size_t)n * C * C;
+                *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = *(const device float4*)(src + f * 4);
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+
+              // X = K S^T, Xq = Q S^T (C x 8 each)
+              simdgroup_float8x8 Xk[CT];
+              simdgroup_float8x8 Xq[CT];
+              _Pragma("clang loop unroll(full)")
+              for (int ti = 0; ti < CT; ++ti) {
+                Xk[ti] = simdgroup_float8x8(0);
+                Xq[ti] = simdgroup_float8x8(0);
+              }
+              _Pragma("clang loop unroll(full)")
+              for (int d = 0; d < DT; ++d) {
+                _Pragma("clang loop unroll(full)")
+                for (int ti = 0; ti < CT; ++ti) {
+                  simdgroup_float8x8 ka, qa;
+                  simdgroup_load(ka, Ksh + (ti * 8) * LK + d * 8, LK);
+                  simdgroup_load(qa, Qsh + (ti * 8) * LK + d * 8, LK);
+                  simdgroup_multiply_accumulate(Xk[ti], ka, St[d], Xk[ti]);
+                  simdgroup_multiply_accumulate(Xq[ti], qa, St[d], Xq[ti]);
+                }
+              }
+              // Z = V - diag(exp gam) Xk (in Xk); Xq <- diag(exp gam) Xq
+              _Pragma("clang loop unroll(full)")
+              for (int ti = 0; ti < CT; ++ti) {
+                const int row = ti * 8 + fm;
+                const float eg = gf_[row];
+                thread auto& zk = Xk[ti].thread_elements();
+                thread auto& zq = Xq[ti].thread_elements();
+                const float2 vv = *(const device float2*)(v_ + row * vs + fn);
+                zk[0] = vv.x - eg * zk[0];
+                zk[1] = vv.y - eg * zk[1];
+                zq[0] = eg * zq[0];
+                zq[1] = eg * zq[1];
+              }
+              // Delta = T' Z (T' lower triangular)
+              simdgroup_float8x8 Dl[CT];
+              _Pragma("clang loop unroll(full)")
+              for (int ti = 0; ti < CT; ++ti) {
+                Dl[ti] = simdgroup_float8x8(0);
+                _Pragma("clang loop unroll(full)")
+                for (int tj = 0; tj <= ti; ++tj) {
+                  simdgroup_float8x8 ta;
+                  simdgroup_load(ta, TPsh + (ti * 8) * LC + tj * 8, LC);
+                  simdgroup_multiply_accumulate(Dl[ti], ta, Xk[tj], Dl[ti]);
+                }
+              }
+              // Y = diag(exp gam) Q S^T + P Delta
+              _Pragma("clang loop unroll(full)")
+              for (int ti = 0; ti < CT; ++ti) {
+                _Pragma("clang loop unroll(full)")
+                for (int tj = 0; tj <= ti; ++tj) {
+                  simdgroup_float8x8 pa;
+                  simdgroup_load(pa, TPsh + C * LC + (ti * 8) * LC + tj * 8, LC);
+                  simdgroup_multiply_accumulate(Xq[ti], pa, Dl[tj], Xq[ti]);
+                }
+                const int row = ti * 8 + fm;
+                thread auto& ye = Xq[ti].thread_elements();
+                *(device float2*)(y_ + row * vs + fn) = float2(ye[0], ye[1]);
+              }
+              // Delta~ = diag(exp(gam_C - gam)) Delta
+              _Pragma("clang loop unroll(full)")
+              for (int ti = 0; ti < CT; ++ti) {
+                const int row = ti * 8 + fm;
+                const float r = gf_[C + row];
+                thread auto& de = Dl[ti].thread_elements();
+                de[0] = de[0] * r;
+                de[1] = de[1] * r;
+              }
+              // S^T <- exp(gam_C) S^T + K^T Delta~
+              const float eC = gf_[C - 1];
+              _Pragma("clang loop unroll(full)")
+              for (int d = 0; d < DT; ++d) {
+                thread auto& se = St[d].thread_elements();
+                se[0] = se[0] * eC;
+                se[1] = se[1] * eC;
+                _Pragma("clang loop unroll(full)")
+                for (int ti = 0; ti < CT; ++ti) {
+                  simdgroup_float8x8 kt;
+                  simdgroup_load(kt, Ksh + (ti * 8) * LK + d * 8, LK, ulong2(0, 0), true);
+                  simdgroup_multiply_accumulate(St[d], kt, Dl[ti], St[d]);
+                }
+              }
+            }
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < DT; ++d)
+              simdgroup_store(St[d], state_out + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
+        """
+    // END GENERATED CHUNKED GDN SOURCES
 }
 
 /// Wide-window (prefill) variant of the unmasked gated-delta kernel.
@@ -949,6 +1519,8 @@ final class Qwen35GatedDeltaNet: Module {
 
         Qwen35GDNPrefillKernel.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35GatedDeltaChunked.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -1281,7 +1853,9 @@ final class Qwen35GatedDeltaNet: Module {
             var ssm = ssmState ?? MLXArray.zeros([B, numVHeads, headVDim, headKDim], dtype: .float32)
             if ssm.dtype != .float32 { ssm = ssm.asType(.float32) }
             let (out, newSsmState) =
-                Qwen35GatedDeltaV3.run(
+                Qwen35GatedDeltaChunked.run(
+                    q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssm)
+                ?? Qwen35GatedDeltaV3.run(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssm)
                 ?? gatedDeltaKernel(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssm, mask: nil)
@@ -1751,7 +2325,9 @@ final class Qwen35GatedDeltaNet: Module {
             let recurrence: (MLXArray, MLXArray)
             if let pre {
                 recurrence =
-                    Qwen35GatedDeltaV3.run(
+                    Qwen35GatedDeltaChunked.runVerify(
+                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
+                    ?? Qwen35GatedDeltaV3.run(
                         q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
                     ?? gatedDeltaKernel(
                         q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState,
@@ -2858,34 +3434,6 @@ public class Qwen35TextModelInner: Module {
 
     private func tapLayerIdsForNarrowing() -> [Int]? { dFlash2Tap.layerIds }
 
-    /// Submission slices (`BONSAI_VERIFY_SLICES=0` / `BONSAI_PROMPT_SLICES=0`
-    /// submit each forward as one graph). The host builds a 64-layer graph in
-    /// a few milliseconds while the GPU waits for it: behind the drafter's
-    /// block on a verify, from idle on a prompt. Committing the tower every
-    /// sixteen layers (a prompt also after its fourth, as nothing runs ahead
-    /// of it) lets the GPU run the front while the host builds the rest. Same
-    /// kernels, same inputs, same order; only command-buffer boundaries move
-    /// (Meganpark980320 `72b3b48`, DPZZxlz `5f72492`, DrCleverHans `db2d22e`).
-    static let verifySlices = sliceFlag("BONSAI_VERIFY_SLICES")
-    static let promptSlices = sliceFlag("BONSAI_PROMPT_SLICES")
-
-    private static func sliceFlag(_ name: String) -> Bool {
-        let value = ProcessInfo.processInfo.environment[name]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }
-
-    private func submitsSlice(
-        after modelLayerIndex: Int, verify: Bool, width: Int
-    ) -> Bool {
-        guard modelLayerIndex + 1 < layers.count else { return false }
-        if verify {
-            return Self.verifySlices && (modelLayerIndex + 1) % 16 == 0
-        }
-        return Self.promptSlices && width > 32
-            && (modelLayerIndex == 3 || (modelLayerIndex + 1) % 16 == 0)
-    }
-
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2909,6 +3457,10 @@ public class Qwen35TextModelInner: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        // Early-submission boundaries for this forward (`Qwen35TrunkSubmission`).
+        let submission = Qwen35TrunkSubmission.plan(
+            rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
+            caches: caches)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -2953,9 +3505,10 @@ public class Qwen35TextModelInner: Module {
                 if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                     pendingTapSlot = slot
                 }
-                if submitsSlice(
-                    after: modelLayerIndex, verify: captureRecurrentWindow,
-                    width: hiddenStates.dim(1))
+                // EARLY SUBMISSION (`Qwen35TrunkSubmission`): the layer's
+                // output is `h + f` with the add left pending, so both go.
+                if let submission,
+                    submission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
                     asyncEval([out.h, out.f])
                 }
@@ -2984,9 +3537,10 @@ public class Qwen35TextModelInner: Module {
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
             }
-            if submitsSlice(
-                after: modelLayerIndex, verify: captureRecurrentWindow,
-                width: hiddenStates.dim(1))
+            // EARLY SUBMISSION (verify slices / prompt pipelining): hand
+            // the GPU the layers built so far. See `Qwen35TrunkSubmission`.
+            if let submission,
+                submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
                 asyncEval([hiddenStates])
             }
