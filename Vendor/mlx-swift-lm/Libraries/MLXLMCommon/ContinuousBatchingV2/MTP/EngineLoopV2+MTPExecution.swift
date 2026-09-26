@@ -5,17 +5,6 @@
 import Foundation
 import MLX
 
-/// On unless explicitly disabled: a round whose driver does not use the
-/// marginal depth policy drops the dead verify top-two readback.
-/// `DARKBLOOM_MTP_SKIP_DEAD_MARGIN=0` keeps the readback.
-enum CBv2MTPDeadMarginSkip {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MTP_SKIP_DEAD_MARGIN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-}
-
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
     let start: Int
@@ -44,9 +33,6 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
-    /// Prompt rows that sampled their first token in this step and can carry
-    /// straight into a block-drafter round (no seed forward).
-    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
 }
 
 extension EngineLoopV2 {
@@ -305,7 +291,6 @@ extension EngineLoopV2 {
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
-        var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -354,11 +339,6 @@ extension EngineLoopV2 {
                     positionIds: positions, requirement: requirement) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = mtp.committedObservationHidden(forward.lastHidden)
-                if row.samples, Self.mtpPrefillCarryEnabled, mtp.blockDrafter != nil {
-                    let width = forward.lastHidden.dim(1)
-                    prefillCarries.append(
-                        (id: rec.id, hidden: forward.lastHidden[0..., (width - 1)..., 0...]))
-                }
                 do {
                     cacheInnerState.append(contentsOf: try evaluation.evaluate())
                 } catch {
@@ -479,21 +459,8 @@ extension EngineLoopV2 {
             seedHidden: seedHidden,
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
-            committedObservationRows: committedObservationRows,
-            prefillCarries: prefillCarries)
+            committedObservationRows: committedObservationRows)
     }
-
-    /// A BLOCK drafter's first block needs only the prompt's tapped context
-    /// and the prompt's sampled token as its anchor, so a prompt row can carry
-    /// straight into a round: the one-token seed forward that re-established a
-    /// carry after the prompt is skipped (its position is computed by that
-    /// first round's verify instead). `DARKBLOOM_BONSAI_PREFILL_CARRY=0`
-    /// restores the seed step.
-    static let mtpPrefillCarryEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_CARRY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
 
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
@@ -733,11 +700,7 @@ extension EngineLoopV2 {
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
-            // The verify top-two values feed only the marginal depth policy
-            // (`previousTopTwoMargin`); with a fixed draft depth nothing
-            // reads them, so the round neither retains nor reads them back.
-            policyTopTwoValues: (mtp.usesMarginalPolicy || !CBv2MTPDeadMarginSkip.enabled)
-                ? target.policyTopTwo?.values : nil,
+            policyTopTwoValues: target.policyTopTwo?.values,
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill

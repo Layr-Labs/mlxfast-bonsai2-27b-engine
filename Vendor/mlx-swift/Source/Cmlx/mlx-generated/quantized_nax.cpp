@@ -961,6 +961,197 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Verify-width body of qmm_t_nax: at most 16 live rows in a BM = 32 tile
+// (k_half below), 2-bit weights with group_size a multiple of 128, N aligned
+// to the 64-column tile, float or half activations.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+constexpr bool qmm_t_nax_rows16_applies() {
+  return true && (metal::is_same_v<T, float> || metal::is_same_v<T, half>) &&
+      bits == 2 && (group_size % 128 == 0) && aligned_N && BM == 32 &&
+      BK == 64 && BN == 64 && WM == 2 && WN == 2;
+}
+
+// Ws elements the qmm_t_nax kernels declare: BN x BK_padded, and at least the
+// 64 x 136 half tile (17408 B) of the rows16 body when it applies. For float
+// that is the same 17408 B as before; for half it grows from 9216 B.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+constexpr int qmm_t_nax_ws_elems() {
+  constexpr int base = BN * (BK + 16 / sizeof(T));
+  constexpr int rows16 = int(64 * (128 + 8) * sizeof(half) / sizeof(T));
+  return (true && (metal::is_same_v<T, float> || metal::is_same_v<T, half>) &&
+          bits == 2 && (group_size % 128 == 0) && aligned_N && BM == 32 &&
+          BK == 64 && BN == 64 && WM == 2 && WN == 2 && rows16 > base)
+      ? rows16
+      : base;
+}
+
+// One 2-bit word -> 16 half weights, dequantized in float from the float
+// scale and offset and rounded once (for T = half: the same values
+// dequantize_2bit_word<half> stores).
+METAL_FUNC void dequantize_2bit_word_half(
+    uint32_t word,
+    float s,
+    float b,
+    threadgroup half* w_local) {
+  float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+  for (int i = 0; i < 4; i++) {
+    const uint8_t wb = static_cast<uint8_t>((word >> (8 * i)) & 0xff);
+    w_local[4 * i] = static_cast<half>(sc[0] * (wb & 0x03) + b);
+    w_local[4 * i + 1] = static_cast<half>(sc[1] * (wb & 0x0c) + b);
+    w_local[4 * i + 2] = static_cast<half>(sc[2] * (wb & 0x30) + b);
+    w_local[4 * i + 3] = static_cast<half>(sc[3] * (wb & 0xc0) + b);
+  }
+}
+
+// The rows16 body. Weights sit in Ws as half, 64 columns x 128 K per step, so
+// each barrier pair covers one whole quantization group instead of half of
+// one. The KS simdgroup rows split every 128-K step KS ways (KS = 4: 32 K
+// each over all 64 columns) and the partial sums meet in Ws at the end. The
+// MMA is T x half -> float: for T = half the operands are exactly those of the
+// BK = 64 path and only the float summation order changes; for T = float the
+// weights are rounded once to half instead of the activations being truncated.
+template <typename T, int group_size, int KS>
+METAL_FUNC void qmm_t_nax_rows16(
+    const device uint8_t* wl,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws_raw,
+    const int K,
+    const int N,
+    const int rows,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(KS == 2 || KS == 4, "4 simdgroups: 4/KS column groups x KS");
+  constexpr int BN = 64;
+  constexpr int BK = 128;
+  constexpr int SK = 32;
+  constexpr int LD = BK + 8;
+  constexpr int CG = 4 / KS; // column groups
+  constexpr int SN = BN / CG;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  constexpr int KPER = BK / KS; // K per simdgroup per step
+  constexpr int WPT = BK / 32; // uint32 words per loader thread per step
+  static_assert(group_size % BK == 0, "one scale per row per step");
+
+  threadgroup half* Ws = (threadgroup half*)Ws_raw;
+  const short cg = short(simd_gid % CG);
+  const short kg = short(simd_gid / CG);
+  const short kk0 = kg * KPER;
+  const short tn = cg * SN;
+
+  // Loader: thread t fills row t / 2, K half (t & 1) of the step.
+  const int t = int(simd_gid) * 32 + int(simd_lid);
+  const int prow = t >> 1;
+  const int K_g = K / group_size;
+  const device uint32_t* pw =
+      (const device uint32_t*)wl + prow * (K / 16) + (t & 1) * WPT;
+  const device T* ps = scales + prow * K_g;
+  const device T* pb = biases + prow * K_g;
+  threadgroup half* pdst = Ws + prow * LD + (t & 1) * (BK / 2);
+
+  NAXTile<float, 1, TN> Dtile;
+  Dtile.clear();
+
+  uint32_t pwv[WPT];
+  for (int j = 0; j < WPT; j++) {
+    pwv[j] = pw[j];
+  }
+  float psc = float(ps[0]);
+  float pbi = float(pb[0]);
+
+  const bool full = rows >= 16;
+  const device T* xk = x + kk0;
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = 0; j < WPT; j++) {
+      dequantize_2bit_word_half(pwv[j], psc, pbi, pdst + 16 * j);
+    }
+    if (k + BK < K) {
+      const int nk = k + BK;
+      for (int j = 0; j < WPT; j++) {
+        pwv[j] = pw[nk / 16 + j];
+      }
+      psc = float(ps[nk / group_size]);
+      pbi = float(pb[nk / group_size]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < KPER; kk += SK) {
+      NAXTile<T, 1, TK> Atile;
+      NAXTile<half, TN, TK> Btile;
+      volatile int compiler_barrier;
+      if (full) {
+        Atile.load(xk + k + kk, K);
+      } else {
+        Atile.load_safe(xk + k + kk, K, short2(SK, rows));
+      }
+      Btile.template load<half, LD, 1>(Ws + tn * LD + kk0 + kk);
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<false>{},
+          Btile,
+          metal::bool_constant<true>{});
+      (void)compiler_barrier;
+    }
+  }
+
+  // K groups 1..KS-1 hand their partials to K group 0 (same column group,
+  // same lane layout).
+  constexpr short kE = NAXTile<float, 1, TN>::kElemsPerTile;
+  static_assert(
+      (KS - 1) * CG * 32 * kE * sizeof(float) <= 64 * LD * sizeof(half),
+      "K-split reduction must fit in Ws");
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup float* red = (threadgroup float*)Ws_raw + simd_lid;
+  if (kg != 0) {
+    threadgroup float* r = red + ((kg - 1) * CG + cg) * (32 * kE);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kE; i++) {
+      r[i * 32] = Dtile.elems()[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (kg != 0) {
+    return;
+  }
+  STEEL_PRAGMA_UNROLL
+  for (short q = 0; q < KS - 1; q++) {
+    threadgroup float* r = red + (q * CG + cg) * (32 * kE);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kE; i++) {
+      Dtile.elems()[i] += r[i * 32];
+    }
+  }
+  if (full) {
+    Dtile.store(y + tn, N);
+  } else {
+    Dtile.store_safe(y + tn, N, short2(SN, rows));
+  }
+}
+
 template <
     typename T,
     const int group_size,
@@ -1008,88 +1199,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  // Visit adjacent M tiles of each N tile so prompt-width calls reuse the
-  // packed weight tile while it remains in cache. For a fixed NAX grid this
-  // remaps each (M,N) tile exactly once; tid.z remains the batch index.
-  const int m_tiles = (M + BM - 1) / BM;
-  const int n_tiles = (N + BN - 1) / BN;
-  int y_row;
-  int y_col;
-  if (m_tiles == 1) {
-    // Narrow decode/verify uses a single M tile; avoid runtime div/mod there.
-    y_row = int(tid.y) * BM;
-    y_col = int(tid.x) * BN;
-  } else {
-    const int tile_id = int(tid.y) * n_tiles + int(tid.x);
-    y_row = (tile_id % m_tiles) * BM;
-    y_col = (tile_id / m_tiles) * BN;
-  }
-
-#ifdef MLX_QMM_M16_NAX
-  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
-  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
-  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
-  // are summed through Ws, which this path does not otherwise use.
-  if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
-      const uint cb = simd_gid >> 1;
-      const uint ks = simd_gid & 1;
-      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
-      qmm_m16_block<T, 2>(
-          w,
-          scales,
-          biases,
-          x + y_row * static_cast<int64_t>(K),
-          y + y_row * static_cast<int64_t>(N),
-          K,
-          N,
-          M - y_row,
-          y_col + 32 * int(cb),
-          0,
-          K,
-          ks,
-          simd_lid,
-          red,
-          red);
-      return;
-    }
-  }
-#endif
-
-#ifdef MLX_QMM_M16_NAX
-  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
-  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
-  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
-  // are summed through Ws, which this path does not otherwise use.
-  if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
-      const uint cb = simd_gid >> 1;
-      const uint ks = simd_gid & 1;
-      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
-      qmm_m16_block<T, 2>(
-          w,
-          scales,
-          biases,
-          x + y_row * static_cast<int64_t>(K),
-          y + y_row * static_cast<int64_t>(N),
-          K,
-          N,
-          M - y_row,
-          y_col + 32 * int(cb),
-          0,
-          K,
-          ks,
-          simd_lid,
-          red,
-          red);
-      return;
-    }
-  }
-#endif
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w;
 
@@ -1121,6 +1232,14 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   const bool row_fit =
       kNaxRowFit != 0 && kRowFitShape && (M - y_row) <= int(SM);
   const bool k_half = kNaxRowFit == 2 && row_fit;
+  if constexpr (qmm_t_nax_rows16_applies<
+                    T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>()) {
+    if (k_half) {
+      qmm_t_nax_rows16<T, group_size, 4>(
+          wl, scales, biases, x, y, Ws, K, N, M - y_row, simd_gid, simd_lid);
+      return;
+    }
+  }
 
   const short tm = k_half ? short(0) : short(SM * (simd_gid / WN));
   const short tn = SN * (simd_gid % WN);
@@ -1433,7 +1552,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[qmm_t_nax_ws_elems<
+      T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>()];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1558,7 +1678,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[qmm_t_nax_ws_elems<
+      T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>()];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1890,6 +2011,8 @@ template <
     });
   }
 }
+
+///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
 
