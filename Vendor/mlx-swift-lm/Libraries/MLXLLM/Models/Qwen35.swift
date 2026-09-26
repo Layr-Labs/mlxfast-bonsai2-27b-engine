@@ -1678,448 +1678,7 @@ enum Qwen35GDNVerifyStateSkip {
 /// window that is not a whole number of chunks runs its remainder rows on the
 /// sequential kernel from the chunked state. `MLXFAST_GDN_CHUNKED=0` turns
 /// the path off; `MLXFAST_GDN_CHUNK` picks the chunk (8, the default, or 16).
-enum Qwen35GatedDeltaChunked {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    static let chunk: Int = {
-        let raw = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNK"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let raw, let value = Int(raw), [8, 16].contains(value) { return value }
-        return 8
-    }()
-
-    /// Shortest window that takes the chunked path.
-    static let minRows = 64
-
-    /// Simdgroups per scan threadgroup (each owns 8 state rows of one head).
-    static let scanSimdgroups = 4
-
-    static func supports(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> Bool {
-        guard q.ndim == 4, k.ndim == 4, v.ndim == 4, q.shape == k.shape else { return false }
-        let B = k.dim(0)
-        let T = k.dim(1)
-        let Hk = k.dim(2)
-        let Hv = v.dim(2)
-        let Dv = v.dim(3)
-        return k.dim(3) == 128 && Dv % 8 == 0 && Hv % Hk == 0 && v.dim(1) == T
-            && g.shape == [B, T, Hv] && beta.shape == [B, T, Hv]
-            && state.shape == [B, Hv, Dv, 128]
-            && q.dtype == .float32 && k.dtype == .float32 && v.dtype == .float32
-            && g.dtype == .float32 && beta.dtype == .float32 && state.dtype == .float32
-    }
-
-    static func run(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> (MLXArray, MLXArray)? {
-        let T = k.dim(1)
-        guard enabled, T >= minRows, T >= chunk,
-            supports(q: q, k: k, v: v, g: g, beta: beta, state: state)
-        else { return nil }
-        return window(q: q, k: k, v: v, g: g, beta: beta, state: state)
-    }
-
-    /// Capture-verify windows (the DFlash block, 16 rows) of at least two
-    /// whole chunks also take the chunked kernels. The verify only needs the
-    /// rows' outputs and the window's final state (the replay of a strict
-    /// prefix re-runs the sequential kernel from the retained pre-verify state
-    /// and inputs), which is exactly what `chunks` returns. A window that is
-    /// not a whole number of chunks stays on the sequential kernel: a
-    /// sequential tail costs more than it saves at these widths.
-    /// `MLXFAST_GDN_CHUNKED_VERIFY=0` keeps verify on the sequential kernel.
-    /// Off by default here: every verify-width change on this lineage that
-    /// the ranked box measured lengthened the decode window, and this record's
-    /// own window is 5.9% longer than its parent's. `MLXFAST_GDN_CHUNKED_VERIFY=1`
-    /// takes the chunked kernels at verify width.
-    static let verifyEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED_VERIFY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return enabled && ["1", "true", "yes", "on"].contains(value ?? "")
-    }()
-
-    static func runVerify(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> (MLXArray, MLXArray)? {
-        let T = k.dim(1)
-        guard verifyEnabled, T >= 2 * chunk, T % chunk == 0,
-            supports(q: q, k: k, v: v, g: g, beta: beta, state: state)
-        else { return nil }
-        return chunks(q: q, k: k, v: v, g: g, beta: beta, state: state)
-    }
-
-    /// Whole chunks on the chunked kernels, any remainder on the sequential one.
-    private static func window(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        let T = k.dim(1)
-        let head = (T / chunk) * chunk
-        if head == T {
-            return chunks(q: q, k: k, v: v, g: g, beta: beta, state: state)
-        }
-        let rows = 0 ..< head
-        let (yHead, sHead) = chunks(
-            q: q[0..., rows], k: k[0..., rows], v: v[0..., rows], g: g[0..., rows],
-            beta: beta[0..., rows], state: state)
-        let tq = q[0..., head...]
-        let tk = k[0..., head...]
-        let tv = v[0..., head...]
-        let tg = g[0..., head...]
-        let tb = beta[0..., head...]
-        let tail =
-            Qwen35GatedDeltaV3.run(q: tq, k: tk, v: tv, g: tg, beta: tb, state: sHead)
-            ?? gatedDeltaKernel(q: tq, k: tk, v: tv, g: tg, beta: tb, state: sHead, mask: nil)
-        return (concatenated([yHead, tail.0], axis: 1), tail.1)
-    }
-
-    private static func chunks(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        let B = k.dim(0)
-        let T = k.dim(1)
-        let Hk = k.dim(2)
-        let Dk = k.dim(3)
-        let Hv = v.dim(2)
-        let Dv = v.dim(3)
-        let C = chunk
-        let NC = T / C
-        let rowCount = MLXArray(Int32(T))
-        let prepared = prepKernel(
-            [q, k, g, beta, rowCount],
-            template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
-            grid: (32, NC, B * Hk),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
-            outputDTypes: [.float32, .float32, .float32])
-        let outputs = scanKernel(
-            [q, k, v, prepared[0], prepared[1], prepared[2], state, rowCount],
-            template: [
-                ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
-                ("NS", scanSimdgroups),
-            ],
-            grid: (32, Dv / 8, B * Hv),
-            threadGroup: (32, scanSimdgroups, 1),
-            outputShapes: [[B, T, Hv, Dv], state.shape],
-            outputDTypes: [.float32, .float32])
-        return (outputs[0], outputs[1])
-    }
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var prepared = Set<[Int]>()
-
-    /// Builds both kernels' pipelines (and the remainder path's) for this
-    /// geometry once per process, on throwaway inputs, so the first prompt
-    /// window does not pay their compiles. Called from the layer's init.
-    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int) {
-        guard enabled, hk > 0, hv % hk == 0 else { return }
-        lock.withLock {
-            guard prepared.insert([hk, dk, hv, dv]).inserted else { return }
-            let rows = chunk + 3
-            let q = MLXArray.zeros([1, rows, hk, dk], dtype: .float32)
-            let v = MLXArray.zeros([1, rows, hv, dv], dtype: .float32)
-            let g = MLXArray.ones([1, rows, hv], dtype: .float32)
-            let beta = MLXArray.zeros([1, rows, hv], dtype: .float32)
-            let state = MLXArray.zeros([1, hv, dv, dk], dtype: .float32)
-            guard supports(q: q, k: q, v: v, g: g, beta: beta, state: state) else { return }
-            let (y, s) = window(q: q, k: q, v: v, g: g, beta: beta, state: state)
-            eval(y, s)
-        }
-    }
-
-    private static let prepKernel = MLXFast.metalKernel(
-        name: "bonsai_gated_delta_chunk_prep",
-        inputNames: ["q", "k", "g", "beta", "T"],
-        outputNames: ["tp", "pm", "gf"],
-        source: prepSource)
-
-    private static let scanKernel = MLXFast.metalKernel(
-        name: "bonsai_gated_delta_chunk_scan",
-        inputNames: ["q", "k", "v", "tp", "pm", "gf", "state_in", "T"],
-        outputNames: ["y", "state_out"],
-        source: scanSource)
-
-    // BEGIN GENERATED CHUNKED GDN SOURCES
-    private static let prepSource = """
-            // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
-            // Q K^T are formed once and serve the Hv / Hk value heads of this key
-            // head, which run side by side in lane groups of C lanes (lane = head
-            // group * C + row), GP heads per pass.
-            constexpr int HR = Hv / Hk;
-            constexpr int GP = (32 / C) < HR ? (32 / C) : HR;
-            constexpr int CT = C / 8;
-            constexpr int LD = C + 1;
-            threadgroup float KK[C * LD];
-            threadgroup float QK[C * LD];
-            threadgroup float Ah[GP * C * LD];
-            threadgroup float Th[GP * C * LD];
-            const uint lane = thread_index_in_simdgroup;
-            const int T_ = T;
-            const int NC = T_ / C;
-            const int n = int(thread_position_in_grid.y);
-            const int bk = int(thread_position_in_grid.z);
-            const int b_idx = bk / Hk;
-            const int hk = bk % Hk;
-            const int t0 = n * C;
-            const int ks = Hk * Dk;
-            const device float* k_ = k + ((size_t)b_idx * T_ + t0) * ks + hk * Dk;
-            const device float* q_ = q + ((size_t)b_idx * T_ + t0) * ks + hk * Dk;
-
-            // lower tiles of K K^T and Q K^T
-            _Pragma("clang loop unroll(full)")
-            for (int ti = 0; ti < CT; ++ti) {
-              _Pragma("clang loop unroll(full)")
-              for (int tj = 0; tj <= ti; ++tj) {
-                simdgroup_float8x8 akk = simdgroup_float8x8(0);
-                simdgroup_float8x8 aqk = simdgroup_float8x8(0);
-                _Pragma("clang loop unroll(full)")
-                for (int d = 0; d < Dk / 8; ++d) {
-                  simdgroup_float8x8 ka, qa, kb;
-                  simdgroup_load(ka, k_ + (ti * 8) * ks + d * 8, ks);
-                  simdgroup_load(qa, q_ + (ti * 8) * ks + d * 8, ks);
-                  simdgroup_load(kb, k_ + (tj * 8) * ks + d * 8, ks, ulong2(0, 0), true);
-                  simdgroup_multiply_accumulate(akk, ka, kb, akk);
-                  simdgroup_multiply_accumulate(aqk, qa, kb, aqk);
-                }
-                simdgroup_store(akk, KK + (ti * 8) * LD + tj * 8, LD);
-                simdgroup_store(aqk, QK + (ti * 8) * LD + tj * 8, LD);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const int grp = int(lane) / C;
-            const int row = int(lane) % C;
-            const int gbase = grp * C;
-            for (int h0 = 0; h0 < HR; h0 += GP) {
-              const int h = h0 + grp;
-              const bool live = grp < GP && h < HR;
-              const int hv = hk * HR + (live ? h : 0);
-              const size_t slot = ((size_t)b_idx * Hv + hv) * NC + n;
-              // in-chunk inclusive prefix of log g within each lane group. A row
-              // whose g underflowed (g == 0, or subnormal) has no finite log: it
-              // zeroes every decay product spanning it, so it adds 0 to the prefix
-              // and `zr` (the group's underflowed rows, one bit per row) masks
-              // the products that span it.
-              float gam = 0.0f;
-              float bet = 0.0f;
-              bool zero = false;
-              if (live) {
-                const float gv = g[((size_t)b_idx * T_ + t0 + row) * Hv + hv];
-                zero = !(gv >= FLT_MIN);
-                gam = zero ? 0.0f : metal::precise::log(zero ? 1.0f : gv);
-                bet = beta[((size_t)b_idx * T_ + t0 + row) * Hv + hv];
-              }
-              const uint zr = uint(static_cast<simd_vote::vote_t>(simd_ballot(zero)) >> gbase) & ((1u << C) - 1u);
-              _Pragma("clang loop unroll(full)")
-              for (int off = 1; off < C; off <<= 1) {
-                const float up = simd_shuffle_up(gam, ushort(off));
-                gam += row >= off ? up : 0.0f;
-              }
-              const float gam_last = simd_shuffle(gam, ushort(gbase + C - 1));
-              // rows (j, i] as a bit mask: ((2 << i) - 1) & ~((2 << j) - 1)
-              const uint upto = (2u << row) - 1u;
-              // decay factors for the scan: exp(gam_i), exp(gam_last - gam_i)
-              if (live) {
-                device float* gf_ = gf + slot * 2 * C;
-                gf_[row] = (zr & upto) == 0u ? metal::precise::exp(gam) : 0.0f;
-                gf_[C + row] = (zr & ~upto) == 0u ? metal::precise::exp(gam_last - gam) : 0.0f;
-              }
-              // P row (lower incl. diagonal) to device; A row (strict lower) to Ah
-              threadgroup float* A_ = Ah + grp * C * LD;
-              threadgroup float* M_ = Th + grp * C * LD;
-              device float* pm_ = pm + slot * C * C;
-              _Pragma("clang loop unroll(full)")
-              for (int j = 0; j < C; ++j) {
-                const float gj = simd_shuffle(gam, ushort(gbase + j));
-                if (live) {
-                  float pv = 0.0f;
-                  float av = 0.0f;
-                  if (j <= row) {
-                    const uint span = upto & ~((2u << j) - 1u);
-                    const float e = (zr & span) == 0u ? metal::precise::exp(gam - gj) : 0.0f;
-                    pv = QK[row * LD + j] * e;
-                    if (j < row) av = bet * KK[row * LD + j] * e;
-                  }
-                  pm_[row * C + j] = pv;
-                  A_[row * LD + j] = av;
-                }
-              }
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-              // T = (I + A)^-1, column m = row per lane, stored transposed in M_[m][i]
-              if (live) {
-                const int m = row;
-                for (int i = 0; i < C; ++i) M_[m * LD + i] = (i == m) ? 1.0f : 0.0f;
-                for (int i = m + 1; i < C; ++i) {
-                  float s0 = 0.0f, s1 = 0.0f;
-                  int j = m;
-                  for (; j + 1 < i; j += 2) {
-                    s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
-                    s1 = metal::fma(A_[i * LD + j + 1], M_[m * LD + j + 1], s1);
-                  }
-                  if (j < i) s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
-                  M_[m * LD + i] = -(s0 + s1);
-                }
-                // T' = T diag(beta): T'[i][m] = T[i][m] * beta_m
-                device float* tp_ = tp + slot * C * C;
-                for (int i = 0; i < C; ++i) tp_[i * C + m] = M_[m * LD + i] * bet;
-              }
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        """
-
-    private static let scanSource = """
-            // grid: (32, Dv / 8, B * Hv), threadgroup (32, NS, 1). One simdgroup per
-            // 8 state rows (its S^T columns held in registers across the chunks); the
-            // threadgroup shares each chunk's K, Q, T' and P through threadgroup
-            // memory.
-            constexpr int CT = C / 8;
-            constexpr int DT = Dk / 8;
-            constexpr int LK = Dk + 8;
-            constexpr int LC = C + 8;
-            constexpr int NT = 32 * NS;
-            constexpr int KQ4 = C * (Dk / 4);        // float4s of one chunk of K (or Q)
-            constexpr int TP4 = C * (C / 4);         // float4s of one chunk of T' (or P)
-            threadgroup float Ksh[C * LK];
-            threadgroup float Qsh[C * LK];
-            threadgroup float TPsh[2 * C * LC];
-            const uint lane = thread_index_in_simdgroup;
-            const int tid = int(thread_index_in_threadgroup);
-            const int T_ = T;
-            const int NC = T_ / C;
-            const int r0 = int(thread_position_in_grid.y) * 8;
-            const int bh = int(thread_position_in_grid.z);
-            const int b_idx = bh / Hv;
-            const int hv = bh % Hv;
-            const int hk = hv / (Hv / Hk);
-            const int ks = Hk * Dk;
-            const int vs = Hv * Dv;
-            const short qid = lane / 4;
-            const short fm = (qid & 4) + ((lane / 2) % 4);
-            const short fn = (qid & 2) * 2 + (lane % 2) * 2;
-            const device float* kbase = k + (size_t)b_idx * T_ * ks + hk * Dk;
-            const device float* qbase = q + (size_t)b_idx * T_ * ks + hk * Dk;
-            const device float* tbase = tp + (size_t)bh * NC * C * C;
-            const device float* pbase = pm + (size_t)bh * NC * C * C;
-
-            simdgroup_float8x8 St[DT];
-            _Pragma("clang loop unroll(full)")
-            for (int d = 0; d < DT; ++d)
-              simdgroup_load(St[d], state_in + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
-
-            for (int n = 0; n < NC; ++n) {
-              const int t0 = n * C;
-              const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
-              device float* y_ = y + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
-              const device float* gf_ = gf + ((size_t)bh * NC + n) * 2 * C;
-              // stage this chunk's K, Q, T', P (the previous chunk's readers are done)
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-              for (int e = tid; e < KQ4; e += NT) {
-                const int row = e / (Dk / 4);
-                const int c4 = (e % (Dk / 4)) * 4;
-                const size_t src = (size_t)(t0 + row) * ks + c4;
-                *(threadgroup float4*)(Ksh + row * LK + c4) = *(const device float4*)(kbase + src);
-                *(threadgroup float4*)(Qsh + row * LK + c4) = *(const device float4*)(qbase + src);
-              }
-              for (int e = tid; e < 2 * TP4; e += NT) {
-                const int which = e / TP4;
-                const int f = e % TP4;
-                const int row = f / (C / 4);
-                const int c4 = (f % (C / 4)) * 4;
-                const device float* src = (which == 0 ? tbase : pbase) + (size_t)n * C * C;
-                *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = *(const device float4*)(src + f * 4);
-              }
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-
-              // X = K S^T, Xq = Q S^T (C x 8 each)
-              simdgroup_float8x8 Xk[CT];
-              simdgroup_float8x8 Xq[CT];
-              _Pragma("clang loop unroll(full)")
-              for (int ti = 0; ti < CT; ++ti) {
-                Xk[ti] = simdgroup_float8x8(0);
-                Xq[ti] = simdgroup_float8x8(0);
-              }
-              _Pragma("clang loop unroll(full)")
-              for (int d = 0; d < DT; ++d) {
-                _Pragma("clang loop unroll(full)")
-                for (int ti = 0; ti < CT; ++ti) {
-                  simdgroup_float8x8 ka, qa;
-                  simdgroup_load(ka, Ksh + (ti * 8) * LK + d * 8, LK);
-                  simdgroup_load(qa, Qsh + (ti * 8) * LK + d * 8, LK);
-                  simdgroup_multiply_accumulate(Xk[ti], ka, St[d], Xk[ti]);
-                  simdgroup_multiply_accumulate(Xq[ti], qa, St[d], Xq[ti]);
-                }
-              }
-              // Z = V - diag(exp gam) Xk (in Xk); Xq <- diag(exp gam) Xq
-              _Pragma("clang loop unroll(full)")
-              for (int ti = 0; ti < CT; ++ti) {
-                const int row = ti * 8 + fm;
-                const float eg = gf_[row];
-                thread auto& zk = Xk[ti].thread_elements();
-                thread auto& zq = Xq[ti].thread_elements();
-                const float2 vv = *(const device float2*)(v_ + row * vs + fn);
-                zk[0] = vv.x - eg * zk[0];
-                zk[1] = vv.y - eg * zk[1];
-                zq[0] = eg * zq[0];
-                zq[1] = eg * zq[1];
-              }
-              // Delta = T' Z (T' lower triangular)
-              simdgroup_float8x8 Dl[CT];
-              _Pragma("clang loop unroll(full)")
-              for (int ti = 0; ti < CT; ++ti) {
-                Dl[ti] = simdgroup_float8x8(0);
-                _Pragma("clang loop unroll(full)")
-                for (int tj = 0; tj <= ti; ++tj) {
-                  simdgroup_float8x8 ta;
-                  simdgroup_load(ta, TPsh + (ti * 8) * LC + tj * 8, LC);
-                  simdgroup_multiply_accumulate(Dl[ti], ta, Xk[tj], Dl[ti]);
-                }
-              }
-              // Y = diag(exp gam) Q S^T + P Delta
-              _Pragma("clang loop unroll(full)")
-              for (int ti = 0; ti < CT; ++ti) {
-                _Pragma("clang loop unroll(full)")
-                for (int tj = 0; tj <= ti; ++tj) {
-                  simdgroup_float8x8 pa;
-                  simdgroup_load(pa, TPsh + C * LC + (ti * 8) * LC + tj * 8, LC);
-                  simdgroup_multiply_accumulate(Xq[ti], pa, Dl[tj], Xq[ti]);
-                }
-                const int row = ti * 8 + fm;
-                thread auto& ye = Xq[ti].thread_elements();
-                *(device float2*)(y_ + row * vs + fn) = float2(ye[0], ye[1]);
-              }
-              // Delta~ = diag(exp(gam_C - gam)) Delta
-              _Pragma("clang loop unroll(full)")
-              for (int ti = 0; ti < CT; ++ti) {
-                const int row = ti * 8 + fm;
-                const float r = gf_[C + row];
-                thread auto& de = Dl[ti].thread_elements();
-                de[0] = de[0] * r;
-                de[1] = de[1] * r;
-              }
-              // S^T <- exp(gam_C) S^T + K^T Delta~
-              const float eC = gf_[C - 1];
-              _Pragma("clang loop unroll(full)")
-              for (int d = 0; d < DT; ++d) {
-                thread auto& se = St[d].thread_elements();
-                se[0] = se[0] * eC;
-                se[1] = se[1] * eC;
-                _Pragma("clang loop unroll(full)")
-                for (int ti = 0; ti < CT; ++ti) {
-                  simdgroup_float8x8 kt;
-                  simdgroup_load(kt, Ksh + (ti * 8) * LK + d * 8, LK, ulong2(0, 0), true);
-                  simdgroup_multiply_accumulate(St[d], kt, Dl[ti], St[d]);
-                }
-              }
-            }
-            _Pragma("clang loop unroll(full)")
-            for (int d = 0; d < DT; ++d)
-              simdgroup_store(St[d], state_out + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
-        """
-    // END GENERATED CHUNKED GDN SOURCES
-}
+// Qwen35GatedDeltaChunked is defined in Qwen35A3BOptimization.swift.
 
 /// Wide-window (prefill) variant of the unmasked gated-delta kernel.
 ///
@@ -2634,6 +2193,10 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GDNReplayBatch.prepare(layer: self)
         Qwen35GDNVerifyStateSkip.prepare(layer: self)
         Qwen35GDNReplayFused.prepare(layer: self)
+        Qwen35GDNPrework.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35GatedDeltaChunked.prepareFresh(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -3043,6 +2606,13 @@ final class Qwen35GatedDeltaNet: Module {
                 headVDim: headVDim)
         else { return nil }
         let stateShape = [B, numVHeads, headVDim, headKDim]
+        // Whole chunks from the zero state without the zeros array
+        // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
+        if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
+        {
+            return (out, pre.tail, newSsmState)
+        }
         // The record's chunked recurrence takes prompt windows; keep it (from
         // a zero state) and only replace the prework in front of it.
         if Qwen35GatedDeltaChunked.enabled,
@@ -5501,6 +5071,16 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        if strided, B == 1, S % rowTile == 0,
+            rowTileVerified(
+                keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
+                dtype: qkv.dtype)
+        {
+            return freshStridedRows(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
+                normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim, rows: rowTile)
+        }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
             [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
@@ -5518,6 +5098,353 @@ enum Qwen35GDNPrework {
         return Outputs(
             q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
             tail: outputs[5])
+    }
+
+    // MARK: Row-tiled fresh strided prework
+
+    /// `BONSAI_GDN_PREWORK_ROWS=0` keeps `freshStridedKernel` (one row per
+    /// threadgroup) for every prompt chunk.
+    static let rowTiledEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Rows per threadgroup of `freshStridedRowsKernel`: one fixed value, not
+    /// chosen per chip or at run time. A chunk whose row count it does not
+    /// divide takes `freshStridedKernel`.
+    static let rowTile = 4
+
+    /// `freshStridedSource` with one threadgroup per (key head, `RW`
+    /// consecutive rows) instead of per (key head, row). The stock launch reads
+    /// every chunk element from the threadgroups of four neighbouring rows and
+    /// a column's conv taps from every row's threadgroup; here each column's
+    /// `RW + NK` chunk rows and `KS` taps are read once per threadgroup.
+    /// Thread c still owns channel c, so every simdgroup holds the same
+    /// channels in the same lanes and `simd_sum` sees the same operands; row
+    /// t0 + i accumulates the same taps in the same order (`fma` over
+    /// j = 0..KS-1 on chunk row t0 + i + j - NK, the stock kernel's r); each
+    /// row's norms reduce through the same `(r0 + r1) + (r2 + r3)` tree. Every
+    /// formula (the chunk-row load, the tap load and `fma`, SiLU, the norms,
+    /// the gates, the tail) is cut from `freshStridedSource` by checked spans,
+    /// so the arithmetic is the stock kernel's text and follows it; only the
+    /// row bookkeeping around it is new. Checked bit for bit against the stock
+    /// launch at model construction (`prepare`).
+    private static let freshStridedRowsSource: String = {
+        let src = freshStridedSource
+        func fail(_ what: String) -> Never {
+            preconditionFailure(
+                "Qwen35 GDN prework rows: the strided fresh source no longer matches (\(what))")
+        }
+        func occurrences(_ s: String, in text: String) -> Int {
+            text.components(separatedBy: s).count - 1
+        }
+        func once(_ s: String) -> String {
+            if occurrences(s, in: src) != 1 { fail(s) }
+            return s
+        }
+        // The text of `src` from the unique `start` through the first `end` after it.
+        func span(_ start: String, through end: String) -> String {
+            let head = src.range(of: once(start))!
+            guard let stop = src.range(of: end, range: head.upperBound ..< src.endIndex)
+            else { fail(end) }
+            return String(src[head.lowerBound ..< stop.upperBound])
+        }
+        func replacing(
+            _ text: String, _ target: String, _ replacement: String, count: Int = 1
+        ) -> String {
+            if occurrences(target, in: text) != count { fail(target) }
+            return text.replacingOccurrences(of: target, with: replacement)
+        }
+
+        // Constants, thread ids, strides; the row id becomes the tile's first
+        // row and the row-dependent a/b bases move into the gates' row scope.
+        let abBase = span("const int64_t ab = ", through: ";")
+        let bBase = span("const int64_t bbase = ", through: ";")
+        var header = span("constexpr int GRP", through: "threadgroup float red[8];")
+        header = replacing(
+            header, "const uint t = threadgroup_position_in_grid.y;",
+            "const uint t0 = threadgroup_position_in_grid.y * uint(RW);")
+        header = replacing(header, abBase, "")
+        header = replacing(header, bBase, "")
+        header = replacing(header, "threadgroup float red[8];", "threadgroup float red[8 * RW];")
+        if header.range(of: "\\bt\\b", options: .regularExpression) != nil { fail("row id") }
+
+        let silu = span("// MLX's silu", through: "return acc * sig;")
+        let chunkLoad = span("const float xv = (r < 0)", through: ";")
+        let tap = span("acc = fma(xv, ", through: ";")
+        guard tap.hasSuffix(", acc);") else { fail(tap) }
+        let tapWeight = String(tap.dropFirst("acc = fma(xv, ".count).dropLast(", acc);".count))
+        let tapFma = replacing(tap, tapWeight, "wt[j]")
+
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        var normPartial = span("float sq = simd_sum(xq * xq);", through: barrier)
+        normPartial = replacing(String(normPartial.dropLast(barrier.count)), "red[", "rd[", count: 2)
+        let normApply = replacing(
+            span("sq = (red[0]", through: "* wk[c];"), "red[", "rd[", count: 8)
+
+        let vStore = replacing(
+            once("v[vrow * size_t(DV) + c] = conv_silu(colv);"), "conv_silu(colv)", "xvs[ri]")
+        let tailMarker = once("// Next convolution tail")
+        let tail = String(src[src.range(of: tailMarker)!.lowerBound...])
+
+        var text = """
+            @HEADER@
+
+            auto silu = [&](float acc) -> float {
+              @SILU@
+            };
+
+            // Column `col` for rows t0 .. t0+RW-1: window element m is chunk row
+            // t0 + m - NK (the stock kernel's r), row t0 + i takes tap j on
+            // window element i + j.
+            auto conv_silu_rows = [&](uint col, thread float* out) {
+              float wt[KS];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) {
+                wt[j] = @TAPWEIGHT@;
+              }
+              float xw[RW + NK];
+              #pragma clang loop unroll(full)
+              for (int m = 0; m < RW + NK; m++) {
+                const int r = int(t0) + m - NK;
+                @CHUNKLOAD@
+                xw[m] = xv;
+              }
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < RW; i++) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) {
+                  const float xv = xw[i + j];
+                  @TAPFMA@
+                }
+                out[i] = silu(acc);
+              }
+            };
+
+            // q and k channel c of key head h, rows t0 .. t0+RW-1.
+            @COLQ@
+            @COLK@
+            float xqs[RW];
+            float xks[RW];
+            conv_silu_rows(colq, xqs);
+            conv_silu_rows(colk, xks);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              @NORMPARTIAL@
+            }
+
+            // The GRP value heads of this key head (they do not read the norms).
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GRP; i++) {
+              @VHEAD@
+              @COLV@
+              float xvs[RW];
+              conv_silu_rows(colv, xvs);
+              #pragma clang loop unroll(full)
+              for (int ri = 0; ri < RW; ri++) {
+                const uint t = t0 + uint(ri);
+                @VROW@
+                @VSTORE@
+              }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              float sq;
+              float sk;
+              @NORMAPPLY@
+            }
+
+            // Gates: thread c < GRP * RW takes row t0 + c / GRP, value head c % GRP.
+            if (c < uint(GRP * RW)) {
+              const uint t = t0 + c / uint(GRP);
+              const uint hv = h * GRP + c % uint(GRP);
+              @ABBASE@
+              @BBASE@
+              @GROW@
+              @GATES@
+            }
+
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              @TAIL@
+            }
+            """
+        for (placeholder, piece) in [
+            ("@HEADER@", header),
+            ("@SILU@", silu),
+            ("@TAPWEIGHT@", tapWeight),
+            ("@CHUNKLOAD@", chunkLoad),
+            ("@TAPFMA@", tapFma),
+            ("@COLQ@", span("const uint colq = ", through: ";")),
+            ("@COLK@", span("const uint colk = ", through: ";")),
+            ("@NORMPARTIAL@", normPartial),
+            ("@VHEAD@", once("const uint hv = h * GRP + uint(i);")),
+            ("@COLV@", once("const uint colv = VOFF + hv * DV + c;")),
+            ("@VROW@", span("const size_t vrow = ", through: ";")),
+            ("@VSTORE@", vStore),
+            ("@NORMAPPLY@", normApply),
+            ("@ABBASE@", abBase),
+            ("@BBASE@", bBase),
+            ("@GROW@", span("const size_t grow = ", through: ";")),
+            ("@GATES@", span(
+                "// g = exp(-exp(A_log)",
+                through: "beta[grow] = (bv < 0.0f) ? by : 1.0f - by;")),
+            ("@TAIL@", tail),
+        ] {
+            text = replacing(text, placeholder, piece)
+        }
+        if text.contains("@") || text.contains("conv_silu(") || text.contains("red[sg]") {
+            fail("assembly")
+        }
+        return text
+    }()
+
+    private static let freshStridedRowsKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_strided_rows",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: freshStridedRowsSource,
+        ensureRowContiguous: false)
+
+    /// The row-tiled launch on `runFreshState`'s arguments (after its guards
+    /// and dtype conversions), `rows` rows per threadgroup; `rows` must divide
+    /// the chunk. The outputs have `freshStridedKernel`'s shapes and dtypes.
+    static func freshStridedRows(
+        qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, rows: Int
+    ) -> Outputs {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        precondition(
+            headKDim == 128 && rows > 0 && S % rows == 0
+                && (valueHeads / keyHeads) * rows <= headKDim,
+            "Qwen35 GDN prework rows: unsupported launch")
+        let outputs = freshStridedRowsKernel(
+            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+            ],
+            grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5])
+    }
+
+    private struct RowTileGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
+    }
+
+    private static let rowTileLock = NSLock()
+    nonisolated(unsafe) private static var rowTileVerdicts: [RowTileGeometry: Bool] = [:]
+
+    /// Verdict lookup only (the check runs in `prepare`, never inside a
+    /// forward); a geometry or qkv dtype that was not prepared, or failed its
+    /// check, keeps the stock kernel.
+    private static func rowTileVerified(
+        keyHeads: Int, valueHeads: Int, convDim: Int, taps: Int, dtype: DType
+    ) -> Bool {
+        guard rowTiledEnabled else { return false }
+        let geometry = RowTileGeometry(
+            hk: keyHeads, hv: valueHeads, cd: convDim, ks: taps, dtype: "\(dtype)")
+        return rowTileLock.withLock { rowTileVerdicts[geometry] ?? false }
+    }
+
+    /// Compile the row-tiled kernel for this geometry and check it bit for bit
+    /// against the stock launch (`runFreshState` itself, which takes the stock
+    /// kernel while no verdict exists), once per process, at model
+    /// construction, for every qkv dtype `runFreshState` accepts. A mismatch
+    /// prints one line and keeps the stock kernel. Called from the layer's init.
+    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard enabled, freshStridedReads, rowTiledEnabled, dk == 128, dv == 128, hk > 0,
+            hv % hk == 0, (hv / hk) * rowTile <= dk, ks > 1
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            if rowTileLock.withLock({ rowTileVerdicts[geometry] != nil }) { continue }
+            let verdict = rowTileSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
+            let recorded = rowTileLock.withLock { () -> Bool in
+                guard rowTileVerdicts[geometry] == nil else { return false }
+                rowTileVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded && !verdict {
+                FileHandle.standardError.write(
+                    "qwen35: GDN row-tiled prework kernel disagrees with the stock kernel on this device (\(dtype)); using the stock kernel\n"
+                        .data(using: .utf8)!)
+            }
+        }
+    }
+
+    private static func rowTileSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> Bool {
+        let cd = 2 * hk * dk + hv * dv
+        // qkv is a column slice of a wider stack, as the model's qkv|z product.
+        let width = cd + hv * dv
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7277_7469), into: 8)
+        for T in [64, 512] where T % rowTile == 0 {
+            // A wide magnitude spread; rows 0..<ks of key head 0's q channels
+            // are zero, so those rows' q norm reduces exact zeros (eps only).
+            let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+            let zero = (MLXArray.arange(T).reshaped(1, T, 1) .< ks)
+                .&& (MLXArray.arange(width).reshaped(1, 1, width) .< dk)
+            let stack = which(zero, Float(0), spread).asType(dtype)
+            let qkv = stack[.ellipsis, ..<cd]
+            let ba = MLXRandom.normal([1, T, 2 * hv], key: keys[2]) * 2
+            let b = ba[.ellipsis, ..<hv]
+            let a = ba[.ellipsis, hv...]
+            let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[3]) * 0.5
+            // The layer's decay coefficient, formed as the layer forms it.
+            let aDecay = Qwen35GDNDerived().decay(MLXRandom.normal([hv], key: keys[4]) * 0.5)
+            let dtBias = MLXRandom.normal([hv], key: keys[5])
+            let normScales = (
+                q: MLXRandom.normal([dk], key: keys[6]), k: MLXRandom.normal([dk], key: keys[7])
+            )
+            guard
+                let stock = runFreshState(
+                    qkv: qkv, convStateShape: [1, ks - 1, cd], convWeight: convWeight,
+                    a: a, b: b, aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv)
+            else { return false }
+            let tiled = freshStridedRows(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
+                normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                headVDim: dv, rows: rowTile)
+            var same = MLXArray(true)
+            for (x, y) in [
+                (stock.q, tiled.q), (stock.k, tiled.k), (stock.v, tiled.v),
+                (stock.g, tiled.g), (stock.beta, tiled.beta), (stock.tail, tiled.tail),
+            ] {
+                same = same .&& all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
+            }
+            if !same.item(Bool.self) { return false }
+        }
+        return true
     }
 }
 
