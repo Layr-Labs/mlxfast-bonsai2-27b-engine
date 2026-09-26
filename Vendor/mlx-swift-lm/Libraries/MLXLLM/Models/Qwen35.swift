@@ -301,6 +301,26 @@ enum Qwen35TrunkSubmission {
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
         default: Plan(stride: 4, offset: 0, explicit: nil))
 
+    /// The prompt plan of a forward on the pending-residual path (the tensor
+    /// route's fused layer boundaries, see `Qwen35FusedBoundaryQ8`), which
+    /// builds each layer through `cbv2ForwardPending` and so never reaches
+    /// the plain loop's submissions: commit after layers 4, 16, 32 and 48, as
+    /// newjordan's `9024f66b` pending path does. `MLXFAST_PREFILL_PIPELINE_FUSED`
+    /// sets the plan (same syntax); `0` submits the forward as one graph.
+    static let promptFused: Plan = Plan.parse(
+        ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
+        default: Plan(stride: 0, offset: 0, explicit: [4, 16, 32, 48]))
+
+    /// The plan for a prompt-width forward on the pending-residual path, or
+    /// nil for a single submission. Never a capture-verify forward (that path
+    /// is prompt-only), never over paged KV.
+    static func fusedPromptPlan(rows: Int, caches: [any CBv2AttendingLayerCache]) -> Plan? {
+        guard rows >= promptMinimumRows, !promptFused.isOff,
+            !caches.contains(where: { $0 is PagedLayerCache })
+        else { return nil }
+        return promptFused
+    }
+
     /// The plan for one trunk forward, or nil for a single submission.
     static func plan(
         rows: Int, captureRecurrentWindow: Bool, caches: [any CBv2AttendingLayerCache]
@@ -1525,6 +1545,8 @@ final class Qwen35GatedDeltaNet: Module {
         {
             return y
         }
+        // A narrow (FP16) qkv|z stack's gate is widened here for the op chain.
+        let gate = gate.dtype == out.dtype ? gate : gate.asType(out.dtype)
         if Qwen35FusedElementwise.foldsHadamardSigns,
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
@@ -1789,12 +1811,27 @@ final class Qwen35GatedDeltaNet: Module {
         return sharedHadamardSiblings([inProjQKV, inProjZ])
     }
 
+    /// `narrowStack`: the packed qkv|z product stays in the route's output
+    /// dtype (FP16) instead of being widened to FP32 as one [rows, 16384]
+    /// cast (newjordan's `9024f66b`). Its prompt-path consumers widen at the
+    /// read: the prework kernel (`InT`), the conv fallback's concatenation
+    /// with the FP32 conv state, the tensor route's gated-norm producer and
+    /// the gated-norm rotation, and `projectGatedOut`'s op chains. Taken at
+    /// prompt width only (`cbv2Forward`, `BonsaiPromptWidth.minimumRows`);
+    /// `BONSAI_GDN_NARROW_STACK=0` keeps the FP32 product.
+    static let narrowStackEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_NARROW_STACK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// `quantized`, when given, is qkv|z's tensor-route activation for
     /// `inputs`, already formed at the layer boundary (`Qwen35FusedBoundaryQ8`);
     /// b and a read `inputs` itself.
     private func projectInputs(
         _ inputs: MLXArray, B: Int, S: Int,
-        quantized: SignedBlockHadamard.Int8Activation? = nil
+        quantized: SignedBlockHadamard.Int8Activation? = nil,
+        narrowStack: Bool = false
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
@@ -1803,9 +1840,13 @@ final class Qwen35GatedDeltaNet: Module {
             // transform; rotate it once. b and a stay full precision.
             var routed: [MLXArray]? = nil
             if let quantized, let siblings = sharedHadamardSiblings([inProjQKV, inProjZ]) {
-                routed = sharedHadamardProjectionsQuantized(quantized, leading: [B, S], siblings)
+                routed = sharedHadamardProjectionsQuantized(
+                    quantized, leading: [B, S], siblings, widenOutput: !narrowStack)
             }
-            if let shared = routed ?? sharedHadamardProjections(inputs, [inProjQKV, inProjZ]) {
+            if let shared = routed
+                ?? sharedHadamardProjections(
+                    inputs, [inProjQKV, inProjZ], widenOutput: !narrowStack)
+            {
                 if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA) {
                     return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
                 }
@@ -2249,7 +2290,9 @@ final class Qwen35GatedDeltaNet: Module {
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
-        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, quantized: quantizedInput)
+        let (qkv, z, b, a) = projectInputs(
+            inputs, B: B, S: S, quantized: quantizedInput,
+            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows)
 
         let processed: (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)
         if let fresh = freshPromptChunk(
@@ -2775,11 +2818,23 @@ final class Qwen35Attention: Module {
                 .reshaped(B, 1, -1)
             attendedGate = gate[0..., (L - 1)..., 0...]
         } else {
-            output = cache.updateAndAttend(
+            let attended = cache.updateAndAttend(
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
-                .reshaped(B, L, -1)
+            // Prompt width on the tensor route: the gate producer reads the
+            // head-transposed output and the gate half of each q|gate head
+            // through their strides, neither reshaped into a copy (newjordan
+            // `9024f66b`). Same elements, same arithmetic; other widths keep
+            // the reshaped operands below.
+            if !exactTargetVerify, B * L >= BonsaiPromptWidth.minimumRows,
+                let packed = oProj as? HadamardQuantizedLinear,
+                let y = packed.applyAfterSigmoidGateHeadsOnRoute(
+                    attended, gate: qSplit[1], widenOutput: false)
+            {
+                return y
+            }
+            output = attended.reshaped(B, L, -1)
             attendedGate = gate
         }
         if exactTargetVerify {
@@ -3588,6 +3643,11 @@ public class Qwen35TextModelInner: Module {
             && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
+        // The pending path's own early-submission plan (prompt width only).
+        let fusedSubmission =
+            pendingPath
+            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
@@ -3620,6 +3680,14 @@ public class Qwen35TextModelInner: Module {
                     } else {
                         pendingTapSlot = slot
                     }
+                }
+                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
+                // GPU the layers built so far, the layer output as `h` and its
+                // pending `f` (both of which the next boundary kernel reads).
+                if let fusedSubmission,
+                    fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
+                {
+                    asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
                 }
                 continue
             }
@@ -4441,6 +4509,28 @@ enum Qwen35FusedHadamard {
         header: header,
         ensureRowContiguous: true)
 
+    // Operand addressing for the producer: element (row, c) of a [rows, W]
+    // view (HD 0) or of a [B, L, heads, HD] view, through its strides.
+    private static let headerProducer = header + """
+        template <int HD>
+        inline int64_t bonsai_q8p_row(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return int64_t(row) * st[0];
+          }
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        template <int HD>
+        inline int64_t bonsai_q8p_col(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return int64_t(c) * st[1];
+          }
+          return int64_t(c / uint(HD)) * st[2] + int64_t(c % uint(HD)) * st[3];
+        }
+
+        """
+
     // The quantizing rotation with the projection's input producer formed in
     // its read (the same FP32 arithmetic as the model's compiled chains):
     // PROD 1 `(a * sigmoid(a)) * b` (SwiGLU), 2 `a * sigmoid(b)` (the
@@ -4455,7 +4545,14 @@ enum Qwen35FusedHadamard {
         const short i = short(thread_position_in_threadgroup.x);
         const uint row = blk / uint(BPR);
         const uint bcol = (blk % uint(BPR)) * uint(N);
+        // a and b are read through their strides (bonsai_q8p_row/col): the
+        // SwiGLU halves are column slices of the stacked gate|up product, the
+        // attention output is head-transposed and its gate is the second half
+        // of each q|gate head, and the GDN z is a slice of qkv|z. None is
+        // copied into a row-contiguous array first.
         const size_t rowbase = size_t(row) * size_t(W);
+        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
+        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
         threadgroup float buf[N];
         threadgroup float inv_rms[8];
         if (PROD == 3) {
@@ -4469,11 +4566,11 @@ enum Qwen35FusedHadamard {
             const uint kh = p0 / uint(GR * GD);
             const uint rep = (p0 % uint(GR * GD)) / uint(GD);
             const uint src_head = rep * uint(GKH) + kh;
-            const device InT* xh = a + rowbase + size_t(src_head) * size_t(GD) + size_t(lane) * 4;
+            const uint c0 = src_head * uint(GD) + lane * 4;
             float acc = 0.0f;
             #pragma clang loop unroll(full)
             for (int r = 0; r < 4; r++) {
-              const float tx = float(xh[r]);
+              const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
               acc += tx * tx;
             }
             acc = simd_sum(acc);
@@ -4497,8 +4594,8 @@ enum Qwen35FusedHadamard {
               const uint rr = hr % uint(GR);
               src = (rr * uint(GKH) + h) * uint(GD) + d;
             }
-            const float av = float(a[rowbase + src]);
-            const float bv = float(b[rowbase + src]);
+            const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
+            const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
             float v;
             if (PROD == 1) {
               v = (av * bonsai_sigmoid(av)) * bv;
@@ -4522,8 +4619,8 @@ enum Qwen35FusedHadamard {
         inputNames: ["a", "b", "w", "eps", "signs"],
         outputNames: ["out", "qscale", "qsum"],
         source: sourceInt8Producer,
-        header: header,
-        ensureRowContiguous: true)
+        header: headerProducer,
+        ensureRowContiguous: false)
 
     nonisolated(unsafe) private static let unusedWeight = MLXArray.zeros([128], dtype: .float32)
     nonisolated(unsafe) private static let unusedEps = MLXArray([Float(0)])
@@ -4691,7 +4788,10 @@ enum Qwen35FusedHadamard {
                 else { return nil }
                 a = x; b = gate; w = weight; eps = MLXArray([epsilon]); prod = 3
             }
-            guard a.dtype == b.dtype, [DType.float32, .float16].contains(a.dtype), a.ndim >= 1
+            // Each operand is widened at its own read: the z of an FP16 qkv|z
+            // stack gates an FP32 GDN output.
+            guard [DType.float32, .float16].contains(a.dtype),
+                [DType.float32, .float16].contains(b.dtype), a.ndim >= 1
             else { return nil }
             let width = signs.size
             guard width % 1024 == 0, a.size % width == 0 else { return nil }
@@ -4714,15 +4814,28 @@ enum Qwen35FusedHadamard {
             let rows = a.size / width
             guard rows > 0 else { return nil }
             let blocksPerRow = width / 1024
+            // 4-D operands are read as [B, L, heads, headDim] (the head
+            // transpose of the attention output and the gate half of each
+            // q|gate head flatten only through a copy); the rest as
+            // [rows, width] views, which a column slice reshapes to.
+            func operand(_ v: MLXArray) -> (MLXArray, Int) {
+                if v.ndim == 4, v.dim(0) * v.dim(1) == rows, v.dim(2) * v.dim(3) == width {
+                    return (v, v.dim(3))
+                }
+                return (v.reshaped(rows, width), 0)
+            }
+            let (aView, aHead) = operand(a)
+            let (bView, bHead) = operand(b)
             let template: [(String, any KernelTemplateArg)] = [
                 ("InT", a.dtype), ("W", width), ("BPR", blocksPerRow),
                 ("GR", repeats), ("GKH", keyHeads), ("GD", headDim), ("PROD", prod),
                 ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("AHD", aHead), ("BHD", bHead),
             ]
             let outShape = [rows, width]
             let groupShape = [rows, width / 128]
             let outputs = kernelInt8Producer(
-                [a, b, w, eps, signs], template: template,
+                [aView, bView, w, eps, signs], template: template,
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [outShape, groupShape, groupShape],
                 outputDTypes: [.uint8, .float32, .float32])

@@ -229,7 +229,8 @@ public struct SignedBlockHadamard {
             headDim == 128, 1024 % headDim == 0,
             layout == nil || (layout!.width == width && layout!.valueHeads == valueHeads),
             repeats * keyHeads == valueHeads, x.shape == z.shape, x.dtype == .float32,
-            z.dtype == .float32, weight.dtype == .float32, weight.ndim == 1,
+            z.dtype == .float32 || z.dtype == .float16, weight.dtype == .float32,
+            weight.ndim == 1,
             weight.dim(0) == headDim
         else { return nil }
         return FusedInputHadamardKernel.gatedRMSNorm(
@@ -1045,6 +1046,20 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let rotated = transform.rotatedSigmoidGate(x, gate: gate, outputDType: store)
         else { return nil }
         return fusedInputForward(rotated, widenOutput: widenOutput)
+    }
+
+    /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
+    /// through their strides, on the prompt-width tensor route only: its
+    /// producer reads the head-transposed attention output and the gate half
+    /// of each q|gate head in place (newjordan's `9024f66b`), so neither is
+    /// reshaped into a copy first. Nil when the route does not take them (the
+    /// caller then reshapes and calls `applyAfterSigmoidGate`).
+    public func applyAfterSigmoidGateHeadsOnRoute(
+        _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        guard gdnLayout == nil, x.ndim == 4, x.shape == gate.shape else { return nil }
+        return tensorRouteForwardProducer(
+            .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
     }
 
     /// The GDN output projection of `silu(z) * rmsNorm(x, weight, eps)` with the
