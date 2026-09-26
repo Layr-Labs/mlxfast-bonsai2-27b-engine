@@ -2,10 +2,19 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
 extension EngineLoopV2 {
+    /// Default OFF (`BONSAI_POLL_PACKET=1` polls the acceptance packet instead
+    /// of sleeping on its completion event, ercumentyildirim `cc0895d`). The
+    /// wake-up it saves is tens of microseconds per round, and the ranked M5
+    /// runs that spun a core through the whole verify measured longer windows.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "1"
+
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -15,12 +24,12 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
-    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
     /// Default OFF (`BONSAI_EARLY_REPLAY=1` submits the committed recurrent
     /// state at finalize). polymorf measured the early submission at +1.5% of
     /// the decode window on the M5 Max (1404 -> 1427 ms); with the verify
     /// committed in slices, the lazy replay rides in the verify's first slice
-    /// and overlaps the host's build of the rest (newjordan `f807f4e`).
+    /// and overlaps the host's build of the rest. Locally the window is 0.5%
+    /// shorter without it, with the same tokens and acceptance.
     static let submitsCommittedRecurrentStateEarly: Bool =
         ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] == "1"
 
@@ -110,6 +119,23 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        if Self.pollsAcceptancePacket {
+            // The packet was submitted with the verify (asyncEval at launch).
+            // Poll it instead of sleeping on its completion event: the step
+            // thread stays on a clocked-up core and resumes the instant the
+            // verify finishes, and the finalize and the next round's graph
+            // build are on the GPU's critical path. Bounded: after 200 ms the
+            // blocking read below takes over.
+            var available = false
+            var spins = 0
+            let deadline = DispatchTime.now().uptimeNanoseconds &+ 200_000_000
+            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
+                !available
+            {
+                spins &+= 1
+                if spins & 4095 == 0, DispatchTime.now().uptimeNanoseconds > deadline { break }
+            }
+        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
