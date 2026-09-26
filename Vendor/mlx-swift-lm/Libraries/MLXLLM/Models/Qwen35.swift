@@ -2694,7 +2694,11 @@ enum Qwen35GDNPrework {
     // grid (128 * HK, S, B), threadgroup (128, 1, 1).
     // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
     // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
-    // alog/dtb [HV], wq/wk [DK], S (scalar).
+    // alog/dtb [HV], wq/wk [DK], S (scalar). qkv, cs, w, a and b are read
+    // through their strides: qkv and a/b are column slices of the stacked
+    // qkv|z and b|a products, which a row-contiguous launch would copy first
+    // (three extra dispatches per layer). The one-dimensional parameter
+    // vectors also honor strides, including broadcast vectors.
     private static let source = """
         constexpr int GRP = HV / HK;
         constexpr int KEY = HK * DK;
@@ -2705,8 +2709,14 @@ enum Qwen35GDNPrework {
         const uint t = threadgroup_position_in_grid.y;
         const uint bb = threadgroup_position_in_grid.z;
         const int Sn = S;
-        const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);
-        const size_t csbase = size_t(bb) * size_t(NK) * size_t(CD);
+        const int64_t qb = int64_t(bb) * qkv_strides[0];
+        const int64_t qs1 = qkv_strides[1];
+        const int64_t qs2 = qkv_strides[2];
+        const int64_t cb = int64_t(bb) * cs_strides[0];
+        const int64_t cs1 = cs_strides[1];
+        const int64_t cs2 = cs_strides[2];
+        const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];
+        const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];
         threadgroup float red[8];
 
         auto conv_silu = [&](uint col) -> float {
@@ -2715,9 +2725,9 @@ enum Qwen35GDNPrework {
           for (int j = 0; j < KS; j++) {
             const int r = int(t) + j - NK;
             const float xv = (r < 0)
-                ? cs[csbase + size_t(r + NK) * size_t(CD) + col]
-                : float(qkv[rowbase + size_t(r) * size_t(CD) + col]);
-            acc = fma(xv, w[size_t(col) * size_t(KS) + size_t(j)], acc);
+                ? cs[cb + int64_t(r + NK) * cs1 + int64_t(col) * cs2]
+                : float(qkv[qb + int64_t(r) * qs1 + int64_t(col) * qs2]);
+            acc = fma(xv, w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]], acc);
           }
           // MLX's silu: x * sigmoid(x), sigmoid in its stable functor form.
           const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
@@ -2744,8 +2754,8 @@ enum Qwen35GDNPrework {
         const float invq = metal::precise::rsqrt(sq / float(DK) + 1e-6f);
         const float invk = metal::precise::rsqrt(sk / float(DK) + 1e-6f);
         const size_t qkrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HK) + size_t(h);
-        q[qkrow * size_t(DK) + c] = (xq * invq) * wq[c];
-        k[qkrow * size_t(DK) + c] = (xk * invk) * wk[c];
+        q[qkrow * size_t(DK) + c] = (xq * invq) * wq[int64_t(c) * wq_strides[0]];
+        k[qkrow * size_t(DK) + c] = (xk * invk) * wk[int64_t(c) * wk_strides[0]];
 
         // The GRP value heads of this key head.
         #pragma clang loop unroll(full)
@@ -2761,12 +2771,12 @@ enum Qwen35GDNPrework {
           const size_t grow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV) + size_t(hv);
           // g = exp(-exp(A_log) * softplus(a + dt_bias)), softplus as MLX's
           // logaddexp(x, 0); beta = sigmoid(b) in MLX's functor form.
-          const float av = a[grow] + dtb[hv];
+          const float av = a[ab + int64_t(hv) * a_strides[2]] + dtb[int64_t(hv) * dtb_strides[0]];
           const float mx = metal::max(av, 0.0f);
           const float mn = metal::min(av, 0.0f);
           const float sp = mx + log1p(metal::exp(mn - mx));
-          g[grow] = metal::precise::exp(-metal::precise::exp(alog[hv]) * sp);
-          const float bv = b[grow];
+          g[grow] = metal::precise::exp(-metal::precise::exp(alog[int64_t(hv) * alog_strides[0]]) * sp);
+          const float bv = b[bbase + int64_t(hv) * b_strides[2]];
           const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
           beta[grow] = (bv < 0.0f) ? by : 1.0f - by;
         }
@@ -2776,22 +2786,23 @@ enum Qwen35GDNPrework {
           const int src = Sn + r - NK; // chunk row feeding tail row r (< 0: from cs)
           if (src >= 0 && int(t) == src) {
             const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
-            tail[trow + colq] = float(qkv[rowbase + size_t(t) * size_t(CD) + colq]);
-            tail[trow + colk] = float(qkv[rowbase + size_t(t) * size_t(CD) + colk]);
+            const int64_t qrow = qb + int64_t(t) * qs1;
+            tail[trow + colq] = float(qkv[qrow + int64_t(colq) * qs2]);
+            tail[trow + colk] = float(qkv[qrow + int64_t(colk) * qs2]);
             #pragma clang loop unroll(full)
             for (int i = 0; i < GRP; i++) {
               const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
-              tail[trow + colv] = float(qkv[rowbase + size_t(t) * size_t(CD) + colv]);
+              tail[trow + colv] = float(qkv[qrow + int64_t(colv) * qs2]);
             }
           } else if (src < 0 && t == 0) {
             const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
-            const size_t crow = csbase + size_t(src + NK) * size_t(CD);
-            tail[trow + colq] = cs[crow + colq];
-            tail[trow + colk] = cs[crow + colk];
+            const int64_t crow = cb + int64_t(src + NK) * cs1;
+            tail[trow + colq] = cs[crow + int64_t(colq) * cs2];
+            tail[trow + colk] = cs[crow + int64_t(colk) * cs2];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GRP; i++) {
               const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
-              tail[trow + colv] = cs[crow + colv];
+              tail[trow + colv] = cs[crow + int64_t(colv) * cs2];
             }
           }
         }
@@ -2802,7 +2813,15 @@ enum Qwen35GDNPrework {
         inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: source,
-        ensureRowContiguous: true)
+        ensureRowContiguous: !stridedReads)
+
+    /// `DARKBLOOM_QWEN35_GDN_PREWORK_STRIDED=0` copies the strided inputs to
+    /// row-contiguous buffers before the launch, as before.
+    private static let stridedReads: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_GDN_PREWORK_STRIDED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     static func run(
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
