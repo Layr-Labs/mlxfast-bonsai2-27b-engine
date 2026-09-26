@@ -2476,6 +2476,15 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
+            // At verify width on the int8 route: the norm and the gated tail
+            // in one launch (`Qwen35GatedNormTail`), the same values.
+            if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
+                let signed = Qwen35GatedNormTail.apply(
+                    out, gate: gate, weight: norm.weight, eps: norm.eps,
+                    signs: packed.transform.signVector)
+            {
+                return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+            }
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
             let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
@@ -3675,7 +3684,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3880,6 +3889,22 @@ final class Qwen35Attention: Module {
             {
                 return y
             }
+            // The int8 verify route (neither form above takes it): the gate and
+            // the projection's signs in one elementwise launch that reads the
+            // head-transposed output and the gate half of each q|gate head
+            // through their strides, so neither is reshaped into a copy first.
+            // Same elements, same compiled program; its output is contiguous.
+            if !exactTargetVerify, Qwen35FusedElementwise.foldsHadamardSigns,
+                let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+                attended.dtype == qSplit[1].dtype, attended.shape == qSplit[1].shape,
+                attended.dim(2) * attended.dim(3) == packed.transform.width,
+                HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * L)
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    attended, qSplit[1],
+                    packed.transform.signVector.reshaped(attended.dim(2), attended.dim(3)))
+                return packed.forwardPreSigned(signed.reshaped(B, L, -1), widenOutput: false)
+            }
             output = attended.reshaped(B, L, -1)
             attendedGate = gate
         }
@@ -3965,19 +3990,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3992,18 +4041,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -6886,6 +6937,179 @@ enum Qwen35FusedBoundaryQ8 {
         ensureRowContiguous: true)
 }
 
+/// The GDN output's gated per-head RMSNorm and the output projection's
+/// Hadamard signs at verify width as ONE launch. The composed path runs
+/// `MLXFast.rmsNorm` over each 128-wide head (`rms_single_row`) and the
+/// compiled `gatedNormTailSigned` (`(z * sigmoid(z)) * normed * signs`): two
+/// launches per GDN layer. The arithmetic here is the int8 producer kernel's
+/// PROD 3 read, which already matches that composed chain bit for bit: per
+/// head, lane l squares elements 4l .. 4l + 3 in order, `simd_sum`,
+/// `precise::rsqrt(acc / 128 + eps)`, `w[d] * (x * inv)`, then `(z *
+/// sigmoid(z)) * xn` with MLX's `Sigmoid` and the signs. One simdgroup per
+/// (row, head), as `rms_single_row`: the launch keeps the norm's parallelism
+/// and the quantizing rotation stays its own launch. z is read through its
+/// strides (a slice of the qkv|z product), so it is not copied first.
+///
+/// Before first use a self-test on the running GPU compares the output bit for
+/// bit against the composed ops (FP32 and FP16 z, a strided z); a mismatch or
+/// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
+/// too.
+enum Qwen35GatedNormTail {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let header = """
+        // MLX `Sigmoid` (unary_ops.h), verbatim.
+        METAL_FUNC float bgn_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        // element (row, c) of a [B, L, heads, 128] view, through its strides
+        inline int64_t bgn_row(const constant int* shape, const constant int64_t* st, uint row) {
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        inline int64_t bgn_col(const constant int64_t* st, uint c) {
+          return int64_t(c / 128u) * st[2] + int64_t(c % 128u) * st[3];
+        }
+
+        """
+
+    // grid (32 * rows * H, 1, 1), threadgroup (256, 1, 1): one simdgroup per
+    // (row, head). Inputs: x float [B, L, H, 128], z float|half [B, L, H,
+    // 128] (any strides), w float [128], eps float [1], signs float [H * 128].
+    // Template: H, InZ. Output: out float [rows, H * 128].
+    private static let source = """
+        const uint gidx = thread_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint hr = gidx / 32u;
+        const uint row = hr / uint(H);
+        const uint head = hr % uint(H);
+        const int64_t xrow = bgn_row(x_shape, x_strides, row);
+        const int64_t zrow = bgn_row(z_shape, z_strides, row);
+        const uint c0 = head * 128u + lane * 4u;
+        float xv[4];
+        float acc = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          xv[r] = float(x[xrow + bgn_col(x_strides, c0 + uint(r))]);
+          acc += xv[r] * xv[r];
+        }
+        acc = simd_sum(acc);
+        const float inv = metal::precise::rsqrt(acc / float(128) + eps[0]);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const uint col = c0 + uint(r);
+          const float bv = float(z[zrow + bgn_col(z_strides, col)]);
+          const float xn = w[col % 128u] * (xv[r] * inv);
+          const float v = (bv * bgn_sigmoid(bv)) * xn;
+          out[size_t(row) * size_t(H * 128) + col] = v * signs[col];
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gdn_gated_norm_signed",
+        inputNames: ["x", "z", "w", "eps", "signs"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+
+    /// `gatedNormTailSigned(rmsNorm(x, weight, eps), z, signs)` flattened to
+    /// `[rows, H * 128]`, or nil when it does not apply.
+    static func apply(
+        _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray? {
+        guard enabled, x.dtype == .float32, z.dtype == .float32 || z.dtype == .float16,
+            x.ndim == 4, z.shape == x.shape, x.dim(3) == 128,
+            (x.dim(0) * x.dim(1) * x.dim(2)) % 8 == 0,
+            weight.dtype == .float32, weight.ndim == 1, weight.dim(0) == 128,
+            signs.dtype == .float32, signs.size == x.dim(2) * 128,
+            verified(eps: eps)
+        else { return nil }
+        return launch(x, z, weight: weight, eps: eps, signs: signs)
+    }
+
+    private static func launch(
+        _ x: MLXArray, _ z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray {
+        let rows = x.dim(0) * x.dim(1)
+        let heads = x.dim(2)
+        return kernel(
+            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            template: [("H", heads), ("InZ", z.dtype)],
+            grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    private static func verified(eps: Float) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict { return verdict }
+        let report = selfTest(eps: eps)
+        verdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify gated norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    static func selfTest(eps: Float) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        do {
+            try withError { error in
+                let rows = 16
+                let heads = 48
+                let width = heads * 128
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(121))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let weight = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [128], key: MLXRandom.key(122))
+                let scale = MLXRandom.uniform(
+                    Float(0.01) ..< Float(20), [1, rows, heads, 1], key: MLXRandom.key(123))
+                let x = MLXRandom.normal([1, rows, heads, 128], key: MLXRandom.key(124)) * scale
+                // z as the qkv|z product's slice: a strided view.
+                let wide = MLXRandom.normal([1, rows, 10240 + width], key: MLXRandom.key(125))
+                    * Float(3)
+                for zType in [DType.float32, .float16] {
+                    let z = wide.asType(zType)[0..., 0..., 10240...].reshaped(1, rows, heads, 128)
+                    let zw = z.dtype == x.dtype ? z : z.asType(x.dtype)
+                    let normed = MLXFast.rmsNorm(x, weight: weight, eps: eps)
+                    let reference = Qwen35FusedElementwise.gatedNormTailSigned(
+                        normed, zw, signs.reshaped(heads, 128)
+                    ).asType(x.dtype).reshaped(rows, width)
+                    let fused = launch(x, z, weight: weight, eps: eps, signs: signs)
+                    report.cases += 1
+                    guard fused.shape == reference.shape, fused.dtype == reference.dtype else {
+                        report.passed = false
+                        report.error = "output \(fused.dtype) \(fused.shape)"
+                        return
+                    }
+                    let differ = (fused.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    let count = Int(differ.item(Int32.self))
+                    report.values += fused.size
+                    report.mismatches += count
+                    if count != 0 { report.passed = false }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
 /// The verify window's decoder-layer boundary on the matrix route as ONE
 /// launch: the FP16 residual add `h = x + r`, the RMSNorm of `h` with its FP32
 /// gain, the input transform's signs, the 1024-block Walsh-Hadamard transform
@@ -8312,11 +8536,25 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. nb = n0 + 16*(sg&1)
+        // + fn with fn in {0,4,8,12} and N multiple of 64, so the base is
+        // 4-element aligned. Hot path: support==staged8 (signed + FACTORED).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
