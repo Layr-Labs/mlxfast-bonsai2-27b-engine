@@ -5917,7 +5917,12 @@ enum Qwen35TensorPackedMatmul {
           auto tA = A.template slice<128, 64>(g * 128, m0);
           if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
+          float4 b0, b1;
+          if constexpr (NEGATIVE_SCALE_BIAS) {
+            b0 = -s0; b1 = -s1;
+          } else {
+            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+          }
           float4 u0 = 0.0f, u1 = 0.0f;
           if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
           float as[4], rb[4];
@@ -6152,18 +6157,22 @@ enum Qwen35TensorPackedMatmul {
                     .transposed(1, 0).contiguous()
             }
             let packedKernel: MLXFast.MLXFastKernel
+            var template: [(String, any KernelTemplateArg)] = [
+                ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                ("SIGNED", signedCodes ? 1 : 0),
+            ]
             switch support {
             case .native2b: packedKernel = kernel
-            case .staged8: packedKernel = kernelStaged8
+            case .staged8:
+                packedKernel = kernelStaged8
+                template.append(("NEGATIVE_SCALE_BIAS",
+                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
                 [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                template: [
-                    ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
-                    ("SIGNED", signedCodes ? 1 : 0),
-                ],
+                template: template,
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
