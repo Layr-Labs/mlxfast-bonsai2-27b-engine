@@ -680,49 +680,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// On unless explicitly disabled: the drafter's shared-head read (a BF16
-    /// or FP16 activation, at most 16 rows) takes the verify-width int8
-    /// kernel the target's own head already uses. `MLXFAST_DFLASH_HEAD_INT8=0`
-    /// keeps `forwardUnwidened`.
-    public static let drafterHeadInt8: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_HEAD_INT8"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// On unless explicitly disabled: the zero rows that pad a verify-width
-    /// activation up to 16 are one resident buffer per shape, not a fresh
-    /// zeros kernel on every projection. `MLXFAST_NARROW_ZERO_PAD=0` allocates
-    /// them again each call.
-    private static let narrowZeroPad: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_NARROW_ZERO_PAD"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-    private struct NarrowPadKey: Hashable {
-        var rows: Int
-        var cols: Int
-        var dtype: DType
-    }
-    private static let narrowPadLock = NSLock()
-    nonisolated(unsafe) private static var narrowPads: [NarrowPadKey: MLXArray] = [:]
-
-    /// Zeros of `[rows, cols]` in `dtype`. The same buffer is reused across
-    /// projections; it is never written.
-    static func cachedNarrowZeros(rows: Int, cols: Int, dtype: DType) -> MLXArray {
-        guard narrowZeroPad, rows > 0, cols > 0 else {
-            return MLXArray.zeros([rows, cols], dtype: dtype)
-        }
-        let key = NarrowPadKey(rows: rows, cols: cols, dtype: dtype)
-        narrowPadLock.lock()
-        defer { narrowPadLock.unlock() }
-        if let hit = narrowPads[key] { return hit }
-        let made = MLXArray.zeros([rows, cols], dtype: dtype)
-        if narrowPads.count > 12 { narrowPads.removeAll(keepingCapacity: true) }
-        narrowPads[key] = made
-        return made
-    }
-
     private let matrixRoute = HadamardMatrixRouteOperands()
 
     @discardableResult
@@ -814,12 +771,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ layoutCache: HadamardConstantLayoutCache
     ) -> MLXArray?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8: TensorPackedMatmulNarrowInt8?
-    /// Whether a full verify window on the int8 narrow route may form this
-    /// producer inside the quantizing rotation (`tensorRouteForwardNarrowProducer`);
-    /// the model installs it behind its own 16-row bitwise self-test. Nil
-    /// keeps the composed chain.
-    nonisolated(unsafe) public static var narrowProducerApproves:
-        ((SignedBlockHadamard.Int8Producer, SignedBlockHadamard) -> Bool)?
     static var narrowRouteInstalled: Bool {
         (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
             && tensorPackedMatmulNarrowApplies != nil
@@ -1119,30 +1070,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return y.reshaped(leading + [n])
     }
 
-    /// A full verify window (16 rows) on the int8 narrow route with this
-    /// projection's input producer formed in the quantizing rotation's read, as
-    /// `tensorRouteForwardProducer` forms it at prompt width: the producer's
-    /// own launches and the rotation become one launch with the same codes,
-    /// scales and sums. Nil when it does not apply or `narrowProducerApproves`
-    /// does not approve the producer.
-    fileprivate func tensorRouteForwardNarrowProducer(
-        _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
-    ) -> MLXArray? {
-        guard let approves = Self.narrowProducerApproves else { return nil }
-        let x = producer.primary
-        let k = transform.width
-        guard x.ndim >= 2, x.size % k == 0,
-            tensorRouteTakesNarrowInt8(rows: x.size / k, siblings: [self]),
-            approves(producer, transform),
-            let activation = transform.forwardInt8(
-                producer: producer, gdnLayout: gdnLayout, groupSize: 128)
-        else { return nil }
-        let leading = x.ndim == 4 ? [x.dim(0), x.dim(1)] : Array(x.shape.dropLast())
-        return tensorRouteForwardQuantized(
-            activation, rows: x.size / k, leading: leading, siblings: [self],
-            widenOutput: widenOutput)?.first
-    }
-
     /// The verify-width tensor route: one FP16 rotation with group sums, rows
     /// padded to 16, one packed matmul over the (stacked) codes.
     private func tensorRouteForwardNarrow(
@@ -1164,11 +1091,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         var g = sums
         let padded = Self.tensorRouteMaximumNarrowRows
         if rows < padded {
-            a = concatenated(
-                [a, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16)], axis: 0)
-            g = concatenated(
-                [g, Self.cachedNarrowZeros(rows: padded - rows, cols: k / 128, dtype: .float32)],
-                axis: 0)
+            a = concatenated([a, MLXArray.zeros([padded - rows, k], dtype: .float16)], axis: 0)
+            g = concatenated([g, MLXArray.zeros([padded - rows, k / 128], dtype: .float32)], axis: 0)
         }
         if siblings.count == 1 {
             guard let y = matmul(
@@ -1202,9 +1126,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let padded = Self.tensorRouteMaximumNarrowRows
         let input =
             rows < padded
-            ? concatenated(
-                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
-            : x
+            ? concatenated([x, MLXArray.zeros([padded - rows, k], dtype: x.dtype)], axis: 0) : x
         guard
             let activation = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
@@ -1232,29 +1154,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// as is instead of being widened first. The consumer's promotion widens
     /// the same values exactly, so the arithmetic is unchanged and one cast
     /// dispatch per call is saved.
-    /// The drafter's vocabulary-head read on the verify-width int8 kernel.
-    /// The tower's `tensorRouteForward` admits only FP32, so a BF16 or FP16
-    /// head activation (the drafter's dtype) was falling through to the
-    /// dequantizing head kernel. Nil when that kernel is not installed or
-    /// the shape is not a verify-width vocabulary head; the caller keeps
-    /// `forwardUnwidened`. The quantizer already accepts these dtypes, and
-    /// the matmul is the one the target's own head uses. Logits stay FP16,
-    /// which is what the drafter's top-k reads.
-    public func forwardDrafterInt8(_ x: MLXArray) -> MLXArray? {
-        guard Self.drafterHeadInt8, Self.tensorRouteEnabled, x.ndim >= 2,
-            x.dtype == .bfloat16 || x.dtype == .float16 || x.dtype == .float32
-        else { return nil }
-        let k = x.dim(-1)
-        let rows = x.size / k
-        guard rows >= 1, rows <= Self.tensorRouteMaximumNarrowRows,
-            weight.dim(0) >= Self.vocabularyHeadMinimumRows, tensorRouteTakes(self),
-            let y = tensorRouteForwardNarrow(
-                x.reshaped(rows, k), rows: rows, k: k, n: weight.dim(0), siblings: [self],
-                preSigned: false, outputDType: .float16, leading: Array(x.shape.dropLast()))
-        else { return nil }
-        return y[0]
-    }
-
     public func forwardUnwidened(_ x: MLXArray) -> MLXArray {
         if let routed = tensorRouteForward(x, siblings: [self], preSigned: false, widenOutput: false) {
             return routed[0]
@@ -1321,8 +1220,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     {
         if gdnLayout == nil,
             let y = tensorRouteForwardProducer(.swiglu(gate: gate, up: up), widenOutput: widenOutput)
-                ?? tensorRouteForwardNarrowProducer(
-                    .swiglu(gate: gate, up: up), widenOutput: widenOutput)
         {
             return y
         }
@@ -1371,14 +1268,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterSigmoidGateHeads(
         _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
     ) -> MLXArray? {
-        // A full verify window on the int8 narrow route: the producer reads
-        // both views through their strides.
-        if gdnLayout == nil, x.ndim == 4, x.shape == gate.shape,
-            let y = tensorRouteForwardNarrowProducer(
-                .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
-        {
-            return y
-        }
         guard HadamardStridedInputs.enabled, gdnLayout == nil, x.ndim == 4,
             x.shape == gate.shape, x.dim(2) * x.dim(3) == transform.width,
             let store = fusedInputStoreDType(rows: x.dim(0) * x.dim(1)),
@@ -1392,10 +1281,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterGatedRMSNorm(
         _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, widenOutput: Bool = true
     ) -> MLXArray? {
-        let producer = SignedBlockHadamard.Int8Producer.gatedRMSNorm(
-            x: x, gate: z, weight: weight, eps: eps)
-        if let y = tensorRouteForwardProducer(producer, widenOutput: widenOutput)
-            ?? tensorRouteForwardNarrowProducer(producer, widenOutput: widenOutput)
+        if let y = tensorRouteForwardProducer(
+            .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
         {
             return y
         }
@@ -1480,8 +1367,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let padded = tensorRouteMaximumNarrowRows
             if rows < padded {
                 headInput = concatenated(
-                    [headInput, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: .float16)],
-                    axis: 0)
+                    [headInput, MLXArray.zeros([padded - rows, k], dtype: .float16)], axis: 0)
             }
             let plainDType: DType = sourceDType == .bfloat16 ? .float32 : sourceDType
             let headOutputDType: DType = widenOutput ? plainDType : .float16

@@ -454,6 +454,9 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
+        // The comparison graph is the same for every layer of every later
+        // round with this geometry. Realize it once, here, so those rounds
+        // read the stored mask instead of replaying the graph.
         eval(made)
         key = requested
         cached = made
@@ -1573,15 +1576,6 @@ enum DFlash2GreedyWalk {
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
-    /// The mask columns of a proposal are not embedded (the bind-time mask
-    /// row is broadcast). `MLXFAST_DFLASH_ANCHOR_COLUMN=0` builds the full
-    /// token block again.
-    static let anchorColumnOnly: Bool = {
-        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ANCHOR_COLUMN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(raw ?? "")
-    }()
-
     public let config: DFlash2Configuration
 
     @ModuleInfo(key: "fc") public var fc: Linear
@@ -1710,8 +1704,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0,
-        maskColumns: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -1732,13 +1725,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // time; broadcast that exact value across the block. Keep the general
         // one-row case unchanged.
         let embeddedInputs: MLXArray
-        // `maskColumns > 0` means `inputs` is the anchor column only. The mask
-        // positions are the bind-time embedding, never read from token ids.
-        if inputs.dim(1) > 1 || maskColumns > 0 {
+        if inputs.dim(1) > 1 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
             let batch = inputs.dim(0)
-            let cols = maskColumns > 0 ? maskColumns : inputs.dim(1) - 1
+            let cols = inputs.dim(1) - 1
             let repeatedMasks: MLXArray
             if batch == 1,
                 let cached = cachedMaskEmbeddingBlock,
@@ -1819,30 +1810,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
-        // The mask columns of the block are never embedded: `hiddenStates`
-        // broadcasts the bind-time mask row. Building those token ids (and
-        // the GPU array that holds them) is host work on every round. The
-        // anchor ids are one array, also the greedy path's start token.
-        let anchorIds = MLXArray(anchor.map { Int32($0) })
-        let block: MLXArray
-        let maskColumns: Int
-        if Self.anchorColumnOnly {
-            block = anchorIds.reshaped([anchor.count, 1])
-            maskColumns = blockSize - 1
-        } else {
-            let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
-            let rows = anchor.flatMap { [Int32($0)] + masks }
-            block = MLXArray(rows, [anchor.count, blockSize])
-            maskColumns = 0
-        }
+        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+        let rows = anchor.flatMap { [Int32($0)] + masks }
+        let block = MLXArray(rows, [anchor.count, blockSize])
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
-            submittingLeadingLayers: leadingLayers, maskColumns: maskColumns)
+            submittingLeadingLayers: leadingLayers)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: anchorIds)
+            anchor: MLXArray(anchor.map { Int32($0) }))
     }
 
     /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
