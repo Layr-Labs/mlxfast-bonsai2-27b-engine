@@ -1193,7 +1193,11 @@ enum Qwen35GatedDeltaChunked {
 /// the stock kernel is used if the check fails. Only windows of at least
 /// `minimumT` rows use it; `MLXFAST_GDN_PREFILL_KERNEL=0` disables it.
 enum Qwen35GDNPrefillKernel {
-    static let minimumT = 64
+    // The four-row recurrence is bit-identical to the stock kernel at every
+    // width. Reuse it for verify and decode windows too; keep the wider
+    // self-check independent of the dispatch threshold.
+    static let minimumT = 1
+    private static let selfCheckT = 64
     private static let rows = 4
 
     static let enabled: Bool =
@@ -1400,7 +1404,7 @@ enum Qwen35GDNPrefillKernel {
     }
 
     private static func selfCheck(_ geo: Geometry, dtype: DType) -> Bool {
-        let T = minimumT
+        let T = selfCheckT
         let keys = MLXRandom.split(key: MLXRandom.key(0x6d6c_7866), into: 9)
         // Wide magnitude spread so the pairwise sums actually differ by order.
         func spread(_ shape: [Int], _ i: Int) -> MLXArray {

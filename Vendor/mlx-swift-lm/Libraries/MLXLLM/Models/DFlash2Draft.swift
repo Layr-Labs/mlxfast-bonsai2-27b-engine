@@ -477,6 +477,7 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
     private let qkv = DFlash2QKVStack()
+    private let kv = DFlash2KVStack()
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -504,6 +505,7 @@ private final class DFlash2Attention: Module {
         modulePath: [String] = []
     ) throws -> Self {
         qkv.clear()
+        kv.clear()
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
@@ -545,15 +547,18 @@ private final class DFlash2Attention: Module {
         let values: MLXArray
         let cachedLength: Int
         if dflash2KVConcatEnabled {
-            // One K and one V projection over [context; block]. The block's
-            // positions continue the context's, so one rope at the context's
-            // offset rotates every row where the two separate ropes did.
+            // Share the context+block K/V projection and compute Q only on the
+            // block rows. The block's positions continue the context's, so one
+            // rope at the context's offset rotates every row where the two
+            // separate ropes did.
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
             let projectedQ: MLXArray
             let projectedK: MLXArray
             let projectedV: MLXArray
-            if let stacked = qkv.apply(rows, blockRows: L, q: qProj, k: kProj, v: vProj) {
+            if let stacked = kv.apply(rows, blockRows: L, q: qProj, k: kProj, v: vProj) {
+                (projectedQ, projectedK, projectedV) = stacked
+            } else if let stacked = qkv.apply(rows, blockRows: L, q: qProj, k: kProj, v: vProj) {
                 (projectedQ, projectedK, projectedV) = stacked
             } else {
                 (projectedQ, projectedK, projectedV) = (qProj(x), kProj(rows), vProj(rows))
@@ -633,6 +638,48 @@ private final class DFlash2Attention: Module {
     }
 }
 
+/// Fuses context and block K/V into one projection while applying Q only to
+/// the draft block. The QKV stack below would also project Q over every context
+/// row, although the drafter discards those rows. Set
+/// `DARKBLOOM_DFLASH2_KV_ONLY=0` to use that existing stacked path instead.
+/// The narrow Q projection also takes the M5 tensor path when available.
+private final class DFlash2KVStack {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_KV_ONLY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private var weight: MLXArray?
+    private var kvBoundary = 0
+
+    func clear() {
+        weight = nil
+        kvBoundary = 0
+    }
+
+    func apply(
+        _ rows: MLXArray, blockRows: Int, q: Linear, k: Linear, v: Linear
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard Self.enabled, q.bias == nil, k.bias == nil, v.bias == nil,
+            q.weight.ndim == 2, k.weight.ndim == 2, v.weight.ndim == 2,
+            q.weight.dtype == k.weight.dtype, k.weight.dtype == v.weight.dtype,
+            q.weight.dim(1) == k.weight.dim(1), k.weight.dim(1) == v.weight.dim(1),
+            k.weight.dim(0) == v.weight.dim(0),
+            rows.ndim == 3, blockRows > 0, blockRows <= rows.dim(1)
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([k.weight, v.weight], axis: 0)
+            kvBoundary = k.weight.dim(0)
+        }
+        let projectedKV = matmul(rows, weight!.T)
+        let queryRows = rows[0..., (rows.dim(1) - blockRows)..., 0...]
+        return (
+            DFlash2TensorMatmul.linear(q, queryRows),
+            projectedKV[.ellipsis, ..<kvBoundary],
+            projectedKV[.ellipsis, kvBoundary...])
+    }
+}
+
 /// The q, k and v projections' weights stacked along the output axis, as
 /// `DFlash2GateUpStack` stacks gate and up: the same BF16 bytes concatenated
 /// once on first use, held off the module tree. One matmul over the
@@ -693,6 +740,14 @@ private let dflash2KVConcatEnabled: Bool = {
 /// Kill switch for dropping a sliding mask that allows everything (default on).
 private let dflash2NoMaskEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_NOMASK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Pad the drafter's short target context to one 16-row tile for `fc`.
+/// Rows 11...15 otherwise need an extra partial pass on the tensor route.
+private let dflash2ContextPadEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_CONTEXT_PAD"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -1611,7 +1666,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
+        let targetHiddenInput = targetHidden.asType(dtype)
+        let contextRows = targetHiddenInput.dim(1)
+        let fcInput: MLXArray
+        if dflash2ContextPadEnabled, (11 ..< 16).contains(contextRows) {
+            let zeros = MLXArray.zeros(
+                [targetHiddenInput.dim(0), 16 - contextRows, targetHiddenInput.dim(2)],
+                dtype: dtype)
+            fcInput = concatenated([targetHiddenInput, zeros], axis: 1)
+        } else {
+            fcInput = targetHiddenInput
+        }
+        var context = DFlash2TensorMatmul.linear(fc, fcInput)
+        if contextRows < fcInput.dim(1) {
+            context = context[0..., ..<contextRows, 0...]
+        }
+        context = hiddenNorm(context)
 
         let masks = DFlash2SlidingMaskMemo()
         let submitAfter = DFlash2DraftSubmission.layers
