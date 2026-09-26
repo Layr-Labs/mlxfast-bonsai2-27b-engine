@@ -7138,15 +7138,33 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Same fold as the scalar loop / v0 int8 path; store four consecutive
+          // columns as float4/half4. Layout: i groups of 4 share mh,nq with
+          // c=0..3; half h adds 32*h. Alignment: fn in {0,4,8,12}, n0 multiple
+          // of TN (32/64), N multiple of 32 — base is 4-element aligned.
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) {
-              float v = acc[h][i];
+            for (int i = 0; i < CAP; i += 4) {
+              const int mh = (i >> 2) & 1;
+              const int nq = i >> 3;
+              float v0 = acc[h][i];
+              float v1 = acc[h][i + 1];
+              float v2 = acc[h][i + 2];
+              float v3 = acc[h][i + 3];
               #pragma clang loop unroll(full)
-              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
+              for (int q = 0; q < 4 - 1; q++) {
+                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
+              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
+              if constexpr (sizeof(OutT) == sizeof(float)) {
+                *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+              } else {
+                *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+              }
             }
           }
         }
