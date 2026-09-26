@@ -965,6 +965,17 @@ enum Qwen35GDNReplayBatch {
                 const int b_rs = ab_rows[2 * b_idx + 1];
                 const float g_nexp = -metal::precise::exp(alog[n]);
                 const float g_dtb = dtb[n];
+                // One token's gates per SIMD lane, then broadcast the step's
+                // values. All lanes reconverge before the recurrence.
+                float cached_gt = 0.f;
+                float cached_bt = 0.f;
+                if constexpr (CACHE_GATES) {
+                  if (lane < uint(T)) {
+                    const float sp = qwen35_replay_logaddexp(a_[size_t(lane) * size_t(a_rs)] + g_dtb, 0.0f);
+                    cached_gt = metal::precise::exp(g_nexp * sp);
+                    cached_bt = qwen35_replay_sigmoid(b_[size_t(lane) * size_t(b_rs)]);
+                  }
+                }
                 const device float* q_ = k_;
                 device float* y_ = state_out;
                 {
@@ -997,10 +1008,17 @@ enum Qwen35GDNReplayBatch {
             ),
             (
                 "const float gt = g_[0];",
-                "const float g_sp = qwen35_replay_logaddexp(a_[0] + g_dtb, 0.0f);\n"
-                    + "const float gt = metal::precise::exp(g_nexp * g_sp);"
+                "float gt;\n"
+                    + "if constexpr (CACHE_GATES) { gt = simd_shuffle(cached_gt, ushort(t)); }\n"
+                    + "else { const float sp = qwen35_replay_logaddexp(a_[0] + g_dtb, 0.0f); "
+                    + "gt = metal::precise::exp(g_nexp * sp); }"
             ),
-            ("const float bt = beta_[0];", "const float bt = qwen35_replay_sigmoid(b_[0]);"),
+            (
+                "const float bt = beta_[0];",
+                "float bt;\n"
+                    + "if constexpr (CACHE_GATES) { bt = simd_shuffle(cached_bt, ushort(t)); }\n"
+                    + "else { bt = qwen35_replay_sigmoid(b_[0]); }"
+            ),
             (
                 "k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;",
                 "k_ += Hk * Dk; v_ += Hv * Dv; a_ += a_rs; b_ += b_rs;"
@@ -1139,7 +1157,7 @@ enum Qwen35GDNReplayBatch {
             inputs,
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", false),
-                ("DVPL", dvpl), ("CD", CD), ("NK", NK),
+                ("DVPL", dvpl), ("CD", CD), ("NK", NK), ("CACHE_GATES", keep <= 32),
             ],
             grid: (128, Dv / (16 * dvpl), G * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[G, Hv, Dv, Dk], [G, NK, CD]],
