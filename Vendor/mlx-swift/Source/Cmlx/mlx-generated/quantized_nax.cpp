@@ -583,17 +583,7 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
-// One packed byte's decoded values, written to threadgroup memory as a single
-// element-aligned aggregate, the way steel's BlockLoader writes its ReadVector.
-template <typename T, int N>
-struct alignas(sizeof(T)) DequantizedPack {
-  T v[N];
-};
-
-// Same values as four dequantize<U, 4, 2> calls on the bytes of `word`. Each
-// byte's four values are decoded into registers and stored at once: four
-// scalar stores per byte land 4-way bank conflicted at the Ws row pitch
-// (BK_padded = 68, 68 = 4 mod 32). Values and positions are unchanged.
+// Same values as four dequantize<U, 4, 2> calls on the bytes of `word`.
 template <typename U>
 inline void
 dequantize_2bit_word(uint32_t word, U scale, U bias, threadgroup U* w_local) {
@@ -602,12 +592,10 @@ dequantize_2bit_word(uint32_t word, U scale, U bias, threadgroup U* w_local) {
   float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
   for (int i = 0; i < 4; i++) {
     const uint8_t wb = static_cast<uint8_t>((word >> (8 * i)) & 0xff);
-    DequantizedPack<U, 4> decoded;
-    decoded.v[0] = static_cast<U>(sc[0] * (wb & 0x03) + b);
-    decoded.v[1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
-    decoded.v[2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
-    decoded.v[3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
-    *((threadgroup DequantizedPack<U, 4>*)(w_local + 4 * i)) = decoded;
+    w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
+    w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
+    w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
+    w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
   }
 }
 
