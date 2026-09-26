@@ -7140,6 +7140,19 @@ enum Qwen35TensorPackedMatmul {
 
     /// Compiles and runs the head kernel on a small random product and checks
     /// it against the core's own matmul; false on a JIT error or a mismatch.
+    /// The DFlash 2 drafter's head read (BF16, 16 rows, the vocabulary head)
+    /// on the int8 verify-width route, like the target's verify head, instead
+    /// of the matrix route: 855 us against 1160 us per read on an M5 Max.
+    /// Only when the verify route runs its int8 form. The drafter only
+    /// proposes; the target decides every token.
+    /// `DARKBLOOM_DFLASH2_HEAD_INT8=0` keeps the matrix route.
+    static let drafterHeadInt8: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_HEAD_INT8"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? "") else { return false }
+        return verifyEnabled && verifyForm == .staged8
+    }()
+
     nonisolated(unsafe) private static var headAnnounced = false
 
     static let headAvailable: Bool = {
@@ -9567,6 +9580,12 @@ extension Qwen35TextModel: DFlash2TapTarget {
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {
+            // On the int8 verify route the drafter's block-wide read takes the
+            // same kernel as the target's verify head: the BF16 hidden widened
+            // to FP32 exactly, rotated and quantized per 128-group, FP16 logits.
+            if Qwen35TensorPackedMatmul.drafterHeadInt8, hidden.dtype == .bfloat16 {
+                return head.forwardUnwidened(hidden.asType(.float32))
+            }
             return head.forwardUnwidened(hidden)
         }
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
