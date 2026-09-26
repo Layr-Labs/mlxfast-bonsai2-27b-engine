@@ -307,9 +307,15 @@ enum Qwen35TrunkSubmission {
     /// the plain loop's submissions: commit after layers 4, 16, 32 and 48, as
     /// newjordan's `9024f66b` pending path does. `MLXFAST_PREFILL_PIPELINE_FUSED`
     /// sets the plan (same syntax); `0` submits the forward as one graph.
+    ///
+    /// Off by default as a scheduling experiment. The official decode window
+    /// was 4.639263 ms/token for `ccb885d6` and 4.969085 for `6751fef2`;
+    /// the latter's composite was 1.29% lower. Their hosts and harness hashes
+    /// differ, so this comparison does not isolate a causal gain. The override
+    /// `4,16,32,48` restores the previous default plan.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [4, 16, 32, 48]))
+        default: .off)
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
