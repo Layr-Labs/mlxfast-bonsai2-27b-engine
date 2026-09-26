@@ -5709,13 +5709,18 @@ enum Qwen35TensorPackedMatmul {
           const device uint4* src = (const device uint4*)(wrow + g * 8);
           const uint4 v = *src;
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+          // One word's four planes are four contiguous uint32s (16 codes).
+          // The base is 16-uint32 aligned, so each plane group is one uint4
+          // store. Values and positions match the four scalar stores.
           #pragma clang loop unroll(full)
           for (int j = 0; j < 4; j++) {
             const uint32_t wv = v[j];
-            dst[4 * j + 0] = wv & 0x03030303u;
-            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            const uint4 codes = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+            *(threadgroup uint4*)(dst + 4 * j) = codes;
           }
         };
         stage(0, 0);
