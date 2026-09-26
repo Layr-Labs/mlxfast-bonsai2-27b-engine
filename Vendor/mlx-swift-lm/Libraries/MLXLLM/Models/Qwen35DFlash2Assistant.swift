@@ -152,9 +152,27 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
                 self.warmEngineRound(serving: serving)
                 Stream().synchronize()
                 Memory.clearCache()
+                self.runNarrowInSituTrial(serving: serving)
             }
         }
         Stream().synchronize()
+        Memory.clearCache()
+    }
+
+    /// The verify int8 kernels' in-situ trial
+    /// (`Qwen35TensorPackedMatmul.NarrowInSituTrial`), after the full load:
+    /// one engine request long enough for every candidate's timed rounds,
+    /// cancelled once they are in, then the choice, one stderr line, and the
+    /// buffer cache drained. Nothing runs when no trial is armed (no int8
+    /// verify route, one candidate, or
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off`).
+    private func runNarrowInSituTrial(serving: any LanguageModel) {
+        typealias Trial = Qwen35TensorPackedMatmul.NarrowInSituTrial
+        guard Trial.armed else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded)
+        Stream().synchronize()
+        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
         Memory.clearCache()
     }
 
@@ -188,7 +206,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
     /// pattern `warmTargetPrefill` uses, greedy, so nothing depends on any
     /// request's input; the engine is shut down, the tap restored, and
     /// `warmSpeculativeShapes` drains the buffer cache afterwards.
-    private func warmEngineRound(serving: any LanguageModel) {
+    ///
+    /// `trialRounds > 0` is the in-situ trial's mode: the request asks for
+    /// enough tokens to reach that many rounds even at full acceptance, the
+    /// trial's round hook is armed for it, and the request is cancelled as
+    /// soon as the trial has its rounds.
+    private func warmEngineRound(serving: any LanguageModel, trialRounds: Int = 0) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
         let caches: [any CBv2AttendingLayerCache]
@@ -240,13 +263,22 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
                     maxAutomaticRectangularTokens: 1 + depth,
                     draftTokenCeiling: CBv2MTPConfig.testedMaxBlockDraftTokens))
             released = engine
+            let requestID = CBv2RequestID(1)
             var request = CBv2Request(
-                id: CBv2RequestID(1),
+                id: requestID,
                 promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
-                maxTokens: 1 + Self.warmBlockSize)
+                maxTokens: 1 + Self.warmBlockSize * max(1, trialRounds))
             request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
             request.stopTokens = []
             let warmRequest = request
+            if trialRounds > 0 {
+                // Called on the engine's thread inside a proposal: cancel
+                // from elsewhere, never re-entering the engine loop's locks.
+                Qwen35TensorPackedMatmul.NarrowInSituTrial.begin { [weak engine] in
+                    guard let engine else { return }
+                    DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
+                }
+            }
             let done = DispatchSemaphore(value: 0)
             Task.detached {
                 if let events = try? engine.submit(warmRequest) {
@@ -256,6 +288,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
                 done.signal()
             }
             done.wait()
+            if trialRounds > 0 { Qwen35TensorPackedMatmul.NarrowInSituTrial.active = false }
         }
         // The engine is out of scope here; its last references go as the
         // task above unwinds and its queues drain. Wait (bounded) until it is
@@ -634,6 +667,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
+        Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
         let state = self.state(requestState)
         // A state whose committed rows were all absorbed ahead of this round
         // (`prefetchCommittedContext`) proposes over its cache alone.
