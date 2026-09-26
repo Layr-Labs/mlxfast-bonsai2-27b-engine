@@ -307,9 +307,19 @@ enum Qwen35TrunkSubmission {
     /// the plain loop's submissions: commit after layers 4, 16, 32 and 48, as
     /// newjordan's `9024f66b` pending path does. `MLXFAST_PREFILL_PIPELINE_FUSED`
     /// sets the plan (same syntax); `0` submits the forward as one graph.
+    ///
+    /// OFF by default here, as a measurement on the ranked box: on every
+    /// promoted run since the plan arrived (`3baf5cb4` and after) the decode
+    /// window reads 4.87-4.95 ms/tok against 4.63-4.68 on every run before
+    /// it, with the same 12 rounds and 116 accepted, while the seed window
+    /// fell by about the same amount; locally the plan moves the window by
+    /// nothing and the seed by 2-3%. A submission plan cannot make the seed
+    /// forward cheaper, only move where its cost lands, so this tree submits
+    /// the prompt forward as one graph and lets the box say which it is.
+    /// `MLXFAST_PREFILL_PIPELINE_FUSED=4,16,32,48` restores the plan.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [4, 16, 32, 48]))
+        default: .off)
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
