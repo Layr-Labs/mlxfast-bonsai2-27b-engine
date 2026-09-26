@@ -731,10 +731,6 @@ public final class EngineLoopV2: @unchecked Sendable {
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
-    /// An idle recheck is queued and no other step continuation is; the
-    /// generation retires that recheck when `wakeIdleLoop` steps early.
-    private var idleRecheckPending = false
-    private var idleRecheckGeneration: UInt64 = 0
     /// Nil in production. Configuration and records are engine-queue confined.
     var logitDiagnostic: CBv2LogitDiagnosticState?
     var attentionMetadata: CBv2AttentionMetadataState?
@@ -961,17 +957,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                     finishRequest(
                         rec.id, reason: .cancelled, nowNanos: drainNanos, now: drainNow)
                 }
-                // Running rows are cancelled at the next step boundary instead
-                // of being left to finish naturally. A free-run row asks for
-                // thousands of tokens, so a natural finish always ran into the
-                // shutdown timeout, and that path returns while the loop is
-                // still stepping: its GPU work then completes after the
-                // caller's allocator drain and repopulates the buffer cache.
-                // Cancelling ends the drain one round later, with nothing left
-                // in flight (`completeStop` synchronizes before resuming).
-                if Self.drainCancelsRunningRows {
-                    for rec in scheduler.running { requestCancel(rec.id) }
-                }
                 publishGauges()
                 drainWaiters.append(waiter)
                 completeDrainIfReady()
@@ -1008,24 +993,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// `CBV2_DRAIN_CANCELS_RUNNING=0` restores the natural-finish drain.
-    static let drainCancelsRunningRows: Bool = {
-        let value = ProcessInfo.processInfo.environment["CBV2_DRAIN_CANCELS_RUNNING"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     private func completeStop() {
-        // Nothing the loop submitted may still be executing once the drain
-        // waiters resume: the caller clears the allocator cache next, and a
-        // command buffer that completes afterwards returns its buffers to the
-        // cache it just cleared. Synchronize this queue's default stream and
-        // the global streams (the idiom `handlePagedWriteFailure` uses).
-        if Self.drainCancelsRunningRows {
-            Stream().synchronize()
-            Stream.gpu.synchronize()
-            Stream.cpu.synchronize()
-        }
         mtp?.removeAllRequestState()
         logitDiagnostic = nil
         attentionMetadata?.discardPendingForward()
@@ -1502,7 +1470,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 } else if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
-                wakeIdleLoop()
             } catch let error as CBv2SchedulerError {
                 releaseAbandonedAdoption(prefixLookup.adoption)
                 // Contract violation (duplicate live request id) — surfaced
@@ -2339,29 +2306,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func scheduleIdleRecheck() {
-        idleRecheckPending = true
-        let generation = idleRecheckGeneration
         engineQueue.asyncAfter(deadline: .now() + config.idleRecheckInterval) { [weak self] in
-            guard let self, self.idleRecheckGeneration == generation else { return }
-            self.idleRecheckPending = false
-            self.engineStep()
+            self?.engineStep()
         }
     }
-
-    /// Work just arrived on an idle loop: run the step now rather than when
-    /// the idle recheck timer fires (a timer that, measured, picks a fresh
-    /// request up ~2 ms after submit). The pending recheck is retired by
-    /// generation, so the loop stays ONE chain of steps. Engine-queue only.
-    /// `MLXFAST_ENQUEUE_WAKE=0` restores timer-only pickup.
-    private func wakeIdleLoop() {
-        guard Self.enqueueWakeEnabled, idleRecheckPending else { return }
-        idleRecheckPending = false
-        idleRecheckGeneration &+= 1
-        engineQueue.async { [weak self] in self?.engineStep() }
-    }
-
-    static let enqueueWakeEnabled =
-        ProcessInfo.processInfo.environment["MLXFAST_ENQUEUE_WAKE"] != "0"
 
     /// Model protocols remain nonthrowing. A paged cache records a typed fault
     /// and returns shape-preserving placeholders so later model layers unwind
