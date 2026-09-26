@@ -7653,6 +7653,15 @@ enum Qwen35TensorPackedMatmul {
     /// fewer per output element and 128-group (1-1.5% on the prompt-width
     /// matmuls on an M5 Max). The values differ only by FP32 rounding.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE=0` keeps the unfactored form.
+    /// Vector stores in the int8-staged prompt kernel. The native kernel
+    /// already stores float4/half4. `DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC=0`
+    /// keeps the scalar stores.
+    static let staged8VectorStores: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static let factoredPromptEpilogue: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -8365,11 +8374,32 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+        // Same grouping as the native kernel's store: four consecutive i share
+        // mm and nh, c = 0..3, consecutive columns at nb + 32*nh. nb is
+        // 4-aligned (fn in {0,4,8,12}, n0 and N multiples of 64).
+        if constexpr (VEC != 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            const float v0 = acc[i];
+            const float v1 = acc[i + 1];
+            const float v2 = acc[i + 2];
+            const float v3 = acc[i + 3];
+            const size_t base = (size_t)mm * N + nb + 32 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          }
         }
         """
 
@@ -9231,6 +9261,7 @@ enum Qwen35TensorPackedMatmul {
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
+                template.append(("VEC", staged8VectorStores ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
