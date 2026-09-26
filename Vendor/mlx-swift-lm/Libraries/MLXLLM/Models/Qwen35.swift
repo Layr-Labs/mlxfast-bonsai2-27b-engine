@@ -292,9 +292,10 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        return Plan.parse(
-            env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 2, offset: 0, explicit: nil))
+        // Default OFF: verify slices measured as a window loss on this lineage
+        // on the ranked box (Meganpark980320's `92b05ec3`, ercumentyildirim's
+        // `2530f2a0` table); the early block proposal already fills the gap.
+        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -712,10 +713,13 @@ enum Qwen35GatedDeltaChunked {
     /// not a whole number of chunks stays on the sequential kernel: a
     /// sequential tail costs more than it saves at these widths.
     /// `MLXFAST_GDN_CHUNKED_VERIFY=0` keeps verify on the sequential kernel.
+    /// Default OFF: on the ranked box the chunked verify, with the verify
+    /// slices, cost the decode window +5.9% against the sequential kernel of
+    /// the parent record (`a255ab16` vs `5fbfa003`); `=1` turns it back on.
     static let verifyEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED_VERIFY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
+        return enabled && ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     static func runVerify(

@@ -1735,7 +1735,8 @@ enum DFlash2DraftSubmission {
         guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             !raw.isEmpty
-        else { return [1] }
+        // Default OFF with the verify slices (see `Qwen35TrunkSubmission`).
+        else { return [] }
         if ["0", "off", "false", "no"].contains(raw) { return [] }
         return raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
             Int($0.trimmingCharacters(in: .whitespaces))
