@@ -124,6 +124,7 @@ public struct SignedBlockHadamard {
             x.dtype == .float16, r.dtype == .float16, x.shape == r.shape,
             x.ndim >= 2, x.dim(-1) == width, weight.dtype == .float32, weight.ndim == 1,
             weight.dim(0) == width,
+            x.size / width >= FusedInputHadamardKernel.residualNormMinimumRows,
             outputDType == .float16 || outputDType == .float32
         else { return nil }
         let rows = x.size / width
@@ -651,12 +652,31 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return applyRotated(rotated)
     }
 
+    /// A prompt-width route that consumes the composed FP32 activation itself
+    /// (installed by the model, e.g. a tensor route that quantizes inside its
+    /// own rotation): when it claims these projections (one layer, or a
+    /// sibling stack) at `rows` input rows, every fused-input kernel here
+    /// steps aside (returns nil), so the composed path and that route run.
+    /// Nil (the default): nothing claims, and the fused kernels run.
+    nonisolated(unsafe) public static var promptRouteClaims:
+        ((_ layers: [HadamardQuantizedLinear], _ rows: Int) -> Bool)? =
+            ProcessInfo.processInfo.environment["BONSAI_TEST_PROMPT_CLAIM"] == "1"
+            ? { _, rows in rows >= 128 } : nil
+
+    /// True when an installed prompt route claims `layers` at `rows` rows.
+    public static func promptRouteClaimed(_ layers: [HadamardQuantizedLinear], rows: Int)
+        -> Bool
+    {
+        promptRouteClaims?(layers, rows) ?? false
+    }
+
     /// The dtype a fused-input rotation feeding this layer alone should store:
     /// the dtype the matrix route reads for `rows` rows of an FP32 activation
     /// (so the route never casts it again). Nil when the route does not apply.
     private func fusedInputStoreDType(rows: Int) -> DType? {
         let k = transform.width
-        guard Self.routeApplies(to: self), rows >= 2, k % 64 == 0, k % groupSize == 0
+        guard !Self.promptRouteClaimed([self], rows: rows),
+            Self.routeApplies(to: self), rows >= 2, k % 64 == 0, k % groupSize == 0
         else { return nil }
         return Self.routeInputDType(rows: rows, n: weight.dim(0), sourceDType: .float32)
     }
@@ -970,7 +990,8 @@ public func sharedHadamardStackOnRotated(
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
     else { return nil }
     let k = rotated.dim(-1)
-    guard first.fusedSiblingsApply(siblings, rows: rotated.size / k, k: k),
+    guard !HadamardQuantizedLinear.promptRouteClaimed(siblings, rows: rotated.size / k),
+        first.fusedSiblingsApply(siblings, rows: rotated.size / k, k: k),
         first.fusedSiblingsInputDType(siblings, rows: rotated.size / k, sourceDType: .float32)
             == rotated.dtype,
         let (wide, boundaries) = first.fusedSiblingsWide(
@@ -988,7 +1009,9 @@ public func sharedHadamardStackReadDType(
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
     else { return nil }
     let k = first.transform.width
-    guard first.fusedSiblingsApply(siblings, rows: rows, k: k) else { return nil }
+    guard !HadamardQuantizedLinear.promptRouteClaimed(siblings, rows: rows),
+        first.fusedSiblingsApply(siblings, rows: rows, k: k)
+    else { return nil }
     return first.fusedSiblingsInputDType(siblings, rows: rows, sourceDType: .float32)
 }
 
@@ -1002,7 +1025,9 @@ public func sharedHadamardProjectionsPreSignedWide(
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) }), signed.dtype == .float32
     else { return nil }
     let k = signed.dim(-1)
-    guard first.fusedSiblingsApply(siblings, rows: signed.size / k, k: k) else { return nil }
+    guard !HadamardQuantizedLinear.promptRouteClaimed(siblings, rows: signed.size / k),
+        first.fusedSiblingsApply(siblings, rows: signed.size / k, k: k)
+    else { return nil }
     let routeDType = first.fusedSiblingsInputDType(
         siblings, rows: signed.size / k, sourceDType: signed.dtype)
     let rotated = first.transform.applyPreSigned(signed, outputDType: routeDType)
@@ -1121,6 +1146,17 @@ enum FusedInputHadamardKernel {
 
     /// The fused residual add + RMSNorm + rotation (`BONSAI_FUSED_RESNORM=0` off).
     static let residualNormEnabled = enabled && flag("BONSAI_FUSED_RESNORM")
+
+    /// The fewest rows the fused boundary kernel takes (default 64; override
+    /// with `BONSAI_FUSED_RESNORM_MIN_ROWS`). It runs one 1024-thread
+    /// threadgroup per row, so a 16-row verify boundary occupies 16 GPU cores
+    /// while the op chain's rotation spreads over 80 threadgroups; the ranked
+    /// M5 measured the verify window longer with it and the prompt forward
+    /// shorter, so verify widths keep the op chain.
+    static let residualNormMinimumRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_FUSED_RESNORM_MIN_ROWS"]
+        return raw.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 64
+    }()
 
     /// One threadgroup of 1024 threads per 5120-wide row. See
     /// `SignedBlockHadamard.residualNormRotated`.

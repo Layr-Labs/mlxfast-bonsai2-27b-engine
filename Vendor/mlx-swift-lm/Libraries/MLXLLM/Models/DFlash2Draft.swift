@@ -462,6 +462,44 @@ final class DFlash2SlidingMaskMemo {
 
 // MARK: - Attention
 
+/// An inference-only packed view of the pinned BF16 K and V projections.
+/// A plain class keeps the derived array out of Module parameter reflection,
+/// so checkpoint keys and published drafter weights are unchanged.
+private final class DFlash2KVProjectionCache {
+    private var keySource: MLXArray?
+    private var valueSource: MLXArray?
+    private var joinedWeight: MLXArray?
+
+    func prepare(key: Linear, value: Linear) {
+        keySource = nil
+        valueSource = nil
+        joinedWeight = nil
+        let k = key.weight
+        let v = value.weight
+        guard key.bias == nil, value.bias == nil,
+            k.ndim == 2, k.shape == v.shape, k.dtype == .bfloat16,
+            k.dim(0) > 0, k.dim(1) > 0
+        else { return }
+        let weight = concatenated([k, v], axis: 0)
+        eval(weight)
+        keySource = k
+        valueSource = v
+        joinedWeight = weight
+    }
+
+    func project(_ rows: MLXArray, key: Linear, value: Linear)
+        -> (keys: MLXArray, values: MLXArray)?
+    {
+        guard let keySource, let valueSource, let joinedWeight,
+            key.weight === keySource, value.weight === valueSource,
+            rows.dtype == joinedWeight.dtype, rows.dim(-1) == keySource.dim(1)
+        else { return nil }
+        let width = keySource.dim(0)
+        let output = matmul(rows, joinedWeight.T)
+        return (output[0..., 0..., ..<width], output[0..., 0..., width...])
+    }
+}
+
 private final class DFlash2Attention: Module {
     let layerType: DFlash2LayerType
     let slidingWindow: Int?
@@ -476,6 +514,12 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+
+    private let fusedKV = DFlash2KVProjectionCache()
+
+    func prepareKVFusion() {
+        if dflash2KVFusionEnabled { fusedKV.prepare(key: kProj, value: vProj) }
+    }
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -541,10 +585,13 @@ private final class DFlash2Attention: Module {
             // offset rotates every row where the two separate ropes did.
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
+            let projected = fusedKV.project(rows, key: kProj, value: vProj)
+            let rawKeys = projected?.keys ?? kProj(rows)
+            let rawValues = projected?.values ?? vProj(rows)
             let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                kNorm(rawKeys.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
                 offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let values = rawValues.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
@@ -589,6 +636,20 @@ private final class DFlash2Attention: Module {
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
+
+/// Disable the load-time BF16 K/V projection fusion without changing weights.
+private let dflash2KVFusionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_FUSION"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Drafter submission slices (`MLXFAST_DFLASH_SLICES=0` submits one graph).
+private let dflash2SubmitSlices: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SLICES"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// Kill switch for the one-projection context+block K/V (default on).
 private let dflash2KVConcatEnabled: Bool = {
@@ -891,6 +952,8 @@ private final class DFlash2MLP: Module, UnaryLayer {
 
 private final class DFlash2DecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: DFlash2Attention
+
+    func prepareKVFusion() { selfAttn.prepareKVFusion() }
     @ModuleInfo var mlp: DFlash2MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
@@ -1181,7 +1244,7 @@ enum DFlash2GreedyWalk {
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
     ) -> MLXArray? {
         guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
-            unary.dtype == .float32
+            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
@@ -1289,6 +1352,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             throw DFlash2Error.hiddenSizeMismatch(
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
         }
+        for layer in layers { layer.prepareKVFusion() }
         self.target = target
     }
 
@@ -1367,10 +1431,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        // Submission slices: when this forward starts behind an idle GPU (the
+        // early block at finalize), committing the context projection and the
+        // first layer lets the GPU start while the host builds the remaining
+        // layers, the head and the selector. Same kernels, same order.
+        if dflash2SubmitSlices { asyncEval([context, h]) }
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
+            if dflash2SubmitSlices, index == 0, layers.count > 2 { asyncEval([h]) }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]

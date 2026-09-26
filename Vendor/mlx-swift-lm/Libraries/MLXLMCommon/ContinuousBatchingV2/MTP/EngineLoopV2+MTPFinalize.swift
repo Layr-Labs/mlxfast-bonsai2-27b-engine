@@ -7,13 +7,13 @@ import Foundation
 import MLX
 
 extension EngineLoopV2 {
-    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
-    /// event instead of polling it (ercumentyildirim `cc0895d`).
-    static let pollsAcceptancePacket: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
+    /// Default OFF (`BONSAI_POLL_PACKET=1` polls the acceptance packet instead
+    /// of sleeping on its completion event, ercumentyildirim `cc0895d`). The
+    /// wake-up it saves is tens of microseconds per round, and the ranked M5
+    /// runs that spun a core through the whole verify measured longer windows.
+    static let pollsAcceptancePacket: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "1"
 
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
@@ -24,9 +24,14 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
-    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
+    /// Default OFF (`BONSAI_EARLY_REPLAY=1` submits the committed recurrent
+    /// state at finalize). polymorf measured the early submission at +1.5% of
+    /// the decode window on the M5 Max (1404 -> 1427 ms); with the verify
+    /// committed in slices, the lazy replay rides in the verify's first slice
+    /// and overlaps the host's build of the rest. Locally the window is 0.5%
+    /// shorter without it, with the same tokens and acceptance.
     static let submitsCommittedRecurrentStateEarly: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] == "1"
 
     /// Start the committed recurrent state on the GPU now (ercumentyildirim,
     /// `080cb21`). A partially accepted verify commits each recurrent layer by

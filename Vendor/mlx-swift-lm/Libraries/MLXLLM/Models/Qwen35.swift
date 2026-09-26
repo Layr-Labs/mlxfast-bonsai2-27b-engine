@@ -1466,12 +1466,22 @@ final class Qwen35GatedDeltaNet: Module {
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
-    /// `BONSAI_REPLAY_REUSES_GATES=0` recomputes the replay's gates from the tape.
-    static let replayReusesGates: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_REPLAY_REUSES_GATES"]?
+    /// `BONSAI_PREWORK_CONV_INPUT=0` concatenates the tape's conv input with
+    /// ops (a cast and two copies) instead of writing it from the prework kernel.
+    static let preworkWritesConvInput: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_CONV_INPUT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
+
+    /// Default OFF (`BONSAI_REPLAY_REUSES_GATES=1` slices the verify window's
+    /// prework gates into the replay). Bit-identical either way, but every
+    /// ranked M5 bundle that carried it measured a longer decode window
+    /// (DPZZxlz `5f72492` +2.9%, ercumentyildirim `94da3f5` +1.4%, our v6
+    /// +2.9%), and the one sliced-verify bundle without it measured shorter.
+    static let replayReusesGates: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_REPLAY_REUSES_GATES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "1"
 
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
     /// from the exact pre-verify state and transformed recurrence inputs.
@@ -1698,10 +1708,11 @@ final class Qwen35GatedDeltaNet: Module {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
-        let convInput = concatenated([convState, qkv], axis: 1)
         // The fused prework kernel (conv, SiLU, split, q/k norms, gates, tail)
-        // serves the wide verify window too; the replay tape keeps the lazy
-        // concatenated conv input for its boundary rows.
+        // serves the wide verify window too; the replay tape keeps the
+        // concatenated conv input for its boundary rows, which the prework
+        // kernel also writes (the same FP32 values as the concatenation of the
+        // state with the widened qkv, without its cast and copy launches).
         let pre: Qwen35GDNPrework.Outputs? =
             (!exactTargetVerify && S >= 3 && convKernelSize == 4)
             ? Qwen35GDNPrework.run(
@@ -1709,8 +1720,11 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog, dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim)
+                headVDim: headVDim,
+                writeConvInput: Self.preworkWritesConvInput
+                    && qkv.dtype != .bfloat16 && convState.dtype == .float32)
             : nil
+        let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
@@ -1921,6 +1935,9 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
     let mrope: Qwen35MRoPE
+    /// The plain RoPE's parameters, for the fused q/k prep (nil when the
+    /// configured RoPE is not the plain scale-1 `RoPE`).
+    private let plainRope: (dims: Int, base: Float)?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1952,6 +1969,18 @@ final class Qwen35Attention: Module {
             rope: self.rope, dim: max(1, ropeDims), base: args.ropeTheta,
             scalingConfig: args.ropeScaling,
             sections: args.mropeSection)
+        let ropeType: String = {
+            if let config = args.ropeScaling,
+                let value = config["type"] ?? config["rope_type"], case .string(let s) = value
+            {
+                return s
+            }
+            return "default"
+        }()
+        self.plainRope =
+            (self.rope is RoPE && ropeType == "default" && ropeDims >= 2 && ropeDims % 2 == 0
+                && ropeDims <= headDim)
+            ? (dims: ropeDims, base: args.ropeTheta) : nil
 
         super.init()
     }
@@ -2049,23 +2078,42 @@ final class Qwen35Attention: Module {
         let kProjection = projected.1
         let vProjection = projected.2
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
-        var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
-
-        // Text-only Qwen positions are ordinary scalar-equivalent positions,
-        // but histories differ across rows. Capture the per-row device offsets
-        // before the cache advances and use the array RoPE overload.
-        if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+        var queries: MLXArray
+        var keys: MLXArray
+        if positionIds == nil, !exactTargetVerify, let plainRope,
+            ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+            ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+            let offsets = Optional(cache.positionOffsets + 0),
+            let q = Qwen35QKPrep.run(
+                qSplit[0], weight: qNorm.weight, eps: qNorm.eps, offsets: offsets,
+                ropeDims: plainRope.dims, ropeBase: plainRope.base),
+            let k = Qwen35QKPrep.run(
+                kProjection.reshaped(B, L, kvHeads, -1), weight: kNorm.weight, eps: kNorm.eps,
+                offsets: offsets, ropeDims: plainRope.dims, ropeBase: plainRope.base)
+        {
+            // Norm, head transpose and RoPE in one launch per tensor, reading
+            // the q|gate and k views through their strides.
+            queries = q
+            keys = k
         } else {
-            let offsets = cache.positionOffsets + 0
-            queries = rope(queries, offset: offsets)
-            keys = rope(keys, offset: offsets)
+            queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
+                .transposed(0, 2, 1, 3)
+
+            // Text-only Qwen positions are ordinary scalar-equivalent positions,
+            // but histories differ across rows. Capture the per-row device offsets
+            // before the cache advances and use the array RoPE overload.
+            if let positionIds {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            } else {
+                let offsets = cache.positionOffsets + 0
+                queries = rope(queries, offset: offsets)
+                keys = rope(keys, offset: offsets)
+            }
         }
 
         let output: MLXArray
@@ -2866,7 +2914,25 @@ public class Qwen35TextModelInner: Module {
     /// of it) lets the GPU run the front while the host builds the rest. Same
     /// kernels, same inputs, same order; only command-buffer boundaries move
     /// (Meganpark980320 `72b3b48`, DPZZxlz `5f72492`, DrCleverHans `db2d22e`).
+    /// Verify slices (`BONSAI_VERIFY_SLICES=0` off). The host does NOT build
+    /// the verify while the drafter runs: every op that reads a weight larger
+    /// than MLX's per-command-buffer byte budget (40-50 MB) commits its own
+    /// buffer, the drafter's block commits ~27, and `eval_impl` stalls the
+    /// submitting thread in `wait_for_one` while more than 10 are in flight.
+    /// The drafter's `asyncEval` therefore returns only when the GPU is ten
+    /// buffers from its end, and without slices the GPU then idles while the
+    /// host builds the whole 64-layer verify graph and its tape. A short first
+    /// slice restarts the GPU after `verifySliceFirst` layers; later slices
+    /// every `verifySliceEvery` layers keep it fed.
     static let verifySlices = sliceFlag("BONSAI_VERIFY_SLICES")
+    static let verifySliceFirst: Int = sliceCount("BONSAI_VERIFY_SLICE_FIRST", 4)
+    static let verifySliceEvery: Int = sliceCount("BONSAI_VERIFY_SLICE_EVERY", 8)
+
+    private static func sliceCount(_ name: String, _ fallback: Int) -> Int {
+        let raw = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.flatMap { Int($0) }.map { max(1, $0) } ?? fallback
+    }
     static let promptSlices = sliceFlag("BONSAI_PROMPT_SLICES")
 
     private static func sliceFlag(_ name: String) -> Bool {
@@ -2880,7 +2946,11 @@ public class Qwen35TextModelInner: Module {
     ) -> Bool {
         guard modelLayerIndex + 1 < layers.count else { return false }
         if verify {
-            return Self.verifySlices && (modelLayerIndex + 1) % 16 == 0
+            guard Self.verifySlices else { return false }
+            let done = modelLayerIndex + 1
+            return done == Self.verifySliceFirst
+                || (done > Self.verifySliceFirst
+                    && (done - Self.verifySliceFirst) % Self.verifySliceEvery == 0)
         }
         return Self.promptSlices && width > 32
             && (modelLayerIndex == 3 || (modelLayerIndex + 1) % 16 == 0)
@@ -3008,6 +3078,117 @@ public class Qwen35TextModelInner: Module {
 
 
 
+// MARK: - Fused attention q/k prep
+
+/// The attention's per-head q/k RMSNorm, head transpose and partial RoPE in
+/// one launch per tensor. The op chain ran a row-contiguous copy of the
+/// strided q (k) view, `rms_single_row`, a copy for the RoPE's untouched
+/// dims and the in-place `rope` kernel: four launches per tensor. Here one
+/// 64-thread threadgroup per (batch, position, head) row keeps every
+/// operation's arithmetic: `rms_single_row`'s 64 threads x 4 reads, `acc +=
+/// xi * xi`, `simd_sum`, the 32-slot pass, `precise::rsqrt(acc / D + eps)`,
+/// `w * (x * inv)`; then MLX's `rope` for the first `RD` dims (non-traditional
+/// pairs `(p, p + RD/2)`, `inv_freq = exp2(-(p / (RD/2)) * log2(base))`,
+/// `theta = float(pos + offset) * inv_freq`, `fast::cos` / `fast::sin`, the
+/// same two products per output), the rest copied. Output `[B, H, L, D]`
+/// FP32 as the chain's. `DARKBLOOM_QWEN35_QK_PREP=0` keeps the chain.
+enum Qwen35QKPrep {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_QK_PREP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `x`: `[B, L, H, D]` (any strides), FP32; `weight`: `[D]` FP32;
+    /// `offsets`: `[B]` int32 position offsets.
+    static func run(
+        _ x: MLXArray, weight: MLXArray, eps: Float, offsets: MLXArray,
+        ropeDims: Int, ropeBase: Float
+    ) -> MLXArray? {
+        guard enabled, x.ndim == 4, x.dtype == .float32, weight.dtype == .float32,
+            weight.ndim == 1, x.dim(3) == 256, weight.dim(0) == 256,
+            ropeDims <= 256, ropeDims % 2 == 0,
+            offsets.dtype == .int32, offsets.size == x.dim(0)
+        else { return nil }
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let H = x.dim(2)
+        let D = x.dim(3)
+        return kernel(
+            [x, weight, offsets.reshaped([-1]), MLXArray(eps), MLXArray(Foundation.log2(ropeBase))],
+            template: [("H", H), ("L", L), ("D", D), ("RD", ropeDims)],
+            grid: (64, B * L * H, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[B, H, L, D]], outputDTypes: [.float32])[0]
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_qk_norm_rope",
+        inputNames: ["x", "w", "offsets", "eps", "base"],
+        outputNames: ["out"],
+        source: """
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint h = row % uint(H);
+            const uint l = (row / uint(H)) % uint(L);
+            const uint bb = row / (uint(H) * uint(L));
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+            threadgroup float buf[D];
+
+            const int64_t src = int64_t(bb) * x_strides[0] + int64_t(l) * x_strides[1]
+                + int64_t(h) * x_strides[2];
+            float xv[4];
+            float acc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+              xv[i] = x[src + int64_t(lid * 4 + uint(i)) * x_strides[3]];
+              acc += xv[i] * xv[i];
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) { local_sums[lane] = 0; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) { local_sums[sg] = acc; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              float t = simd_sum(local_sums[lane]);
+              if (lane == 0) { local_inv[0] = metal::precise::rsqrt(t / float(D) + eps); }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+              const uint e = lid * 4 + uint(i);
+              buf[e] = w[e] * static_cast<float>(xv[i] * inv);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            constexpr uint HALF = uint(RD) / 2;
+            const float L_pos = 1.0f * static_cast<float>(int(l) + offsets[bb]);
+            const size_t dst = ((size_t(bb) * size_t(H) + size_t(h)) * size_t(L) + size_t(l)) * size_t(D);
+            for (int i = 0; i < 4; i++) {
+              const uint e = lid * 4 + uint(i);
+              float v = buf[e];
+              if (e < uint(RD)) {
+                const uint p = e % HALF;
+                const float d = static_cast<float>(p) / static_cast<float>(HALF);
+                const float inv_freq = metal::exp2(-d * base);
+                const float theta = L_pos * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = buf[p];
+                const float x2 = buf[p + HALF];
+                if (e < HALF) {
+                  v = x1 * costheta - x2 * sintheta;
+                } else {
+                  v = x1 * sintheta + x2 * costheta;
+                }
+              }
+              out[dst + e] = v;
+            }
+            """,
+        ensureRowContiguous: false)
+}
+
 // MARK: - Fused gated-delta prework
 
 /// The gated-delta layer's prework between the input projection and the
@@ -3032,6 +3213,8 @@ enum Qwen35GDNPrework {
         let g: MLXArray
         let beta: MLXArray
         let tail: MLXArray
+        /// `concatenated([convState, qkv], axis: 1)` in FP32, when requested.
+        let convInput: MLXArray?
     }
 
     private static let enabled: Bool = {
@@ -3128,6 +3311,33 @@ enum Qwen35GDNPrework {
           const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
           beta[grow] = (bv < 0.0f) ? by : 1.0f - by;
         }
+        // The concatenated conv input [cs; qkv] (FP32), when requested: row
+        // NK + t from this row's columns, rows 0..NK-1 from the state (t == 0).
+        if (WCI) {
+          const size_t cirow = (size_t(bb) * size_t(Sn + NK) + size_t(NK) + size_t(t)) * size_t(CD);
+          const int64_t qsrc = qb + int64_t(t) * qs1;
+          ci[cirow + colq] = float(qkv[qsrc + int64_t(colq) * qs2]);
+          ci[cirow + colk] = float(qkv[qsrc + int64_t(colk) * qs2]);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GRP; i++) {
+            const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+            ci[cirow + colv] = float(qkv[qsrc + int64_t(colv) * qs2]);
+          }
+          if (t == 0) {
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NK; r++) {
+              const size_t cirow0 = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+              const int64_t csrc = cb + int64_t(r) * cs1;
+              ci[cirow0 + colq] = cs[csrc + int64_t(colq) * cs2];
+              ci[cirow0 + colk] = cs[csrc + int64_t(colk) * cs2];
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < GRP; i++) {
+                const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+                ci[cirow0 + colv] = cs[csrc + int64_t(colv) * cs2];
+              }
+            }
+          }
+        }
         // Next convolution tail: rows S-NK..S-1 of the concatenated input.
         #pragma clang loop unroll(full)
         for (int r = 0; r < NK; r++) {
@@ -3159,7 +3369,7 @@ enum Qwen35GDNPrework {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework",
         inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
-        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
         source: source,
         ensureRowContiguous: !stridedReads)
 
@@ -3174,7 +3384,8 @@ enum Qwen35GDNPrework {
     static func run(
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
-        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
+        writeConvInput: Bool = false
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3 else { return nil }
         let B = qkv.dim(0)
@@ -3200,18 +3411,18 @@ enum Qwen35GDNPrework {
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
-                ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("WCI", writeConvInput ? 1 : 0),
             ],
             grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
             outputShapes: [
                 [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
                 [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
-                [B, KS - 1, CD],
+                [B, KS - 1, CD], writeConvInput ? [B, KS - 1 + S, CD] : [1],
             ],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
         return Outputs(
             q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
-            tail: outputs[5])
+            tail: outputs[5], convInput: writeConvInput ? outputs[6] : nil)
     }
 }
 
