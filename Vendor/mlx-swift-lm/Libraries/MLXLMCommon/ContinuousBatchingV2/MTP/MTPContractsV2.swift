@@ -450,19 +450,9 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// length once a round has finalized.
     func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int)
-
-    /// Absorb the committed context rows the state holds into the drafter's
-    /// own cache ahead of the next proposal, when that is worth a separate
-    /// submission (a prompt's worth of rows). Returns the lazy arrays to
-    /// evaluate, or nothing when the rows stay pending for the next block.
-    func prefetchCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
-    public func prefetchCommittedContext(
-        requestState: any CBv2MTPRequestState
-    ) -> [MLXArray] { [] }
-
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
     /// branch never reaches these, so a caller that does has taken the wrong
@@ -483,21 +473,6 @@ extension CBv2MTPBlockDrafter {
     ) -> (tokens: MLXArray, hidden: MLXArray) {
         preconditionFailure("CBv2 block drafter: draftStep is not the block seam")
     }
-}
-
-/// A block drafter whose proposal can hand the GPU its leading layers while
-/// the proposal is still being built. The engine takes this only for the
-/// early block proposal at finalize, where it submits the rest of the
-/// proposal itself after the committed recurrent state
-/// (`EngineLoopV2.earlyDraftLeadingLayers`). The proposal is the same graph
-/// as `proposeBlock`'s; only command-buffer boundaries move.
-public protocol CBv2MTPBlockLeadingSubmission: CBv2MTPBlockDrafter {
-    /// `proposeBlock`, with the drafter's first `leadingLayers` layers (and
-    /// everything they read) submitted as soon as they are built.
-    func proposeBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
-        submittingLeadingLayers leadingLayers: Int
-    ) throws -> MLXArray
 }
 
 // MARK: - Config

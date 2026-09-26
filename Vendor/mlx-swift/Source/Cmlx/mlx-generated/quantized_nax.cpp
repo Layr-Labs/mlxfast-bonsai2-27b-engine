@@ -496,9 +496,9 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits, typename W>
+template <typename U, int N, int bits>
 inline void
-dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
+dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -584,29 +584,18 @@ dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 }
 
 // Same values as four dequantize<U, 4, 2> calls on the bytes of `word`.
-// Keeping one decoded quad in an aligned aggregate lets the threadgroup store
-// use the natural transaction width of the four values instead of four scalar
-// stores to the padded loader tile.
-template <typename U, int N>
-struct alignas(sizeof(U)) DequantizedPack {
-  U v[N];
-};
-
-template <typename U, typename W>
+template <typename U>
 inline void
-dequantize_2bit_word(uint32_t word, U scale, U bias, W w_local) {
+dequantize_2bit_word(uint32_t word, U scale, U bias, threadgroup U* w_local) {
   const float s = float(scale);
   const float b = float(bias);
   float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
   for (int i = 0; i < 4; i++) {
     const uint8_t wb = static_cast<uint8_t>((word >> (8 * i)) & 0xff);
-    DequantizedPack<U, 4> pack = {{
-        static_cast<U>(sc[0] * (wb & 0x03) + b),
-        static_cast<U>(sc[1] * (wb & 0x0c) + b),
-        static_cast<U>(sc[2] * (wb & 0x30) + b),
-        static_cast<U>(sc[3] * (wb & 0xc0) + b),
-    }};
-    *((threadgroup DequantizedPack<U, 4>*)(&w_local[4 * i])) = pack;
+    w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
+    w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
+    w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
+    w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
   }
 }
 
@@ -1035,39 +1024,6 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     y_row = (tile_id % m_tiles) * BM;
     y_col = (tile_id / m_tiles) * BN;
   }
-
-#ifdef MLX_QMM_M16_NAX
-  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
-  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
-  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
-  // are summed through Ws, which this path does not otherwise use.
-  if constexpr (
-      bits == 2 && group_size == 128 && BM == 32 && BN == 64 &&
-      WM * WN == 4) {
-    if (M - y_row <= 16 && N < 65536) {
-      const uint cb = simd_gid >> 1;
-      const uint ks = simd_gid & 1;
-      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
-      qmm_m16_block<T, 2>(
-          w,
-          scales,
-          biases,
-          x + y_row * static_cast<int64_t>(K),
-          y + y_row * static_cast<int64_t>(N),
-          K,
-          N,
-          M - y_row,
-          y_col + 32 * int(cb),
-          0,
-          K,
-          ks,
-          simd_lid,
-          red,
-          red);
-      return;
-    }
-  }
-#endif
 
 #ifdef MLX_QMM_M16_NAX
   // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared

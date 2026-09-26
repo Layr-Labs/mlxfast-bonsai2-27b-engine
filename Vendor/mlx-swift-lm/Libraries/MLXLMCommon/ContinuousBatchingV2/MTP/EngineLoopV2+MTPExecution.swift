@@ -5,17 +5,6 @@
 import Foundation
 import MLX
 
-/// On unless explicitly disabled: a round whose driver does not use the
-/// marginal depth policy drops the dead verify top-two readback.
-/// `DARKBLOOM_MTP_SKIP_DEAD_MARGIN=0` keeps the readback.
-enum CBv2MTPDeadMarginSkip {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MTP_SKIP_DEAD_MARGIN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-}
-
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
     let start: Int
@@ -47,10 +36,6 @@ struct CBv2MTPGraphBuild {
     /// Prompt rows that sampled their first token in this step and can carry
     /// straight into a block-drafter round (no seed forward).
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
-    /// Work submitted in its own command buffer AFTER `asyncEvalTargets`, so
-    /// the step's sampled tokens never wait for it: a block drafter's
-    /// absorption of a prompt's committed context.
-    let lateEvalTargets: [MLXArray]
 }
 
 extension EngineLoopV2 {
@@ -310,7 +295,6 @@ extension EngineLoopV2 {
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
         var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
-        var lateEvalTargets: [MLXArray] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -395,17 +379,6 @@ extension EngineLoopV2 {
             }
             if let observedHidden {
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
-                // A prompt row that carries into a block round: its drafter
-                // context is a function of the rows just observed, not of the
-                // token this step samples, so it is absorbed now and
-                // submitted behind the step (`lateEvalTargets`).
-                if row.samples, Self.mtpPrefillCarryEnabled, let block = mtp.blockDrafter,
-                    let observed = committedObservationRows.last, observed.id == rec.id
-                {
-                    lateEvalTargets.append(
-                        contentsOf: block.prefetchCommittedContext(
-                            requestState: observed.assistantState))
-                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -496,8 +469,7 @@ extension EngineLoopV2 {
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
-            prefillCarries: prefillCarries,
-            lateEvalTargets: lateEvalTargets)
+            prefillCarries: prefillCarries)
     }
 
     /// A BLOCK drafter's first block needs only the prompt's tapped context
@@ -601,7 +573,6 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        var blockDraftIDs: MLXArray?
         if let block = mtp.blockDrafter {
             // ONE propose per round. The block is the row's last committed
             // token followed by k mask tokens, and the drafter's single
@@ -645,9 +616,6 @@ extension EngineLoopV2 {
             }
             let batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
-            // The block proposal already has the [B, k] draft-ID layout; keep
-            // it instead of re-stacking its columns (terrapinelf `7502085`).
-            blockDraftIDs = batched
             // The whole block is known before target construction starts, so
             // publish it now; finalization still joins it through the
             // acceptance packet.
@@ -718,7 +686,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = blockDraftIDs ?? stacked(draftSteps, axis: 1)
+        let draftIDs = stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -754,11 +722,7 @@ extension EngineLoopV2 {
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
-            // The verify top-two values feed only the marginal depth policy
-            // (`previousTopTwoMargin`); with a fixed draft depth nothing
-            // reads them, so the round neither retains nor reads them back.
-            policyTopTwoValues: (mtp.usesMarginalPolicy || !CBv2MTPDeadMarginSkip.enabled)
-                ? target.policyTopTwo?.values : nil,
+            policyTopTwoValues: target.policyTopTwo?.values,
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill

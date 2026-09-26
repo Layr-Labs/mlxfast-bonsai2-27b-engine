@@ -2,10 +2,19 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
 extension EngineLoopV2 {
+    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
+    /// event instead of polling it (ercumentyildirim `cc0895d`).
+    static let pollsAcceptancePacket: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -18,24 +27,6 @@ extension EngineLoopV2 {
     /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
     static let submitsCommittedRecurrentStateEarly: Bool =
         ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
-
-    /// Drafter layers the early block proposal submits while it is built,
-    /// ahead of the committed recurrent state; the rest of the proposal is
-    /// submitted right after that state. Three layers (with the context
-    /// projection they read) are ~11 of the proposal's ~32 command buffers
-    /// on an M4 Max: as many as MLX keeps in flight without holding the host,
-    /// and enough GPU time to cover the committed state's host build.
-    /// `DARKBLOOM_BONSAI_DRAFT_LEAD_LAYERS=0` restores one submission of the
-    /// whole proposal before the committed state; a positive count overrides.
-    static let earlyDraftLeadingLayers: Int = {
-        guard
-            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DRAFT_LEAD_LAYERS"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            !raw.isEmpty
-        else { return 3 }
-        if ["0", "off", "false", "no"].contains(raw) { return 0 }
-        return max(0, Int(raw) ?? 3)
-    }()
 
     /// Start the committed recurrent state on the GPU now (ercumentyildirim,
     /// `080cb21`). A partially accepted verify commits each recurrent layer by
@@ -123,6 +114,23 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        if Self.pollsAcceptancePacket {
+            // The packet was submitted with the verify (asyncEval at launch).
+            // Poll it instead of sleeping on its completion event: the step
+            // thread stays on a clocked-up core and resumes the instant the
+            // verify finishes, and the finalize and the next round's graph
+            // build are on the GPU's critical path. Bounded: after 200 ms the
+            // blocking read below takes over.
+            var available = false
+            var spins = 0
+            let deadline = DispatchTime.now().uptimeNanoseconds &+ 200_000_000
+            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
+                !available
+            {
+                spins &+= 1
+                if spins & 4095 == 0, DispatchTime.now().uptimeNanoseconds > deadline { break }
+            }
+        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
@@ -314,18 +322,7 @@ extension EngineLoopV2 {
             // decides every token. Only a fixed-depth block leg with a full
             // next round ahead takes this path, so the next round's depth is
             // the depth proposed here.
-            //
-            // SPLIT SUBMISSION (`earlyDraftLeadingLayers`). One `asyncEval` of
-            // the whole proposal holds this thread in MLX's in-flight cap (at
-            // most 10 command buffers; the proposal is ~30) until the drafter
-            // is nearly done, and only then does the host build and encode
-            // the committed recurrent state below, eating the drafter tail
-            // the next verify build needs to hide under. So the drafter hands
-            // the GPU only its leading layers while it builds, the committed
-            // state is built and submitted while they run, and the rest of
-            // the proposal is submitted after it, still inside this finalize.
             var earlyBlock: CBv2MTPEarlyBlockProposal?
-            var deferredDraftTargets: [MLXArray] = []
             if finishReason == nil, confirmed > 0, let block = mtp.blockDrafter,
                 let state = metadata.assistantState,
                 let fixedDepth = mtp.config.fixedDraftTokens, fixedDepth == k,
@@ -333,26 +330,11 @@ extension EngineLoopV2 {
             {
                 let anchor = kept[confirmed - 1]
                 let kvOffset = rec.numComputedTokens
-                let leading =
-                    Self.earlyDraftLeadingLayers > 0
-                    ? block as? any CBv2MTPBlockLeadingSubmission : nil
-                let proposal: MLXArray?
-                if let leading {
-                    proposal = try? leading.proposeBlock(
-                        anchor: anchor, depth: k, requestState: state,
-                        submittingLeadingLayers: Self.earlyDraftLeadingLayers)
-                } else {
-                    proposal = try? block.proposeBlock(
-                        anchor: anchor, depth: k, requestState: state)
-                }
-                if let tokens = proposal {
+                if let tokens = try? block.proposeBlock(
+                    anchor: anchor, depth: k, requestState: state)
+                {
                     block.trimBlockState(state, toCommittedLength: kvOffset)
-                    let targets = [tokens] + block.evaluationTargets(for: state)
-                    if leading != nil {
-                        deferredDraftTargets = targets
-                    } else {
-                        asyncEval(targets)
-                    }
+                    asyncEval([tokens] + block.evaluationTargets(for: state))
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 }
@@ -390,11 +372,6 @@ extension EngineLoopV2 {
                             "CBv2 recurrent MTP finalization failed for \(id): \(error)")
                     }
                 }
-            }
-            // The rest of the early proposal, right behind the committed
-            // recurrent state (at once when this row has none).
-            if !deferredDraftTargets.isEmpty {
-                asyncEval(deferredDraftTargets)
             }
             // The speculative suffix is now reconciled in BOTH the page tables
             // and scheduler record. Publish only the accepted frontier; doing
