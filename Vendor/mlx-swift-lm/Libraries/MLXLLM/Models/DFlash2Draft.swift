@@ -477,6 +477,8 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
     private let qkv = DFlash2QKVStack()
+    private let preworkBase: Float
+    private let preworkGeometry: DFlash2AttentionPrework.Geometry?
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -485,6 +487,12 @@ private final class DFlash2Attention: Module {
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
+        self.preworkBase = config.ropeTheta
+        self.preworkGeometry = config.headDim == 128
+            ? DFlash2AttentionPrework.prepare(
+                heads: config.attentionHeads, kvHeads: config.kvHeads,
+                base: config.ropeTheta, eps: config.rmsNormEps)
+            : nil
 
         _qProj.wrappedValue = Linear(
             config.hiddenSize, config.attentionHeads * config.headDim, bias: false)
@@ -558,12 +566,22 @@ private final class DFlash2Attention: Module {
             } else {
                 (projectedQ, projectedK, projectedV) = (qProj(x), kProj(rows), vProj(rows))
             }
-            queries = rope(
-                qNorm(projectedQ.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
-                offset: blockOffset)
-            let allKeys = rope(
-                kNorm(projectedK.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
+            let qRows = projectedQ.reshaped(B, L, heads, -1)
+            let kRows = projectedK.reshaped(B, n, kvHeads, -1)
+            let allKeys: MLXArray
+            if let geometry = preworkGeometry,
+                ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+                ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+                let fused = DFlash2AttentionPrework.run(
+                    q: qRows, k: kRows, qNorm: qNorm, kNorm: kNorm,
+                    qOffset: blockOffset, kOffset: cache.offset,
+                    geometry: geometry, base: preworkBase)
+            {
+                (queries, allKeys) = fused
+            } else {
+                queries = rope(qNorm(qRows).transposed(0, 2, 1, 3), offset: blockOffset)
+                allKeys = rope(kNorm(kRows).transposed(0, 2, 1, 3), offset: cache.offset)
+            }
             let allValues = projectedV.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             if let block = cache as? DFlash2BlockKVCache,
                 let held = block.updateBlock(
@@ -630,6 +648,183 @@ private final class DFlash2Attention: Module {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DFlash2TensorMatmul.linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
+}
+
+/// One SIMD group per 128-channel BF16 head, with the RMSNorm's two BF16
+/// roundings retained before the full nontraditional RoPE. Q and K can have
+/// different lengths and offsets. Reads the projection views with their actual
+/// strides and writes head-major attention inputs in one launch. Prepared once
+/// per geometry at construction; any numerical disagreement keeps the op chain.
+/// MLXFAST_DFLASH_ATTN_PREWORK=0 keeps the op chain on every device.
+private enum DFlash2AttentionPrework {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ATTN_PREWORK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    struct Geometry: Hashable {
+        let heads: Int
+        let kvHeads: Int
+        let base: Float
+        let eps: Float
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static let source = """
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint group = threadgroup_position_in_grid.x;
+        const uint nq = uint(q_shape[1]) * uint(HQ);
+        const uint nk = uint(k_shape[1]) * uint(HK);
+        const uint bb = group / (nq + nk);
+        const uint local = group % (nq + nk);
+        const bool isq = local < nq;
+        const int L = isq ? int(q_shape[1]) : int(k_shape[1]);
+        const uint row = isq ? local : local - nq;
+        const uint h = row / uint(L);
+        const uint t = row % uint(L);
+        const int64_t base = isq
+            ? int64_t(bb) * q_strides[0] + int64_t(t) * q_strides[1] + int64_t(h) * q_strides[2]
+            : int64_t(bb) * k_strides[0] + int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
+        const int64_t cs = isq ? q_strides[3] : k_strides[3];
+        auto src = isq ? q : k;
+        auto w = isq ? wq : wk;
+        auto dst = isq ? qo : ko;
+        threadgroup T rot[128];
+        float acc = 0;
+        float thread_x[4];
+        for (int i = 0; i < 4; i++) {
+          thread_x[i] = static_cast<float>(src[base + int64_t(lid * 4 + i) * cs]);
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        const float eps = isq ? epsq : epsk;
+        const float inv = metal::precise::rsqrt(acc / 128u + eps);
+        for (int i = 0; i < 4; i++) {
+          const uint c = lid * 4 + uint(i);
+          rot[c] = static_cast<T>(w[c] * static_cast<T>(thread_x[i] * inv));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const size_t obase = ((size_t(bb) * size_t(isq ? HQ : HK) + size_t(h)) * size_t(L) + size_t(t)) * 128;
+        const int off = isq ? qoff : koff;
+        const float position = static_cast<float>(int(t) + off);
+        for (int i = 0; i < 2; i++) {
+          const uint c = lid + uint(i) * 32;
+          const float d = static_cast<float>(c) / 64.0f;
+          const float inv_freq = metal::exp2(-d * lbase);
+          const float theta = position * inv_freq;
+          const float costheta = metal::fast::cos(theta);
+          const float sintheta = metal::fast::sin(theta);
+          const float x1 = static_cast<float>(rot[c]);
+          const float x2 = static_cast<float>(rot[c + 64]);
+          dst[obase + c] = static_cast<T>(x1 * costheta - x2 * sintheta);
+          dst[obase + c + 64] = static_cast<T>(x1 * sintheta + x2 * costheta);
+        }
+        """
+    private static let kernel = MLXFast.metalKernel(name: "dflash2_attn_prework",
+        inputNames: ["q", "k", "wq", "wk", "epsq", "epsk", "qoff", "koff", "lbase"],
+        outputNames: ["qo", "ko"], source: source, ensureRowContiguous: false)
+
+    static func run(
+        q: MLXArray, k: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
+        qOffset: Int, kOffset: Int, geometry: Geometry, base: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, base == geometry.base, qNorm.eps == geometry.eps,
+            kNorm.eps == geometry.eps,
+            q.ndim == 4, k.ndim == 4, q.dim(0) > 0, q.dim(0) == k.dim(0),
+            q.dim(1) > 0, k.dim(1) > 0, q.dim(1) < 65536, k.dim(1) < 65536,
+            q.dim(2) == geometry.heads, k.dim(2) == geometry.kvHeads,
+            q.dim(3) == 128, k.dim(3) == 128,
+            q.dtype == .bfloat16, k.dtype == .bfloat16,
+            qNorm.weight.dtype == .bfloat16, kNorm.weight.dtype == .bfloat16,
+            qNorm.weight.shape == [128], kNorm.weight.shape == [128],
+            qNorm.weight.strides == [1], kNorm.weight.strides == [1],
+            qOffset >= 0, kOffset >= 0,
+            qOffset <= Int(Int32.max) - q.dim(1),
+            kOffset <= Int(Int32.max) - k.dim(1)
+        else { return nil }
+        return launch(q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
+            qOffset: qOffset, kOffset: kOffset, geometry: geometry)
+    }
+
+    private static func launch(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray,
+        qOffset: Int, kOffset: Int, geometry: Geometry
+    ) -> (MLXArray, MLXArray) {
+        let result = kernel(
+            [q, k, wq, wk, MLXArray(geometry.eps), MLXArray(geometry.eps),
+             MLXArray(Int32(qOffset)), MLXArray(Int32(kOffset)), MLXArray(log2(geometry.base))],
+            template: [("T", DType.bfloat16), ("HQ", geometry.heads), ("HK", geometry.kvHeads)],
+            grid: (32 * q.dim(0) * (q.dim(1) * q.dim(2) + k.dim(1) * k.dim(2)), 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[q.dim(0), q.dim(2), q.dim(1), 128],
+                           [k.dim(0), k.dim(2), k.dim(1), 128]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+
+    static func prepare(heads: Int, kvHeads: Int, base: Float, eps: Float) -> Geometry? {
+        guard enabled, heads > 0, heads <= 128, kvHeads > 0, kvHeads <= 128,
+            base.isFinite, base > 0, eps.isFinite, eps > 0
+        else { return nil }
+        let geometry = Geometry(heads: heads, kvHeads: kvHeads, base: base, eps: eps)
+        return lock.withLock {
+            if let passed = verdicts[geometry] { return passed ? geometry : nil }
+            let passed = selfCheck(geometry)
+            verdicts[geometry] = passed
+            if !passed {
+                FileHandle.standardError.write(
+                    "dflash2: fused attention prework disagrees or is unavailable; using the op chain\n"
+                        .data(using: .utf8)!)
+            }
+            return passed ? geometry : nil
+        }
+    }
+
+    private static func selfCheck(_ geometry: Geometry) -> Bool {
+        do {
+            return try withError { error in
+                let dtype = DType.bfloat16
+                let wq = (1 + 0.25 * MLXRandom.normal([128], key: MLXRandom.key(317))).asType(dtype)
+                let wk = (1 + 0.25 * MLXRandom.normal([128], key: MLXRandom.key(318))).asType(dtype)
+                var same = MLXArray(true)
+                for (index, (batch, ql, kl, offset)) in
+                    [(1, 1, 17, 0), (1, 16, 32, 511), (1, 16, 528, 4093), (2, 8, 24, 200003)]
+                    .enumerated()
+                {
+                    let width = (geometry.heads + 2 * geometry.kvHeads) * 128
+                    let wide = (MLXRandom.normal(
+                        [batch, kl, width], key: MLXRandom.key(UInt64(319 + index)))
+                        * exp(MLXRandom.normal(
+                            [batch, kl, width], key: MLXRandom.key(UInt64(323 + index)))))
+                        .asType(dtype)
+                    let q = wide[0..., (kl - ql)..., ..<(geometry.heads * 128)]
+                        .reshaped(batch, ql, geometry.heads, 128)
+                    let k = wide[.ellipsis, (geometry.heads * 128)..<((geometry.heads + geometry.kvHeads) * 128)]
+                        .reshaped(batch, kl, geometry.kvHeads, 128)
+                    let qOffset = offset + kl - ql
+                    let a = MLXFast.RoPE(
+                        MLXFast.rmsNorm(q, weight: wq, eps: geometry.eps).transposed(0, 2, 1, 3),
+                        dimensions: 128, traditional: false, base: geometry.base, scale: 1,
+                        offset: qOffset)
+                    let b = MLXFast.RoPE(
+                        MLXFast.rmsNorm(k, weight: wk, eps: geometry.eps).transposed(0, 2, 1, 3),
+                        dimensions: 128, traditional: false, base: geometry.base, scale: 1,
+                        offset: offset)
+                    let fused = launch(q: q, k: k, wq: wq, wk: wk,
+                        qOffset: qOffset, kOffset: offset, geometry: geometry)
+                    same = same .&& all(a.view(dtype: .uint16) .== fused.0.view(dtype: .uint16))
+                        .&& all(b.view(dtype: .uint16) .== fused.1.view(dtype: .uint16))
+                }
+                eval(same)
+                try error.check()
+                return same.item(Bool.self)
+            }
+        } catch {
+            return false
+        }
     }
 }
 
