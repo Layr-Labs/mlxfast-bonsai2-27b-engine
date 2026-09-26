@@ -425,15 +425,15 @@ public enum DFlash2SlidingMask {
     }
 }
 
-/// The sliding mask of ONE block forward, built once and handed to every layer
+/// The sliding mask for one geometry, built once and handed to every layer
 /// that asks for the same geometry.
 ///
 /// Every layer of a forward sees the same context rows and the same block, so
 /// its mask inputs are equal and the mask is the same array. Building it per
 /// layer re-ran the same comparison graph once per layer. The memo is keyed on
 /// every input of ``DFlash2SlidingMask/make(contextLength:blockLength:slidingWindow:isCausal:)``,
-/// so a layer whose inputs differ still gets its own mask. It lives for one
-/// forward only and is a plain class, off the module tree (see
+/// so a layer whose inputs differ still gets its own mask. The drafter retains
+/// only the latest geometry in this plain class, off the module tree (see
 /// ``DFlash2TapSlot``).
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
@@ -1471,6 +1471,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
+    // Reuse the most recent geometry across speculative forwards (terrapinelf /
+    // ercumentyildirim; carried from promoted f3d5ad75 and ccb885d6).
+    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1613,7 +1616,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
 
-        let masks = DFlash2SlidingMaskMemo()
         let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
