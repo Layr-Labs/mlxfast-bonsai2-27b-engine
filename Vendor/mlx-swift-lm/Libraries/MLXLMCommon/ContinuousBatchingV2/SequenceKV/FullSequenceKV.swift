@@ -151,8 +151,9 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
-        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        let (writtenKeys, writtenValues) = CBv2SqueezedKVUpdate.updates(newKeys, newValues)
+        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = writtenKeys
+        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = writtenValues
         absoluteOffset += n
 
         return (
@@ -223,5 +224,51 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
         capacity = newCapacity
+    }
+}
+
+/// The KV append's updates with the batch axis squeezed (a view) before the
+/// slice assignment. The assignment drops leading singleton axes itself by a
+/// reshape, and MLX's reshape copies a strided input whose first axis is 1
+/// (`prepare_reshape` keeps that axis when collapsing): the head-transposed
+/// values of a verify window (a column slice of the q|k|v product) took one
+/// copy launch per attention layer before the slice update. The squeeze is a
+/// view and the slice update reads the same elements through their strides.
+/// Checked once, on first use, bit for bit against the unsqueezed assignment
+/// on a head-transposed column slice; `MLXFAST_KV_SQUEEZED_UPDATE=0` keeps the
+/// unsqueezed updates.
+enum CBv2SqueezedKVUpdate {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_KV_SQUEEZED_UPDATE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let verified: Bool = {
+        var same = true
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            let wide = MLXRandom.normal([1, 16, 14336], key: MLXRandom.key(41)).asType(dtype)
+            let update = wide[0..., 0..., 13312...].reshaped(1, 16, 4, 256).transposed(0, 2, 1, 3)
+            var plain = MLXArray.zeros([1, 4, 64, 256], dtype: dtype)
+            var squeezed = MLXArray.zeros([1, 4, 64, 256], dtype: dtype)
+            plain[.ellipsis, 5 ..< 21, 0...] = update
+            squeezed[.ellipsis, 5 ..< 21, 0...] = update.squeezed(axis: 0)
+            let bits = dtype == .float32 ? DType.uint32 : .uint16
+            same = same
+                && all(plain.view(dtype: bits) .== squeezed.view(dtype: bits)).item(Bool.self)
+        }
+        FileHandle.standardError.write(
+            (same
+                ? "mlxfast squeezed KV update: self-test passed (3 dtypes bitwise); squeezed\n"
+                : "mlxfast squeezed KV update: mismatch; unsqueezed updates kept\n")
+                .data(using: .utf8)!)
+        return same
+    }()
+
+    static func updates(_ keys: MLXArray, _ values: MLXArray) -> (MLXArray, MLXArray) {
+        guard enabled, keys.ndim == 4, values.ndim == 4, keys.dim(0) == 1, values.dim(0) == 1,
+            verified
+        else { return (keys, values) }
+        return (keys.squeezed(axis: 0), values.squeezed(axis: 0))
     }
 }
