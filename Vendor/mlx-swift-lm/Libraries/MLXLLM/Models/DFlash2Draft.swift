@@ -882,10 +882,15 @@ final class DFlash2GroupedDynamicCausalConv: Module {
             baseKernel.shape == [2, kernelSize, hiddenSize], baseKernel.dtype == dtype,
             residual.map({ $0.shape == hidden.shape && $0.dtype == dtype }) ?? true
         else { return nil }
+        let wide = dflash2ConvWide && hiddenSize % 1024 == 0 && groupSize % 4 == 0
         let template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("KS", kernelSize), ("GS", groupSize), ("TAP", tap),
+            ("WIDE", wide ? 1 : 0),
+            ("HVEC", wide && dflash2ConvHiddenVec ? 1 : 0),
+            ("BVEC", wide && dflash2ConvBaseVec ? 1 : 0),
+            ("RVEC", wide && dflash2ConvResidualVec ? 1 : 0),
         ]
-        let grid = (hiddenSize, length, batch)
+        let grid = wide ? (hiddenSize / 4, length, batch) : (hiddenSize, length, batch)
         if let residual {
             return dflash2GroupedConvResidualKernel(
                 [hidden, projection, baseKernel, residual],
@@ -941,6 +946,32 @@ private let dflash2FusedConvEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private func dflash2EnvOn(_ name: String) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw)
+}
+
+/// Four channels per thread in the grouped convolution. `MLXFAST_DFLASH_CONV_WIDE=0`
+/// keeps one channel per thread. Enabled only when the hidden size is a multiple
+/// of 1024 (so the 256-wide threadgroup still divides the grid) and the group
+/// size is a multiple of 4 (so the four channels share one dynamic tap).
+private let dflash2ConvWide = dflash2EnvOn("MLXFAST_DFLASH_CONV_WIDE")
+
+/// Vector load of the four hidden lanes. `MLXFAST_DFLASH_CONV_HVEC=0` reads
+/// them one element at a time inside the wide thread.
+private let dflash2ConvHiddenVec = dflash2EnvOn("MLXFAST_DFLASH_CONV_HVEC")
+
+/// Vector load of the four base-kernel lanes. `MLXFAST_DFLASH_CONV_BVEC=0`
+/// reads them one element at a time inside the wide thread.
+private let dflash2ConvBaseVec = dflash2EnvOn("MLXFAST_DFLASH_CONV_BVEC")
+
+/// Vector load of the four residual lanes on the finish kernel.
+/// `MLXFAST_DFLASH_CONV_RVEC=0` reads them one element at a time. Ignored
+/// when the wide thread is off.
+private let dflash2ConvResidualVec = dflash2EnvOn("MLXFAST_DFLASH_CONV_RVEC")
+
 /// One element of `DFlash2GroupedDynamicCausalConv.convolve` for tap `TAP`.
 ///
 /// `h` is the block `[B, L, H]`, `dyn` the kernel projection `[B, L, 2*KS*G]`
@@ -970,28 +1001,127 @@ private let dflash2GroupedConvHeader = """
       }
       return out;
     }
+
+    template <typename T>
+    struct mlxfast_t4 { T v0; T v1; T v2; T v3; };
+
+    // One aligned load or store of the four lanes this thread owns. The
+    // element type stays T, so a bfloat lane is not converted through half.
+    template <typename T>
+    inline mlxfast_t4<T> mlxfast_load4(const device T* p) {
+      struct alignas(sizeof(T) * 4) Pack { T v[4]; };
+      const Pack q = *(const device Pack*)p;
+      mlxfast_t4<T> r;
+      r.v0 = q.v[0]; r.v1 = q.v[1]; r.v2 = q.v[2]; r.v3 = q.v[3];
+      return r;
+    }
+
+    template <typename T>
+    inline void mlxfast_store4(device T* p, T a, T b, T c, T d) {
+      struct alignas(sizeof(T) * 4) Pack { T v[4]; };
+      Pack q;
+      q.v[0] = a; q.v[1] = b; q.v[2] = c; q.v[3] = d;
+      *(device Pack*)p = q;
+    }
+
+    // Same products as dflash2_grouped_conv, four consecutive channels.
+    // c4 * 4 is the first channel. HVEC/BVEC select the load; the arithmetic
+    // order per lane is the scalar chain's.
+    template <typename T, int KS, int GS, int TAP, int HVEC, int BVEC>
+    inline mlxfast_t4<T> dflash2_grouped_conv4(
+        const device T* h, const device T* dyn, const device T* base,
+        uint b, uint l, uint c4, uint L, uint H) {
+    #pragma clang fp contract(off)
+      const uint c0 = c4 * 4u;
+      const uint G = H / uint(GS);
+      const uint g = c0 / uint(GS);
+      const size_t row = size_t(b) * L + l;
+      T o0 = static_cast<T>(0.0f);
+      T o1 = static_cast<T>(0.0f);
+      T o2 = static_cast<T>(0.0f);
+      T o3 = static_cast<T>(0.0f);
+      for (int o = 0; o < KS; ++o) {
+        T v0, v1, v2, v3;
+        if (l >= uint(o)) {
+          const device T* hp = h + (row - uint(o)) * H + c0;
+          if (HVEC) {
+            const mlxfast_t4<T> q = mlxfast_load4(hp);
+            v0 = q.v0; v1 = q.v1; v2 = q.v2; v3 = q.v3;
+          } else {
+            v0 = hp[0]; v1 = hp[1]; v2 = hp[2]; v3 = hp[3];
+          }
+        } else {
+          v0 = static_cast<T>(0.0f); v1 = v0; v2 = v0; v3 = v0;
+        }
+        T kb0, kb1, kb2, kb3;
+        const device T* bp = base + (size_t(TAP) * KS + o) * H + c0;
+        if (BVEC) {
+          const mlxfast_t4<T> q = mlxfast_load4(bp);
+          kb0 = q.v0; kb1 = q.v1; kb2 = q.v2; kb3 = q.v3;
+        } else {
+          kb0 = bp[0]; kb1 = bp[1]; kb2 = bp[2]; kb3 = bp[3];
+        }
+        const T kv0 = kb0 * v0; o0 = o0 + kv0;
+        const T kv1 = kb1 * v1; o1 = o1 + kv1;
+        const T kv2 = kb2 * v2; o2 = o2 + kv2;
+        const T kv3 = kb3 * v3; o3 = o3 + kv3;
+        const T d = dyn[row * (2 * KS * G) + (size_t(TAP) * KS + o) * G + g];
+        const T dv0 = d * v0; o0 = o0 + dv0;
+        const T dv1 = d * v1; o1 = o1 + dv1;
+        const T dv2 = d * v2; o2 = o2 + dv2;
+        const T dv3 = d * v3; o3 = o3 + dv3;
+      }
+      mlxfast_t4<T> r;
+      r.v0 = o0; r.v1 = o1; r.v2 = o2; r.v3 = o3;
+      return r;
+    }
     """
 
 private let dflash2GroupedConvSource = """
-    const uint c = thread_position_in_grid.x;
     const uint l = thread_position_in_grid.y;
     const uint b = thread_position_in_grid.z;
-    const uint H = threads_per_grid.x;
     const uint L = threads_per_grid.y;
-    out[(size_t(b) * L + l) * H + c] =
-        dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    if (WIDE) {
+      const uint c4 = thread_position_in_grid.x;
+      const uint H = threads_per_grid.x * 4u;
+      const mlxfast_t4<T> conv = dflash2_grouped_conv4<T, KS, GS, TAP, HVEC, BVEC>(
+          h, dyn, base, b, l, c4, L, H);
+      mlxfast_store4(out + (size_t(b) * L + l) * H + c4 * 4u,
+                     conv.v0, conv.v1, conv.v2, conv.v3);
+    } else {
+      const uint c = thread_position_in_grid.x;
+      const uint H = threads_per_grid.x;
+      out[(size_t(b) * L + l) * H + c] =
+          dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    }
     """
 
 private let dflash2GroupedConvResidualSource = """
     #pragma clang fp contract(off)
-    const uint c = thread_position_in_grid.x;
     const uint l = thread_position_in_grid.y;
     const uint b = thread_position_in_grid.z;
-    const uint H = threads_per_grid.x;
     const uint L = threads_per_grid.y;
-    const size_t i = (size_t(b) * L + l) * H + c;
-    const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
-    out[i] = res[i] + conv;
+    if (WIDE) {
+      const uint c4 = thread_position_in_grid.x;
+      const uint H = threads_per_grid.x * 4u;
+      const mlxfast_t4<T> conv = dflash2_grouped_conv4<T, KS, GS, TAP, HVEC, BVEC>(
+          h, dyn, base, b, l, c4, L, H);
+      const size_t i = (size_t(b) * L + l) * H + c4 * 4u;
+      T r0, r1, r2, r3;
+      if (RVEC) {
+        const mlxfast_t4<T> q = mlxfast_load4(res + i);
+        r0 = q.v0; r1 = q.v1; r2 = q.v2; r3 = q.v3;
+      } else {
+        r0 = res[i]; r1 = res[i + 1]; r2 = res[i + 2]; r3 = res[i + 3];
+      }
+      mlxfast_store4(out + i, r0 + conv.v0, r1 + conv.v1, r2 + conv.v2, r3 + conv.v3);
+    } else {
+      const uint c = thread_position_in_grid.x;
+      const uint H = threads_per_grid.x;
+      const size_t i = (size_t(b) * L + l) * H + c;
+      const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+      out[i] = res[i] + conv;
+    }
     """
 
 private let dflash2GroupedConvKernel = MLXFast.metalKernel(
