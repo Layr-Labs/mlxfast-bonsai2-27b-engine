@@ -991,7 +991,21 @@ enum Qwen35GDNReplayBatch {
                 }
 
         """
-        var text = Qwen35GatedDeltaV3.source
+        guard let parts = Qwen35GatedDeltaV3.sourceParts else { return nil }
+        // The checked stock tail only stores state. Keep its values/addresses,
+        // with four adjacent FP32 elements per aligned store.
+        let vectorStore = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < R; i += 4) {
+                const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+                *(device float4*)(state_out + base) = float4(
+                    state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
+              }
+            }
+            """
+        var text = parts.head + parts.loop + "\n" + vectorStore
         // Single-line anchors, each unique in the stock text.
         let replacements: [(String, String)] = [
             ("const device float* q_ = q;", prelude),
