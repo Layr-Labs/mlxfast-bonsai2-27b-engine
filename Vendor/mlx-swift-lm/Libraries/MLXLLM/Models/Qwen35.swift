@@ -224,38 +224,27 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 /// Early submission of a trunk forward: at chosen layer boundaries the
 /// forward `asyncEval`s its hidden state, so the GPU runs the front of the
-/// tower while the host is still building the rest. The same kernels run on
-/// the same inputs in the same order; only command-buffer boundaries move,
-/// so every value is bit-identical.
-///
-/// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block is on the GPU
+/// tower while the host builds the rest. Same kernels, same inputs, same
+/// order; only command-buffer boundaries move, so every value is
+/// bit-identical. One mechanism, two plans, picked per forward:
+/// - VERIFY (a capture-verify forward): the drafter's block is on the GPU
 ///   while the host builds this graph, and the verify's first command buffer
-///   is committed only once all 64 layers are built. When the drafter's GPU
-///   time is shorter than the host's path from the acceptance readback to
-///   that commit (finalize, the leading draft submission, the committed
-///   recurrent state, the rest of the draft, then the ~3 ms verify build),
-///   the GPU idles in between. The default plan is ONE boundary after the
-///   first 8 layers (a LEADING verify submission, the verify's first ~5
-///   command buffers): the GPU gets the front of the verify as soon as it is
-///   built, and the host builds the other 48 layers while it runs. One
-///   boundary rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
-///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
-///   again. Both trunk paths honour it: the plain per-layer loop and the
-///   pending-residual path a verify window takes on the matrix route.
-/// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
-///   prefill starts its first layers while the host builds the rest.
-///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
-/// Plain decode and short forwards are untouched. Never over paged KV: its
-/// write faults are checked only after the whole forward is built, before
-/// anything may be evaluated.
+///   commits only once all 64 layers are built; the GPU would idle until
+///   then. Default: ONE boundary after the first 8 layers (a LEADING verify
+///   submission). Not periodic slices: every extra command buffer at verify
+///   width has measured as a cost on the ranked box (slices every 2 layers
+///   lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan
+///   (same syntax); `=0` or `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the
+///   verify as one graph again. Both trunk paths honour it.
+/// - PROMPT (>= `promptMinimumRows` rows): the seed prefill starts its first
+///   layers while the host builds the rest. `MLXFAST_PREFILL_PIPELINE` sets
+///   the plan (default 4).
+/// Plain decode and short forwards are untouched. Never over paged KV (its
+/// write faults are checked only after the whole forward is built).
 ///
-/// A plan is `N` (every N layers), `N@o` (every N layers, shifted so the
-/// first boundary falls after layer `o`), or an explicit list of layer
-/// counts (`4,16,32,48`; `;` also separates); `0`/`off` disables it.
+/// A plan is `N` (every N layers), `N@o` (shifted so the first boundary
+/// falls after layer `o`), or an explicit list of layer counts
+/// (`4,16,32,48`; `;` also separates); `0`/`off` disables it.
 enum Qwen35TrunkSubmission {
     static let promptMinimumRows = 128
 
@@ -563,15 +552,18 @@ enum Qwen35GatedDeltaV3 {
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
     }()
 
-    /// Dv rows per lane (template `DVPL`): 2 by default; `BONSAI_GDN_V3_DVPL=4`
-    /// selects the four-row layout (samfenwick `41a687f6`, carried in
-    /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
-    /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
-    static let rowsPerLane: Int = {
+    /// Dv rows per lane (template `DVPL`). `BONSAI_GDN_V3_DVPL=4` or `=2`
+    /// forces a layout (the four-row one is samfenwick `41a687f6`, carried
+    /// in terrapinelf `2e0f5f12`); unset, the load-time timed choice owns it
+    /// (`Qwen35GDNKernelTunes.choose`, 2 unless the four-row layout measured
+    /// faster on the running GPU). Rows never mix, so the values are the
+    /// same bit for bit either way. A threadgroup covers `16 * DVPL` dv rows.
+    static let forcedRowsPerLane: Int? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "4" ? 4 : 2
+        return value == "4" ? 4 : value == "2" ? 2 : nil
     }()
+    static var rowsPerLane: Int { forcedRowsPerLane ?? Qwen35GDNKernelTunes.dvpl }
 
     fileprivate static let source = """
         constexpr int R = 16;
@@ -877,33 +869,30 @@ enum Qwen35GatedDeltaV3 {
 ///
 /// A partially accepted verify commits each GDN layer by replaying the
 /// accepted prefix from the pre-verify state (`replayedPrefixState`): per
-/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3` with
-/// `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows. That is
+/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3`
+/// with `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows —
 /// three small dependent launches per layer, 144 per round on the 48 GDN
-/// layers, each built, encoded and dispatched on its own; the replay's bytes
-/// (each layer's state read once and written once) are the same either way,
-/// so what batching removes is that per-launch cost. Here one launch serves
-/// `layersPerLaunch` layers: every threadgroup of the stock V3 grid gains a
-/// layer index (the V3 kernel's batch index, the batch now being the
-/// layers), computes its step's gates in registers with MLX's own functors in
-/// the gate kernel's order, runs the V3 recurrence text unchanged (derived
-/// from `Qwen35GatedDeltaV3.source`), and copies its share of the layer's
-/// boundary conv rows. Layers never mix, and each layer's values go through
-/// the same operations in the same order as its own replay (the gates are
-/// the same FP32 expression, held in a register instead of stored and
-/// reloaded), so every committed bit is the per-layer replay's.
+/// layers, while the replay's bytes (state read once, written once) are the
+/// same either way; batching removes the per-launch cost. Here one launch
+/// serves `layersPerLaunch` layers: every threadgroup of the stock V3 grid
+/// gains a layer index (the V3 batch index, now the layers), computes its
+/// step's gates in registers with MLX's own functors in the gate kernel's
+/// order, runs the V3 recurrence text unchanged, and copies its share of
+/// the boundary conv rows. Layers never mix and each layer's values go
+/// through the same operations in the same order as its own replay, so every
+/// committed bit is the per-layer replay's.
 ///
-/// Metal binds at most 31 buffers per launch. A layer binds six (k, v, a, b,
-/// the pre-verify state and the conv input, all read in place); a launch adds
-/// six (the group's stacked A_log and dt_bias, the a/b row strides, the row
-/// count and the two pooled outputs): 6 * 4 + 6 = 30. The committed state and
-/// conv rows of the group's layers are views into those pooled outputs.
+/// Metal binds at most 31 buffers per launch: a layer binds six (k, v, a,
+/// b, pre-verify state, conv input, read in place) and a launch adds six
+/// (stacked A_log and dt_bias, a/b row strides, row count, two pooled
+/// outputs): 6 * 4 + 6 = 30. The group's committed states and conv rows are
+/// views into those pooled outputs.
 ///
 /// At model construction a self-test on the running GPU replays synthetic
-/// tapes (four layers, every committed row count of a 16-row window, extreme
-/// gate inputs included) both ways and compares every bit; a mismatch or any
-/// MLX error keeps the per-layer replay. A group that does not fit the
-/// kernel's shape, dtype and stride assumptions replays per layer too.
+/// tapes (four layers, every committed row count of a 16-row window,
+/// extreme gate inputs included) both ways and compares every bit; a
+/// mismatch or any MLX error keeps the per-layer replay, as does a group
+/// that does not fit the kernel's shape, dtype and stride assumptions.
 enum Qwen35GDNReplayBatch {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_REPLAY_BATCH"]?
@@ -991,7 +980,21 @@ enum Qwen35GDNReplayBatch {
                 }
 
         """
-        var text = Qwen35GatedDeltaV3.source
+        guard let parts = Qwen35GatedDeltaV3.sourceParts else { return nil }
+        // The checked stock tail only stores state. Keep its values/addresses,
+        // with four adjacent FP32 elements per aligned store.
+        let vectorStore = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < R; i += 4) {
+                const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+                *(device float4*)(state_out + base) = float4(
+                    state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
+              }
+            }
+            """
+        var text = parts.head + parts.loop + "\n" + vectorStore
         // Single-line anchors, each unique in the stock text.
         let replacements: [(String, String)] = [
             ("const device float* q_ = q;", prelude),
@@ -2627,6 +2630,10 @@ final class Qwen35GatedDeltaNet: Module {
 
         super.init()
 
+        // Before any V3-templated prepare: the tuned DVPL must be settled
+        // first so every compiled pipeline uses the chosen layout.
+        Qwen35GDNKernelTunes.choose(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GDNPrefillKernel.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GatedDeltaChunked.prepare(
@@ -5523,270 +5530,6 @@ enum Qwen35GDNPrework {
 
 // MARK: - Fused attention prework
 
-/// The full-attention layer's pre-SDPA work as ONE launch (polymorf's "fused
-/// attention prework", `d4ed6585` notes; this is an independent
-/// implementation, that one was not shipped): for each (row, head) the q or k
-/// head is read through its strides from the q|gate and k projections, then
-/// MLX's `rms_single_row` over the head (D/4 lanes x 4 reads, the
-/// `acc += x * x` chain, `simd_sum`, the zeroed 32-slot threadgroup pass,
-/// `precise::rsqrt(acc / axis + eps)`, `w * (x * inv)`), then MLX's `rope`
-/// kernel on the first RD channels (`exp2(-(i / (RD/2)) * log2(base))`,
-/// `fast::cos`/`fast::sin` of `scale * float(t + offset) * inv_freq`,
-/// `x1 * cos - x2 * sin`, `x1 * sin + x2 * cos`), written head-major
-/// ([B, H, L, D], row-contiguous) as the rope's partial-dims copy lays it out.
-/// The op chain runs eight launches per attention layer for this (a strided
-/// copy and an `rms` launch per norm, a copy and a `rope` launch per partial
-/// rotation) plus the offsets copy; the kernel reads the cache's offsets array
-/// before the cache advances, which is what the copy captured. Same
-/// expressions in the same order, all compiled without fast math; verified
-/// bit for bit against the op chain once per geometry at model construction
-/// (a disagreeing device keeps the op chain). `BONSAI_FUSED_ATTN_PREWORK=0`
-/// keeps the op chain.
-enum Qwen35AttentionPrework {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_ATTN_PREWORK"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    // grid (TPG * (HQ + HK), L, B), threadgroup (TPG, 1, 1), TPG = D / 4.
-    // Inputs: q [B, L, HQ, D] and k [B, L, HK, D] (any strides, same dtype),
-    // wq/wk [D] FP32, offs [1] or [B] int32 (any stride), epsq/epsk/scale/
-    // lbase (log2 of the rope base) FP32 scalars, axis (= D) uint32 scalar.
-    // Outputs qo [B, HQ, L, D], ko [B, HK, L, D] FP32.
-    private static let source = """
-        constexpr int NR = 4;
-        constexpr int HALF = RD / 2;
-        const uint lid = thread_position_in_threadgroup.x;
-        const uint hh = threadgroup_position_in_grid.x;
-        const uint t = threadgroup_position_in_grid.y;
-        const uint bb = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int Ln = int(q_shape[1]);
-        const bool isq = hh < uint(HQ);
-        const uint h = isq ? hh : hh - uint(HQ);
-
-        threadgroup float local_sums[32];
-        threadgroup float local_inv[1];
-        threadgroup float rot[RD];
-
-        // rms_single_row: lane lid holds channels NR*lid .. NR*lid+NR-1.
-        const int64_t base = isq
-            ? int64_t(bb) * q_strides[0] + int64_t(t) * q_strides[1] + int64_t(h) * q_strides[2]
-            : int64_t(bb) * k_strides[0] + int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
-        const int64_t cs = isq ? q_strides[3] : k_strides[3];
-        auto src = isq ? q : k;
-        float acc = 0;
-        float thread_x[NR];
-        for (int i = 0; i < NR; i++) {
-          thread_x[i] = static_cast<float>(src[base + int64_t(lid * NR + i) * cs]);
-          acc += thread_x[i] * thread_x[i];
-        }
-        acc = simd_sum(acc);
-        if (sg == 0) {
-          local_sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) {
-          local_sums[sg] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          acc = simd_sum(local_sums[lane]);
-          if (lane == 0) {
-            const float eps = isq ? epsq : epsk;
-            local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto w = isq ? wq : wk;
-        auto dst = isq ? qo : ko;
-        const size_t obase =
-            ((size_t(bb) * size_t(isq ? HQ : HK) + size_t(h)) * size_t(Ln) + size_t(t)) * size_t(D);
-        const float inv = local_inv[0];
-        for (int i = 0; i < NR; i++) {
-          const uint c = lid * NR + uint(i);
-          const float n = w[c] * static_cast<float>(thread_x[i] * inv);
-          if (c < uint(RD)) {
-            rot[c] = n;
-          } else {
-            dst[obase + c] = n;
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // rope on channels [0, RD): pair (j, j + HALF), as MLX's rope kernel.
-        if (lid < uint(HALF)) {
-          const int off = offs[OB ? 0 : int64_t(bb) * offs_strides[0]];
-          float d = static_cast<float>(lid) / static_cast<float>(HALF);
-          float inv_freq = metal::exp2(-d * lbase);
-          float L = scale * static_cast<float>(t + off);
-          float theta = L * inv_freq;
-          float costheta = metal::fast::cos(theta);
-          float sintheta = metal::fast::sin(theta);
-          float x1 = rot[lid];
-          float x2 = rot[lid + HALF];
-          float rx1 = x1 * costheta - x2 * sintheta;
-          float rx2 = x1 * sintheta + x2 * costheta;
-          dst[obase + lid] = rx1;
-          dst[obase + lid + HALF] = rx2;
-        }
-        """
-
-    private static let kernel = MLXFast.metalKernel(
-        name: "bonsai_attn_prework",
-        inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
-        outputNames: ["qo", "ko"],
-        source: source,
-        ensureRowContiguous: false)
-
-    /// `(rope(qNorm(q).transposed(0, 2, 1, 3)), rope(kNorm(k).transposed(0, 2, 1,
-    /// 3)))` at `offsets` for `q` [B, L, HQ, D] and `k` [B, L, HK, D]; nil when
-    /// it does not apply.
-    static func run(
-        q: MLXArray, k: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
-        offsets: MLXArray, ropeDims: Int, ropeBase: Float
-    ) -> (MLXArray, MLXArray)? {
-        guard enabled, q.ndim == 4, k.ndim == 4,
-            verified(
-                Geometry(
-                    hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims, dtype: "\(q.dtype)"))
-        else { return nil }
-        return runUnchecked(
-            q: q, k: k, wq: qNorm.weight, wk: kNorm.weight, epsQ: qNorm.eps, epsK: kNorm.eps,
-            offsets: offsets, ropeDims: ropeDims, ropeBase: ropeBase)
-    }
-
-    private static func runUnchecked(
-        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
-        offsets: MLXArray, ropeDims: Int, ropeBase: Float
-    ) -> (MLXArray, MLXArray)? {
-        let B = q.dim(0)
-        let L = q.dim(1)
-        let HQ = q.dim(2)
-        let HK = k.dim(2)
-        let D = q.dim(3)
-        guard k.dim(0) == B, k.dim(1) == L, k.dim(3) == D,
-            q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
-            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
-            offsets.dtype == .int32, offsets.ndim <= 1,
-            offsets.size == 1 || offsets.size == B,
-            L > 0, L < 65536
-        else { return nil }
-        let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
-        let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
-            template: [
-                ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
-                ("OB", offs.size == 1 ? 1 : 0),
-            ],
-            grid: ((D / 4) * (HQ + HK), L, B), threadGroup: (D / 4, 1, 1),
-            outputShapes: [[B, HQ, L, D], [B, HK, L, D]],
-            outputDTypes: [.float32, .float32])
-        return (outputs[0], outputs[1])
-    }
-
-    private struct Geometry: Hashable {
-        let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
-    }
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
-
-    private static func verified(_ geometry: Geometry) -> Bool {
-        lock.withLock { verdicts[geometry] ?? false }
-    }
-
-    /// Compile the kernel and check it bit for bit against the op chain for one
-    /// attention geometry, once per process, at model construction (before
-    /// any timed forward). A geometry or dtype that was not prepared, or that
-    /// disagrees, keeps the op chain.
-    static func prepare(
-        hq: Int, hk: Int, d: Int, ropeDims rd: Int, ropeBase: Float, epsQ: Float, epsK: Float
-    ) {
-        guard enabled, d % 128 == 0, d <= 4096, rd > 0, rd % 4 == 0, rd <= d,
-            rd / 2 <= d / 4
-        else { return }
-        lock.withLock {
-            for dtype in [DType.float32] {
-                let geometry = Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)")
-                if verdicts[geometry] != nil { continue }
-                let verdict = selfCheck(
-                    geometry, dtype: dtype, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
-                verdicts[geometry] = verdict
-                if !verdict {
-                    FileHandle.standardError.write(
-                        "qwen35: fused attention prework disagrees with the op chain on this device (\(dtype)); using the op chain\n"
-                            .data(using: .utf8)!)
-                }
-            }
-        }
-    }
-
-    private static func selfCheck(
-        _ geo: Geometry, dtype: DType, ropeBase: Float, epsQ: Float, epsK: Float
-    ) -> Bool {
-        let keys = MLXRandom.split(key: MLXRandom.key(0x6174_746e), into: 6)
-        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
-        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
-        // The op chain as `Qwen35Attention.cbv2Forward` composes it (RMSNorm and
-        // RoPE modules call exactly these).
-        func chain(_ x: MLXArray, _ w: MLXArray, _ eps: Float, _ offsets: MLXArray) -> MLXArray {
-            MLXFast.RoPE(
-                MLXFast.rmsNorm(x, weight: w, eps: eps).transposed(0, 2, 1, 3),
-                dimensions: geo.rd, traditional: false, base: ropeBase, scale: 1,
-                offset: offsets + 0)
-        }
-        var same = MLXArray(true)
-        for (index, (rows, offset)) in [(16, 611), (1, 4093), (37, 0), (5, 200_003)].enumerated() {
-            // The q|gate, k and v projections stacked as the verify produces
-            // them; wide magnitude spread so the reductions see real rounding.
-            let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
-            let wide = (MLXRandom.normal([1, rows, width], key: keys[2 + index % 4])
-                * exp(MLXRandom.normal([1, rows, width], key: keys[(3 + index) % 6])))
-                .asType(dtype)
-            let parts = MLX.split(
-                wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d],
-                axis: -1)
-            let q = parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0]
-            let k = parts[1].reshaped(1, rows, geo.hk, -1)
-            let offsets = MLXArray([Int32(offset)])
-            let refQ = chain(q, wq, epsQ, offsets)
-            let refK = chain(k, wk, epsK, offsets)
-            guard
-                let (newQ, newK) = runUnchecked(
-                    q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
-                    ropeDims: geo.rd, ropeBase: ropeBase),
-                refQ.shape == newQ.shape, refK.shape == newK.shape,
-                refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
-            else { return false }
-            same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
-                .&& all(refK.view(dtype: .uint32) .== newK.view(dtype: .uint32))
-        }
-        return same.item(Bool.self)
-    }
-}
-
-// MARK: - Fused q/k norm + table-driven rotation for explicit positions
-
-/// q/k RMSNorm, the head transpose and the partial rotary embedding in one
-/// launch for forwards that carry explicit per-row positions (the speculative
-/// verify), driven by the same (cosine, sine) tables the op chain builds.
-///
-/// This mirrors `Qwen35AttentionPrework` exactly -- same grid, same
-/// `rms_single_row` replication with the same two roundings, same transposed
-/// outputs -- except the rotation reads the chain's own cosine/sine tables
-/// instead of deriving angles from a scalar offset, so it applies wherever
-/// `Qwen35MRoPE.apply` applies, with no consecutiveness assumption. The
-/// rotation math is the chain's `applyDefault` in the same order
-/// (`rotating * cosine + rotatedHalf * sine`, pair `(j, j + HALF)`), over the
-/// same table values, so a prepared geometry is bit-identical to the chain;
-/// anything else keeps the chain. Like the offset prework, one geometry is
-/// compiled and checked bit for bit at model construction, on the box that
-/// runs it, before any timed forward.
 enum Qwen35AttentionPreworkExplicit {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_QKROPE"]?
@@ -7604,13 +7347,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nq with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < SG - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < SG - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -8171,13 +7931,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nq with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -8887,11 +8664,23 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nh with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const float v = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nh = (i >> 3) & 1;
+            const float v0 = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            const float v1 = acc[i + 1] + red[0][(i + 1) * 32 + lane] + red[1][(i + 1) * 32 + lane] + red[2][(i + 1) * 32 + lane];
+            const float v2 = acc[i + 2] + red[0][(i + 2) * 32 + lane] + red[1][(i + 2) * 32 + lane] + red[2][(i + 2) * 32 + lane];
+            const float v3 = acc[i + 3] + red[0][(i + 3) * 32 + lane] + red[1][(i + 3) * 32 + lane] + red[2][(i + 3) * 32 + lane];
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -8955,7 +8744,11 @@ enum Qwen35TensorPackedMatmul {
     /// is the same with each group staged and multiplied in two K = 64 halves
     /// (half the threadgroup memory, twice the threadgroups per core); `tn64`
     /// is `pd1` over 64 columns per threadgroup (twice the threadgroup
-    /// memory). All bitwise identical.
+    /// memory), and `tn64pd2` / `tn64pd3` that tile with deeper word rings.
+    /// `pd5` / `pd6` (and their `k64` forms) extend the ring depth past the
+    /// record's four. All bitwise identical; the load-time self-test drops
+    /// any body the toolchain rejects or that mismatches, and a new body
+    /// reaches production only through the in-situ round trial.
     enum NarrowVariant: Int, CaseIterable {
         case v0 = 0
         case pd1 = 1
@@ -8967,18 +8760,30 @@ enum Qwen35TensorPackedMatmul {
         case k64pd2 = 7
         case k64pd3 = 8
         case k64pd4 = 9
+        case pd5 = 10
+        case pd6 = 11
+        case k64pd5 = 12
+        case k64pd6 = 13
+        case tn64pd2 = 14
+        case tn64pd3 = 15
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1: return 1
-            case .pd2, .k64pd2: return 2
-            case .pd3, .k64pd3: return 3
+            case .pd2, .k64pd2, .tn64pd2: return 2
+            case .pd3, .k64pd3, .tn64pd3: return 3
             case .pd4, .k64pd4: return 4
+            case .pd5, .k64pd5: return 5
+            case .pd6, .k64pd6: return 6
             }
         }
-        var tn: Int { self == .tn64 ? 64 : 32 }
-        var kh: Int { [.k64pd1, .k64pd2, .k64pd3, .k64pd4].contains(self) ? 64 : 128 }
+        var tn: Int {
+            [.tn64, .tn64pd2, .tn64pd3].contains(self) ? 64 : 32
+        }
+        var kh: Int {
+            [.k64pd1, .k64pd2, .k64pd3, .k64pd4, .k64pd5, .k64pd6].contains(self) ? 64 : 128
+        }
 
         init?(name: String) {
             guard let v = Self.allCases.first(where: { "\($0)" == name }) else { return nil }
@@ -9392,8 +9197,9 @@ enum Qwen35TensorPackedMatmul {
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
     /// (master kill switch); `neg` / `f32` force that epilogue.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
-    /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd4`,
-    /// `tn64`, `k64pd1` .. `k64pd4`) limits the pipelined candidates to those.
+    /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd6`,
+    /// `tn64`, `tn64pd2`, `tn64pd3`, `k64pd1` .. `k64pd6`) limits the
+    /// pipelined candidates to those.
     private static func chooseNarrowKernels() -> (NarrowChoice, [NarrowChoice]) {
         let environment = ProcessInfo.processInfo.environment
         func knob(_ name: String) -> String? {
@@ -9409,6 +9215,7 @@ enum Qwen35TensorPackedMatmul {
         // Default order = self-test order (what the deadline would cut last).
         let defaultVariants: [NarrowVariant] = [
             .pd1, .pd2, .k64pd1, .k64pd2, .pd3, .k64pd3, .pd4, .k64pd4, .tn64,
+            .pd5, .k64pd5, .tn64pd2, .pd6, .k64pd6, .tn64pd3,
         ]
         var variants = defaultVariants
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
