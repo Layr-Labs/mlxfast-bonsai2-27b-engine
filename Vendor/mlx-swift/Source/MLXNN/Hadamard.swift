@@ -1089,6 +1089,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return applies(rows, n, k)
     }
 
+    /// The fewest rows at which this tree's own fused-input kernels (the
+    /// stacked SwiGLU and head-strided gate rotations, the strided gated-norm
+    /// and GDN prework reads, the FP16 qkv|z stack and the prework's tape
+    /// conv input) run; below it (the 16-row verify) the record's path runs
+    /// unchanged. On the ranked M5 every such change that reached the 16-row
+    /// verify lengthened the decode window while shortening both prompt
+    /// phases (ercumentyildirim's paired table in `ff96d1e7`: our v6 +2.9%
+    /// window, -5.6% seed). `BONSAI_PROMPT_KERNELS_MIN_ROWS` overrides it.
+    public static let promptKernelsMinimumRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_PROMPT_KERNELS_MIN_ROWS"]
+        return raw.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 64
+    }()
+
     /// Whether the prompt-width tensor route takes `layers` (self first) at
     /// `rows` rows, for a caller that quantizes the activation itself
     /// (`SignedBlockHadamard.residualNormQuantized`).
@@ -1189,6 +1202,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ wide: MLXArray, gateOffset: Int, upOffset: Int, widenOutput: Bool = true
     ) -> MLXArray? {
         guard gdnLayout == nil,
+            wide.size / max(wide.dim(-1), 1) >= Self.promptKernelsMinimumRows,
             let store = fusedInputStoreDType(rows: wide.size / max(wide.dim(-1), 1)),
             let rotated = transform.rotatedSwiGLUStacked(
                 wide, gateOffset: gateOffset, upOffset: upOffset, outputDType: store)
@@ -1226,6 +1240,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return y
         }
         guard gdnLayout == nil, x.ndim == 4,
+            x.dim(0) * x.dim(1) >= Self.promptKernelsMinimumRows,
             let store = fusedInputStoreDType(rows: x.size / max(transform.width, 1)),
             let rotated = transform.rotatedSigmoidGateHeads(x, gate: gate, outputDType: store)
         else { return nil }
@@ -2196,6 +2211,22 @@ extension FusedInputHadamardKernel {
         // splits its last axis without a copy), so the launch no longer
         // copies it to a row-contiguous buffer first.
         let heads = repeats * keyHeads
+        // Below the prompt-kernel row threshold (the 16-row verify) the
+        // record's kernel runs, on row-contiguous FP32 operands.
+        if B * S < HadamardQuantizedLinear.promptKernelsMinimumRows,
+            x.dtype == .float32, z.dtype == .float32
+        {
+            return gatedRMSNormKernelRecord(
+                [x, z, weight, signs, MLXArray(eps)],
+                template: [
+                    ("REPEATS", repeats), ("KEY_HEADS", keyHeads), ("HEAD_DIM", headDim),
+                    ("OutT", outputDType),
+                ],
+                grid: (64, x.size / 1024, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[B, S, repeats * keyHeads * headDim]],
+                outputDTypes: [outputDType])[0]
+        }
         return gatedRMSNormKernel(
             [x.reshaped(B, S, heads, headDim), z.reshaped(B, S, heads, headDim), weight, signs,
              MLXArray(eps)],
@@ -2208,6 +2239,129 @@ extension FusedInputHadamardKernel {
             outputShapes: [[B, S, repeats * keyHeads * headDim]],
             outputDTypes: [outputDType])[0]
     }
+
+    /// The record's gated-norm rotation (row-contiguous FP32 operands, 32-bit
+    /// indexing), which the 16-row verify keeps (see `gatedRMSNorm`).
+    private static let gatedRMSNormKernelRecord = MLXFast.metalKernel(
+        name: "bonsai_fused_input_gated_rmsnorm_hadamard_1024_rc",
+        inputNames: ["x", "z", "w", "signs", "eps"],
+        outputNames: ["out"],
+        source: """
+            constexpr short NT = 64;
+            constexpr uint WIDTH = REPEATS * KEY_HEADS * HEAD_DIM;
+            constexpr uint BLOCKS = WIDTH / 1024;
+            constexpr uint HEADS_PER_BLOCK = 1024 / HEAD_DIM;
+            short i = short(thread_position_in_grid.x);
+            uint blk = thread_position_in_grid.y;
+            uint row_base = (blk / BLOCKS) * WIDTH;
+            uint col0 = (blk % BLOCKS) * 1024;
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+
+            threadgroup float buf[1024];
+            threadgroup float inv_rms[HEADS_PER_BLOCK];
+
+            // Per-head RMS as rms_single_row with 32 threads x 4 reads: lane l
+            // sums elements 4l..4l+3 of the head in order, then simd_sum.
+            BONSAI_UNROLL for (uint hh = sg; hh < HEADS_PER_BLOCK; hh += 2) {
+              uint p0 = col0 + hh * HEAD_DIM;
+              uint kh = p0 / (REPEATS * HEAD_DIM);
+              uint rep = (p0 % (REPEATS * HEAD_DIM)) / HEAD_DIM;
+              uint src_head = rep * KEY_HEADS + kh;
+              const device float* xh = x + row_base + src_head * HEAD_DIM + lane * 4;
+              float acc = 0;
+              float tx[4];
+              BONSAI_UNROLL for (int r = 0; r < 4; r++) {
+                tx[r] = xh[r];
+                acc += tx[r] * tx[r];
+              }
+              acc = simd_sum(acc);
+              if (lane == 0) {
+                inv_rms[hh] = metal::precise::rsqrt(acc / HEAD_DIM + eps);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+              short index = j * 4 * NT + i * 4;
+              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                uint p = col0 + index + r;
+                uint kh = p / (REPEATS * HEAD_DIM);
+                uint rem = p % (REPEATS * HEAD_DIM);
+                uint src = ((rem / HEAD_DIM) * KEY_HEADS + kh) * HEAD_DIM + rem % HEAD_DIM;
+                float xn = w[src % HEAD_DIM] * (x[row_base + src] * inv_rms[(index + r) / HEAD_DIM]);
+                float zv = z[row_base + src];
+                float gz = zv * bonsai_sigmoid(zv);
+                float v = gz * xn;
+                buf[index + r] = v * signs[p];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float v[16];
+            short h = 1;
+            BONSAI_UNROLL for (short s = 0; s < 2; s++) {
+              short k = i & (h - 1);
+              short j = ((i - k) << 4) + k;
+              BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+                v[r] = buf[j + h * r];
+              }
+              bonsai_hadamard_radix<16>(v);
+              BONSAI_UNROLL for (short r = 0; r < 16; r++) {
+                buf[j + h * r] = v[r];
+              }
+              h <<= 4;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            BONSAI_UNROLL for (short t = 0; t < 4; t++) {
+              short index = i + t * NT;
+              short k = index & (h - 1);
+              short j = ((index - k) << 2) + k;
+              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                v[r] = buf[j + h * r];
+              }
+              bonsai_hadamard_radix<4>(v);
+              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                buf[j + h * r] = v[r];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+              short index = j * 4 * NT + i * 4;
+              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                out[row_base + col0 + index + r] = static_cast<OutT>(buf[index + r] * 0.03125f);
+              }
+            }
+            """,
+        header: """
+            #define BONSAI_UNROLL _Pragma("clang loop unroll(full)")
+
+            template <short R>
+            METAL_FUNC void bonsai_hadamard_radix(thread float* x) {
+              constexpr short logR = __builtin_ctz(R);
+              short h = 1;
+              BONSAI_UNROLL for (short s = 0; s < logR; s++) {
+                BONSAI_UNROLL for (short i = 0; i < R / 2; i++) {
+                  short k = i & (h - 1);
+                  short j = ((i - k) << 1) + k;
+                  float a = x[j];
+                  float b = x[j + h];
+                  x[j] = a + b;
+                  x[j + h] = a - b;
+                }
+                h <<= 1;
+              }
+            }
+
+            // MLX `Sigmoid` (unary_ops.h), verbatim.
+            METAL_FUNC float bonsai_sigmoid(float x) {
+              auto y = 1 / (1 + metal::exp(metal::abs(x)));
+              return (x < 0) ? y : 1 - y;
+            }
+
+            """)
 
     private static let gatedRMSNormKernel = MLXFast.metalKernel(
         name: "bonsai_fused_input_gated_rmsnorm_hadamard_1024",

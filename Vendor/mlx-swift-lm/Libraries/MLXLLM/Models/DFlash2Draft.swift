@@ -1497,6 +1497,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
+    // Sliding masks depend only on block geometry. Keep the memo with the
+    // drafter so repeated speculative forwards can reuse the same graph
+    // (ercumentyildirim / terrapinelf `ff96d1e`).
+    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1644,7 +1648,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // layers, the head and the selector. Same kernels, same order.
         if dflash2SubmitSlices { asyncEval([context, h]) }
 
-        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
             if dflash2SubmitSlices, index == 0, layers.count > 2 { asyncEval([h]) }

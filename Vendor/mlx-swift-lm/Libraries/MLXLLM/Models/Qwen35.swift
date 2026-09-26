@@ -347,11 +347,13 @@ fileprivate final class Qwen35SignedGain {
 /// prompt-sized window (see `Qwen35GatedDeltaChunked`) takes the chunked form.
 func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?,
+    outputNeeded: Bool = true
 ) -> (MLXArray, MLXArray) {
     let gates = Qwen35FusedElementwise.gatedDeltaGates([a, b, aLog, dtBias])
     return qwen35GatedDelta(
-        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: state, mask: mask)
+        q: q, k: k, v: v, g: gates[0], beta: gates[1], state: state, mask: mask,
+        outputNeeded: outputNeeded)
 }
 
 /// `qwen35GatedDelta` on gates already formed. The verify window's prework
@@ -361,7 +363,7 @@ func qwen35GatedDelta(
 /// taped a and b (DPZZxlz `5f72492`).
 func qwen35GatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
-    state: MLXArray?, mask: MLXArray?
+    state: MLXArray?, mask: MLXArray?, outputNeeded: Bool = true
 ) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
@@ -379,7 +381,8 @@ func qwen35GatedDelta(
     }
     if mask == nil,
         let fast = Qwen35GatedDeltaV3.run(
-            q: q, k: k, v: v, g: g, beta: beta, state: ssm)
+            q: q, k: k, v: v, g: g, beta: beta, state: ssm,
+            outputNeeded: outputNeeded)
     {
         return fast
     }
@@ -424,12 +427,18 @@ enum Qwen35GatedDeltaV3 {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint dk0 = (lane % LPD) * R;
         const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
-        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* q_ = q;
         const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
         const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
         const device float* g_ = g + b_idx * T * Hv + hv_idx;
         const device float* beta_ = beta + b_idx * T * Hv + hv_idx;
-        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        device float* y_ = y;
+        if constexpr (OUTPUT_NEEDED) {
+          q_ += (b_idx * T * Hk + hk_idx) * Dk + dk0;
+          y_ += (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        } else if (n == 0 && dvbase == 0 && lane == 0) {
+          y[0] = 0.f;
+        }
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -447,8 +456,10 @@ enum Qwen35GatedDeltaV3 {
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((const device float4*)k_)[j];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
-            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            if constexpr (OUTPUT_NEEDED) {
+              const float4 q4 = ((const device float4*)q_)[j];
+              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            }
           }
           float kv[DVPL];
           float vt[DVPL];
@@ -485,27 +496,35 @@ enum Qwen35GatedDeltaV3 {
               state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
               state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
               state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              o0 = fma(state[d][4 * j], qr[4 * j], o0);
-              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              if constexpr (OUTPUT_NEEDED) {
+                o0 = fma(state[d][4 * j], qr[4 * j], o0);
+                o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+                o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+                o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              }
             }
-            out[d] = (o0 + o1) + (o2 + o3);
+            if constexpr (OUTPUT_NEEDED) {
+              out[d] = (o0 + o1) + (o2 + o3);
+            }
           }
-          #pragma clang loop unroll(full)
-          for (int o = LPD / 2; o > 0; o >>= 1) {
+          if constexpr (OUTPUT_NEEDED) {
             #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              out[d] += simd_shuffle_xor(out[d], o);
+            for (int o = LPD / 2; o > 0; o >>= 1) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                out[d] += simd_shuffle_xor(out[d], o);
+              }
             }
-          }
-          if (lane % LPD == 0) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              y_[d] = out[d];
+            if (lane % LPD == 0) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                y_[d] = out[d];
+              }
             }
+            q_ += Hk * Dk;
+            y_ += Hv * Dv;
           }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+          k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -524,7 +543,8 @@ enum Qwen35GatedDeltaV3 {
         ensureRowContiguous: true)
 
     static func run(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+        outputNeeded: Bool = true
     ) -> (MLXArray, MLXArray)? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
             g.dtype == .float32, beta.dtype == .float32, state.dtype == .float32,
@@ -540,11 +560,17 @@ enum Qwen35GatedDeltaV3 {
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
+        // Prefix replay consumes only state_out. Avoid copying its sliced q
+        // input or allocating a full y tensor when no output row is needed.
+        // The unused q slot aliases the already-contiguous gate buffer.
         let outputs = kernel(
-            [q, k, v, g, beta, state, MLXArray(Int32(T))],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            [outputNeeded ? q : g, k, v, g, beta, state, MLXArray(Int32(T))],
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("OUTPUT_NEEDED", outputNeeded),
+            ],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputShapes: [outputNeeded ? [B, T, Hv, Dv] : [1], state.shape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
     }
@@ -628,14 +654,11 @@ enum Qwen35GatedDeltaChunked {
     /// and inputs), which is exactly what `chunks` returns. A window that is
     /// not a whole number of chunks stays on the sequential kernel: a
     /// sequential tail costs more than it saves at these widths.
-    /// Off by default on this tree (`MLXFAST_GDN_CHUNKED_VERIFY=1` turns it
-    /// on): the record that introduced it measured a longer verify window on
-    /// the ranked box together with two-layer verify slices, so the verify
-    /// keeps the sequential kernel and this tree's slice plan.
+    /// `MLXFAST_GDN_CHUNKED_VERIFY=0` keeps verify on the sequential kernel.
     static let verifyEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_CHUNKED_VERIFY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return enabled && ["1", "true", "yes", "on"].contains(value ?? "")
+        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     static func runVerify(
@@ -1940,7 +1963,8 @@ final class Qwen35GatedDeltaNet: Module {
                 g: gates.g[0..., rows, 0...],
                 beta: gates.beta[0..., rows, 0...],
                 state: tape.ssmPre,
-                mask: nil
+                mask: nil,
+                outputNeeded: false
             ).1
         } else {
             boundarySsm = qwen35GatedDelta(
@@ -1952,7 +1976,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: tape.ssmPre,
-                mask: tape.mask.map { $0[0..., rows] }
+                mask: tape.mask.map { $0[0..., rows] },
+                outputNeeded: false
             ).1
         }
         let boundaryConvView = tape.convInput[
@@ -2111,7 +2136,9 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
         let (qkv, z, b, a) = projectInputs(
-            inputs, B: B, S: S, preRotated: preRotated, narrowStack: Self.narrowStackEnabled,
+            inputs, B: B, S: S, preRotated: preRotated,
+            narrowStack: Self.narrowStackEnabled
+                && B * S >= HadamardQuantizedLinear.promptKernelsMinimumRows,
             preQuantized: preQuantized)
 
         var convRows: [MLXArray] = []
@@ -2184,7 +2211,9 @@ final class Qwen35GatedDeltaNet: Module {
             // Preserve main's fused GDN projection construction and graph.
             (qkv, z, b, a) = projectInputs(
                 inputs, B: B, S: S, preRotated: preRotated,
-                narrowStack: Self.narrowStackEnabled, preQuantized: preQuantized)
+                narrowStack: Self.narrowStackEnabled
+                    && B * S >= HadamardQuantizedLinear.promptKernelsMinimumRows,
+                preQuantized: preQuantized)
         }
 
         var convRows: [MLXArray] = []
@@ -2224,7 +2253,8 @@ final class Qwen35GatedDeltaNet: Module {
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim,
                 writeConvInput: Self.preworkWritesConvInput
-                    && qkv.dtype != .bfloat16 && convState.dtype == .float32)
+                    && qkv.dtype != .bfloat16 && convState.dtype == .float32
+                    && B * S >= HadamardQuantizedLinear.promptKernelsMinimumRows)
             : nil
         let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
@@ -3963,6 +3993,124 @@ enum Qwen35GDNPrework {
         source: source,
         ensureRowContiguous: !stridedReads)
 
+
+    // The record's prework (row-contiguous inputs), which the 16-row verify
+    // keeps: this tree's strided reads measured a longer verify round on the
+    // ranked M5 (pratikgx `6b57e531`, the strided prework alone at verify
+    // width: +6.5% per round against the record on the same box).
+    // grid (128 * HK, S, B), threadgroup (128, 1, 1).
+    // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
+    // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
+    // alog/dtb [HV], wq/wk [DK], S (scalar).
+    private static let recordSource = """
+        constexpr int GRP = HV / HK;
+        constexpr int KEY = HK * DK;
+        constexpr int VOFF = 2 * KEY;
+        constexpr int NK = KS - 1;
+        const uint c = thread_position_in_threadgroup.x;
+        const uint h = threadgroup_position_in_grid.x;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint bb = threadgroup_position_in_grid.z;
+        const int Sn = S;
+        const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);
+        const size_t csbase = size_t(bb) * size_t(NK) * size_t(CD);
+        threadgroup float red[8];
+
+        auto conv_silu = [&](uint col) -> float {
+          float acc = 0.0f;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < KS; j++) {
+            const int r = int(t) + j - NK;
+            const float xv = (r < 0)
+                ? cs[csbase + size_t(r + NK) * size_t(CD) + col]
+                : float(qkv[rowbase + size_t(r) * size_t(CD) + col]);
+            acc = fma(xv, w[size_t(col) * size_t(KS) + size_t(j)], acc);
+          }
+          // MLX's silu: x * sigmoid(x), sigmoid in its stable functor form.
+          const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+          const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+          return acc * sig;
+        };
+
+        // q and k channel c of key head h.
+        const uint colq = h * DK + c;
+        const uint colk = KEY + h * DK + c;
+        const float xq = conv_silu(colq);
+        const float xk = conv_silu(colk);
+        float sq = simd_sum(xq * xq);
+        float sk = simd_sum(xk * xk);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        if (lane == 0) {
+          red[sg] = sq;
+          red[4 + sg] = sk;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sq = (red[0] + red[1]) + (red[2] + red[3]);
+        sk = (red[4] + red[5]) + (red[6] + red[7]);
+        const float invq = metal::precise::rsqrt(sq / float(DK) + 1e-6f);
+        const float invk = metal::precise::rsqrt(sk / float(DK) + 1e-6f);
+        const size_t qkrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HK) + size_t(h);
+        q[qkrow * size_t(DK) + c] = (xq * invq) * wq[c];
+        k[qkrow * size_t(DK) + c] = (xk * invk) * wk[c];
+
+        // The GRP value heads of this key head.
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GRP; i++) {
+          const uint hv = h * GRP + uint(i);
+          const uint colv = VOFF + hv * DV + c;
+          const size_t vrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV) + size_t(hv);
+          v[vrow * size_t(DV) + c] = conv_silu(colv);
+        }
+        // Gates for those heads.
+        if (c < uint(GRP)) {
+          const uint hv = h * GRP + c;
+          const size_t grow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV) + size_t(hv);
+          // g = exp(-exp(A_log) * softplus(a + dt_bias)), softplus as MLX's
+          // logaddexp(x, 0); beta = sigmoid(b) in MLX's functor form.
+          const float av = a[grow] + dtb[hv];
+          const float mx = metal::max(av, 0.0f);
+          const float mn = metal::min(av, 0.0f);
+          const float sp = mx + log1p(metal::exp(mn - mx));
+          g[grow] = metal::precise::exp(-metal::precise::exp(alog[hv]) * sp);
+          const float bv = b[grow];
+          const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
+          beta[grow] = (bv < 0.0f) ? by : 1.0f - by;
+        }
+        // Next convolution tail: rows S-NK..S-1 of the concatenated input.
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < NK; r++) {
+          const int src = Sn + r - NK; // chunk row feeding tail row r (< 0: from cs)
+          if (src >= 0 && int(t) == src) {
+            const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
+            tail[trow + colq] = float(qkv[rowbase + size_t(t) * size_t(CD) + colq]);
+            tail[trow + colk] = float(qkv[rowbase + size_t(t) * size_t(CD) + colk]);
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GRP; i++) {
+              const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+              tail[trow + colv] = float(qkv[rowbase + size_t(t) * size_t(CD) + colv]);
+            }
+          } else if (src < 0 && t == 0) {
+            const size_t trow = size_t(bb) * size_t(NK) * size_t(CD) + size_t(r) * size_t(CD);
+            const size_t crow = csbase + size_t(src + NK) * size_t(CD);
+            tail[trow + colq] = cs[crow + colq];
+            tail[trow + colk] = cs[crow + colk];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GRP; i++) {
+              const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+              tail[trow + colv] = cs[crow + colv];
+            }
+          }
+        }
+        """
+
+    private static let recordKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_rc",
+        inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: recordSource,
+        ensureRowContiguous: true)
+
     /// `DARKBLOOM_QWEN35_GDN_PREWORK_STRIDED=0` copies the strided inputs to
     /// row-contiguous buffers before the launch, as before.
     private static let stridedReads: Bool = {
@@ -3996,6 +4144,25 @@ enum Qwen35GDNPrework {
         else { return nil }
         let alog = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        if B * S < HadamardQuantizedLinear.promptKernelsMinimumRows, !writeConvInput {
+            let outputs = recordKernel(
+                [qkv, convState, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
+                 MLXArray(Int32(S))],
+                template: [
+                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                    ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ],
+                grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+                outputShapes: [
+                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                    [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                    [B, KS - 1, CD],
+                ],
+                outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+            return Outputs(
+                q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+                tail: outputs[5], convInput: nil)
+        }
         let outputs = kernel(
             [qkv, convState, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
