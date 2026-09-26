@@ -1382,13 +1382,8 @@ enum DFlash2TopK {
         header: header)
 }
 
-/// The greedy candidate walk with every edge score computed up front.
-///
-/// Position 0 scores its candidates against the anchor; every later position
-/// scores its candidates against each candidate of the position before it, as
-/// one `[L-1, K, K]` table built from the same element-wise products and the
-/// same final-axis sum as the per-position loop. One small kernel then walks
-/// the table in order, so the selected path is the loop's path.
+/// Single-SIMD-group greedy scoring. Read codebook rows directly when their
+/// layout qualifies, retaining the gathered FP32 implementation as a fallback.
 enum DFlash2GreedyWalk {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_FUSED_WALK"]?
@@ -1407,6 +1402,26 @@ enum DFlash2GreedyWalk {
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
         guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        if directCodebookEnabled,
+            unary.shape == [1, length, k], projected.shape == [1, length, rank],
+            predecessorCodebook.ndim == 2, successorCodebook.ndim == 2,
+            predecessorCodebook.dim(1) == rank, successorCodebook.dim(1) == rank,
+            [DType.float32, .float16, .bfloat16].contains(projected.dtype),
+            [DType.float32, .float16, .bfloat16].contains(predecessorCodebook.dtype),
+            [DType.float32, .float16, .bfloat16].contains(successorCodebook.dtype),
+            [DType.int32, .uint32].contains(candidates.dtype),
+            [DType.int32, .uint32].contains(anchor.dtype)
+        {
+            // Inline conversion to FP32 preserves the gathered walk's scalar
+            // multiply and rank-accumulation order. Only selected predecessors
+            // are read, with no per-block codebook gathers or FP32 copies.
+            let path = directCodebookKernel(
+                [candidates, unary, projected, predecessorCodebook, successorCodebook, anchor],
+                template: [("L", length), ("K", k), ("R", rank)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[length]], outputDTypes: [.int32])[0]
+            return path.reshaped([1, length])
+        }
         let c = candidates[0]
         // Gather only the codebook rows the candidate lists can visit. The
         // fused kernel scores each edge and advances the greedy walk in one
@@ -1428,6 +1443,41 @@ enum DFlash2GreedyWalk {
             outputDTypes: [.int32])[0]
         return path.reshaped([1, length])
     }
+
+    private static let directCodebookEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_DIRECT_CODEBOOK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let directCodebookKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_direct_fp32_walk",
+        inputNames: [
+            "candidates", "unary", "projected", "predecessor_book", "successor_book", "anchor",
+        ],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            uint previous_token = uint(anchor[0]);
+            for (uint i = 0; i < L; ++i) {
+                float score = -INFINITY;
+                if (c < K) {
+                    uint id = uint(candidates[i * K + c]);
+                    float edge = 0.0f;
+                    for (uint d = 0; d < R; ++d) {
+                        edge += (float(predecessor_book[previous_token * R + d])
+                            * float(projected[i * R + d]))
+                            * float(successor_book[id * R + d]);
+                    }
+                    score = float(unary[i * K + c]) + edge;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                previous_token = uint(candidates[i * K + sel]);
+                if (c == 0) path[i] = int(previous_token);
+            }
+            """,
+        ensureRowContiguous: true)
 
     private static let kernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_fused_greedy_walk",
