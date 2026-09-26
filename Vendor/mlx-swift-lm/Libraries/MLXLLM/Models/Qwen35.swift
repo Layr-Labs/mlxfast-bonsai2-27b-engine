@@ -3621,6 +3621,18 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
+                // Keep prompt pipelining active on the fused-boundary path.
+                // Both lazy roots must be submitted; the next layer still
+                // fuses their residual add, norm and quantizing rotation.
+                if let submission,
+                    submission.submits(after: modelLayerIndex + 1, of: layers.count)
+                {
+                    if let pending {
+                        asyncEval([hiddenStates, pending])
+                    } else {
+                        asyncEval([hiddenStates])
+                    }
+                }
                 continue
             }
             hiddenStates = layer.cbv2Forward(
