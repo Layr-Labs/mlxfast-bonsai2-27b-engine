@@ -5702,13 +5702,14 @@ enum Qwen35TensorPackedMatmul {
         const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sp * WPP;
         auto stage = [&](int g, int buf) {
           threadgroup uint32_t* dst = bs[sg][buf] + sc * 32 + sp * (WPP * 4);
+          // One word's four planes are four contiguous uint32s at a 4-word
+          // aligned offset: one uint4 store, same values and positions.
           #pragma clang loop unroll(full)
           for (int j = 0; j < WPP; j++) {
             const uint32_t wv = wrow[g * 8 + j];
-            dst[4 * j + 0] = wv & 0x03030303u;
-            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
           }
         };
         stage(g0, 0);
@@ -5789,13 +5790,13 @@ enum Qwen35TensorPackedMatmul {
             const int sc = int(lane) + 32 * cc;
             const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
             threadgroup uint32_t* dst = bs[sg][buf] + sc * 32;
+            // As in the prompt kernel's staging: one uint4 store per word.
             #pragma clang loop unroll(full)
             for (int j = 0; j < 8; j++) {
               const uint32_t wv = wrow[j];
-              dst[4 * j + 0] = wv & 0x03030303u;
-              dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-              dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-              dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
             }
           }
         };
@@ -6005,13 +6006,18 @@ enum Qwen35TensorPackedMatmul {
           const device uint4* src = (const device uint4*)(wrow + g * 8);
           const uint4 v = *src;
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+          // One word's four planes are four contiguous uint32s (16 codes).
+          // The base is 16-uint32 aligned, so each plane group is one uint4
+          // store. Values and positions match the four scalar stores.
           #pragma clang loop unroll(full)
           for (int j = 0; j < 4; j++) {
             const uint32_t wv = v[j];
-            dst[4 * j + 0] = wv & 0x03030303u;
-            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            const uint4 codes = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+            *(threadgroup uint4*)(dst + 4 * j) = codes;
           }
         };
         stage(0, 0);
@@ -6022,7 +6028,12 @@ enum Qwen35TensorPackedMatmul {
           auto tA = A.template slice<128, 64>(g * 128, m0);
           if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
+          float4 b0, b1;
+          if constexpr (NEGATIVE_SCALE_BIAS) {
+            b0 = -s0; b1 = -s1;
+          } else {
+            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+          }
           float4 u0 = 0.0f, u1 = 0.0f;
           if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
           float as[4], rb[4];
@@ -6285,18 +6296,22 @@ enum Qwen35TensorPackedMatmul {
                     .transposed(1, 0).contiguous()
             }
             let packedKernel: MLXFast.MLXFastKernel
+            var template: [(String, any KernelTemplateArg)] = [
+                ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                ("SIGNED", signedCodes ? 1 : 0),
+            ]
             switch support {
             case .native2b: packedKernel = kernel
-            case .staged8: packedKernel = kernelStaged8
+            case .staged8:
+                packedKernel = kernelStaged8
+                template.append(("NEGATIVE_SCALE_BIAS",
+                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
                 [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                template: [
-                    ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
-                    ("SIGNED", signedCodes ? 1 : 0),
-                ],
+                template: template,
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }

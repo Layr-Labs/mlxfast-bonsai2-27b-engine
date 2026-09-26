@@ -961,10 +961,9 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 /// the two matmuls.
 /// The drafter's BF16 projections at a block width (<= 16 rows) on the tensor
 /// unit with `tensor` operands (`bfloat x bfloat -> float`, MetalPerformance-
-/// Primitives `matmul2d`): each threadgroup owns 32 output columns. Wide
-/// projections use two simdgroups over contiguous K halves; smaller ones use
-/// four over K quarters. Each chunk is a 16 x 32 x 256 op, and the partials
-/// are summed through threadgroup memory. The
+/// Primitives `matmul2d`): each threadgroup owns 32 output columns, its four
+/// simdgroups take four contiguous K quarters (one 16 x 32 x 256 op per
+/// chunk) and their partials are summed through threadgroup memory. The
 /// weights are the layer's BF16 arrays read as stored; the result is the same
 /// FP32-accumulated product in a different summation order, rounded to BF16.
 /// The drafter only proposes. `DARKBLOOM_DFLASH2_TENSOR_MATMUL=0` keeps the
@@ -986,15 +985,14 @@ enum DFlash2TensorMatmul {
 
         """
 
-    // grid: (N / 32 * (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1).
-    // Inputs: x bfloat
+    // grid: (N / 32 * 128, 1, 1), threadgroup (128, 1, 1). Inputs: x bfloat
     // [16, K], w bfloat [N, K], ksz int32 [K, 16, N]. K % 1024 == 0.
     private static let source = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int kq = K / SPLITS;
+        const int kq = K / 4;
         const int k0 = int(sg) * kq;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
             16, 32, 256, false, true, false,
@@ -1017,7 +1015,7 @@ enum DFlash2TensorMatmul {
         // m = fm + 8 * ((i >> 2) & 1).
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        threadgroup float red[SPLITS - 1][16 * 32];
+        threadgroup float red[3][16 * 32];
         if (sg > 0) {
           #pragma clang loop unroll(full)
           for (int i = 0; i < 16; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
@@ -1026,12 +1024,7 @@ enum DFlash2TensorMatmul {
         if (sg == 0) {
           #pragma clang loop unroll(full)
           for (int i = 0; i < 16; i++) {
-            float v;
-            if constexpr (SPLITS == 2) {
-              v = cT[i] + red[0][i * 32 + lane];
-            } else {
-              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            }
+            const float v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
             const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
             out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
           }
@@ -1073,14 +1066,9 @@ enum DFlash2TensorMatmul {
             a = concatenated(
                 [a, MLXArray.zeros([rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
         }
-        // Wide projections expose enough output tiles to use fewer K partitions.
-        // Keep the accepted four-way route for the smaller projections.
-        let splits = n >= 16384 ? 2 : 4
-        let threads = splits * 32
         let y = kernel(
-            [a, weight, dimsArray(k: k, n: n)],
-            template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
-            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            [a, weight, dimsArray(k: k, n: n)], template: [("OutT", DType.bfloat16)],
+            grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
         let rowsOut = rows < rowsPerTile ? y[0 ..< rows] : y
         return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
@@ -1629,16 +1617,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     ///   - inputs: the block's token ids, `[B, blockLength]`.
     ///   - targetHidden: the fused target hidden state, `[B, contextLength, targetHiddenSize]`.
     ///   - logitsStart: how many leading block positions to drop before the head.
-    ///   - leadingLayers: when positive, the trunk `asyncEval`s its hidden state
-    ///     as soon as this many layers (at most all of them) are built, so the
-    ///     GPU starts them, and the context projection they read, while the
-    ///     host builds the rest.
     func hiddenStates(
         _ inputs: MLXArray,
         targetHidden: MLXArray?,
         cache: [KVCache],
-        logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        logitsStart: Int
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -1677,16 +1660,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
 
         let submitAfter = DFlash2DraftSubmission.layers
-        let leadAt = leadingLayers > 0 ? min(leadingLayers, layers.count) : 0
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
             // EARLY SUBMISSION: hand the GPU the drafter layers built so far
             // while the host builds the rest and the head. Same kernels, same
-            // order; only command-buffer boundaries move. One submission per
-            // layer at most, whichever of the two asks for it.
-            if index + 1 == leadAt
-                || (!submitAfter.isEmpty && submitAfter.contains(index + 1))
-            {
+            // order; only command-buffer boundaries move.
+            if !submitAfter.isEmpty, submitAfter.contains(index + 1) {
                 asyncEval([h])
             }
         }
@@ -1720,14 +1699,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     ///   - anchor: the last committed token, one per row.
     ///   - targetHidden: the fused target hidden state of the positions the
     ///     target has already consumed, `[B, contextLength, targetHiddenSize]`.
-    ///   - leadingLayers: see `hiddenStates`; 0 submits nothing.
     /// - Returns: the draft tokens, `[B, blockSize - 1]`.
     public func propose(
         anchor: [Int],
         targetHidden: MLXArray?,
         cache: [KVCache],
-        blockSize: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        blockSize: Int
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
@@ -1735,8 +1712,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let block = MLXArray(rows, [anchor.count, blockSize])
 
         let hidden = try hiddenStates(
-            block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
-            submittingLeadingLayers: leadingLayers)
+            block, targetHidden: targetHidden, cache: cache, logitsStart: 1)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),

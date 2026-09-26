@@ -99,7 +99,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        CBv2DeferredLoadWarm.runIfPending(rows: tokens.size)
         guard let recurrent = model as? any CBv2RecurrentLanguageModelForwardable else {
             preconditionFailure(
                 "CBv2 recurrent forward reached a model without recurrent-state support")
@@ -460,37 +459,5 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
         (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
-    }
-}
-
-/// A one-time warm that a model or drafter registers at load and that runs
-/// at the first teacher-forced forward of at least `minimumRows` rows: the
-/// resident's boot warm (a 1024-token stepper forward), which runs after the
-/// runner has adopted the model and before the socket serves anything, so no
-/// timed phase can reach it (the timed prompts are 512 tokens). A process
-/// that never runs such a forward never runs the warm.
-/// `MLXFAST_DEFERRED_WARM_ROWS` overrides the threshold.
-public enum CBv2DeferredLoadWarm {
-    static let minimumRows: Int = {
-        let raw = ProcessInfo.processInfo.environment["MLXFAST_DEFERRED_WARM_ROWS"]
-        return raw.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 1024
-    }()
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var pending: (() -> Void)?
-
-    /// Replaces any warm registered earlier.
-    public static func register(_ warm: @escaping () -> Void) {
-        lock.withLock { pending = warm }
-    }
-
-    static func runIfPending(rows: Int) {
-        guard rows >= minimumRows else { return }
-        let warm: (() -> Void)? = lock.withLock {
-            let registered = pending
-            pending = nil
-            return registered
-        }
-        warm?()
     }
 }

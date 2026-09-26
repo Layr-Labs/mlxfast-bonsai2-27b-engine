@@ -485,21 +485,6 @@ extension CBv2MTPBlockDrafter {
     }
 }
 
-/// A block drafter whose proposal can hand the GPU its leading layers while
-/// the proposal is still being built. The engine takes this only for the
-/// early block proposal at finalize, where it submits the rest of the
-/// proposal itself after the committed recurrent state
-/// (`EngineLoopV2.earlyDraftLeadingLayers`). The proposal is the same graph
-/// as `proposeBlock`'s; only command-buffer boundaries move.
-public protocol CBv2MTPBlockLeadingSubmission: CBv2MTPBlockDrafter {
-    /// `proposeBlock`, with the drafter's first `leadingLayers` layers (and
-    /// everything they read) submitted as soon as they are built.
-    func proposeBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
-        submittingLeadingLayers leadingLayers: Int
-    ) throws -> MLXArray
-}
-
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.
