@@ -564,13 +564,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // The vocabulary head at verify width (16 rows) reaches the tensor
-        // route here; the tower projections reach it through the shared and
-        // pre-signed forwards below.
-        if let routed = tensorRouteForward(x, siblings: [self], preSigned: false, widenOutput: true) {
-            return routed[0]
-        }
-        return applyRotated(rotate(x))
+        applyRotated(rotate(x))
     }
 
     /// The input transform alone: GDN layout, signs, Hadamard, dtype restore.
