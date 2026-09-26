@@ -140,8 +140,100 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     func warmSpeculativeShapes() {
         guard Self.speculativeWarmEnabled else { return }
         warmDrafter()
+        if Self.targetWarmEnabled { warmTargetRound() }
         Stream().synchronize()
         Memory.clearCache()
+    }
+
+    /// Kill switch for the load-time TARGET round warm (default on).
+    static let targetWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_SPEC_TARGET_WARM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The target's side of a scored round, once per shape, at load.
+    ///
+    /// The resident's boot warm runs the plain stepper (a 1024-row prompt and
+    /// single-row decodes) and the drafter warm above runs the drafter, but
+    /// nothing before the timed window runs the target at the round's own
+    /// shapes: the engine prompt with the context tap armed, the 16-row
+    /// capture-verify forward, and the recurrent prefix replay at each
+    /// accepted length. A fresh resident therefore built those kernels'
+    /// pipelines (MLX JIT libraries, custom kernels, compiled graphs) inside
+    /// the first timed window. Measured locally, the first 128-token window of
+    /// a process ran ~1 s longer than every later one.
+    ///
+    /// This drives exactly those seams (`forwardWithHiddenForPrefill`,
+    /// `forwardWithHiddenCaptured`, `commit(keepPositions:)`) on a throwaway
+    /// contiguous backend, throwaway layer caches and a throwaway recurrent
+    /// state, with a synthetic prompt of ordinary ids. The tap is disarmed
+    /// again afterwards (the engine build arms it per leg), every result is
+    /// evaluated and dropped, and the caller drains the buffer cache, so the
+    /// served phases start from the footprint a cold load leaves. Nothing is
+    /// keyed on, or kept from, any request.
+    private func warmTargetRound() {
+        let promptRows = 512
+        let block = Self.warmBlockSize
+        do {
+            try setBlockContextArmed(true)
+            defer {
+                target.dFlash2TapLayerIds = nil
+                target.model.dFlash2Tap.tappedHidden = nil
+            }
+            let adapter = CBv2SteppableLanguageModelAdapter(target)
+            let kinds = target.cbv2LayerKinds
+            let backend = CBv2ContiguousKVBackend(
+                config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 26))
+            let layerCaches = try target.newCacheV2 { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            }
+            let bank = CBv2LayerCacheBank(caches: layerCaches)
+            let rowState = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 0, maxLength: promptRows + block * (block + 2))
+            defer {
+                bank.releaseBoundRows()
+                backend.release(rowState)
+            }
+            let recurrent = try CBv2RecurrentRequestState(spec: target.cbv2RecurrentStateSpec)
+            defer { try? recurrent.release() }
+            let caches = bank.layerCaches(rowStates: [rowState])
+            let innerState: () -> [MLXArray] = {
+                caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+            }
+            func ids(_ count: Int, _ salt: Int) -> MLXArray {
+                MLXArray((0 ..< count).map { Int32(100 + (($0 + salt) &* 7919) % 20_000) })
+                    .reshaped([1, count])
+            }
+
+            // The seed: the engine's prompt forward with the tap armed.
+            let seed = try recurrent.bind()
+            let prompt = adapter.forwardWithHiddenForPrefill(
+                tokens: ids(promptRows, 0), caches: caches, recurrentState: [seed],
+                positionIds: nil, requirement: .lastPositionLogits)
+            var roots = try seed.evaluate()
+            eval([prompt.logits, prompt.lastHidden] + roots + innerState()
+                + [target.dFlash2TappedHidden].compactMap { $0 })
+            try seed.commit()
+
+            // One capture-verify window per accepted length, shortest first:
+            // each shorter one stages a prefix replay that the next window's
+            // forward materializes, and the last (the full block) commits its
+            // own captured state, so no replay is left pending.
+            for keep in 1 ... block {
+                let window = try recurrent.bind()
+                let verify = adapter.forwardWithHiddenCaptured(
+                    tokens: ids(block, keep), caches: caches, recurrentState: [window],
+                    positionIds: nil)
+                roots = try window.evaluate()
+                eval([verify.logits.argMax(axis: -1), verify.lastHidden] + roots + innerState()
+                    + [target.dFlash2TappedHidden].compactMap { $0 })
+                try window.commit(keepPositions: keep)
+            }
+        } catch {
+            // A warm that cannot run changes nothing: the first timed round
+            // builds its pipelines as before.
+        }
     }
 
     private func warmDrafter() {
