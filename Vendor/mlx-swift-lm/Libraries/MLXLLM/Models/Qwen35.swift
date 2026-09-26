@@ -525,6 +525,56 @@ enum Qwen35GatedDeltaV3 {
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
     }
+
+    /// `kernel` for a state known to be the fresh zeros of a new request's
+    /// first chunk (see `Qwen35GatedDeltaNet.freshPromptChunk`): the state
+    /// registers start at 0.0f instead of loading a zeros array, which is
+    /// then never materialized. The same values (+0.0f) enter the same
+    /// arithmetic. Derived from `source` so the stock kernel stays as it is.
+    private static let freshSource: String = {
+        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        precondition(
+            source.components(separatedBy: load).count == 2,
+            "Qwen35 GDN v3: the fresh-state source no longer matches the stock kernel")
+        let text = source.replacingOccurrences(of: load, with: "state[d][i] = 0.0f;")
+        precondition(!text.contains("state_in"))
+        return text
+    }()
+
+    private static let freshKernel = MLXFast.metalKernel(
+        name: "qwen35_gated_delta_v3_fresh",
+        inputNames: ["q", "k", "v", "g", "beta", "T"],
+        outputNames: ["y", "state_out"],
+        source: freshSource,
+        ensureRowContiguous: true)
+
+    /// `run(q:k:v:g:beta:state:)` for an all-zero FP32 `state` of
+    /// `stateShape`, which is not passed; nil exactly when `run` would be.
+    static func runFreshState(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            g.dtype == .float32, beta.dtype == .float32,
+            q.ndim == 4, k.ndim == 4, v.ndim == 4
+        else { return nil }
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        guard Dk == 128, Dv % 32 == 0, Hv % Hk == 0, T > 0,
+            q.shape == k.shape, stateShape == [B, Hv, Dv, Dk],
+            g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
+        else { return nil }
+        let outputs = freshKernel(
+            [q, k, v, g, beta, MLXArray(Int32(T))],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], stateShape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
 }
 
 /// Wide-window (prefill) variant of the unmasked gated-delta kernel.
@@ -1259,6 +1309,56 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    /// `BONSAI_GDN_FRESH_STATE=0` materializes a new request's zero states.
+    static let freshStateKernels: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_FRESH_STATE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `processChunk` of a new request's first prompt chunk, whose conv and
+    /// SSM states are the zeros `cbv2Forward` creates exactly when the row
+    /// has no input state for this layer (`inputState == nil`, the explicit
+    /// fresh-request signal; never inferred from values). The prework and
+    /// recurrence kernels start from 0.0f instead of reading those zeros, so
+    /// neither `[1, 3, convDim]` nor `[1, Hv, Dv, Dk]` zeros array is
+    /// materialized (two dispatches and ~6.4 MB per layer). Same kernels'
+    /// arithmetic on the same values. One row, prompt width, FP32 activations
+    /// (the dtype those conv zeros would have had, which the stock prework
+    /// requires), kernel paths only; nil otherwise, and the caller takes the
+    /// stock path. The recurrence inputs (`qkv`, `a`, `b`) and the output
+    /// are untouched: whatever produced `qkv` (the tensor route at prompt
+    /// width) and whatever reads `out` see the same arrays.
+    private func freshPromptChunk(
+        _ inputs: MLXArray, qkv: MLXArray, a: MLXArray, b: MLXArray,
+        modelLayerIndex: Int, recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)? {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        guard Self.freshStateKernels, B == 1, recurrentState.count == 1,
+            B * S >= BonsaiPromptWidth.minimumRows, inputs.dtype == .float32,
+            convKernelSize == 4,
+            recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil,
+            let pre = Qwen35GDNPrework.runFreshState(
+                qkv: qkv, convStateShape: [1, convKernelSize - 1, convDim],
+                convWeight: conv1d.weight, a: a, b: b,
+                aLog: aLog, dtBias: dtBias,
+                normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
+                keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                headVDim: headVDim)
+        else { return nil }
+        let stateShape = [B, numVHeads, headVDim, headKDim]
+        if let (out, newSsmState) = Qwen35GatedDeltaV3.runFreshState(
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
+        {
+            return (out, pre.tail, newSsmState)
+        }
+        let (out, newSsmState) = gatedDeltaKernel(
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+            state: MLXArray.zeros(stateShape, dtype: .float32), mask: nil)
+        return (out, pre.tail, newSsmState)
+    }
+
     /// Run one legacy-cache verify chunk while retaining only the transformed
     /// recurrence inputs needed to rebuild a shorter committed prefix. The
     /// CBv2 rectangular path below uses the same tape and replay math.
@@ -1520,27 +1620,36 @@ final class Qwen35GatedDeltaNet: Module {
 
         let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
-        }
+        let processed: (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)
+        if let fresh = freshPromptChunk(
+            inputs, qkv: qkv, a: a, b: b, modelLayerIndex: modelLayerIndex,
+            recurrentState: recurrentState)
+        {
+            processed = fresh
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
 
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
-        let (out, newConvState, newSsmState) = processChunk(
-            qkv: qkv, a: a, b: b,
-            convState: convState, ssmState: ssmState, mask: nil)
+            let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+            processed = processChunk(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: ssmState, mask: nil)
+        }
+        let (out, newConvState, newSsmState) = processed
 
         for (row, evaluation) in recurrentState.enumerated() {
             do {
@@ -2830,6 +2939,133 @@ enum Qwen35GDNPrework {
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let outputs = kernel(
             [qkv, convState, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS),
+            ],
+            grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5])
+    }
+
+    /// `kernel` for a new request's first chunk, whose conv state is known to
+    /// be the fresh zeros (see `Qwen35GatedDeltaNet.freshPromptChunk`): the
+    /// taps before the chunk read 0.0f instead of a zeros array, and the conv
+    /// tail's pre-chunk rows (reached only by a chunk shorter than the tail)
+    /// store 0.0f. The zeros array is never materialized; the same values
+    /// (+0.0f) enter the same arithmetic. Derived from `source` so the stock
+    /// kernel stays as it is.
+    private static let freshSource: String = {
+        var text = source
+        for (target, replacement) in [
+            ("const size_t csbase = size_t(bb) * size_t(NK) * size_t(CD);", ""),
+            ("? cs[csbase + size_t(r + NK) * size_t(CD) + col]", "? 0.0f"),
+            ("const size_t crow = csbase + size_t(src + NK) * size_t(CD);", ""),
+            ("cs[crow + colq]", "0.0f"),
+            ("cs[crow + colk]", "0.0f"),
+            ("cs[crow + colv]", "0.0f"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "Qwen35 GDN prework: the fresh-state source no longer matches the stock kernel")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        precondition(!text.contains("cs[") && !text.contains("csbase") && !text.contains("crow"))
+        return text
+    }()
+
+    private static let freshKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh",
+        inputNames: ["qkv", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: freshSource,
+        ensureRowContiguous: true)
+
+    /// `freshSource` reading `qkv`, `w`, `a` and `b` through their strides
+    /// (newjordan's `5123445c` indexing): at prompt width `qkv` is a column
+    /// slice of the stacked qkv|z product and `a`/`b` of the b|a product, which
+    /// a row-contiguous launch copies first. The same elements are read, so the
+    /// outputs are the same values. `BONSAI_PREWORK_STRIDED=0` keeps the copy.
+    private static let freshStridedSource: String = {
+        var text = freshSource
+        for (target, replacement) in [
+            ("const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);",
+             "const int64_t qb = int64_t(bb) * qkv_strides[0];\n        const int64_t qs1 = qkv_strides[1];\n        const int64_t qs2 = qkv_strides[2];\n        const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];\n        const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];"),
+            ("float(qkv[rowbase + size_t(r) * size_t(CD) + col])",
+             "float(qkv[qb + int64_t(r) * qs1 + int64_t(col) * qs2])"),
+            ("w[size_t(col) * size_t(KS) + size_t(j)]",
+             "w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]]"),
+            ("const float av = a[grow] + dtb[hv];",
+             "const float av = a[ab + int64_t(hv) * a_strides[2]] + dtb[hv];"),
+            ("const float bv = b[grow];",
+             "const float bv = b[bbase + int64_t(hv) * b_strides[2]];"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colq])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colq) * qs2])"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colk])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colk) * qs2])"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colv])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colv) * qs2])"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "Qwen35 GDN prework: the strided fresh source no longer matches")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        precondition(!text.contains("rowbase"))
+        return text
+    }()
+
+    private static let freshStridedKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_strided",
+        inputNames: ["qkv", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: freshStridedSource,
+        ensureRowContiguous: false)
+
+    private static let freshStridedReads: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_STRIDED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `run` for an all-zero FP32 conv state of `convStateShape`, which is not
+    /// passed; nil exactly when `run` would be for that state.
+    static func runFreshState(
+        qkv: MLXArray, convStateShape: [Int], convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+    ) -> Outputs? {
+        guard enabled, qkv.ndim == 3, convStateShape.count == 3, convWeight.ndim == 3
+        else { return nil }
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        guard headKDim == 128, headVDim == 128, valueHeads % keyHeads == 0,
+            CD == 2 * keyHeads * headKDim + valueHeads * headVDim,
+            convStateShape == [B, KS - 1, CD], convWeight.shape == [CD, KS, 1],
+            [DType.float32, .float16, .bfloat16].contains(qkv.dtype),
+            convWeight.dtype == .float32,
+            a.dtype == .float32, b.dtype == .float32,
+            a.shape == [B, S, valueHeads], b.shape == [B, S, valueHeads],
+            aLog.shape == [valueHeads], dtBias.shape == [valueHeads],
+            normScales.q.dtype == .float32, normScales.k.dtype == .float32,
+            normScales.q.shape == [headKDim], normScales.k.shape == [headKDim],
+            S > 0, S < 65536
+        else { return nil }
+        let alog = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
+        let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        let outputs = (strided ? freshStridedKernel : freshKernel)(
+            [qkv, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),

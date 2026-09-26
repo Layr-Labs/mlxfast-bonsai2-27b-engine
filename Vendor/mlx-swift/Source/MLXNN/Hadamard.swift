@@ -1306,6 +1306,20 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
     }
 }
 
+/// The row count from which a forward counts as prompt width: the timed
+/// prefill and the seed prefill, never a verify window (at most 17 rows).
+/// Paths measured at prompt width only gate on it (the composed causal
+/// attention of a prompt's query blocks, the fresh recurrent state of a new
+/// request's first chunk), so every verify-width path keeps its kernels.
+/// `BONSAI_PROMPT_MIN_ROWS` overrides the default of 64.
+public enum BonsaiPromptWidth {
+    public static let minimumRows: Int = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_MIN_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.flatMap { Int($0) } ?? 64
+    }()
+}
+
 /// ercumentyildirim's (`ade7529`) fused-INPUT rotations: the SwiGLU product,
 /// the attention output gate, or the GDN output's per-head RMSNorm and gated
 /// tail, formed in the read of MLX's `hadamard_n<float, 1024, 16, 4>` with the
