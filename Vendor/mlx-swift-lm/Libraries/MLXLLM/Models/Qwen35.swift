@@ -377,13 +377,47 @@ enum Qwen35FusedElementwise {
         }
 }
 
-/// Input-independent constants a GDN layer derives from its geometry, held
+/// Input-independent constants a GDN layer derives from geometry and weights, held
 /// outside the parameter tree (a plain class, so Module reflection sees
 /// `.other`).
 private final class Qwen35GDNDerived {
     private let lock = NSLock()
     private var qScale: MLXArray?
     private var kScale: MLXArray?
+    private var decaySource: MLXArray?
+    private var cachedDecay: MLXArray?
+
+    // Same FP32 intermediate and Metal intrinsic as the prework expression.
+    // This depends on the model parameter only, never on request data.
+    private static let decayKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_derived_decay",
+        inputNames: ["alog"], outputNames: ["decay"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i < N) decay[i] = -metal::precise::exp(alog[i]);
+            """,
+        ensureRowContiguous: true)
+
+    func decay(_ aLog: MLXArray) -> MLXArray {
+        lock.withLock {
+            if let cachedDecay, decaySource === aLog { return cachedDecay }
+            let source = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
+            let result = Self.decayKernel(
+                [source], template: [("N", aLog.size)],
+                grid: (aLog.size, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [aLog.shape], outputDTypes: [.float32])[0]
+            decaySource = aLog
+            cachedDecay = result
+            return result
+        }
+    }
+
+    func clearDecay() {
+        lock.withLock {
+            decaySource = nil
+            cachedDecay = nil
+        }
+    }
 
     /// Per-dimension weights for the q and k norms that carry the head-scale
     /// factors: `rmsNorm(x, weight: w)` computes `w * (x * inv)` and a
@@ -1488,7 +1522,7 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
-    /// Derived norm weights; a plain box, never a parameter.
+    /// Derived norm weights and decay coefficients; never model parameters.
     private let derived = Qwen35GDNDerived()
     /// The dense `in_proj_b` and `in_proj_a` weights stacked along the output
     /// axis (same bytes, concatenated once, held outside the parameter
@@ -1615,6 +1649,7 @@ final class Qwen35GatedDeltaNet: Module {
         path: [String] = [], modulePath: [String] = []
     ) throws -> Self {
         baStack.clear()
+        derived.clearDecay()
         let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
         let replacesInputProjection = parameters.flattened().contains { key, _ in
             prefixes.contains(where: key.hasPrefix)
@@ -1883,7 +1918,7 @@ final class Qwen35GatedDeltaNet: Module {
         if mask == nil, convKernelSize == 4,
             let pre = Qwen35GDNPrework.run(
                 qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
-                aLog: aLog, dtBias: dtBias,
+                aDecay: derived.decay(aLog), dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim)
@@ -1962,7 +1997,7 @@ final class Qwen35GatedDeltaNet: Module {
             let pre = Qwen35GDNPrework.runFreshState(
                 qkv: qkv, convStateShape: [1, convKernelSize - 1, convDim],
                 convWeight: conv1d.weight, a: a, b: b,
-                aLog: aLog, dtBias: dtBias,
+                aDecay: derived.decay(aLog), dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim)
@@ -2360,7 +2395,7 @@ final class Qwen35GatedDeltaNet: Module {
             (!exactTargetVerify && S >= 3 && convKernelSize == 4)
             ? Qwen35GDNPrework.run(
                 qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
-                aLog: aLog, dtBias: dtBias,
+                aDecay: derived.decay(aLog), dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim)
@@ -3698,7 +3733,7 @@ enum Qwen35GDNPrework {
     // grid (128 * HK, S, B), threadgroup (128, 1, 1).
     // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
     // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
-    // alog/dtb [HV], wq/wk [DK], S (scalar).
+    // decay/dtb [HV], wq/wk [DK], S (scalar).
     private static let source = """
         constexpr int GRP = HV / HK;
         constexpr int KEY = HK * DK;
@@ -3769,7 +3804,7 @@ enum Qwen35GDNPrework {
           const float mx = metal::max(av, 0.0f);
           const float mn = metal::min(av, 0.0f);
           const float sp = mx + log1p(metal::exp(mn - mx));
-          g[grow] = metal::precise::exp(-metal::precise::exp(alog[hv]) * sp);
+          g[grow] = metal::precise::exp(decay[hv] * sp);
           const float bv = b[grow];
           const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
           beta[grow] = (bv < 0.0f) ? by : 1.0f - by;
@@ -3803,14 +3838,14 @@ enum Qwen35GDNPrework {
 
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework",
-        inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: source,
         ensureRowContiguous: true)
 
     static func run(
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
         keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3 else { return nil }
@@ -3825,15 +3860,15 @@ enum Qwen35GDNPrework {
             convState.dtype == .float32, convWeight.dtype == .float32,
             a.dtype == .float32, b.dtype == .float32,
             a.shape == [B, S, valueHeads], b.shape == [B, S, valueHeads],
-            aLog.shape == [valueHeads], dtBias.shape == [valueHeads],
+            aDecay.shape == [valueHeads], aDecay.dtype == .float32,
+            dtBias.shape == [valueHeads],
             normScales.q.dtype == .float32, normScales.k.dtype == .float32,
             normScales.q.shape == [headKDim], normScales.k.shape == [headKDim],
             S > 0, S < 65536
         else { return nil }
-        let alog = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let outputs = kernel(
-            [qkv, convState, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
+            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
@@ -3879,7 +3914,7 @@ enum Qwen35GDNPrework {
 
     private static let freshKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh",
-        inputNames: ["qkv", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: freshSource,
         ensureRowContiguous: true)
@@ -3920,7 +3955,7 @@ enum Qwen35GDNPrework {
 
     private static let freshStridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided",
-        inputNames: ["qkv", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: freshStridedSource,
         ensureRowContiguous: false)
@@ -3935,7 +3970,7 @@ enum Qwen35GDNPrework {
     /// passed; nil exactly when `run` would be for that state.
     static func runFreshState(
         qkv: MLXArray, convStateShape: [Int], convWeight: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
         keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convStateShape.count == 3, convWeight.ndim == 3
@@ -3951,16 +3986,16 @@ enum Qwen35GDNPrework {
             convWeight.dtype == .float32,
             a.dtype == .float32, b.dtype == .float32,
             a.shape == [B, S, valueHeads], b.shape == [B, S, valueHeads],
-            aLog.shape == [valueHeads], dtBias.shape == [valueHeads],
+            aDecay.shape == [valueHeads], aDecay.dtype == .float32,
+            dtBias.shape == [valueHeads],
             normScales.q.dtype == .float32, normScales.k.dtype == .float32,
             normScales.q.shape == [headKDim], normScales.k.shape == [headKDim],
             S > 0, S < 65536
         else { return nil }
-        let alog = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
         let outputs = (strided ? freshStridedKernel : freshKernel)(
-            [qkv, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
+            [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
