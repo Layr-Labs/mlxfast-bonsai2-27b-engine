@@ -229,15 +229,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block was submitted
-///   before this graph was built, so without slices the GPU idles from the
-///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - VERIFY (a capture-verify forward). By default one boundary after the
+///   first 8 layers hands the GPU the leading graph while the host builds
+///   the remainder. Both trunk paths use this guarded plan.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` accepts another plan; `0` or
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` keeps a single submission.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +288,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // Submit the first 8 layers once while the host builds the rest.
+        // Keep explicit plans and both existing disable switches available.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [8]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -4770,7 +4768,7 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary (no early submission: its plan is prompt-only).
+        // verify boundary and uses the guarded verify submission plan.
         // Where the verify-width tensor route is installed (the int8 form on
         // the ranked box), the projections take it instead, every verify
         // boundary declines, and the window keeps the composed per-layer path.
@@ -4786,10 +4784,13 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // A verify window uses the same guarded plan on either trunk path;
+        // a prompt retains its existing pending-residual submission plan.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -4825,7 +4826,7 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
+                // EARLY SUBMISSION (prompt or verify plan) on this path: hand the
                 // GPU the layers built so far, the layer output as `h` and its
                 // pending `f` (both of which the next boundary kernel reads).
                 if let fusedSubmission,
