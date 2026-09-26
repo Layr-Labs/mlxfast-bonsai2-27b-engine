@@ -292,9 +292,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // Submit the first 8 layers once while the host builds the rest.
+        // Keep explicit plans and both existing disable switches available.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [8]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -3663,7 +3665,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3953,19 +3955,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3980,18 +4006,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -4786,10 +4814,13 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // A verify window uses the same guarded plan on either trunk path;
+        // a prompt retains its existing pending-residual submission plan.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
