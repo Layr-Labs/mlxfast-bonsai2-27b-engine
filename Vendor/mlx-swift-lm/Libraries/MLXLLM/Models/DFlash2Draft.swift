@@ -750,14 +750,17 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     let kernelSize: Int
     let groupSize: Int
     let groups: Int
+    private let finishNorm: DFlash2ConvFinishNorm.Prepared?
 
     @ParameterInfo(key: "base_kernel") var baseKernel: MLXArray
     @ModuleInfo(key: "kernel_projection") var kernelProjection: Linear
 
-    init(hiddenSize: Int, kernelSize: Int, groupSize: Int) {
+    init(hiddenSize: Int, kernelSize: Int, groupSize: Int, finishNormEps: Float? = nil) {
         self.kernelSize = kernelSize
         self.groupSize = groupSize
         self.groups = hiddenSize / groupSize
+        self.finishNorm = hiddenSize == 5120 && kernelSize == 2 && groupSize == 16
+            ? finishNormEps.flatMap { DFlash2ConvFinishNorm.prepare(eps: $0) } : nil
         // Tap 0 wraps the sub-layer input, tap 1 wraps its output.
         _baseKernel.wrappedValue = MLXArray.zeros([2, kernelSize, hiddenSize])
         _kernelProjection.wrappedValue = Linear(
@@ -857,6 +860,31 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         )
     }
 
+    /// Return both streams only when the fused dispatch actually applies.
+    /// A nil result leaves cross-layer normalization at its original site.
+    func fusedFinishAndNormalize(
+        _ hidden: MLXArray, projection: MLXArray, residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard dflash2FusedConvEnabled, let prepared = finishNorm else { return nil }
+        return DFlash2ConvFinishNorm.run(
+            hidden: hidden, projection: projection, base: baseKernel,
+            residual: residual, norm: norm, prepared: prepared)
+    }
+
+    /// Retain the residual stream and its next RMS normalization in one
+    /// dispatch. Parameters are current inputs, never retained activations.
+    func finishAndNormalize(
+        _ hidden: MLXArray, projection: MLXArray, residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray) {
+        if let pair = fusedFinishAndNormalize(
+            hidden, projection: projection, residual: residual, norm: norm)
+        {
+            return pair
+        }
+        let stream = finish(hidden, projection: projection, residual: residual)
+        return (stream, norm(stream))
+    }
+
     /// The second tap, over the sub-layer's output, added to the layer's
     /// residual stream: `residual + conv(hidden)`.
     func finish(_ hidden: MLXArray, projection: MLXArray, residual: MLXArray) -> MLXArray {
@@ -949,6 +977,155 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     source: dflash2GroupedConvResidualSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
+
+/// Fuse the existing tap-1 convolution/residual and the following RMSNorm.
+/// 1024 threads and four reads match MLX's 5120-column looped RMS reduction.
+/// Every convolution intermediate remains T; FP32 RMS reduction and both BF16
+/// norm roundings are retained. Device equality checking enables the callable.
+private enum DFlash2ConvFinishNorm {
+    static let enabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_FINISH_NORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+    final class Prepared: Sendable {
+        let eps: Float
+        let call: @Sendable ([MLXArray]) -> [MLXArray]
+        init(eps: Float) {
+            self.eps = eps
+            self.call = compile(shapeless: false) { (inputs: [MLXArray]) -> [MLXArray] in
+                let h = inputs[0]
+                return DFlash2ConvFinishNorm.kernel(
+                    inputs + [MLXArray(eps)], template: [("T", DType.bfloat16), ("TG", 1024)],
+                    grid: (h.dim(0) * h.dim(1) * 1024, 1, 1), threadGroup: (1024, 1, 1),
+                    outputShapes: [h.shape, h.shape], outputDTypes: [.bfloat16, .bfloat16])
+            }
+        }
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Float: Bool] = [:]
+    nonisolated(unsafe) private static var holders: [Float: Prepared] = [:]
+private static let source = """
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint H = 5120;
+    const uint L = h_shape[1];
+    const uint b = row / L, l = row % L;
+    threadgroup float partial[32];
+    threadgroup float inverse[1];
+    float saved[12];
+    float acc = 0;
+    for (uint r = 0; r < H; r += TG * 4) {
+      for (uint i = 0; i < 4; i++) {
+        const uint c = r + lid * 4 + i;
+        if (c < H) {
+          const T conv = dflash2_grouped_conv<T, 2, 16, 1>(h, dyn, base, b, l, c, L, H);
+          const T a = res[size_t(row) * H + c] + conv;
+          attended[size_t(row) * H + c] = a;
+          const float v = static_cast<float>(a);
+          saved[(r / (TG * 4)) * 4 + i] = v;
+          acc += v * v;
+        }
+      }
+    }
+    acc = simd_sum(acc);
+    if (sg == 0) { partial[lane] = 0; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) { partial[sg] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      acc = simd_sum(partial[lane]);
+      if (lane == 0) { inverse[0] = metal::precise::rsqrt(acc / H + eps); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < H; r += TG * 4) {
+      for (uint i = 0; i < 4; i++) {
+        const uint c = r + lid * 4 + i;
+        if (c < H) {
+          normed[size_t(row) * H + c] = gain[c] * static_cast<T>(
+              saved[(r / (TG * 4)) * 4 + i] * inverse[0]);
+        }
+      }
+    }
+    """
+private static let kernel = MLXFast.metalKernel(
+ name: "dflash2_finish_norm5120", inputNames:["h","dyn","base","res","gain","eps"],
+ outputNames:["attended","normed"], source:source,
+ header:dflash2GroupedConvHeader, ensureRowContiguous:true)
+
+    static func run(
+        hidden: MLXArray, projection: MLXArray, base: MLXArray, residual: MLXArray,
+        norm: RMSNorm, prepared: Prepared
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            hidden.ndim == 3, hidden.dim(0) > 0, hidden.dim(1) > 0,
+            hidden.dim(1) <= 16, hidden.dim(2) == 5120,
+            hidden.dtype == .bfloat16, projection.dtype == .bfloat16,
+            base.dtype == .bfloat16, residual.dtype == .bfloat16,
+            norm.weight.dtype == .bfloat16, norm.weight.shape == [5120],
+            norm.weight.strides == [1], norm.eps == prepared.eps,
+            projection.shape == [hidden.dim(0), hidden.dim(1), 1280],
+            base.shape == [2, 2, 5120], residual.shape == hidden.shape
+        else { return nil }
+        let result = prepared.call([hidden, projection, base, residual, norm.weight])
+        return (result[0], result[1])
+    }
+    static func prepare(eps: Float) -> Prepared? {
+        guard enabled, eps.isFinite, eps > 0 else { return nil }
+        return lock.withLock {
+            if let passed = verdicts[eps] { return passed ? holders[eps] : nil }
+            let holder = Prepared(eps: eps)
+            let passed = selfCheck(holder)
+            verdicts[eps] = passed
+            if passed { holders[eps] = holder }
+            else {
+                FileHandle.standardError.write(
+                    "dflash2: conv/RMS fusion differs or is unavailable; using the op chain\n"
+                    .data(using: .utf8)!)
+            }
+            return passed ? holder : nil
+        }
+    }
+    private static func selfCheck(_ holder: Prepared) -> Bool {
+        do {
+            return try withError { error in
+                var same = MLXArray(true)
+                let base = (0.2 * MLXRandom.normal([2, 2, 5120], key: MLXRandom.key(1181)))
+                    .asType(.bfloat16)
+                let gain = (1 + 0.2 * MLXRandom.normal([5120], key: MLXRandom.key(1182)))
+                    .asType(.bfloat16)
+                for (index, (batch, rows, scale)) in
+                    [(1, 1, Float(0.25)), (1, 8, 1), (1, 16, 8), (2, 16, 1)].enumerated()
+                {
+                    let wide = (scale * MLXRandom.normal(
+                        [batch, rows, 10240], key: MLXRandom.key(UInt64(1183 + index))))
+                        .asType(.bfloat16)
+                    let h = wide[.ellipsis, ..<5120]
+                    let res = (scale * MLXRandom.normal(
+                        [batch, rows, 5120], key: MLXRandom.key(UInt64(1187 + index))))
+                        .asType(.bfloat16)
+                    let dyn = (scale * MLXRandom.normal(
+                        [batch, rows, 1280], key: MLXRandom.key(UInt64(1191 + index))))
+                        .asType(.bfloat16)
+                    let stream = dflash2GroupedConvResidualKernel(
+                        [h, dyn, base, res],
+                        template: [("T", DType.bfloat16), ("KS", 2), ("GS", 16), ("TAP", 1)],
+                        grid: (5120, rows, batch), threadGroup: (256, 1, 1),
+                        outputShapes: [h.shape], outputDTypes: [.bfloat16])[0]
+                    let normed = MLXFast.rmsNorm(stream, weight: gain, eps: holder.eps)
+                    let result = holder.call([h, dyn, base, res, gain])
+                    same = same .&& all(stream.view(dtype: .uint16) .== result[0].view(dtype: .uint16))
+                        .&& all(normed.view(dtype: .uint16) .== result[1].view(dtype: .uint16))
+                }
+                eval(same)
+                try error.check()
+                return same.item(Bool.self)
+            }
+        } catch { return false }
+    }
+}
 
 // MARK: - The decoder layer
 
@@ -1161,11 +1338,11 @@ private final class DFlash2DecoderLayer: Module {
         _attentionConv.wrappedValue = DFlash2GroupedDynamicCausalConv(
             hiddenSize: config.hiddenSize,
             kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
+            groupSize: config.dflash.convGroupSize, finishNormEps: config.rmsNormEps)
         _mlpConv.wrappedValue = DFlash2GroupedDynamicCausalConv(
             hiddenSize: config.hiddenSize,
             kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
+            groupSize: config.dflash.convGroupSize, finishNormEps: config.rmsNormEps)
         super.init()
     }
 
@@ -1175,16 +1352,24 @@ private final class DFlash2DecoderLayer: Module {
 
     func callAsFunction(
         _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
-        masks: DFlash2SlidingMaskMemo
-    ) -> MLXArray {
-        let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        let attended = attentionConv.finish(
+        masks: DFlash2SlidingMaskMemo, normalizedInput: MLXArray?, nextNorm: RMSNorm?
+    ) -> (MLXArray, MLXArray?) {
+        let (attentionInput, attentionTaps) = attentionConv.prepare(
+            normalizedInput ?? inputLayerNorm(x))
+        let (attended, mlpNormalized) = attentionConv.finishAndNormalize(
             selfAttn(
                 attentionInput, context: context, rope: rope, cache: cache,
                 masks: masks),
-            projection: attentionTaps, residual: x)
-        let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
+            projection: attentionTaps, residual: x, norm: postAttentionLayerNorm)
+        let (mlpInput, mlpTaps) = mlpConv.prepare(mlpNormalized)
+        let output = mlp(mlpInput)
+        if let nextNorm,
+            let pair = mlpConv.fusedFinishAndNormalize(
+                output, projection: mlpTaps, residual: attended, norm: nextNorm)
+        {
+            return (pair.0, pair.1)
+        }
+        return (mlpConv.finish(output, projection: mlpTaps, residual: attended), nil)
     }
 }
 
@@ -1660,8 +1845,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
 
         let submitAfter = DFlash2DraftSubmission.layers
+        var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
-            h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
+            let nextNorm = index + 1 < layers.count ? layers[index + 1].inputLayerNorm : nil
+            (h, normalizedInput) = layer(
+                h, context: context, rope: rope, cache: cache[index], masks: masks,
+                normalizedInput: normalizedInput, nextNorm: nextNorm)
             // EARLY SUBMISSION: hand the GPU the drafter layers built so far
             // while the host builds the rest and the head. Same kernels, same
             // order; only command-buffer boundaries move.
