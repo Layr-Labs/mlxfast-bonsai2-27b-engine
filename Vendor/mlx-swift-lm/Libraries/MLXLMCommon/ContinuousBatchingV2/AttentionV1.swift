@@ -406,6 +406,17 @@ enum CBv2AttentionV1 {
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
+        // A verify window's causal block (fewer rows than the prompt width),
+        // composed as SDPA's fallback composes it (`CBv2PromptCausalAttention`).
+        if keepMask == nil, metadata == nil, packet == nil, sinks == nil, softcap == nil,
+            window(of: kind) == nil, !kind.isBidirectional,
+            L < BonsaiPromptWidth.minimumRows,
+            let composed = CBv2PromptCausalAttention.attend(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, promptRows: L, verify: true)
+        {
+            return composed
+        }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
@@ -956,9 +967,24 @@ enum CBv2AttentionV1 {
 /// Nil when any condition does not hold; the caller then runs SDPA as
 /// before. Prompt width only (`BonsaiPromptWidth.minimumRows`);
 /// `BONSAI_PROMPT_CAUSAL_BLOCK=0` disables it.
+///
+/// `verify: true` serves a verify window's block (fewer rows than the prompt
+/// width: 16 queries at depth 15), where SDPA takes the same fallback (more
+/// than 8 queries at head dim 256), in three launches instead of the
+/// fallback's eight: the same composition, exact by the same argument. Its
+/// key count need not be a multiple of 4 while `softmaxKernel` serves it: that
+/// kernel pads a partial last read exactly as MLX's single-row softmax does
+/// (only `maskKernel`, past 4096 keys, needs whole four-column groups).
+/// `BONSAI_VERIFY_CAUSAL_BLOCK=0` disables it.
 enum CBv2PromptCausalAttention {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_CAUSAL_BLOCK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let verifyEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_CAUSAL_BLOCK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -1090,9 +1116,10 @@ enum CBv2PromptCausalAttention {
     private static let softmaxSingleRowLimit = 4096
 
     static func attend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
+        verify: Bool = false
     ) -> MLXArray? {
-        guard enabled, promptRows >= BonsaiPromptWidth.minimumRows,
+        guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
             scale > 0, scale.isNormal, scale.significandBitPattern == 0
@@ -1105,7 +1132,8 @@ enum CBv2PromptCausalAttention {
         let kL = keys.dim(2)
         guard L > 8, L < 1024, D == 192 || D == 256, keys.dim(0) == B, values.dim(0) == B,
             keys.dim(3) == D, values.dim(1) == kvHeads, values.dim(2) == kL,
-            kvHeads > 0, H % kvHeads == 0, kL >= L, kL % 4 == 0,
+            kvHeads > 0, H % kvHeads == 0, kL >= L,
+            kL % 4 == 0 || (verify && kL <= softmaxSingleRowLimit),
             B * H * L * kL < Int(Int32.max)
         else { return nil }
         let repeats = H / kvHeads

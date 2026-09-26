@@ -1443,11 +1443,13 @@ enum DFlash2GreedyWalk {
                 if (c < K) {
                     const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
                     const uint succ_base = (i * K + c) * R;
+                    const device float* pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+                    const device float* proj_ptr = projected + i * R;
+                    const device float* succ_ptr = next + succ_base;
                     float edge = 0.0f;
+                    #pragma clang loop unroll(full)
                     for (uint d = 0; d < R; d++) {
-                        const float predecessor = i == 0
-                            ? anchor_predecessor[d] : previous[pred_base + d];
-                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
+                        edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
                     }
                     score = unary[i * K + c] + edge;
                 }
@@ -1471,6 +1473,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
+    // Sliding masks depend only on block geometry. Keep the memo with the
+    // drafter so repeated speculative forwards can reuse the same graph
+    // (ercumentyildirim / terrapinelf `ff96d1e`).
+    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1613,7 +1619,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
 
-        let masks = DFlash2SlidingMaskMemo()
         let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)

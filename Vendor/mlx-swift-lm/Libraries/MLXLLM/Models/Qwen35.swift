@@ -2163,6 +2163,14 @@ final class Qwen35GatedDeltaNet: Module {
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
+    /// `BONSAI_PREWORK_CONV_INPUT=0` concatenates the tape's conv input with
+    /// ops (a cast and two copies) instead of writing it from the prework kernel.
+    static let preworkWritesConvInput: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_CONV_INPUT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
     /// from the exact pre-verify state and transformed recurrence inputs.
     /// Call only after every GDN layer has passed `canReplayPrefix`.
@@ -2395,10 +2403,11 @@ final class Qwen35GatedDeltaNet: Module {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
-        let convInput = concatenated([convState, qkv], axis: 1)
         // The fused prework kernel (conv, SiLU, split, q/k norms, gates, tail)
-        // serves the wide verify window too; the replay tape keeps the lazy
-        // concatenated conv input for its boundary rows.
+        // serves the wide verify window too; the replay tape keeps the
+        // concatenated conv input for its boundary rows, which the prework
+        // kernel also writes (the same FP32 values as the concatenation of the
+        // state with the widened qkv, without its cast and copy launches).
         let pre: Qwen35GDNPrework.Outputs? =
             (!exactTargetVerify && S >= 3 && convKernelSize == 4)
             ? Qwen35GDNPrework.run(
@@ -2406,8 +2415,12 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog, dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim)
+                headVDim: headVDim,
+                writeConvInput: Self.preworkWritesConvInput
+                    && qkv.dtype != .bfloat16 && convState.dtype == .float32,
+                stridedReads: Qwen35GDNPrework.verifyStridedReads)
             : nil
+        let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
@@ -3755,6 +3768,8 @@ enum Qwen35GDNPrework {
         let g: MLXArray
         let beta: MLXArray
         let tail: MLXArray
+        /// `concatenated([convState, qkv], axis: 1)` in FP32, when requested.
+        var convInput: MLXArray? = nil
     }
 
     private static let enabled: Bool = {
@@ -3876,10 +3891,137 @@ enum Qwen35GDNPrework {
         source: source,
         ensureRowContiguous: true)
 
+    /// The concatenated conv input `[cs; qkv]` in FP32 (the replay tape's
+    /// `convInput`, `[B, KS-1+S, CD]`), written by the threadgroups that
+    /// already read those columns (newjordan, submission f807f4e): row NK + t
+    /// from this row's qkv columns, rows 0..NK-1 from the state (t == 0).
+    /// `float(x)` is the concatenation's own widening, so the values are the
+    /// same. qkv and cs are read through their strides, so the block serves a
+    /// row-contiguous launch (row-major strides) and a strided one alike.
+    private static let convInputBlock = """
+        {
+          const int64_t ciq = int64_t(bb) * qkv_strides[0] + int64_t(t) * qkv_strides[1];
+          const int64_t ciqs = qkv_strides[2];
+          const size_t cirow = (size_t(bb) * size_t(Sn + NK) + size_t(NK) + size_t(t)) * size_t(CD);
+          ci[cirow + colq] = float(qkv[ciq + int64_t(colq) * ciqs]);
+          ci[cirow + colk] = float(qkv[ciq + int64_t(colk) * ciqs]);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GRP; i++) {
+            const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+            ci[cirow + colv] = float(qkv[ciq + int64_t(colv) * ciqs]);
+          }
+          if (t == 0) {
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NK; r++) {
+              const int64_t cic = int64_t(bb) * cs_strides[0] + int64_t(r) * cs_strides[1];
+              const int64_t cics = cs_strides[2];
+              const size_t cirow0 = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+              ci[cirow0 + colq] = cs[cic + int64_t(colq) * cics];
+              ci[cirow0 + colk] = cs[cic + int64_t(colk) * cics];
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < GRP; i++) {
+                const uint colv = VOFF + (h * GRP + uint(i)) * DV + c;
+                ci[cirow0 + colv] = cs[cic + int64_t(colv) * cics];
+              }
+            }
+          }
+        }
+
+        """
+
+    /// `text` with `convInputBlock` placed before its convolution-tail stores.
+    private static func withConvInput(_ text: String) -> String {
+        let anchor = "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+        precondition(
+            text.components(separatedBy: anchor).count == 2,
+            "Qwen35 GDN prework: the conv-input source no longer matches the stock kernel")
+        return text.replacingOccurrences(of: anchor, with: convInputBlock + anchor)
+    }
+
+    /// `kernel` plus the seventh output `ci` (`convInputBlock`).
+    private static let convInputKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_ci",
+        inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
+        source: withConvInput(source),
+        ensureRowContiguous: true)
+
+    /// `source` reading every input through its strides, as
+    /// `freshStridedSource` reads the fresh chunk's (newjordan's indexing,
+    /// submissions `5123445c` / f807f4e): at verify width `qkv` is a column
+    /// slice of the stacked qkv|z product and `a`/`b` of the b|a product, which
+    /// the row-contiguous launch copies first (three copy launches per GDN
+    /// layer per round). The same elements enter the same arithmetic, so the
+    /// outputs are the same values. `BONSAI_PREWORK_STRIDED_VERIFY=0` keeps
+    /// the copies.
+    private static let stridedSource: String = {
+        var text = source
+        for (target, replacement) in [
+            ("const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);",
+             "const int64_t qb = int64_t(bb) * qkv_strides[0];\n        const int64_t qs1 = qkv_strides[1];\n        const int64_t qs2 = qkv_strides[2];\n        const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];\n        const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];"),
+            ("const size_t csbase = size_t(bb) * size_t(NK) * size_t(CD);",
+             "const int64_t cb = int64_t(bb) * cs_strides[0];\n        const int64_t cs1 = cs_strides[1];\n        const int64_t cs2 = cs_strides[2];"),
+            ("? cs[csbase + size_t(r + NK) * size_t(CD) + col]",
+             "? cs[cb + int64_t(r + NK) * cs1 + int64_t(col) * cs2]"),
+            ("float(qkv[rowbase + size_t(r) * size_t(CD) + col])",
+             "float(qkv[qb + int64_t(r) * qs1 + int64_t(col) * qs2])"),
+            ("w[size_t(col) * size_t(KS) + size_t(j)]",
+             "w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]]"),
+            ("(xq * invq) * wq[c]", "(xq * invq) * wq[int64_t(c) * wq_strides[0]]"),
+            ("(xk * invk) * wk[c]", "(xk * invk) * wk[int64_t(c) * wk_strides[0]]"),
+            ("const float av = a[grow] + dtb[hv];",
+             "const float av = a[ab + int64_t(hv) * a_strides[2]] + dtb[int64_t(hv) * dtb_strides[0]];"),
+            ("metal::precise::exp(alog[hv])",
+             "metal::precise::exp(alog[int64_t(hv) * alog_strides[0]])"),
+            ("const float bv = b[grow];",
+             "const float bv = b[bbase + int64_t(hv) * b_strides[2]];"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colq])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colq) * qs2])"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colk])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colk) * qs2])"),
+            ("float(qkv[rowbase + size_t(t) * size_t(CD) + colv])",
+             "float(qkv[qb + int64_t(t) * qs1 + int64_t(colv) * qs2])"),
+            ("const size_t crow = csbase + size_t(src + NK) * size_t(CD);",
+             "const int64_t crow = cb + int64_t(src + NK) * cs1;"),
+            ("cs[crow + colq]", "cs[crow + int64_t(colq) * cs2]"),
+            ("cs[crow + colk]", "cs[crow + int64_t(colk) * cs2]"),
+            ("cs[crow + colv]", "cs[crow + int64_t(colv) * cs2]"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "Qwen35 GDN prework: the strided source no longer matches the stock kernel")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        precondition(!text.contains("rowbase") && !text.contains("csbase"))
+        return text
+    }()
+
+    private static let stridedKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_strided",
+        inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: stridedSource,
+        ensureRowContiguous: false)
+
+    private static let stridedConvInputKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_ci_strided",
+        inputNames: ["qkv", "cs", "w", "a", "b", "alog", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
+        source: withConvInput(stridedSource),
+        ensureRowContiguous: false)
+
+    /// The verify window's launch reads its inputs in place (`stridedSource`).
+    static let verifyStridedReads: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_STRIDED_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static func run(
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
-        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
+        writeConvInput: Bool = false, stridedReads: Bool = false
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3 else { return nil }
         let B = qkv.dim(0)
@@ -3900,7 +4042,22 @@ enum Qwen35GDNPrework {
         else { return nil }
         let alog = aLog.dtype == .float32 ? aLog : aLog.asType(.float32)
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
-        let outputs = kernel(
+        // One shape and dtype per output name: six, or seven with `ci`.
+        var outputShapes: [[Int]] = [
+            [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+            [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+            [B, KS - 1, CD],
+        ]
+        var outputDTypes: [DType] = [.float32, .float32, .float32, .float32, .float32, .float32]
+        if writeConvInput {
+            outputShapes.append([B, KS - 1 + S, CD])
+            outputDTypes.append(.float32)
+        }
+        let launch =
+            stridedReads
+            ? (writeConvInput ? stridedConvInputKernel : stridedKernel)
+            : (writeConvInput ? convInputKernel : kernel)
+        let outputs = launch(
             [qkv, convState, convWeight, a, b, alog, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
             template: [
@@ -3908,15 +4065,11 @@ enum Qwen35GDNPrework {
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
             ],
             grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
-            outputShapes: [
-                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
-                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
-                [B, KS - 1, CD],
-            ],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+            outputShapes: outputShapes,
+            outputDTypes: outputDTypes)
         return Outputs(
             q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
-            tail: outputs[5])
+            tail: outputs[5], convInput: writeConvInput ? outputs[6] : nil)
     }
 
     /// `kernel` for a new request's first chunk, whose conv state is known to
