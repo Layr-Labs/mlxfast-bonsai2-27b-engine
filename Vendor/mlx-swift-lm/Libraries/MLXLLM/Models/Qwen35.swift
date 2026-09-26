@@ -9166,6 +9166,8 @@ enum Qwen35TensorPackedMatmul {
         };
         stage(0, 0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Pair iterations so the alternating shared-buffer index can specialize.
+        #pragma clang loop unroll_count(2)
         for (int g = 0; g < Kg; g++) {
           const int cur = g & 1;
           if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
