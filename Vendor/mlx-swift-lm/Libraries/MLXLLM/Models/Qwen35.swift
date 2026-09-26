@@ -294,7 +294,12 @@ enum Qwen35TrunkSubmission {
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
         // Off by default here (the ranked box measured verify slices as a
         // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // pochita0's `11cb04ab` (box-measured +0.16% on its base): the verify's
+        // first 8 layers submitted while the host builds the rest. Promoted,
+        // then dropped by the next grafts; restored here.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [8]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -9674,10 +9679,31 @@ extension Qwen35TextModel: DFlash2TapTarget {
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {
-            return head.forwardUnwidened(hidden)
+            // FREQUENCY-RANKED DRAFT VOCABULARY. Byte-level BPE ids follow the
+            // merge order, so low ids are the frequent tokens; the tail of
+            // this 248,320-entry vocabulary is mostly rare multilingual
+            // pieces. The drafter scores only the leading rows (the same rows
+            // of the same head, computed the same way), which cuts its head
+            // read and its top-k scan by about 60%. A token past the prefix is
+            // never proposed, so that draft position falls to the target's
+            // own token, as any wrong draft does: the target decides every
+            // emitted token. On the public captures 99.9% of the expected
+            // tokens sit below id 100,000. `MLXFAST_DFLASH_VOCAB_ROWS` sets
+            // the prefix; 0 restores the full head.
+            let reading =
+                Self.drafterVocabularyRows > 0
+                ? (head.leadingRows(Self.drafterVocabularyRows) ?? head) : head
+            return reading.forwardUnwidened(hidden)
         }
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
+
+    /// 100,352 = 98 x 1024: the leading rows the drafter scores (see above).
+    static let drafterVocabularyRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_VOCAB_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(0, raw.flatMap { Int($0) } ?? 100_352)
+    }()
 }
 
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {

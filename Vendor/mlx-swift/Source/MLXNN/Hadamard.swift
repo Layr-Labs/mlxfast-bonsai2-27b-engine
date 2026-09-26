@@ -682,6 +682,37 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     private let matrixRoute = HadamardMatrixRouteOperands()
 
+    /// The leading-rows module of `leadingRows(_:)`, held off the module tree
+    /// (a plain class, as `matrixRoute` is), so it is never loaded, updated or
+    /// counted as a parameter of this module.
+    private final class LeadingRowsSlot {
+        var rows = 0
+        var module: HadamardQuantizedLinear?
+    }
+    private let leadingRowsSlot = LeadingRowsSlot()
+
+    /// The first `rows` output rows of this projection as a module of their
+    /// own: views of the same packed rows, scales and offsets under the same
+    /// transform, so every row it computes is this module's row, computed the
+    /// same way. Built once per row count and cached. Nil when it does not
+    /// apply (a GDN layout, a bias, or `rows` not inside the output width).
+    ///
+    /// A block drafter that reads the target's vocabulary head uses it to
+    /// score a frequency-ranked prefix of the vocabulary. This module itself,
+    /// and every target read through it, is unchanged.
+    public func leadingRows(_ rows: Int) -> HadamardQuantizedLinear? {
+        guard rows > 0, rows < weight.dim(0), gdnLayout == nil, bias == nil else { return nil }
+        if leadingRowsSlot.rows == rows, let module = leadingRowsSlot.module { return module }
+        guard
+            let module = try? HadamardQuantizedLinear(
+                weight: weight[0 ..< rows], scales: scales[0 ..< rows], biases: biases?[0 ..< rows],
+                groupSize: groupSize, bits: bits, transform: transform)
+        else { return nil }
+        leadingRowsSlot.rows = rows
+        leadingRowsSlot.module = module
+        return module
+    }
+
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
