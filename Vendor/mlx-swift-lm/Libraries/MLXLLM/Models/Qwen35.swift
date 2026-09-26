@@ -547,7 +547,7 @@ func qwen35GatedDelta(
 /// recurrence contractive). `DARKBLOOM_QWEN35_GDN_KERNEL=v1` keeps the stock
 /// kernel; the masked (chain-verify) path always does.
 enum Qwen35GatedDeltaV3 {
-    private static let enabled: Bool = {
+    fileprivate static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_GDN_KERNEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
@@ -563,7 +563,7 @@ enum Qwen35GatedDeltaV3 {
         return value == "4" ? 4 : 2
     }()
 
-    private static let source = """
+    fileprivate static let source = """
         constexpr int R = 16;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
@@ -775,6 +775,571 @@ enum Qwen35GatedDeltaV3 {
             outputShapes: [[B, T, Hv, Dv], stateShape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
+    }
+}
+
+/// The strict-prefix commit replay of a verify round, batched across GDN
+/// layers (`MLXFAST_GDN_REPLAY_BATCH=0` keeps one replay per layer).
+///
+/// A partially accepted verify commits each GDN layer by replaying the
+/// accepted prefix from the pre-verify state (`replayedPrefixState`): per
+/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3` with
+/// `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows. That is
+/// three small dependent launches per layer, 144 per round on the 48 GDN
+/// layers, each built, encoded and dispatched on its own; the replay's bytes
+/// (each layer's state read once and written once) are the same either way,
+/// so what batching removes is that per-launch cost. Here one launch serves
+/// `layersPerLaunch` layers: every threadgroup of the stock V3 grid gains a
+/// layer index (the V3 kernel's batch index, the batch now being the
+/// layers), computes its step's gates in registers with MLX's own functors in
+/// the gate kernel's order, runs the V3 recurrence text unchanged (derived
+/// from `Qwen35GatedDeltaV3.source`), and copies its share of the layer's
+/// boundary conv rows. Layers never mix, and each layer's values go through
+/// the same operations in the same order as its own replay (the gates are
+/// the same FP32 expression, held in a register instead of stored and
+/// reloaded), so every committed bit is the per-layer replay's.
+///
+/// Metal binds at most 31 buffers per launch. A layer binds six (k, v, a, b,
+/// the pre-verify state and the conv input, all read in place); a launch adds
+/// six (the group's stacked A_log and dt_bias, the a/b row strides, the row
+/// count and the two pooled outputs): 6 * 4 + 6 = 30. The committed state and
+/// conv rows of the group's layers are views into those pooled outputs.
+///
+/// At model construction a self-test on the running GPU replays synthetic
+/// tapes (four layers, every committed row count of a 16-row window, extreme
+/// gate inputs included) both ways and compares every bit; a mismatch or any
+/// MLX error keeps the per-layer replay. A group that does not fit the
+/// kernel's shape, dtype and stride assumptions replays per layer too.
+enum Qwen35GDNReplayBatch {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_REPLAY_BATCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let layersPerLaunch = 4
+
+    /// The verify window the self-test replays: one anchor plus depth 15.
+    static let selfTestRows = 16
+
+    // MARK: Kernel
+
+    /// MLX's functors (`binary_ops.h` LogAddExp, `unary_ops.h` Sigmoid) as
+    /// `Qwen35FusedElementwise.gatedDeltaGates` evaluates them in FP32.
+    private static let header = """
+        inline float qwen35_replay_logaddexp(float x, float y) {
+          if (metal::isnan(x) || metal::isnan(y)) {
+            return metal::numeric_limits<float>::quiet_NaN();
+          }
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(x, y);
+          float minval = metal::min(x, y);
+          return (minval == -inf || maxval == inf)
+              ? maxval
+              : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        inline float qwen35_replay_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+
+        """
+
+    private static func perLayer(_ name: String) -> [String] {
+        (0 ..< layersPerLaunch).map { "\(name)\($0)" }
+    }
+
+    private static let layerInputs = ["k", "v", "a", "b", "s", "c"]
+
+    static let inputNames: [String] =
+        (0 ..< layersPerLaunch).flatMap { j in layerInputs.map { "\($0)\(j)" } }
+        + ["alog", "dtb", "ab_rows", "T"]
+
+    /// `Qwen35GatedDeltaV3.source` with the layer index taking the batch
+    /// index's place: the pointers come from the layer's own buffers, the
+    /// step's `g`/`beta` are formed in registers (the gate kernel's chain:
+    /// `Exp`, `Negative`, `Add`, `LogAddExp`, `Multiply`, `Exp`; `Sigmoid`),
+    /// and the layer's boundary conv rows are copied before the recurrence.
+    /// The recurrence itself is the stock text. Nil (batching off) if that
+    /// text no longer has the anchors this derivation replaces.
+    static let source: String? = {
+        func select(_ name: String) -> String {
+            let names = perLayer(name)
+            var expr = names[names.count - 1]
+            for j in stride(from: names.count - 2, through: 0, by: -1) {
+                expr = "b_idx == \(j) ? \(names[j]) : (\(expr))"
+            }
+            return expr
+        }
+        let prelude = """
+                const device float* k_ = (\(select("k"))) + hk_idx * Dk + dk0;
+                const device float* v_ = (\(select("v"))) + hv_idx * Dv + dvbase;
+                const device float* a_ = (\(select("a"))) + hv_idx;
+                const device float* b_ = (\(select("b"))) + hv_idx;
+                const device float* s_ = (\(select("s")));
+                const int a_rs = ab_rows[2 * b_idx];
+                const int b_rs = ab_rows[2 * b_idx + 1];
+                const float g_nexp = -metal::precise::exp(alog[n]);
+                const float g_dtb = dtb[n];
+                const device float* q_ = k_;
+                device float* y_ = state_out;
+                {
+                  // This layer's boundary conv rows T .. T + NK - 1, spread
+                  // over its threads.
+                  constexpr uint LANES = 128 * (Dv / DVPT) * Hv;
+                  const uint lin = (hv_idx * (Dv / DVPT) + threadgroup_position_in_grid.y) * 128
+                      + sg * 32 + lane;
+                  const device float* csrc = (\(select("c"))) + size_t(T) * size_t(CD);
+                  device float* cdst = conv_out + size_t(b_idx) * size_t(NK * CD);
+                  for (uint e = lin; e < uint(NK * CD); e += LANES) {
+                    cdst[e] = csrc[e];
+                  }
+                }
+
+        """
+        var text = Qwen35GatedDeltaV3.source
+        // Single-line anchors, each unique in the stock text.
+        let replacements: [(String, String)] = [
+            ("const device float* q_ = q;", prelude),
+            ("const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;", ""),
+            ("const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;", ""),
+            ("const device float* g_ = g + b_idx * T * Hv + hv_idx;", ""),
+            ("const device float* beta_ = beta + b_idx * T * Hv + hv_idx;", ""),
+            ("device float* y_ = y;", ""),
+            ("y[0] = 0.f;", "(void)0;"),
+            (
+                "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];",
+                "state[d][i] = s_[(hv_idx * Dv + dvbase + d) * Dk + dk0 + i];"
+            ),
+            (
+                "const float gt = g_[0];",
+                "const float g_sp = qwen35_replay_logaddexp(a_[0] + g_dtb, 0.0f);\n"
+                    + "const float gt = metal::precise::exp(g_nexp * g_sp);"
+            ),
+            ("const float bt = beta_[0];", "const float bt = qwen35_replay_sigmoid(b_[0]);"),
+            (
+                "k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;",
+                "k_ += Hk * Dk; v_ += Hv * Dv; a_ += a_rs; b_ += b_rs;"
+            ),
+        ]
+        for (target, replacement) in replacements {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        guard !text.contains("state_in"), !text.contains("g_["), !text.contains("beta"),
+            !text.contains(" y["), !text.contains("= y;")
+        else { return nil }
+        return text
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = source.map {
+        MLXFast.metalKernel(
+            name: "qwen35_gdn_replay_batch",
+            inputNames: inputNames,
+            outputNames: ["state_out", "conv_out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: false)
+    }
+
+    // MARK: Group launch
+
+    /// One layer's operands: its replay tape and its gate parameters.
+    struct Operand {
+        let tape: ArraysCache.PrefixReplayTape
+        let aLog: MLXArray
+        let dtBias: MLXArray
+    }
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, nk: Int, dvpl: Int
+    }
+
+    /// Row-major strides of `array`, ignoring its leading (size-1) axis.
+    @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
+    private static func rowContiguousAfterLeading(_ array: MLXArray) -> Bool {
+        let shape = array.shape
+        let strides = array.strides
+        guard shape.count == strides.count, shape.count >= 2 else { return false }
+        var expected = 1
+        for axis in stride(from: shape.count - 1, through: 1, by: -1) {
+            if shape[axis] != 1, strides[axis] != expected { return false }
+            expected *= shape[axis]
+        }
+        return true
+    }
+
+    /// The row stride of a `[1, S, Hv]` gate input read in place, or nil
+    /// when its last axis is not unit-stride.
+    @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
+    private static func gateRowStride(_ array: MLXArray) -> Int32? {
+        let shape = array.shape
+        let strides = array.strides
+        guard shape.count == 3, strides.count == 3, shape[2] == 1 || strides[2] == 1,
+            strides[1] >= 0, strides[1] <= Int(Int32.max)
+        else { return nil }
+        return Int32(strides[1])
+    }
+
+    /// The committed (conv, ssm) of each operand after `keep` rows, from one
+    /// launch; nil when the group does not fit the kernel (the caller then
+    /// replays each layer on its own). `alog`/`dtb` are the operands' gate
+    /// parameters stacked in operand order (`[G * Hv]`, FP32).
+    static func launch(
+        _ operands: [Operand], keep: Int, alog: MLXArray, dtb: MLXArray,
+        verifiedOnly: Bool = true
+    ) -> [CBv2RecurrentLayerState]? {
+        guard operands.count == layersPerLaunch, Qwen35GatedDeltaV3.enabled,
+            let kernel, let first = operands.first
+        else { return nil }
+        let tape0 = first.tape
+        guard tape0.q.ndim == 4, tape0.k.ndim == 4, tape0.v.ndim == 4, tape0.convInput.ndim == 3
+        else { return nil }
+        let S = tape0.rowCount
+        let Hk = tape0.k.dim(2)
+        let Dk = tape0.k.dim(3)
+        let Hv = tape0.v.dim(2)
+        let Dv = tape0.v.dim(3)
+        let CD = tape0.convInput.dim(2)
+        let NK = tape0.convStateRows
+        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let geometry = Geometry(hk: Hk, dk: Dk, hv: Hv, dv: Dv, cd: CD, nk: NK, dvpl: dvpl)
+        if verifiedOnly, !isVerified(geometry) { return nil }
+        // The per-layer replay's own routing: `qwen35GatedDelta` takes the
+        // chunked kernels from `minRows` rows and V3 only on these shapes.
+        guard keep >= 1, keep < S,
+            !(Qwen35GatedDeltaChunked.enabled && keep >= Qwen35GatedDeltaChunked.minRows
+                && keep >= Qwen35GatedDeltaChunked.chunk),
+            Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, NK >= 1,
+            alog.dtype == .float32, dtb.dtype == .float32,
+            alog.shape == [layersPerLaunch * Hv], dtb.shape == [layersPerLaunch * Hv]
+        else { return nil }
+        var inputs: [MLXArray] = []
+        inputs.reserveCapacity(inputNames.count)
+        var rowStrides: [Int32] = []
+        for operand in operands {
+            let tape = operand.tape
+            guard let ssmPre = tape.ssmPre, tape.mask == nil, tape.rowCount == S,
+                tape.convStateRows == NK,
+                tape.k.shape == [1, S, Hk, Dk], tape.q.shape == [1, S, Hk, Dk],
+                tape.v.shape == [1, S, Hv, Dv],
+                tape.a.shape == [1, S, Hv], tape.b.shape == [1, S, Hv],
+                ssmPre.shape == [1, Hv, Dv, Dk],
+                tape.convInput.shape == [1, NK + S, CD],
+                tape.k.dtype == .float32, tape.q.dtype == .float32, tape.v.dtype == .float32,
+                tape.a.dtype == .float32, tape.b.dtype == .float32,
+                ssmPre.dtype == .float32, tape.convInput.dtype == .float32,
+                operand.aLog.dtype == .float32, operand.dtBias.dtype == .float32,
+                operand.aLog.shape == [Hv], operand.dtBias.shape == [Hv]
+            else { return nil }
+            inputs += [tape.k, tape.v, tape.a, tape.b, ssmPre, tape.convInput]
+        }
+        // The operands are read in place, so their strides must be final: a
+        // verify's tape is evaluated before its round finalizes (a no-op
+        // wait here); an unevaluated tape is waited for, never misread.
+        eval(inputs)
+        for operand in operands {
+            let tape = operand.tape
+            guard rowContiguousAfterLeading(tape.k), rowContiguousAfterLeading(tape.v),
+                rowContiguousAfterLeading(tape.ssmPre!),
+                rowContiguousAfterLeading(tape.convInput),
+                let aRows = gateRowStride(tape.a), let bRows = gateRowStride(tape.b)
+            else { return nil }
+            rowStrides += [aRows, bRows]
+        }
+        inputs += [alog, dtb, MLXArray(rowStrides), MLXArray(Int32(keep))]
+        let G = layersPerLaunch
+        let outputs = kernel(
+            inputs,
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", false),
+                ("DVPL", dvpl), ("CD", CD), ("NK", NK),
+            ],
+            grid: (128, Dv / (16 * dvpl), G * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[G, Hv, Dv, Dk], [G, NK, CD]],
+            outputDTypes: [.float32, .float32])
+        return (0 ..< G).map { j in
+            CBv2RecurrentLayerState(
+                conv: outputs[1][j ..< (j + 1)], ssm: outputs[0][j ..< (j + 1)])
+        }
+    }
+
+    // MARK: Gate parameter stacks
+
+    private final class StackCache {
+        var sources: [MLXArray] = []
+        var alog: MLXArray?
+        var dtb: MLXArray?
+    }
+
+    private static let stackLock = NSLock()
+    nonisolated(unsafe) private static var stacks: [[ObjectIdentifier]: StackCache] = [:]
+
+    /// The group's A_log and dt_bias stacked in layer order, concatenated once
+    /// and rebuilt only when a layer's parameter array changes.
+    private static func stackedGates(
+        _ layers: [Qwen35GatedDeltaNet]
+    ) -> (MLXArray, MLXArray) {
+        let key = layers.map { ObjectIdentifier($0) }
+        let sources = layers.flatMap { [$0.aLog, $0.dtBias] }
+        return stackLock.withLock {
+            let cache = stacks[key] ?? StackCache()
+            stacks[key] = cache
+            if let alog = cache.alog, let dtb = cache.dtb, cache.sources.count == sources.count,
+                zip(cache.sources, sources).allSatisfy({ $0 === $1 })
+            {
+                return (alog, dtb)
+            }
+            let alog = concatenated(layers.map { $0.aLog }, axis: 0)
+            let dtb = concatenated(layers.map { $0.dtBias }, axis: 0)
+            cache.sources = sources
+            cache.alog = alog
+            cache.dtb = dtb
+            return (alog, dtb)
+        }
+    }
+
+    // MARK: Rounds
+
+    /// The strict-prefix replays one verify forward staged for one request,
+    /// in layer order. The first replay the commit asks for runs the whole
+    /// round's launches; each layer then takes its own states.
+    final class Round {
+        struct Entry {
+            let layer: Qwen35GatedDeltaNet
+            let tape: ArraysCache.PrefixReplayTape
+        }
+
+        weak var owner: AnyObject?
+        private let lock = NSLock()
+        private var entries: [Entry] = []
+        private(set) var sealed = false
+        private var keep = 0
+        private var results: [CBv2RecurrentLayerState?] = []
+
+        init(owner: AnyObject) { self.owner = owner }
+
+        fileprivate func append(_ entry: Entry) -> Int? {
+            lock.withLock {
+                guard !sealed else { return nil }
+                entries.append(entry)
+                return entries.count - 1
+            }
+        }
+
+        /// Entry `index`'s committed state after `keep` rows, or nil when the
+        /// caller must replay that layer itself.
+        func state(index: Int, keep: Int) -> CBv2RecurrentLayerState? {
+            lock.withLock {
+                if !sealed {
+                    sealed = true
+                    self.keep = keep
+                    results = Qwen35GDNReplayBatch.replay(entries, keep: keep)
+                    entries = []
+                }
+                guard self.keep == keep, index < results.count, let state = results[index]
+                else { return nil }
+                results[index] = nil
+                return state
+            }
+        }
+    }
+
+    struct Slot {
+        let round: Round
+        let index: Int
+
+        func state(keep: Int) -> CBv2RecurrentLayerState? {
+            round.state(index: index, keep: keep)
+        }
+    }
+
+    private final class WeakRound {
+        weak var round: Round?
+        init(_ round: Round) { self.round = round }
+    }
+
+    private static let roundLock = NSLock()
+    nonisolated(unsafe) private static var rounds: [WeakRound] = []
+
+    /// Stage `tape` as `layer`'s entry in the round of `owner` (the request's
+    /// recurrent evaluation for this forward). Nil when batching is off or
+    /// its self-test did not pass on this geometry.
+    static func register(
+        owner: AnyObject, layer: Qwen35GatedDeltaNet, tape: ArraysCache.PrefixReplayTape
+    ) -> Slot? {
+        guard enabled, tape.convInput.ndim == 3, tape.v.ndim == 4, tape.k.ndim == 4,
+            isVerified(
+                Geometry(
+                    hk: tape.k.dim(2), dk: tape.k.dim(3), hv: tape.v.dim(2), dv: tape.v.dim(3),
+                    cd: tape.convInput.dim(2), nk: tape.convStateRows,
+                    dvpl: Qwen35GatedDeltaV3.rowsPerLane))
+        else { return nil }
+        return roundLock.withLock {
+            rounds.removeAll { $0.round == nil }
+            let round: Round
+            if let open = rounds.lazy.compactMap({ $0.round }).first(where: {
+                $0.owner === owner && !$0.sealed
+            }) {
+                round = open
+            } else {
+                round = Round(owner: owner)
+                rounds.append(WeakRound(round))
+            }
+            guard let index = round.append(Round.Entry(layer: layer, tape: tape)) else {
+                return nil
+            }
+            return Slot(round: round, index: index)
+        }
+    }
+
+    /// The round's committed states: consecutive groups of `layersPerLaunch`
+    /// entries in one launch each; nil for an entry replayed per layer.
+    private static func replay(_ entries: [Round.Entry], keep: Int) -> [CBv2RecurrentLayerState?] {
+        var results = [CBv2RecurrentLayerState?](repeating: nil, count: entries.count)
+        var start = 0
+        while start + layersPerLaunch <= entries.count {
+            let group = Array(entries[start ..< (start + layersPerLaunch)])
+            if group.allSatisfy({ $0.layer.canReplayPrefix(tape: $0.tape, committedRows: keep) }) {
+                let (alog, dtb) = stackedGates(group.map(\.layer))
+                let operands = group.map {
+                    Operand(tape: $0.tape, aLog: $0.layer.aLog, dtBias: $0.layer.dtBias)
+                }
+                if let states = launch(operands, keep: keep, alog: alog, dtb: dtb) {
+                    for (j, state) in states.enumerated() { results[start + j] = state }
+                }
+            }
+            start += layersPerLaunch
+        }
+        return results
+    }
+
+    // MARK: Self-test
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    private static let verdictLock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static func isVerified(_ geometry: Geometry) -> Bool {
+        verdictLock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Run the bitwise self-test for `layer`'s geometry once per process, at
+    /// model construction (before any timed forward), compiling the batched
+    /// kernel and the per-layer replay's kernels on the way.
+    static func prepare(layer: Qwen35GatedDeltaNet) {
+        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
+        let geometry = Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            cd: layer.convDim, nk: layer.convKernelSize - 1,
+            dvpl: Qwen35GatedDeltaV3.rowsPerLane)
+        verdictLock.lock()
+        defer { verdictLock.unlock() }
+        guard verdicts[geometry] == nil else { return }
+        let (passed, detail) = selfTest(layer: layer)
+        verdicts[geometry] = passed
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN replay batch: self-test " + (passed ? "passed" : "FAILED") + " ("
+                + detail + ")" + (passed ? "; batched\n" : "; per-layer replay kept\n"))
+                .data(using: .utf8)!)
+    }
+
+    /// Four layers' synthetic tapes shaped as a verify window stages them
+    /// (`a`/`b` as column slices of one `[1, S, 2 Hv]` product, conv input
+    /// `[1, NK + S, CD]`), each with its own A_log and dt_bias, replayed at
+    /// every strict prefix both ways. The gate inputs span softplus's and
+    /// sigmoid's saturation and include +-inf; states and values have a wide
+    /// magnitude spread. Outputs are compared as unsigned integers.
+    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+        let G = layersPerLaunch
+        let S = selfTestRows
+        let Hk = layer.numKHeads
+        let Dk = layer.headKDim
+        let Hv = layer.numVHeads
+        let Dv = layer.headVDim
+        let CD = layer.convDim
+        let NK = layer.convKernelSize - 1
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6731_7270), into: 10 * G)
+        var operands: [Operand] = []
+        for j in 0 ..< G {
+            func key(_ i: Int) -> MLXArray { keys[10 * j + i] }
+            let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(0)))
+            let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(1)) * spread * 0.05
+            var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(2)) * 4
+            // Saturating and infinite gate inputs in the first rows.
+            let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+            let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+            let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
+                .reshaped([1, S, 1])
+            gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
+            let q = MLXRandom.normal([1, S, Hk, Dk], key: key(3)) * 0.09
+            let k = MLXRandom.normal([1, S, Hk, Dk], key: key(4)) * 0.09
+            let v = MLXRandom.normal([1, S, Hv, Dv], key: key(5))
+                * exp(MLXRandom.normal([1, S, Hv, Dv], key: key(6)))
+            let convInput = MLXRandom.normal([1, NK + S, CD], key: key(7))
+            let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(8)))
+            let dtBias = MLXRandom.normal([Hv], key: key(9))
+            eval(ssmPre, gatePair, q, k, v, convInput, aLog, dtBias)
+            let b = gatePair[0..., 0..., ..<Hv]
+            let a = gatePair[0..., 0..., Hv...]
+            eval(a, b)
+            let tape = ArraysCache.PrefixReplayTape(
+                convInput: convInput, q: q, k: k, v: v, a: a, b: b, ssmPre: ssmPre,
+                mask: nil, rowCount: S, convStateRows: NK)
+            operands.append(Operand(tape: tape, aLog: aLog, dtBias: dtBias))
+        }
+        let alog = concatenated(operands.map(\.aLog), axis: 0)
+        let dtb = concatenated(operands.map(\.dtBias), axis: 0)
+        var cases = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for keep in 1 ..< S {
+                    guard
+                        let batched = launch(
+                            operands, keep: keep, alog: alog, dtb: dtb, verifiedOnly: false)
+                    else { throw SelfTestFailure.message("no batched launch at \(keep) rows") }
+                    var differ: [MLXArray] = []
+                    for (j, operand) in operands.enumerated() {
+                        guard layer.canReplayPrefix(tape: operand.tape, committedRows: keep)
+                        else { throw SelfTestFailure.message("tape rejected at \(keep) rows") }
+                        let reference = layer.replayedPrefixState(
+                            tape: operand.tape, committedRows: keep,
+                            aLog: operand.aLog, dtBias: operand.dtBias)
+                        for (a, b) in [
+                            (reference.ssm, batched[j].ssm), (reference.conv, batched[j].conv),
+                        ] {
+                            guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
+                                a.dtype == .float32
+                            else {
+                                throw SelfTestFailure.message("output mismatch at \(keep) rows")
+                            }
+                            differ.append(
+                                (a.view(dtype: .uint32) .!= b.view(dtype: .uint32))
+                                    .asType(.int32).sum())
+                            values += a.size
+                        }
+                        cases += 1
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let passed = mismatches == 0 && cases == G * (S - 1)
+        return (
+            passed,
+            "\(cases) layer replays, \(values) values, \(mismatches) mismatches, "
+                + "\(G) layers per launch")
     }
 }
 
@@ -1657,6 +2222,7 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GatedDeltaChunked.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35GDNReplayBatch.prepare(layer: self)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -2147,7 +2713,7 @@ final class Qwen35GatedDeltaNet: Module {
         return (recurrence.0, newConvState, recurrence.1, tape)
     }
 
-    private func canReplayPrefix(
+    fileprivate func canReplayPrefix(
         tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> Bool {
         guard committedRows > 0,
@@ -2191,8 +2757,11 @@ final class Qwen35GatedDeltaNet: Module {
         return canReplayPrefix(tape: tape, committedRows: committedRows)
     }
 
-    private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    /// `aLog`/`dtBias` stand in for the layer's own parameters in
+    /// `Qwen35GDNReplayBatch`'s self-test only.
+    fileprivate func replayedPrefixState(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int,
+        aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
@@ -2204,8 +2773,8 @@ final class Qwen35GatedDeltaNet: Module {
             v: tape.v[0..., rows, 0...],
             a: tape.a[0..., rows, 0...],
             b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
+            aLog: aLogOverride ?? aLog,
+            dtBias: dtBiasOverride ?? dtBias,
             state: tape.ssmPre,
             mask: tape.mask.map { $0[0..., rows] },
             outputNeeded: false
@@ -2589,6 +3158,10 @@ final class Qwen35GatedDeltaNet: Module {
                     }
                     return total
                 }
+                // A strict-prefix commit replays this layer inside its round's
+                // batched launch when batching is on and verified.
+                let replaySlot = Qwen35GDNReplayBatch.register(
+                    owner: evaluation, layer: self, tape: tape)
                 let materializedBytes = checkedByteCount(roots + [finalSSM])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
                 let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
@@ -2611,8 +3184,9 @@ final class Qwen35GatedDeltaNet: Module {
                                 conv: detachedConv, ssm: finalSSM)
                         },
                         replay: { [unowned self] keepPositions in
-                            self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                            replaySlot?.state(keep: keepPositions)
+                                ?? self.replayedPrefixState(
+                                    tape: tape, committedRows: keepPositions)
                         })
                 } catch {
                     preconditionFailure(
