@@ -2399,8 +2399,98 @@ final class Qwen35DenseSiblingStack {
             weight = concatenated([b.weight, a.weight], axis: 0)
             boundary = b.weight.dim(0)
         }
-        let y = matmul(x, weight!.T)
+        let y = Qwen35SmallNMatmul.apply(x, weight!) ?? matmul(x, weight!.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
+
+/// `x @ w.T` for a verify-width FP32 `x` (at most 16 rows) and a narrow FP32
+/// `w` `[N, K]` (N a multiple of 32, K of 128): the GDN layers' stacked
+/// `in_proj_b | in_proj_a` (N = 96, K = 5120).
+///
+/// MLX's GEMM gives this shape three threadgroups (N / 32 by one row tile)
+/// that each walk all of K, so on the verify window it costs about as much
+/// as a packed projection twenty times its size; it also runs FP32 through
+/// the tensor unit's reduced-precision path (max error ~7e-4 of the output
+/// range against a CPU FP32 product on random operands). Here K is split
+/// into 128-wide chunks, one threadgroup per (32 columns, chunk), each thread
+/// accumulating four rows of one column in FP32, and a second kernel adds the
+/// chunks in chunk order. The result is the FP32 product (max error ~4e-4
+/// absolute on outputs of magnitude ~260, i.e. rounding).
+/// `DARKBLOOM_QWEN35_SPLITK_BA=0` keeps MLX's GEMM.
+enum Qwen35SmallNMatmul {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SPLITK_BA"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let chunk = 128
+
+    // grid (N / 32 * 128, K / KC, 1), threadgroup (128, 1, 1). Thread t:
+    // column nb + (t & 31), rows 4 * (t >> 5) .. + 3 (rows >= M skipped).
+    private static let partialSource = """
+        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int nb = int(threadgroup_position_in_grid.x) * 32;
+        const int kc = int(threadgroup_position_in_grid.y);
+        const uint t = thread_position_in_threadgroup.x;
+        const int c = int(t & 31);
+        const int r0 = int(t >> 5) * 4;
+        const int k0 = kc * KC;
+        const device float* wr = w + (size_t)(nb + c) * K + k0;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < KC; k += 4) {
+          const float4 wv = *(const device float4*)(wr + k);
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            const int m = r0 + r;
+            if (m < M) {
+              const float4 xv = *(const device float4*)(x + (size_t)m * K + k0 + k);
+              acc[r] += dot(xv, wv);
+            }
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const int m = r0 + r;
+          if (m < M) { part[((size_t)kc * M + m) * N + nb + c] = acc[r]; }
+        }
+        """
+
+    private static let reduceSource = """
+        const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
+        const uint i = thread_position_in_grid.x;
+        if (i >= uint(M * N)) { return; }
+        float v = 0.0f;
+        for (int s = 0; s < KS; s++) { v += part[(size_t)s * M * N + i]; }
+        out[i] = v;
+        """
+
+    private static let partialKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
+        source: partialSource, ensureRowContiguous: true)
+    private static let reduceKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
+        source: reduceSource, ensureRowContiguous: true)
+
+    static func apply(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
+        guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
+        let k = x.dim(-1)
+        let n = w.dim(0)
+        let rows = x.size / k
+        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else {
+            return nil
+        }
+        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let part = partialKernel(
+            [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
+            grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        let y = reduceKernel(
+            [part, dims], template: [("KC", chunk)],
+            grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+        return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
 }
 
@@ -8129,7 +8219,12 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int cc = 0; cc < CPL; cc++) {
             const int sc = int(lane) + 32 * cc;
-            const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
+            // TILED: the tiled copy (`narrowTiledWeight`) holds each 32-column
+            // block's 8 words per column of a group contiguously, so the 32
+            // lanes read 1 KB in one run instead of 32 B from each of 32 rows.
+            const device uint32_t* wrow = TILED
+                ? w + ((size_t)(n0 / 32) * Kg + (size_t)g) * 256 + (size_t)sc * 8
+                : w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
             threadgroup uint32_t* dst = bs[sg][buf] + sc * 32;
             // As in the prompt kernel's staging: one uint4 store per word.
             #pragma clang loop unroll(full)
@@ -8271,13 +8366,18 @@ enum Qwen35TensorPackedMatmul {
           for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
         }
         // lane -> column lane of each 32-column half, 8 words (two quads) per group
-        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
-        const size_t hstride = (size_t)32 * (K / 16);
+        // TILED: see `sourceNarrowInt8`; the next 32-column half is the next
+        // block, and a group's words sit 256 words after the previous group's.
+        const device uint32_t* wrow = TILED
+            ? w + (size_t)(n0 / 32) * (K / 128) * 256 + (size_t)int(lane) * 8
+            : w + (size_t)(n0 + int(lane)) * (K / 16);
+        const size_t hstride = TILED ? (size_t)(K / 128) * 256 : (size_t)32 * (K / 16);
+        const size_t gstride = TILED ? 256 : 8;
         // quads [q0, q1) of group gg's words into v
         auto getw = [&](int gg, thread uint32_t (&v)[NH][8], int q0, int q1) {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
-            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)gg * 8);
+            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)gg * gstride);
             #pragma clang loop unroll(full)
             for (int q = 0; q < 2; q++) {
               if (q < q0 || q >= q1) { continue; }
@@ -8623,9 +8723,14 @@ enum Qwen35TensorPackedMatmul {
         const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
         // staging assignment: thread t -> column c = t >> 1, K half h = t & 1 (64 codes = 4 words -> 8 words of nibbles)
         const int sc = int(tid >> 1); const int sh = int(tid & 1);
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        // TILED: the tiled copy (`narrowTiledWeight`): column c of the tile
+        // is column c & 31 of block (n0 + c) / 32, whose group g sits at
+        // (block * Kg + g) * 256 words; 64 threads read each block's 1 KB.
+        const device uint32_t* wrow = TILED
+            ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+            : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
         auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
+          const device uint4* src = (const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
           const uint4 v = *src;
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
           // One word's four planes are four contiguous uint32s (16 codes).
@@ -9074,12 +9179,96 @@ enum Qwen35TensorPackedMatmul {
     }
 
     /// The prompt route's load-time preparation of the verify operands: the
-    /// proof and, when any chosen kernel reads them, the FP32 scales.
+    /// tiled weight copy, the proof and, when any chosen kernel reads them, the
+    /// FP32 scales.
     static func prepareNarrowOperands(
-        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray
+        _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, _ scales: MLXArray,
+        _ biases: MLXArray
     ) {
+        if narrowTiled { _ = narrowTiledWeight(cache, weight, materialize: true) }
         guard narrowNeedsProof, cache.biasesAreNegativeScales(scales, biases) else { return }
         if narrowNeedsF32 { _ = narrowScalesF32(cache, scales, materialize: true) }
+    }
+
+    /// The verify int8 kernels read a tiled copy of each projection's packed
+    /// words (`tileNarrowWeight`). The copy holds the stored 32-bit words
+    /// unchanged, only reordered, so every code, scale and offset the kernel
+    /// applies is the stored one and the output is bitwise that of the stored
+    /// layout (the self-test runs every candidate on the copy against
+    /// `original` on the stored words). What changes is the load: 32 lanes
+    /// read a group's 1 KB tile in one contiguous run. The int8-staged prompt
+    /// kernel reads the same copy, after its own bitwise self-test, so the
+    /// copy is in use in every phase and the stored words are read only at
+    /// load. `DARKBLOOM_BONSAI_TENSOR_ROUTE_TILED=0` reads the stored layout on
+    /// both routes.
+    static let narrowTiled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TILED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""), support == .staged8 else {
+            return false
+        }
+        return promptTiledSelfTest()
+    }()
+
+    /// The int8-staged prompt kernel on synthetic operands, once on the stored
+    /// words and once on the tiled copy: every output bit must match (FP32
+    /// output, signed zeros included), or neither route reads the copy.
+    private static func promptTiledSelfTest() -> Bool {
+        let m = 128, k = 1024, n = 192, kg = k / 128
+        let codeType: DType = signedCodes ? .int8 : .uint8
+        let codes = MLXRandom.randInt(
+            signedCodes ? Int32(-127) ..< Int32(128) : Int32(0) ..< Int32(256), [m, k],
+            key: MLXRandom.key(71)
+        ).asType(codeType)
+        let weight = MLXRandom.randInt(
+            Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(72)
+        ).asType(.uint16).view(dtype: .uint32)
+        let scalesT = MLXRandom.uniform(
+            Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(73)
+        ).asType(.float16)
+        let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        let folded = MLXRandom.normal([kg, n], key: MLXRandom.key(74))
+        let ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(75))
+        let asums = MLXRandom.normal([m, kg], key: MLXRandom.key(76)) * Float(50)
+        let tiled = tileNarrowWeight(weight, n: n, k: k)
+        func run(_ words: MLXArray, _ tiledFlag: Int) -> MLXArray {
+            kernelStaged8(
+                [codes, words, scalesT, biasesT, folded, ascale, asums, dimsArray(k: k, m: m, n: n)],
+                template: [
+                    ("OutT", DType.float32), ("MPERM", rowTiledConstants ? 1 : 0),
+                    ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", 1),
+                    ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", tiledFlag),
+                ],
+                grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
+        let stored = run(weight, 0)
+        let copy = run(tiled, 1)
+        let same = (stored.view(dtype: .uint32) .== copy.view(dtype: .uint32)).all().item(Bool.self)
+        FileHandle.standardError.write(
+            Data(
+                ("bonsai tiled weights: prompt kernel self-test "
+                    + (same ? "passed; both routes read the tiled copy\n"
+                        : "FAILED; the stored layout is kept\n")).utf8))
+        return same
+    }
+
+    /// `[N, K/16]` packed words reordered to `[N/32, K/128, 32, 8]`: for each
+    /// 32-column block and 128-group, the 32 columns' 8 words in column order.
+    static func tileNarrowWeight(_ weight: MLXArray, n: Int, k: Int) -> MLXArray {
+        weight.reshaped([n / 32, 32, k / 128, 8]).transposed(0, 2, 1, 3).contiguous()
+            .reshaped([n, k / 16])
+    }
+
+    /// The tiled copy of a projection's words, built once per weight array.
+    static func narrowTiledWeight(
+        _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, materialize: Bool
+    ) -> MLXArray {
+        cache.derived(weight, tag: 5) { w in
+            let tiled = tileNarrowWeight(w, n: w.dim(0), k: w.dim(1) * 16)
+            if materialize { eval(tiled) }
+            return tiled
+        }
     }
 
     /// The FP16 scales widened to FP32 and transposed to `[groups, rows]`.
@@ -9098,13 +9287,13 @@ enum Qwen35TensorPackedMatmul {
     static func launchNarrowInt8(
         _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
         _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, outputDType: DType,
-        kernel: NarrowKernel
+        kernel: NarrowKernel, tiled: Bool = false
     ) -> MLXArray {
         let m = 16
         let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
-            ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
+            ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
         ]
         switch kernel.variant {
         case .v0:
@@ -9127,7 +9316,7 @@ enum Qwen35TensorPackedMatmul {
     /// FP32 activation scales and scaled sums. Nothing depends on a request.
     private struct NarrowOperands {
         let k: Int, n: Int
-        let codes: MLXArray, weight: MLXArray
+        let codes: MLXArray, weight: MLXArray, tiledWeight: MLXArray
         let scalesT: MLXArray, biasesT: MLXArray, scalesT32: MLXArray
         let ascale: MLXArray, rowsum: MLXArray
 
@@ -9154,10 +9343,14 @@ enum Qwen35TensorPackedMatmul {
             ascale = MLXRandom.uniform(
                 Float(0.0001) ..< Float(0.05), [16, kg], key: MLXRandom.key(seed + 4))
             rowsum = MLXRandom.normal([16, kg], key: MLXRandom.key(seed + 5)) * Float(50)
-            eval(codes, weight, scalesT, biasesT, scalesT32, ascale, rowsum)
+            tiledWeight = narrowTiled ? tileNarrowWeight(weight, n: n, k: k) : weight
+            eval(codes, weight, tiledWeight, scalesT, biasesT, scalesT32, ascale, rowsum)
         }
 
-        func run(_ kernel: NarrowKernel, _ outputDType: DType) -> MLXArray {
+        /// `tiled` (default: the route's setting) reads the tiled copy; the
+        /// self-test's reference passes `false`, so every tiled candidate is
+        /// checked bit for bit against `original` on the stored layout.
+        func run(_ kernel: NarrowKernel, _ outputDType: DType, tiled: Bool = narrowTiled) -> MLXArray {
             let (s, b): (MLXArray, MLXArray)
             switch kernel.form {
             case .base: (s, b) = (scalesT, biasesT)
@@ -9165,8 +9358,8 @@ enum Qwen35TensorPackedMatmul {
             case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
             }
             return launchNarrowInt8(
-                codes, weight, s, b, ascale, rowsum, k: k, n: n, outputDType: outputDType,
-                kernel: kernel)
+                codes, tiled ? tiledWeight : weight, s, b, ascale, rowsum, k: k, n: n,
+                outputDType: outputDType, kernel: kernel, tiled: tiled)
         }
     }
 
@@ -9252,7 +9445,7 @@ enum Qwen35TensorPackedMatmul {
                     let bits: DType = outputDType == .float16 ? .uint16 : .uint32
                     var same = true
                     for ops in testOps {
-                        let reference = ops.run(.original, outputDType)
+                        let reference = ops.run(.original, outputDType, tiled: false)
                         let y = ops.run(kernel, outputDType)
                         let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
                             .asType(.int32).sum()
@@ -9474,9 +9667,11 @@ enum Qwen35TensorPackedMatmul {
                     scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
                     biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
                 }
+                let words = narrowTiled
+                    ? narrowTiledWeight(cache, weight, materialize: false) : weight
                 return launchNarrowInt8(
-                    codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
-                    k: k, n: n, outputDType: outputDType, kernel: choice)
+                    codes, words, scalesT, biasesT, activation.scales, activation.scaledSums,
+                    k: k, n: n, outputDType: outputDType, kernel: choice, tiled: narrowTiled)
             }
             installNarrowChoice()
         } else if verifyEnabled, verifyForm != .none {
@@ -9532,7 +9727,7 @@ enum Qwen35TensorPackedMatmul {
             // The verify int8 kernel's per-projection proof and FP32 scales are
             // built here, at the first prompt forward (the load-time warm), so
             // no verify round pays the readback or the widening.
-            prepareNarrowOperands(cache, scales, biases)
+            prepareNarrowOperands(cache, weight, scales, biases)
             let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
             let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
             let foldedSums = cache.derived(scales, tag: 3) { s in
@@ -9551,10 +9746,16 @@ enum Qwen35TensorPackedMatmul {
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
+                template.append(("TILED", narrowTiled ? 1 : 0))
             default: packedKernel = kernelStaged
             }
+            // The prompt route reads the verify route's tiled copy too, so the
+            // copy is in use in every phase (a copy only the verify window
+            // read could lose its GPU residency between windows).
+            let words = support == .staged8 && narrowTiled
+                ? narrowTiledWeight(cache, weight, materialize: true) : weight
             return packedKernel(
-                [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
+                [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
                 template: template,
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
