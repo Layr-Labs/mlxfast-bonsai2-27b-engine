@@ -628,6 +628,7 @@ extension EngineLoopV2 {
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
                 } else {
+                    block.observeCommittedHistory(row.rec.tokens, requestState: requestState)
                     proposal = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
                     // Align the drafter's context cache with the TARGET's

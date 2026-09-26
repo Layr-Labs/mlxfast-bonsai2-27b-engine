@@ -523,6 +523,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
         var contextPrefetched = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
+        /// The committed token history handed over for the next proposal
+        /// (`observeCommittedHistory`); consumed by that proposal.
+        var history: [Int] = []
         var isReleased = false
 
         init(caches: [any KVCache]) { self.caches = caches }
@@ -630,11 +633,30 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
             submittingLeadingLayers: 0)
     }
 
+    /// PROMPT LOOKUP. Text that is being rewritten, quoted or continued
+    /// repeats spans of its own context. When the history's last few tokens
+    /// (ending with `anchor`) occurred earlier, the tokens that followed that
+    /// earlier occurrence are a second proposal for this block. The selector
+    /// takes it position by position only while the drafter itself ranks the
+    /// looked-up token among its best candidates, and falls back to its own
+    /// greedy path at the first position where it does not. This only
+    /// proposes: the target decides every token.
+    public func observeCommittedHistory(
+        _ tokens: [Int], requestState: any CBv2MTPRequestState
+    ) {
+        state(requestState).history = tokens
+    }
+
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
         let state = self.state(requestState)
+        let history = state.history
+        state.history = []
+        let lookup =
+            DFlash2PromptLookup.enabled && history.last == anchor
+            ? DFlash2PromptLookup.continuation(history, depth: depth) : nil
         // A state whose committed rows were all absorbed ahead of this round
         // (`prefetchCommittedContext`) proposes over its cache alone.
         guard !state.pending.isEmpty || state.contextPrefetched else {
@@ -648,7 +670,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
         seedCacheOffsets(state)
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1, submittingLeadingLayers: leadingLayers)
+            blockSize: depth + 1, submittingLeadingLayers: leadingLayers, lookup: lookup)
         state.absorbPending()
         state.contextPrefetched = false
         state.roots.append(tokens)

@@ -456,12 +456,22 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// submission (a prompt's worth of rows). Returns the lazy arrays to
     /// evaluate, or nothing when the rows stay pending for the next block.
     func prefetchCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
+
+    /// The row's committed token history (the prompt and every confirmed
+    /// token, in order, ending with the next proposal's anchor), handed over
+    /// right before that proposal. A drafter may read it to shape the
+    /// proposal; the target still decides every token.
+    func observeCommittedHistory(_ tokens: [Int], requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPBlockDrafter {
     public func prefetchCommittedContext(
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] { [] }
+
+    public func observeCommittedHistory(
+        _ tokens: [Int], requestState: any CBv2MTPRequestState
+    ) {}
 
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block

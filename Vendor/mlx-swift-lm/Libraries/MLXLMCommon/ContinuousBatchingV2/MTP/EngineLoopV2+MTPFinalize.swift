@@ -333,6 +333,7 @@ extension EngineLoopV2 {
             {
                 let anchor = kept[confirmed - 1]
                 let kvOffset = rec.numComputedTokens
+                block.observeCommittedHistory(rec.tokens, requestState: state)
                 let leading =
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil

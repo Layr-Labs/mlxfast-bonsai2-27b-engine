@@ -229,15 +229,23 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block was submitted
-///   before this graph was built, so without slices the GPU idles from the
-///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - VERIFY (a capture-verify forward). The drafter's block is on the GPU
+///   while the host builds this graph, and the verify's first command buffer
+///   is committed only once all 64 layers are built. When the drafter's GPU
+///   time is shorter than the host's path from the acceptance readback to
+///   that commit (finalize, the leading draft submission, the committed
+///   recurrent state, the rest of the draft, then the ~3 ms verify build),
+///   the GPU idles in between. The default plan is ONE boundary after the
+///   first 16 layers (a LEADING verify submission, the verify's first ~10
+///   command buffers): the GPU gets the front of the verify as soon as it is
+///   built, and the host builds the other 48 layers while it runs. One
+///   boundary rather than periodic slices, because every extra command
+///   buffer at verify width has measured as a cost on the ranked box (slices
+///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
+///   again. Both trunk paths honour it: the plain per-layer loop and the
+///   pending-residual path a verify window takes on the matrix route.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // One leading submission after layer 16 (see the type's comment);
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [16]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -3862,7 +3872,7 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary (no early submission: its plan is prompt-only).
+        // verify boundary, and submits early per the verify plan.
         // Where the verify-width tensor route is installed (the int8 form on
         // the ranked box), the projections take it instead, every verify
         // boundary declines, and the window keeps the composed per-layer path.
@@ -3878,10 +3888,13 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // The pending path's early-submission plan: the verify plan for a
+        // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -3917,9 +3930,10 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
-                // GPU the layers built so far, the layer output as `h` and its
-                // pending `f` (both of which the next boundary kernel reads).
+                // EARLY SUBMISSION (prompt pipelining, leading verify) on this
+                // path: hand the GPU the layers built so far, the layer output
+                // as `h` and its pending `f` (both of which the next boundary
+                // kernel reads).
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {

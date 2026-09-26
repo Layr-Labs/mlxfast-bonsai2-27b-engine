@@ -1234,7 +1234,20 @@ final class DFlash2CandidateSelector: Module {
     ///   - logits: the drafter's logits over the same positions, `[B, L, vocab]`.
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
-    func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
+    func selectGreedy(
+        hidden: MLXArray, logits: MLXArray, anchor: MLXArray, lookup: [Int32]? = nil
+    ) -> MLXArray {
+        let (path, candidates, unary) = selectGreedyPath(
+            hidden: hidden, logits: logits, anchor: anchor)
+        guard let lookup, lookup.count == path.dim(1), path.dim(0) == 1 else { return path }
+        return DFlash2PromptLookup.merge(
+            path: path, lookup: lookup, candidates: candidates, unary: unary)
+    }
+
+    /// The greedy path, with the candidate lists it walked.
+    private func selectGreedyPath(hidden: MLXArray, logits: MLXArray, anchor: MLXArray)
+        -> (MLXArray, MLXArray, MLXArray)
+    {
         let vocabularySize = logits.dim(-1)
         let candidates: MLXArray
         let unary: MLXArray
@@ -1251,7 +1264,7 @@ final class DFlash2CandidateSelector: Module {
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
             predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
         {
-            return path
+            return (path, candidates, unary)
         }
 
         var predecessor = anchor
@@ -1272,7 +1285,86 @@ final class DFlash2CandidateSelector: Module {
         }
         // `argPartition` indexes in UInt32, so the path inherits that dtype.
         // Draft tokens are token ids, and the engine reads them as Int32.
-        return stacked(path, axis: 1).asType(.int32)
+        return (stacked(path, axis: 1).asType(.int32), candidates, unary)
+    }
+}
+
+// MARK: - Prompt lookup
+
+/// A second proposal read from the request's own committed history.
+///
+/// `continuation` finds the most recent earlier occurrence of the history's
+/// last `n` tokens, trying `n` from `maxMatch` down to `minMatch`, and returns
+/// the tokens that followed it, padded with -1 to the block depth. `merge`
+/// takes the looked-up token at each position while the drafter ranks it
+/// within its top `maxRank` candidates there (by the drafter's own unary
+/// logit; at the first position only its top candidate), and keeps the drafter's greedy path from the first position where
+/// it does not. Both are prompt-independent: they read only the running
+/// request's tokens and the drafter's own candidate lists.
+enum DFlash2PromptLookup {
+    private static let environment = ProcessInfo.processInfo.environment
+
+    /// `MLXFAST_DFLASH_LOOKUP=0` restores the drafter-only path.
+    static let enabled = environment["MLXFAST_DFLASH_LOOKUP"] != "0"
+    static let minMatch = max(1, Int(environment["MLXFAST_DFLASH_LOOKUP_MIN"] ?? "") ?? 2)
+    static let maxMatch = max(
+        minMatch, Int(environment["MLXFAST_DFLASH_LOOKUP_MAX"] ?? "") ?? 4)
+    static let maxRank = max(1, Int(environment["MLXFAST_DFLASH_LOOKUP_RANK"] ?? "") ?? 4)
+
+    static func continuation(_ history: [Int], depth: Int) -> [Int32]? {
+        let count = history.count
+        guard depth > 0, count > minMatch else { return nil }
+        return history.withUnsafeBufferPointer { h -> [Int32]? in
+            var n = min(maxMatch, count - 1)
+            while n >= minMatch {
+                let keyStart = count - n
+                // Earlier occurrences only: the match ends before the key
+                // does, so at least one continuation token exists.
+                var start = keyStart - 1
+                while start >= 0 {
+                    var matched = true
+                    for offset in 0 ..< n where h[start + offset] != h[keyStart + offset] {
+                        matched = false
+                        break
+                    }
+                    if matched {
+                        let from = start + n
+                        var out = [Int32](repeating: -1, count: depth)
+                        for index in 0 ..< min(depth, count - from) {
+                            out[index] = Int32(truncatingIfNeeded: h[from + index])
+                        }
+                        return out
+                    }
+                    start -= 1
+                }
+                n -= 1
+            }
+            return nil
+        }
+    }
+
+    /// - Parameters:
+    ///   - path: the drafter's greedy path, `[1, L]` int32.
+    ///   - lookup: `L` looked-up ids, -1 where there is none.
+    ///   - candidates: the drafter's candidate ids, `[1, L, K]`.
+    ///   - unary: their logits, `[1, L, K]`.
+    static func merge(
+        path: MLXArray, lookup: [Int32], candidates: MLXArray, unary: MLXArray
+    ) -> MLXArray {
+        let proposed = MLXArray(lookup, [1, lookup.count])
+        let hits = candidates.asType(.int32) .== proposed.expandedDimensions(axis: -1)
+        let scores = unary.asType(.float32)
+        let hitScore = which(hits, scores, MLXArray(-Float.infinity)).max(axis: -1)
+        let rank = (scores .> hitScore.expandedDimensions(axis: -1)).asType(.int32)
+            .sum(axis: -1)
+        // The first position is where the drafter is most reliable: there the
+        // looked-up token must be the drafter's own first choice, so a wrong
+        // lookup cannot cut a block the drafter had right from its start.
+        var limits = [Int32](repeating: Int32(maxRank), count: lookup.count)
+        if !limits.isEmpty { limits[0] = 1 }
+        let taken = hits.any(axis: -1) .&& (rank .< MLXArray(limits, [1, lookup.count]))
+        let prefix = taken.asType(.int32).cumprod(axis: 1) .> Int32(0)
+        return which(prefix, proposed, path.asType(.int32))
     }
 }
 
@@ -1729,7 +1821,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         blockSize: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0,
+        lookup: [Int32]? = nil
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
@@ -1742,7 +1835,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: MLXArray(anchor.map { Int32($0) }))
+            anchor: MLXArray(anchor.map { Int32($0) }),
+            lookup: lookup)
     }
 
     /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
