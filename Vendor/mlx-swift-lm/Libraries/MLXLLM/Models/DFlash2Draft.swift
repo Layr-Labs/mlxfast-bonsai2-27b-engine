@@ -432,9 +432,11 @@ public enum DFlash2SlidingMask {
 /// its mask inputs are equal and the mask is the same array. Building it per
 /// layer re-ran the same comparison graph once per layer. The memo is keyed on
 /// every input of ``DFlash2SlidingMask/make(contextLength:blockLength:slidingWindow:isCausal:)``,
-/// so a layer whose inputs differ still gets its own mask. It lives for one
-/// forward only and is a plain class, off the module tree (see
-/// ``DFlash2TapSlot``).
+/// so a layer whose inputs differ still gets its own mask. Held on the drafter
+/// (instance lifetime) as a plain class off the module tree (see
+/// ``DFlash2TapSlot``). The ranked sliding geometry settles quickly; evaluating
+/// the mask once per key materializes the comparison graph so later hits reuse
+/// a realized buffer instead of replaying the arange/compare ops.
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
@@ -454,6 +456,7 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
+        eval(made)
         key = requested
         cached = made
         return made
