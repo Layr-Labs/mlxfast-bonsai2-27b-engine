@@ -214,8 +214,7 @@ public struct CBv2RecurrentLayerState {
 /// One layer's compact representation of a rectangular recurrent verify.
 /// The replay closure is invoked only for a strict accepted prefix. Full
 /// acceptance may lazily materialize an exact final state; rollback discards
-/// both commit paths. A verify that did not store its final state (`finalSSM`
-/// nil) must supply `fullAcceptance`, which then produces that state.
+/// both commit paths.
 public struct CBv2RecurrentPrefixReplayStage {
     public let positions: Int
     public let finalState: CBv2RecurrentLayerState
@@ -238,7 +237,7 @@ public struct CBv2RecurrentPrefixReplayStage {
     public init(
         positions: Int,
         finalConv: MLXArray,
-        finalSSM: MLXArray?,
+        finalSSM: MLXArray,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -251,10 +250,6 @@ public struct CBv2RecurrentPrefixReplayStage {
         guard positions >= 2 else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay requires at least two positions")
-        }
-        guard finalSSM != nil || fullAcceptance != nil else {
-            throw CBv2RecurrentStateError.lifecycleViolation(
-                "prefix replay without a final state requires a full-acceptance path")
         }
         guard materializedByteCount >= 0,
               strictReplayRetainedByteCount >= 0,
@@ -662,7 +657,7 @@ public final class CBv2RecurrentStateEvaluation {
         modelLayerIndex: Int,
         positions: Int,
         finalConv: MLXArray,
-        finalSSM: MLXArray?,
+        finalSSM: MLXArray,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,

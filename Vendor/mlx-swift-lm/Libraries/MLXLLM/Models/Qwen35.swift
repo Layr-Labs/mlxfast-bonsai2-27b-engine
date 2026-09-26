@@ -229,15 +229,23 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// so every value is bit-identical.
 ///
 /// One mechanism, two plans, picked per forward:
-/// - VERIFY (a capture-verify forward). The drafter's block was submitted
-///   before this graph was built, so without slices the GPU idles from the
-///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+/// - VERIFY (a capture-verify forward). The drafter's block is on the GPU
+///   while the host builds this graph, and the verify's first command buffer
+///   is committed only once all 64 layers are built. When the drafter's GPU
+///   time is shorter than the host's path from the acceptance readback to
+///   that commit (finalize, the leading draft submission, the committed
+///   recurrent state, the rest of the draft, then the ~3 ms verify build),
+///   the GPU idles in between. The default plan is ONE boundary after the
+///   first 16 layers (a LEADING verify submission, the verify's first ~10
+///   command buffers): the GPU gets the front of the verify as soon as it is
+///   built, and the host builds the other 48 layers while it runs. One
+///   boundary rather than periodic slices, because every extra command
+///   buffer at verify width has measured as a cost on the ranked box (slices
+///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
+///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
+///   again. Both trunk paths honour it: the plain per-layer loop and the
+///   pending-residual path a verify window takes on the matrix route.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // One leading submission after layer 16 (see the type's comment);
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [16]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -724,90 +734,6 @@ enum Qwen35GatedDeltaV3 {
         return (outputs[0], outputs[1])
     }
 
-    /// `source` cut into the text before the step loop (pointers and the
-    /// state load), the step loop itself, and the trailing state store; nil
-    /// when the stock text no longer ends in exactly that store after one
-    /// step loop. The derived kernels below reassemble these pieces.
-    fileprivate static let sourceParts: (head: String, loop: String, store: String)? = {
-        let text = source
-        let loopHead = "for (int t = 0; t < T; ++t) {"
-        guard text.components(separatedBy: loopHead).count == 2,
-            let start = text.range(of: loopHead)
-        else { return nil }
-        var depth = 1
-        var end: String.Index?
-        var index = start.upperBound
-        while index < text.endIndex {
-            let character = text[index]
-            if character == "{" {
-                depth += 1
-            } else if character == "}" {
-                depth -= 1
-                if depth == 0 {
-                    end = text.index(after: index)
-                    break
-                }
-            }
-            index = text.index(after: index)
-        }
-        guard let end else { return nil }
-        let store = String(text[end...])
-        let expectedStore = """
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              #pragma clang loop unroll(full)
-              for (int i = 0; i < R; ++i) {
-                state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
-              }
-            }
-            """
-        guard store.filter({ !$0.isWhitespace }) == expectedStore.filter({ !$0.isWhitespace })
-        else { return nil }
-        return (String(text[..<start.lowerBound]), String(text[start.lowerBound ..< end]), store)
-    }()
-
-    /// `source` without the trailing state store: the same step loop, whose
-    /// state lives in registers only. For a verify window whose final state
-    /// is never read (`Qwen35GDNVerifyStateSkip`).
-    private static let outputOnlyKernel: MLXFast.MLXFastKernel? = sourceParts.map { parts in
-        MLXFast.metalKernel(
-            name: "qwen35_gated_delta_v3_output_only",
-            inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
-            outputNames: ["y"],
-            source: parts.head + parts.loop + "\n",
-            ensureRowContiguous: true)
-    }
-
-    /// `run(...).0` without the final state's store (FP32, `B * Hv * Dv * Dk`
-    /// floats); nil exactly when `run` would be, or when the derivation is.
-    static func runOutputOnly(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> MLXArray? {
-        guard enabled, let outputOnlyKernel, q.dtype == .float32, k.dtype == .float32,
-            v.dtype == .float32, g.dtype == .float32, beta.dtype == .float32,
-            state.dtype == .float32, q.ndim == 4, k.ndim == 4, v.ndim == 4
-        else { return nil }
-        let B = k.dim(0)
-        let T = k.dim(1)
-        let Hk = k.dim(2)
-        let Dk = k.dim(3)
-        let Hv = v.dim(2)
-        let Dv = v.dim(3)
-        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
-            q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
-            g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
-        else { return nil }
-        return outputOnlyKernel(
-            [q, k, v, g, beta, state, MLXArray(Int32(T))],
-            template: [
-                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", rowsPerLane),
-            ],
-            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, Dv]],
-            outputDTypes: [.float32])[0]
-    }
-
     /// `kernel` for a state known to be the fresh zeros of a new request's
     /// first chunk (see `Qwen35GatedDeltaNet.freshPromptChunk`): the state
     /// registers start at 0.0f instead of loading a zeros array, which is
@@ -1068,9 +994,7 @@ enum Qwen35GDNReplayBatch {
     /// The committed (conv, ssm) of each operand after `keep` rows, from one
     /// launch; nil when the group does not fit the kernel (the caller then
     /// replays each layer on its own). `alog`/`dtb` are the operands' gate
-    /// parameters stacked in operand order (`[G * Hv]`, FP32). `keep` may be
-    /// the whole window: the full-acceptance replay of a verify that stored
-    /// no final state (`Qwen35GDNVerifyStateSkip`, which self-tests it).
+    /// parameters stacked in operand order (`[G * Hv]`, FP32).
     static func launch(
         _ operands: [Operand], keep: Int, alog: MLXArray, dtb: MLXArray,
         verifiedOnly: Bool = true
@@ -1093,7 +1017,7 @@ enum Qwen35GDNReplayBatch {
         if verifiedOnly, !isVerified(geometry) { return nil }
         // The per-layer replay's own routing: `qwen35GatedDelta` takes the
         // chunked kernels from `minRows` rows and V3 only on these shapes.
-        guard keep >= 1, keep <= S,
+        guard keep >= 1, keep < S,
             !(Qwen35GatedDeltaChunked.enabled && keep >= Qwen35GatedDeltaChunked.minRows
                 && keep >= Qwen35GatedDeltaChunked.chunk),
             Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, NK >= 1,
@@ -1286,9 +1210,7 @@ enum Qwen35GDNReplayBatch {
         var start = 0
         while start + layersPerLaunch <= entries.count {
             let group = Array(entries[start ..< (start + layersPerLaunch)])
-            if group.allSatisfy({
-                $0.layer.canReplayPrefix(tape: $0.tape, committedRows: keep, fullWindow: true)
-            }) {
+            if group.allSatisfy({ $0.layer.canReplayPrefix(tape: $0.tape, committedRows: keep) }) {
                 let (alog, dtb) = stackedGates(group.map(\.layer))
                 let operands = group.map {
                     Operand(tape: $0.tape, aLog: $0.layer.aLog, dtBias: $0.layer.dtBias)
@@ -1313,16 +1235,6 @@ enum Qwen35GDNReplayBatch {
 
     private static func isVerified(_ geometry: Geometry) -> Bool {
         verdictLock.withLock { verdicts[geometry] ?? false }
-    }
-
-    /// Whether `layer`'s geometry passed the self-test (batching serves it).
-    static func isVerified(layer: Qwen35GatedDeltaNet) -> Bool {
-        enabled
-            && isVerified(
-                Geometry(
-                    hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads,
-                    dv: layer.headVDim, cd: layer.convDim, nk: layer.convKernelSize - 1,
-                    dvpl: Qwen35GatedDeltaV3.rowsPerLane))
     }
 
     /// Run the bitwise self-test for `layer`'s geometry once per process, at
@@ -1438,208 +1350,6 @@ enum Qwen35GDNReplayBatch {
             passed,
             "\(cases) layer replays, \(values) values, \(mismatches) mismatches, "
                 + "\(G) layers per launch")
-    }
-}
-
-/// The verify window's recurrence without its final-state store
-/// (`MLXFAST_GDN_VERIFY_STATE_SKIP=0` keeps the store).
-///
-/// A capture verify runs the whole window through `Qwen35GatedDeltaV3` and
-/// stores the state after its last row, `B * Hv * Dv * Dk` FP32 per layer
-/// (3.1 MB here, ~150 MB a round over the 48 GDN layers). The commit reads
-/// that state only when every row is accepted; a strict prefix replays the
-/// accepted rows from the retained pre-verify state instead. Here the verify
-/// runs `Qwen35GatedDeltaV3.runOutputOnly` (the same step loop, no trailing
-/// store), and full acceptance replays the whole window from the same tape
-/// the strict prefix uses (the round's batched replay, or the per-layer
-/// replay), exactly as a strict prefix of every row would.
-///
-/// That replay is the verify's own final state bit for bit: the tape's k and
-/// v ARE the verify's inputs, the replay forms the gates from the tape's a/b
-/// with the prework kernel's formulas, and the state update is the same
-/// step text. At model construction a self-test runs the verify's prework and
-/// recurrence on synthetic windows (four layers, saturating and infinite gate
-/// inputs), then compares the stored final state with the per-layer and the
-/// batched full-window replays, and the output rows with the store-free
-/// kernel's, as unsigned integers; any mismatch or MLX error keeps the store.
-enum Qwen35GDNVerifyStateSkip {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_VERIFY_STATE_SKIP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// The verify window the self-test runs: one anchor plus depth 15.
-    static let selfTestRows = 16
-
-    private struct Geometry: Hashable {
-        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, nk: Int, dvpl: Int
-    }
-
-    private static func geometry(_ layer: Qwen35GatedDeltaNet) -> Geometry {
-        Geometry(
-            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
-            cd: layer.convDim, nk: layer.convKernelSize - 1,
-            dvpl: Qwen35GatedDeltaV3.rowsPerLane)
-    }
-
-    private static let verdictLock = NSLock()
-    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
-
-    /// Whether `layer`'s verify may skip its final-state store.
-    static func applies(to layer: Qwen35GatedDeltaNet) -> Bool {
-        guard enabled, Qwen35GatedDeltaV3.enabled else { return false }
-        let key = geometry(layer)
-        return verdictLock.withLock { verdicts[key] ?? false }
-    }
-
-    private enum SelfTestFailure: Error {
-        case message(String)
-    }
-
-    /// Run the bitwise self-test for `layer`'s geometry once per process, at
-    /// model construction, after `Qwen35GDNReplayBatch.prepare` (its batched
-    /// full-window replay is part of the test when batching is verified).
-    static func prepare(layer: Qwen35GatedDeltaNet) {
-        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
-        let key = geometry(layer)
-        verdictLock.lock()
-        defer { verdictLock.unlock() }
-        guard verdicts[key] == nil else { return }
-        let (passed, detail) = selfTest(layer: layer)
-        verdicts[key] = passed
-        Memory.clearCache()
-        FileHandle.standardError.write(
-            ("qwen35 GDN verify state skip: self-test " + (passed ? "passed" : "FAILED") + " ("
-                + detail + ")"
-                + (passed ? "; verify stores no final state\n" : "; final-state store kept\n"))
-                .data(using: .utf8)!)
-    }
-
-    /// Four synthetic verify windows shaped as the capture verify stages
-    /// them (qkv a column slice of a qkv|z product, a/b column slices of one
-    /// `[1, S, 2 Hv]` product), run through the verify's prework launch and
-    /// `Qwen35GatedDeltaV3.run`; each window's stored final state is compared
-    /// with the per-layer full-window replay of its tape and, when batching
-    /// is verified, the batched one; its output rows with `runOutputOnly`'s.
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
-        let G = Qwen35GDNReplayBatch.layersPerLaunch
-        let S = selfTestRows
-        let Hk = layer.numKHeads
-        let Dk = layer.headKDim
-        let Hv = layer.numVHeads
-        let Dv = layer.headVDim
-        let CD = layer.convDim
-        let KS = layer.convKernelSize
-        let NK = KS - 1
-        guard KS == 4, Dk == 128, Dv == 128, Hv % Hk == 0, CD == 2 * Hk * Dk + Hv * Dv else {
-            return (false, "geometry outside the verify prework")
-        }
-        let batched = Qwen35GDNReplayBatch.isVerified(layer: layer)
-        let derived = Qwen35GDNDerived()
-        let keys = MLXRandom.split(key: MLXRandom.key(0x5653_4b50), into: 8 * G)
-        var comparisons = 0
-        var values = 0
-        var mismatches = 0
-        do {
-            try withError { error in
-                var differ: [MLXArray] = []
-                func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
-                    guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
-                        a.dtype == .float32
-                    else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
-                    differ.append(
-                        (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
-                    values += a.size
-                    comparisons += 1
-                }
-                var operands: [Qwen35GDNReplayBatch.Operand] = []
-                var finals: [MLXArray] = []
-                var tails: [MLXArray] = []
-                for j in 0 ..< G {
-                    func key(_ i: Int) -> MLXArray { keys[8 * j + i] }
-                    let qkvz = MLXRandom.normal([1, S, CD + Hv * Dv], key: key(0))
-                    let qkv = qkvz[0..., 0..., ..<CD]
-                    let convState = MLXRandom.normal([1, NK, CD], key: key(1))
-                    let convWeight = MLXRandom.normal([CD, KS, 1], key: key(2)) * 0.5
-                    var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(3)) * 4
-                    let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
-                    let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
-                    let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
-                        .reshaped([1, S, 1])
-                    gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
-                    let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(4)))
-                    let dtBias = MLXRandom.normal([Hv], key: key(5))
-                    let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(6)))
-                    let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(7)) * spread * 0.05
-                    eval(qkvz, convState, convWeight, gatePair, aLog, dtBias, ssmPre)
-                    let b = gatePair[0..., 0..., ..<Hv]
-                    let a = gatePair[0..., 0..., Hv...]
-                    guard
-                        let pre = Qwen35GDNPrework.run(
-                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
-                            aDecay: derived.decay(aLog), dtBias: dtBias,
-                            normScales: derived.normScales(headKDim: Dk, dtype: .float32),
-                            keyHeads: Hk, valueHeads: Hv, headKDim: Dk, headVDim: Dv,
-                            writeConvInput: true,
-                            stridedReads: Qwen35GDNPrework.verifyStridedReads),
-                        let convInput = pre.convInput
-                    else { throw SelfTestFailure.message("no verify prework") }
-                    guard
-                        let (yStored, finalStored) = Qwen35GatedDeltaV3.run(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmPre),
-                        let yOnly = Qwen35GatedDeltaV3.runOutputOnly(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmPre)
-                    else { throw SelfTestFailure.message("no verify recurrence") }
-                    eval(pre.q, pre.k, pre.v, pre.g, pre.beta, convInput, yStored, finalStored, yOnly)
-                    let tape = ArraysCache.PrefixReplayTape(
-                        convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
-                    guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
-                    else { throw SelfTestFailure.message("tape rejected") }
-                    let replayed = layer.replayedPrefixState(
-                        tape: tape, committedRows: S, aLog: aLog, dtBias: dtBias,
-                        fullWindow: true)
-                    // The stored full-acceptance conv is the window's last NK
-                    // conv input rows.
-                    let tail = convInput[0..., S ..< (S + NK), 0...]
-                    try compare(yOnly, yStored, "output rows")
-                    try compare(replayed.ssm, finalStored, "per-layer final state")
-                    try compare(replayed.conv, tail, "per-layer conv tail")
-                    operands.append(
-                        Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
-                    finals.append(finalStored)
-                    tails.append(tail)
-                }
-                if batched {
-                    guard
-                        let states = Qwen35GDNReplayBatch.launch(
-                            operands, keep: S,
-                            alog: concatenated(operands.map(\.aLog), axis: 0),
-                            dtb: concatenated(operands.map(\.dtBias), axis: 0),
-                            verifiedOnly: false)
-                    else { throw SelfTestFailure.message("no batched full-window replay") }
-                    for j in 0 ..< G {
-                        try compare(states[j].ssm, finals[j], "batched final state")
-                        try compare(states[j].conv, tails[j], "batched conv tail")
-                    }
-                }
-                let count = stacked(differ).sum()
-                eval(count)
-                try error.check()
-                mismatches += Int(count.item(Int32.self))
-            }
-        } catch {
-            return (false, "\(error)")
-        }
-        let expected = G * 3 + (batched ? G * 2 : 0)
-        let passed = mismatches == 0 && comparisons == expected
-        return (
-            passed,
-            "\(G) windows of \(S) rows, \(comparisons) comparisons, \(values) values, "
-                + "\(mismatches) mismatches" + (batched ? ", batched replay included" : ""))
     }
 }
 
@@ -2523,7 +2233,6 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GatedDeltaChunked.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GDNReplayBatch.prepare(layer: self)
-        Qwen35GDNVerifyStateSkip.prepare(layer: self)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -3014,15 +2723,11 @@ final class Qwen35GatedDeltaNet: Module {
         return (recurrence.0, newConvState, recurrence.1, tape)
     }
 
-    /// `fullWindow` also admits the whole window (`committedRows ==
-    /// rowCount`): the full-acceptance replay of a verify that stored no final
-    /// state (`Qwen35GDNVerifyStateSkip`).
     fileprivate func canReplayPrefix(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int, fullWindow: Bool = false
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> Bool {
         guard committedRows > 0,
-              committedRows < tape.rowCount
-                  || (fullWindow && committedRows == tape.rowCount),
+              committedRows < tape.rowCount,
               tape.convStateRows == convKernelSize - 1,
               tape.convInput.ndim == 3,
               tape.q.ndim == 4,
@@ -3066,11 +2771,10 @@ final class Qwen35GatedDeltaNet: Module {
     /// `Qwen35GDNReplayBatch`'s self-test only.
     fileprivate func replayedPrefixState(
         tape: ArraysCache.PrefixReplayTape, committedRows: Int,
-        aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil,
-        fullWindow: Bool = false
+        aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
-            canReplayPrefix(tape: tape, committedRows: committedRows, fullWindow: fullWindow),
+            canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
         let boundarySsm = qwen35GatedDelta(
@@ -3389,32 +3093,18 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            // The window's final state; nil when the verify skips its store
-            // (`Qwen35GDNVerifyStateSkip`) and full acceptance replays the
-            // window from the tape instead.
-            let recurrence: (MLXArray, MLXArray?)
+            let recurrence: (MLXArray, MLXArray)
             if let pre {
-                if let chunked = Qwen35GatedDeltaChunked.runVerify(
-                    q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
-                {
-                    recurrence = (chunked.0, chunked.1)
-                } else if Qwen35GDNVerifyStateSkip.applies(to: self),
-                    let y = Qwen35GatedDeltaV3.runOutputOnly(
+                recurrence =
+                    Qwen35GatedDeltaChunked.runVerify(
                         q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
-                {
-                    recurrence = (y, nil)
-                } else {
-                    let stored =
-                        Qwen35GatedDeltaV3.run(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmState)
-                        ?? gatedDeltaKernel(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmState, mask: nil)
-                    recurrence = (stored.0, stored.1)
-                }
+                    ?? Qwen35GatedDeltaV3.run(
+                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
+                    ?? gatedDeltaKernel(
+                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState,
+                        mask: nil)
             } else {
-                let stored = qwen35GatedDelta(
+                recurrence = qwen35GatedDelta(
                     q: qNormed,
                     k: kNormed,
                     v: v,
@@ -3424,7 +3114,6 @@ final class Qwen35GatedDeltaNet: Module {
                     dtBias: dtBias,
                     state: ssmState,
                     mask: nil)
-                recurrence = (stored.0, stored.1)
             }
             out = recurrence.0
             let finalSsmState = recurrence.1
@@ -3432,7 +3121,7 @@ final class Qwen35GatedDeltaNet: Module {
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState?[rowRange]
+                let finalSSM = finalSsmState[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
                     q: qNormed[rowRange],
@@ -3483,14 +3172,9 @@ final class Qwen35GatedDeltaNet: Module {
                 // batched launch when batching is on and verified.
                 let replaySlot = Qwen35GDNReplayBatch.register(
                     owner: evaluation, layer: self, tape: tape)
-                // A skipped final state is still charged as if stored (the
-                // full-acceptance replay materializes one), and full acceptance
-                // then retains the replay's inputs as a strict prefix does.
-                let materializedBytes = checkedByteCount(roots + [finalSSM ?? tape.ssmPre!])
+                let materializedBytes = checkedByteCount(roots + [finalSSM])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
-                let fullAcceptanceRetainedRoots =
-                    finalSSM == nil ? strictReplayRoots : [tape.convInput]
-                let fullAcceptanceRetainedBytes = checkedByteCount(fullAcceptanceRetainedRoots)
+                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -3502,16 +3186,8 @@ final class Qwen35GatedDeltaNet: Module {
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
                         strictReplayRetainedRoots: strictReplayRoots,
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
-                        fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
-                        fullAcceptance: { [unowned self] in
-                            guard let finalSSM else {
-                                // Every row accepted: the whole window replayed
-                                // from the tape, bitwise the state the verify
-                                // did not store (self-tested at load).
-                                return replaySlot?.state(keep: S)
-                                    ?? self.replayedPrefixState(
-                                        tape: tape, committedRows: S, fullWindow: true)
-                            }
+                        fullAcceptanceRetainedRoots: [tape.convInput],
+                        fullAcceptance: {
                             let detachedConv = finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
@@ -3663,7 +3339,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3953,19 +3629,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3980,18 +3680,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -4770,7 +4472,7 @@ public class Qwen35TextModelInner: Module {
         // norm and quantized rotation (`Qwen35FusedBoundaryQ8`); a tap reads
         // the sum the next layer's kernel stores.
         // A verify window on the matrix route takes the same path with the
-        // verify boundary (no early submission: its plan is prompt-only).
+        // verify boundary, and submits early per the verify plan.
         // Where the verify-width tensor route is installed (the int8 form on
         // the ranked box), the projections take it instead, every verify
         // boundary declines, and the window keeps the composed per-layer path.
@@ -4786,10 +4488,13 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // The pending path's own early-submission plan (prompt width only).
+        // The pending path's early-submission plan: the verify plan for a
+        // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
+            ? (verifyPending
+                ? submission
+                : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -4825,9 +4530,10 @@ public class Qwen35TextModelInner: Module {
                         pendingTapSlot = slot
                     }
                 }
-                // EARLY SUBMISSION (prompt pipelining) on this path: hand the
-                // GPU the layers built so far, the layer output as `h` and its
-                // pending `f` (both of which the next boundary kernel reads).
+                // EARLY SUBMISSION (prompt pipelining, leading verify) on this
+                // path: hand the GPU the layers built so far, the layer output
+                // as `h` and its pending `f` (both of which the next boundary
+                // kernel reads).
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
@@ -8091,35 +7797,15 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          // As in `sourceNarrowInt8` (fkiene 98f554ad): i = 0, 4, 8, 12. mh
-          // and nq are constant on each group and c is 0, 1, 2, 3, so the four
-          // outputs are consecutive columns. The sum is still acc, then
-          // red[0], red[1], red[2], each folded on its own partial. OutT is
-          // half or float; both stores are 4-element aligned because fn, n0,
-          // 32 * h and N are multiples of 4.
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i += 4) {
-              const int mh = (i >> 2) & 1;
-              const int nq = i >> 3;
-              float v0 = acc[h][i];
-              float v1 = acc[h][i + 1];
-              float v2 = acc[h][i + 2];
-              float v3 = acc[h][i + 3];
+            for (int i = 0; i < CAP; i++) {
+              float v = acc[h][i];
               #pragma clang loop unroll(full)
-              for (int q = 0; q < 4 - 1; q++) {
-                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
-                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
-                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
-                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
-              }
-              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
-              if constexpr (sizeof(OutT) == sizeof(float)) {
-                *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-              } else {
-                *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-              }
+              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
             }
           }
         }
@@ -8367,6 +8053,462 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // `sourceStaged8` over a TM x TN output tile (TM, TN in {64, 128}):
+    // TM / 64 x TN / 64 ops of 64 x 64 x 128 per group. Every column tile
+    // re-reads the whole activation, so the two ops of a 128-column tile
+    // reading one A slice halve that traffic; the two ops of a 128-row tile
+    // share each staged weight slice (half the 2-bit staging). DB = 2
+    // double-buffers the staged slices as `sourceStaged8` does; DB = 1 keeps
+    // one buffer (half the threadgroup memory, so a 128-column tile still fits
+    // two threadgroups per core) and holds the next group's words in registers
+    // across the ops. Each output element is still the same 64 x 64 x 128 op
+    // over the same codes, then the same epilogue in the same group order:
+    // bitwise identical to `sourceStaged8`, which the load-time self-test
+    // checks per variant (`choosePromptTiles`). grid: (N / TN * 128, M / TM,
+    // 1), threadgroup (128, 1, 1); same inputs and templates plus TM, TN, DB.
+    private static let sourceStaged8Tiled = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        constexpr int MT = TM / 64;
+        constexpr int NT = TN / 64;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const int m0 = int(threadgroup_position_in_grid.y) * TM;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        // staged B: TN columns x 128 codes as int8 bytes, k inner; column half
+        // h (64 columns, one op's operand) at word 2048 * h of a buffer
+        threadgroup uint32_t bs[DB][TN * 32];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B00((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B01((threadgroup CodeT*)(bs[0] + 2048 * (NT - 1)), dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B10((threadgroup CodeT*)bs[DB - 1], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B11((threadgroup CodeT*)(bs[DB - 1] + 2048 * (NT - 1)), dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        // cT<r><h>: the op over row tile r and column half h
+        auto cT00 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT01 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT10 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        auto cT11 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B00)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[MT * NT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        // Row-tiled constants: this lane's four rows of row tile r are adjacent
+        // in 64-row tile m0 / 64 + r.
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        // staging: thread t -> column t >> 1 of each column half, K half t & 1
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        const size_t wstep = (size_t)64 * (size_t)(K / 16);
+        uint4 wq[NT];
+        auto fetch = [&](int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) { wq[h] = *(const device uint4*)(wrow + h * wstep + g * 8); }
+        };
+        auto put = [&](int buf) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            threadgroup uint32_t* dst = bs[buf] + 2048 * h + sc * 32 + sh * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const uint32_t wv = wq[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        fetch(0);
+        put(0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < Kg; g++) {
+          const int cur = DB == 2 ? (g & 1) : 0;
+          if (g + 1 < Kg) {
+            fetch(g + 1);
+            if (DB == 2) { put(cur ^ 1); }
+          }
+          auto tAr0 = A.template slice<128, 64>(g * 128, m0);
+          auto tAr1 = A.template slice<128, 64>(g * 128, m0 + 64 * (MT - 1));
+          if (cur == 0) {
+            op.run(tAr0, B00, cT00);
+            if (NT == 2) { op.run(tAr0, B01, cT01); }
+            if (MT == 2) { op.run(tAr1, B00, cT10); }
+            if (MT == 2 && NT == 2) { op.run(tAr1, B01, cT11); }
+          } else {
+            op.run(tAr0, B10, cT00);
+            if (NT == 2) { op.run(tAr0, B11, cT01); }
+            if (MT == 2) { op.run(tAr1, B10, cT10); }
+            if (MT == 2 && NT == 2) { op.run(tAr1, B11, cT11); }
+          }
+          float4 s0[NT], s1[NT], b0[NT], b1[NT], u0[NT], u1[NT];
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            s0[h] = float4(sp0[g * NQ + 16 * h]); s1[h] = float4(sp1[g * NQ + 16 * h]);
+            if constexpr (NEGATIVE_SCALE_BIAS) {
+              b0[h] = -s0[h]; b1[h] = -s1[h];
+            } else {
+              b0[h] = float4(bp0[g * NQ + 16 * h]); b1[h] = float4(bp1[g * NQ + 16 * h]);
+            }
+            u0[h] = 0.0f; u1[h] = 0.0f;
+            if (!SIGNED) { u0[h] = up0[g * NQ + 16 * h]; u1[h] = up1[g * NQ + 16 * h]; }
+          }
+          float as[MT][4], rb[MT][4];
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < MT; r++) {
+            if (MPERM) {
+              const size_t tb = tbase + (size_t)r * (size_t)Kg * 64 + (size_t)g * 64;
+              const float4 as4 = *(const device float4*)(ascale + tb);
+              const float4 rb4 = *(const device float4*)(rsb + tb);
+              as[r][0] = as4.x; as[r][1] = as4.y; as[r][2] = as4.z; as[r][3] = as4.w;
+              rb[r][0] = rb4.x; rb[r][1] = rb4.y; rb[r][2] = rb4.z; rb[r][3] = rb4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4; q++) {
+                as[r][q] = ascale[(mrow[q] + 64 * r) * Kg + g]; rb[r][q] = rsb[(mrow[q] + 64 * r) * Kg + g];
+              }
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < MT * NT; t++) {
+            const int r = t / NT; const int h = t % NT;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+              const int ci = r == 0 ? (h == 0 ? cT00[i] : cT01[i]) : (h == 0 ? cT10[i] : cT11[i]);
+              const float s = nh ? s1[h][c] : s0[h][c];
+              const float b = nh ? b1[h][c] : b0[h][c];
+              const float u = nh ? u1[h][c] : u0[h][c];
+              const float tv = SIGNED ? s * float(ci) : fma(s, float(ci), u);
+              acc[t][i] = fma(b, rb[r][mh], fma(as[r][mh], tv, acc[t][i]));
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (DB == 1 && g + 1 < Kg) {
+            put(0);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mm = mb + 64 * r + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            out[(size_t)mm * N + nb + 64 * h + c + 32 * nh] = OutT(acc[t][i]);
+          }
+        }
+        """
+
+    private static let kernelStaged8Tiled = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_tiled",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Tiled,
+        header: header,
+        ensureRowContiguous: true)
+
+    // MARK: - Prompt int8 kernel tile choice
+
+    /// A prompt-width int8-staged kernel: `original` is `sourceStaged8` (64 x
+    /// 64, double-buffered); any other value is `sourceStaged8Tiled` over a
+    /// `tm` x `tn` output tile with `db` staging buffers.
+    struct PromptTile: Hashable, CustomStringConvertible {
+        var tm: Int, tn: Int, db: Int
+        static let original = PromptTile(tm: 64, tn: 64, db: 0)
+        var description: String { self == .original ? "base" : "\(tm)x\(tn)x\(db)" }
+        /// True when this is a tiled kernel whose tile divides `[m, n]`.
+        func takes(m: Int, n: Int) -> Bool { self != .original && m % tm == 0 && n % tn == 0 }
+    }
+
+    /// The candidates, in the order the self-test tries them under its
+    /// deadline: the 128-column tile first (half the activation traffic), with
+    /// one buffer (two threadgroups per core) and with two (overlapped
+    /// staging); then the 128-row tile, the 128 x 128 tile and the one-buffer
+    /// 64 x 64 tile. `128x128x2` (32 KB of staging) runs only on request.
+    static let promptTileCandidates: [PromptTile] = [
+        PromptTile(tm: 64, tn: 128, db: 1), PromptTile(tm: 64, tn: 128, db: 2),
+        PromptTile(tm: 128, tn: 64, db: 2), PromptTile(tm: 128, tn: 64, db: 1),
+        PromptTile(tm: 128, tn: 128, db: 1), PromptTile(tm: 64, tn: 64, db: 1),
+    ]
+
+    /// The prompt window's production shapes `(k, n)`, timed at 512 rows:
+    /// qkv|z, attention qkv, o, gate|up, down.
+    static let promptTunedShapes = [
+        (5120, 16384), (5120, 14336), (6144, 5120), (5120, 34816), (17408, 5120),
+    ]
+
+    /// The load-time choice (see `choosePromptTiles`): per production shape
+    /// `[k, n]`, and a default for every other shape. `original` until then,
+    /// and everywhere under `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE=off`.
+    nonisolated(unsafe) static var promptTileDefault = PromptTile.original
+    nonisolated(unsafe) static var promptTileByShape: [[Int]: PromptTile] = [:]
+
+    /// The kernel for an `[m, k] x [k, n]` prompt matmul: the choice for its
+    /// shape (else the default) where its tile divides `[m, n]`, else `original`.
+    static func promptTile(k: Int, n: Int, m: Int) -> PromptTile {
+        let tile = promptTileByShape[[k, n]] ?? promptTileDefault
+        return tile.takes(m: m, n: n) ? tile : .original
+    }
+
+    /// One launch of the int8-staged prompt kernel `tile`. `template` carries
+    /// OutT, MPERM, SIGNED and NEGATIVE_SCALE_BIAS; the tiled kernel appends
+    /// its tile. `kernelStaged8` wherever the tile does not divide `[m, n]`.
+    static func launchStaged8(
+        _ inputs: [MLXArray], template: [(String, any KernelTemplateArg)], m: Int, n: Int,
+        outputDType: DType, tile: PromptTile
+    ) -> MLXArray {
+        if tile.takes(m: m, n: n),
+            let y = kernelStaged8Tiled(
+                inputs, template: template + [("TM", tile.tm), ("TN", tile.tn), ("DB", tile.db)],
+                grid: (n / tile.tn * 128, m / tile.tm, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType]
+            ).first
+        {
+            return y
+        }
+        return kernelStaged8(
+            inputs, template: template,
+            grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Synthetic operands for the prompt kernel choice: `m` rows of codes in
+    /// the route's form (signed int8 when `signedCodes`), random 2-bit words,
+    /// FP16 scales of both signs (zeros and signed zeros included) with
+    /// offsets that are their FP16 negations bit for bit (the pattern
+    /// NEGATIVE_SCALE_BIAS = 1 relies on), independent offsets for
+    /// NEGATIVE_SCALE_BIAS = 0, folded code sums, and FP32 activation scales
+    /// and scaled sums (read row-tiled when `rowTiledConstants`, so every
+    /// 64-row tile's constants differ). Nothing depends on a request.
+    private struct PromptOperands {
+        let k: Int, n: Int, m: Int
+        let codes: MLXArray, weight: MLXArray
+        let scalesT: MLXArray, negatedT: MLXArray, biasesT: MLXArray, foldedSums: MLXArray
+        let ascale: MLXArray, rsb: MLXArray
+
+        init(k: Int, n: Int, m: Int, seed: UInt64) {
+            self.k = k
+            self.n = n
+            self.m = m
+            let kg = k / 128
+            func key(_ i: UInt64) -> MLXArray { MLXRandom.key(seed &* 16 &+ i) }
+            codes =
+                signedCodes
+                ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: key(0)).asType(.int8)
+                : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: key(0)).asType(.uint8)
+            weight = MLXRandom.randInt(Int32(0) ..< Int32(65536), [n, k / 8], key: key(1))
+                .asType(.uint16).view(dtype: .uint32)
+            var s = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [n, kg], key: key(2))
+            let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [n, kg], key: key(3))
+            s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+            s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+            let scales = s.asType(.float16)
+            scalesT = scales.transposed(1, 0).contiguous()
+            negatedT = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000)))
+                .view(dtype: .float16).transposed(1, 0).contiguous()
+            biasesT = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(4))
+                .asType(.float16)
+            foldedSums = MLXRandom.normal([kg, n], key: key(5)) * Float(100)
+            ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: key(6))
+            rsb = MLXRandom.normal([m, kg], key: key(7)) * Float(50)
+            eval(codes, weight, scalesT, negatedT, biasesT, foldedSums, ascale, rsb)
+        }
+
+        func run(_ tile: PromptTile, _ outputDType: DType, negativeScaleBias: Bool) -> MLXArray {
+            let template: [(String, any KernelTemplateArg)] = [
+                ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                ("SIGNED", signedCodes ? 1 : 0),
+                ("NEGATIVE_SCALE_BIAS", negativeScaleBias ? 1 : 0),
+            ]
+            return launchStaged8(
+                [codes, weight, scalesT, negativeScaleBias ? negatedT : biasesT, foldedSums,
+                 ascale, rsb, dimsArray(k: k, m: m, n: n)],
+                template: template, m: m, n: n, outputDType: outputDType, tile: tile)
+        }
+    }
+
+    /// Chooses the prompt int8 kernel once, at load, on the running GPU.
+    ///
+    /// Self-test: each candidate runs against `original` on synthetic 512-row
+    /// operands (three shapes, see `PromptOperands`) and must match every
+    /// output bit in the production form (FP16 output, NEGATIVE_SCALE_BIAS =
+    /// 1); a mismatch or any MLX error (a failed compile included) drops it,
+    /// and a candidate not started within 1.5 s is skipped. Timing: the
+    /// survivors and `original` run alternately on the five production shapes
+    /// at 512 rows, best of five; each shape keeps its fastest kernel and every
+    /// other shape takes the fastest in total. Each picked kernel must then
+    /// also match in the remaining forms (FP32 output; NEGATIVE_SCALE_BIAS = 0
+    /// with independent offsets, both outputs), or it is dropped and the picks
+    /// redone. Runs at model init, before any timed phase, and builds the
+    /// chosen pipelines. `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE=off` keeps
+    /// `original` everywhere (kill switch); a comma list of `TMxTNxDB` (for
+    /// example `64x128x1,128x64x2`) replaces the candidates.
+    private static func choosePromptTiles() -> (PromptTile, [[Int]: PromptTile]) {
+        let raw =
+            ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_TILE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        // Off unless asked for (`on` or a tile list): carried onto the record
+        // with the wider verify set, the tiles came with seed and prefill legs
+        // no shorter than the record's on the ranked box.
+        if raw.isEmpty || ["off", "0", "false", "no", "base"].contains(raw) { return (.original, [:]) }
+        let requested = raw.split(separator: ",").compactMap { item -> PromptTile? in
+            let v = item.split(separator: "x").compactMap { Int($0) }
+            guard v.count == 3, [64, 128].contains(v[0]), [64, 128].contains(v[1]),
+                [1, 2].contains(v[2])
+            else { return nil }
+            return PromptTile(tm: v[0], tn: v[1], db: v[2])
+        }
+        let candidates = requested.isEmpty ? promptTileCandidates : requested
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+        var log = "bonsai prompt int8 tiles:"
+        var passed: [PromptTile] = []
+        var failed: [PromptTile] = []
+        var skipped: [PromptTile] = []
+        var failedLate = Set<PromptTile>()
+        var timings: [PromptTile: [Double]] = [:]
+        var byShape: [[Int]: PromptTile] = [:]
+        var fallback = PromptTile.original
+        do {
+            try withError { error in
+                let testOps = [(5120, 1024, UInt64(91)), (17408, 256, UInt64(92)), (1536, 384, UInt64(93))]
+                    .map { PromptOperands(k: $0.0, n: $0.1, m: 512, seed: $0.2) }
+                try error.check()
+                // True when `tile` matches `original` bit for bit in every
+                // `(output dtype, NEGATIVE_SCALE_BIAS)` form; false on a
+                // mismatch or on any MLX error inside (scoped to this call).
+                func matches(_ tile: PromptTile, _ forms: [(DType, Bool)]) -> Bool {
+                    do {
+                        return try withError { scoped in
+                            for (outputDType, negative) in forms {
+                                let bits: DType = outputDType == .float16 ? .uint16 : .uint32
+                                for ops in testOps {
+                                    let reference = ops.run(.original, outputDType, negativeScaleBias: negative)
+                                    let y = ops.run(tile, outputDType, negativeScaleBias: negative)
+                                    let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                                        .asType(.int32).sum()
+                                    eval(differ)
+                                    try scoped.check()
+                                    if differ.item(Int32.self) != 0 { return false }
+                                }
+                            }
+                            return true
+                        }
+                    } catch {
+                        return false
+                    }
+                }
+                for tile in candidates {
+                    if elapsedMs() > 1500 { skipped.append(tile); continue }
+                    if matches(tile, [(.float16, true)]) { passed.append(tile) } else { failed.append(tile) }
+                }
+                guard !passed.isEmpty else { return }
+
+                let kernels = [PromptTile.original] + passed
+                let sets = promptTunedShapes.enumerated().map { (index, shape) in
+                    PromptOperands(k: shape.0, n: shape.1, m: 512, seed: 100 + UInt64(index))
+                }
+                for kernel in kernels {
+                    eval(sets.map { $0.run(kernel, .float16, negativeScaleBias: true) })
+                }
+                try error.check()
+                for kernel in kernels { timings[kernel] = Array(repeating: .infinity, count: sets.count) }
+                for _ in 0 ..< 5 {
+                    for (index, ops) in sets.enumerated() {
+                        for kernel in kernels {
+                            let outs = (0 ..< 2).map { _ in
+                                ops.run(kernel, .float16, negativeScaleBias: true)
+                            }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
+                                / Double(outs.count)
+                            timings[kernel]![index] = min(timings[kernel]![index], us)
+                        }
+                    }
+                }
+                try error.check()
+
+                // Picks, then the remaining forms for each picked kernel; a
+                // kernel failing them is dropped and the picks redone.
+                var verified = Set<PromptTile>()
+                while true {
+                    let usable = kernels.filter { !failedLate.contains($0) }
+                    func fastest(_ cost: (PromptTile) -> Double) -> PromptTile {
+                        usable.min { cost($0) < cost($1) } ?? .original
+                    }
+                    fallback = fastest { timings[$0]!.reduce(0, +) }
+                    byShape = [:]
+                    for (index, shape) in promptTunedShapes.enumerated() {
+                        byShape[[shape.0, shape.1]] = fastest { timings[$0]![index] }
+                    }
+                    var clean = true
+                    for tile in Set([fallback] + Array(byShape.values)).subtracting([.original])
+                    where !verified.contains(tile) {
+                        if matches(tile, [(.float32, true), (.float16, false), (.float32, false)]) {
+                            verified.insert(tile)
+                        } else {
+                            failedLate.insert(tile)
+                            clean = false
+                        }
+                    }
+                    if clean { break }
+                }
+            }
+        } catch {
+            byShape = [:]
+            fallback = .original
+            log += " error \(error);"
+        }
+        log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
+        if !failed.isEmpty { log += " failed [" + failed.map(\.description).joined(separator: " ") + "]" }
+        if !skipped.isEmpty { log += " skipped [" + skipped.map(\.description).joined(separator: " ") + "]" }
+        if !failedLate.isEmpty {
+            log += " failed FP32/offset forms [" + failedLate.map(\.description).joined(separator: " ") + "]"
+        }
+        if !timings.isEmpty {
+            log += "; us/launch per shape (qkv|z attn-qkv o gate|up down):"
+            for kernel in [PromptTile.original] + passed {
+                guard let row = timings[kernel] else { continue }
+                log += " \(kernel)=" + row.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            }
+        }
+        Memory.clearCache()
+        log += "; using default \(fallback), per shape ["
+            + promptTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
+            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
+        FileHandle.standardError.write(log.data(using: .utf8)!)
+        return (fallback, byShape)
+    }
+
+    /// Installs the choice (the int8-staged form only).
+    private static func installPromptTileChoice() {
+        let (fallback, byShape) = choosePromptTiles()
+        promptTileDefault = fallback
+        promptTileByShape = byShape
+    }
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -8563,164 +8705,6 @@ enum Qwen35TensorPackedMatmul {
     nonisolated(unsafe) static var narrowNeedsProof = false
     nonisolated(unsafe) static var narrowNeedsF32 = false
 
-    /// One choice: a default kernel and per-shape kernels.
-    typealias NarrowChoice = (NarrowKernel, [[Int]: NarrowKernel])
-
-    /// The record's (dcaf489's) kernel bodies: its own autotune chooses among
-    /// these (and `original`), so the pick over them is the record's pick.
-    static let narrowRecordVariants: Set<NarrowVariant> = [.v0, .pd1, .pd2, .tn64]
-
-    /// Sets `narrowNeedsProof` / `narrowNeedsF32` for these choices.
-    static func setNarrowOperandNeeds(_ choices: [NarrowChoice]) {
-        let all = choices.flatMap { [$0.0] + Array($0.1.values) }
-        narrowNeedsProof = all.contains { $0.form != .base }
-        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
-    }
-
-    /// The in-situ choice of the verify int8 kernels: a few candidate choices
-    /// (shortlisted by the synthetic self-test and timing at load) run in turn
-    /// on real speculative rounds of the load-time engine warm, and a
-    /// candidate replaces the record's pick only when its median round beats
-    /// the record's pick's by more than 0.5 %. The synthetic timing streams
-    /// each kernel for 0.5-0.7 ms bursts in which the GPU never reaches the
-    /// clock state of the decode window, so it mispicks; a whole round does
-    /// reach it. Every candidate passed the bitwise self-test (FP16 and FP32
-    /// outputs), so the rounds and their tokens are the same whichever runs.
-    ///
-    /// `roundBoundary()` runs at the top of every block proposal (one static
-    /// bool check when no trial is active): round r's time is the host time
-    /// from its proposal to the next one, and the choice installed at a
-    /// boundary is what the next verify graph build reads. The first round
-    /// after the seed is discarded. Runs only inside the deferred load warm
-    /// (`Qwen35DFlash2Assistant`), never in a served request.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps the record's
-    /// pick without a trial.
-    enum NarrowInSituTrial {
-        nonisolated(unsafe) static var active = false
-        nonisolated(unsafe) static var sets: [NarrowChoice] = []
-        nonisolated(unsafe) static var roundTimes: [[UInt64]] = []
-        nonisolated(unsafe) static var roundIndex = 0
-        nonisolated(unsafe) static var lastBoundary: UInt64 = 0
-        nonisolated(unsafe) static var onEnough: (() -> Void)?
-
-        /// Timed rounds per candidate.
-        static let roundsPerSet = 8
-        /// A candidate must beat the record's pick by more than this.
-        static let adoptMargin = 0.005
-        /// Rounds above this multiple of their candidate's median are dropped.
-        static let outlierFactor = 1.5
-
-        static let enabled: Bool = {
-            let value = ProcessInfo.processInfo.environment[
-                "DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return !["0", "false", "no", "off"].contains(value ?? "")
-        }()
-
-        /// Whether a trial is set up (two or more distinct candidates; the
-        /// first is the record's pick).
-        static var armed: Bool { enabled && sets.count >= 2 }
-
-        /// Proposals the trial needs: the discarded round, the seed-side
-        /// boundary, then `roundsPerSet` per candidate.
-        static var roundsNeeded: Int { 2 + roundsPerSet * sets.count }
-
-        @inline(__always) static func roundBoundary() {
-            guard active else { return }
-            boundary()
-        }
-
-        private static func boundary() {
-            let now = DispatchTime.now().uptimeNanoseconds
-            let count = sets.count
-            if roundIndex >= 2 {
-                roundTimes[(roundIndex - 1) % count].append(now - lastBoundary)
-            }
-            lastBoundary = now
-            let set = sets[roundIndex % count]
-            narrowDefault = set.0
-            narrowByShape = set.1
-            roundIndex += 1
-            if roundIndex >= roundsNeeded {
-                active = false
-                let enough = onEnough
-                onEnough = nil
-                enough?()
-            }
-        }
-
-        /// Arms the round hook. `onEnough` runs (on the engine's thread) once
-        /// every candidate has its rounds.
-        static func begin(onEnough: @escaping () -> Void) {
-            guard armed else { return }
-            roundTimes = Array(repeating: [], count: sets.count)
-            roundIndex = 0
-            lastBoundary = 0
-            self.onEnough = onEnough
-            active = true
-        }
-
-        private static func median(_ values: [UInt64]) -> Double? {
-            guard !values.isEmpty else { return nil }
-            let sorted = values.sorted()
-            let mid = sorted.count / 2
-            return sorted.count % 2 == 1
-                ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
-        }
-
-        private static func describe(_ set: NarrowChoice) -> String {
-            guard !set.1.isEmpty else { return "\(set.0)" }
-            return "\(set.0){"
-                + narrowTunedShapes.map { "\(set.1[[$0.0, $0.1]] ?? set.0)" }
-                .joined(separator: ",") + "}"
-        }
-
-        /// Ends the trial: installs the winner (or the record's pick), logs
-        /// one line and disarms. Safe to call when nothing ran.
-        static func finish(elapsedNanoseconds: UInt64) {
-            active = false
-            onEnough = nil
-            guard armed else { return }
-            if roundTimes.count != sets.count {
-                roundTimes = Array(repeating: [], count: sets.count)
-            }
-            let medians: [(Double?, Int, Int)] = roundTimes.map { times in
-                guard let first = median(times) else { return (nil, 0, 0) }
-                let kept = times.filter { Double($0) <= outlierFactor * first }
-                return (median(kept), kept.count, times.count)
-            }
-            var chosen = 0
-            if let record = medians[0].0 {
-                var best = record
-                for (index, entry) in medians.enumerated().dropFirst() {
-                    if let m = entry.0, m < best { best = m; chosen = index }
-                }
-                if chosen != 0, !(best < record * (1 - adoptMargin)) { chosen = 0 }
-            }
-            let set = sets[chosen]
-            narrowDefault = set.0
-            narrowByShape = set.1
-            setNarrowOperandNeeds([set])
-            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; median ms/round"
-            for (index, candidate) in sets.enumerated() {
-                let (m, kept, total) = medians[index]
-                log += (index == 0 ? " [record " : " | ") + describe(candidate) + " "
-                    + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
-            }
-            log += "]; "
-            if chosen == 0 {
-                log += "keeping the record's pick"
-            } else if let record = medians[0].0, let m = medians[chosen].0 {
-                log += "adopted " + describe(set)
-                    + String(format: " (%+.2f%%)", (m / record - 1) * 100)
-            }
-            log += String(format: "; %.0f ms\n", Double(elapsedNanoseconds) / 1e6)
-            FileHandle.standardError.write(log.data(using: .utf8)!)
-            sets = []
-            roundTimes = []
-        }
-    }
-
     /// The kernel for this projection: the chosen one for its shape when its
     /// constants pass the proof (or it needs none), else `original`.
     /// `materialize` evaluates the FP32 scales now (the prompt route's
@@ -8850,39 +8834,34 @@ enum Qwen35TensorPackedMatmul {
     /// every body (`v0` and each pipelined variant) in each epilogue form.
     /// Timing: the survivors and `original` run alternately on the four
     /// production shapes, each over distinct weight sets of >= 96 MB (so
-    /// every launch streams its weights), best of five trials. The record's
-    /// pick: over the record's bodies (`narrowRecordVariants`), each shape
+    /// every launch streams its weights), best of five trials; each shape
     /// keeps its fastest kernel and every other shape takes the fastest in
-    /// total. That is what is installed; the timing only shortlists the
-    /// in-situ candidates (`NarrowInSituTrial`): the record's pick, `v0` with
-    /// the negated offset, and the two fastest K3 bodies in total, each after
-    /// its FP32 self-test, and every candidate kernel is then launched once
-    /// per production shape with FP16 and FP32 outputs. A candidate not
-    /// started within 4 s of the self-test is skipped (load time is not
-    /// timed). Runs at model init, before any timed phase, and builds every
-    /// candidate's pipelines, so no verify round (nor any trial round)
-    /// compiles anything.
+    /// total. A candidate not started within 4 s of the self-test is skipped
+    /// (load time is not timed). Runs at model init, before any timed phase,
+    /// and builds the chosen pipelines, so the first verify round compiles
+    /// nothing.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
     /// (master kill switch); `neg` / `f32` force that epilogue.
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
     /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd4`,
     /// `tn64`, `k64pd1` .. `k64pd4`) limits the pipelined candidates to those.
-    private static func chooseNarrowKernels() -> (NarrowChoice, [NarrowChoice]) {
+    private static func chooseNarrowKernels() -> (NarrowKernel, [[Int]: NarrowKernel]) {
         let environment = ProcessInfo.processInfo.environment
         func knob(_ name: String) -> String? {
             environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
         let forms: [NarrowEpilogue]
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
-        case "off", "0", "false", "no", "base": return ((.original, [:]), [])
+        case "off", "0", "false", "no", "base": return (.original, [:])
         case "neg": forms = [.negativeBias]
         case "f32": forms = [.negativeBiasF32Scales]
         default: forms = [.negativeBias, .negativeBiasF32Scales]
         }
-        // Default order = self-test order (what the deadline would cut last).
-        let defaultVariants: [NarrowVariant] = [
-            .pd1, .pd2, .k64pd1, .k64pd2, .pd3, .k64pd3, .pd4, .k64pd4, .tn64,
-        ]
+        // Default: the record's two pipelined bodies. The wider set (k64pd1-4,
+        // pd3, pd4, tn64) stays selectable by name: carried onto the record
+        // together with the prompt tiles (DPZZxlz's be4df6d7), it came with a
+        // decode window 3.4% longer on the ranked box than the record's own.
+        let defaultVariants: [NarrowVariant] = [.pd1, .pd2]
         var variants = defaultVariants
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
         case "off", "0", "false", "no", "v0": variants = []
@@ -8906,7 +8885,6 @@ enum Qwen35TensorPackedMatmul {
         var timings: [NarrowKernel: [Double]] = [:]
         var byShape: [[Int]: NarrowKernel] = [:]
         var fallback = NarrowKernel.original
-        var trial: [NarrowChoice] = []
         do {
             try withError { error in
                 let testShapes = [
@@ -8964,22 +8942,10 @@ enum Qwen35TensorPackedMatmul {
                 }
                 try error.check()
 
-                // The record's picks, then the FP32 self-test of each picked
-                // kernel; a kernel failing it is dropped and the picks redone.
-                var checkedF32 = Set<NarrowKernel>()
-                func exactF32(_ kernel: NarrowKernel) throws -> Bool {
-                    if kernel == .original || checkedF32.contains(kernel) {
-                        return !failedF32.contains(kernel)
-                    }
-                    checkedF32.insert(kernel)
-                    if try matches(kernel, .float32) { return true }
-                    failedF32.insert(kernel)
-                    return false
-                }
+                // Picks, then the FP32 self-test of each picked kernel; a
+                // kernel failing it is dropped and the picks redone.
                 while true {
-                    let usable = kernels.filter {
-                        !failedF32.contains($0) && narrowRecordVariants.contains($0.variant)
-                    }
+                    let usable = kernels.filter { !failedF32.contains($0) }
                     func fastest(_ cost: (NarrowKernel) -> Double) -> NarrowKernel {
                         usable.min { cost($0) < cost($1) } ?? .original
                     }
@@ -8991,52 +8957,18 @@ enum Qwen35TensorPackedMatmul {
                     let picked = Set([fallback] + Array(byShape.values)).subtracting([.original])
                     var clean = true
                     for kernel in picked {
-                        if try !exactF32(kernel) { clean = false }
+                        if try !matches(kernel, .float32) {
+                            failedF32.insert(kernel)
+                            clean = false
+                        }
                     }
                     if clean { break }
                 }
-
-                // The in-situ candidates: the record's pick, v0 with the
-                // negated offset, and the two fastest K3 bodies in total, each
-                // exact at FP32 as well. Choices equal on every shape collapse.
-                guard NarrowInSituTrial.enabled else { return }
-                var shortlist: [NarrowChoice] = [(fallback, byShape)]
-                let v0Negative = NarrowKernel(variant: .v0, form: .negativeBias)
-                if passed.contains(v0Negative), try exactF32(v0Negative) {
-                    shortlist.append((v0Negative, [:]))
-                }
-                let k3 = passed.filter { !narrowRecordVariants.contains($0.variant) }
-                    .sorted { timings[$0]!.reduce(0, +) < timings[$1]!.reduce(0, +) }
-                var survivors = 0
-                for kernel in k3 where survivors < 2 {
-                    if try exactF32(kernel) {
-                        shortlist.append((kernel, [:]))
-                        survivors += 1
-                    }
-                }
-                func effective(_ choice: NarrowChoice) -> [NarrowKernel] {
-                    [choice.0] + narrowTunedShapes.map { choice.1[[$0.0, $0.1]] ?? choice.0 }
-                }
-                for choice in shortlist
-                where !trial.contains(where: { effective($0) == effective(choice) }) {
-                    trial.append(choice)
-                }
-                guard trial.count >= 2 else { trial = []; return }
-                // Every candidate kernel once per production shape, FP16 and
-                // FP32 outputs, so no pipeline compiles inside a trial round.
-                let trialKernels = Set(trial.flatMap { [$0.0] + Array($0.1.values) })
-                for kernel in trialKernels {
-                    for outputDType in [DType.float16, .float32] {
-                        eval(sets.map { $0[0].run(kernel, outputDType) })
-                    }
-                }
-                try error.check()
             }
         } catch {
             passed = []
             byShape = [:]
             fallback = .original
-            trial = []
             log += " error \(error)"
         }
         if !timings.isEmpty {
@@ -9052,25 +8984,19 @@ enum Qwen35TensorPackedMatmul {
         Memory.clearCache()
         log += "; using default \(fallback), per shape ["
             + narrowTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
-            .joined(separator: " ") + "]"
-        if !trial.isEmpty {
-            log += "; in-situ candidates [record" + trial.dropFirst().map { " \($0.0)" }
-                .joined() + "]"
-        }
-        log += "; \(String(format: "%.0f", elapsedMs())) ms\n"
+            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
         FileHandle.standardError.write(log.data(using: .utf8)!)
-        return ((fallback, byShape), trial)
+        return (fallback, byShape)
     }
 
-    /// Installs the record's pick and sets up the in-situ trial. The operands
-    /// every candidate reads (the per-projection proof, the FP32 scales) are
-    /// prepared at the load-time prompt forward, before any trial round.
+    /// Installs the choice.
     private static func installNarrowChoice() {
-        let (choice, trial) = chooseNarrowKernels()
-        narrowDefault = choice.0
-        narrowByShape = choice.1
-        NarrowInSituTrial.sets = trial
-        setNarrowOperandNeeds([choice] + trial)
+        let (fallback, byShape) = chooseNarrowKernels()
+        narrowDefault = fallback
+        narrowByShape = byShape
+        let all = [fallback] + Array(byShape.values)
+        narrowNeedsProof = all.contains { $0.form != .base }
+        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
     }
 
     nonisolated(unsafe) private static var installed = false
@@ -9213,10 +9139,16 @@ enum Qwen35TensorPackedMatmul {
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
-                packedKernel = kernelStaged8
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
+                // The tile chosen at load for this shape; `kernelStaged8`
+                // where none is or the tile does not divide [m, n].
+                return launchStaged8(
+                    [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
+                     activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                    template: template, m: m, n: n, outputDType: outputDType,
+                    tile: promptTile(k: k, n: n, m: m))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
@@ -9226,6 +9158,7 @@ enum Qwen35TensorPackedMatmul {
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
+        if support == .staged8 { installPromptTileChoice() }
     }
 }
 
