@@ -297,9 +297,15 @@ enum Qwen35TrunkSubmission {
         return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
     }()
 
+    // Default OFF: on the ranked box a pipelined prompt pays a slower decode
+    // WINDOW afterwards. dukemawex's `6751fef2` turned the fused-path plan on
+    // over `ccb885d6` and nothing else: seed 0.720 -> 0.698 ms/tok, window
+    // 4.636 -> 4.969 ms/tok, composite 3.539 -> 3.493; every tree with the
+    // prompt plan active reads ~4.9 against ~4.65 without it. `MLXFAST_PREFILL_PIPELINE`
+    // (and `..._FUSED` below) still set a plan.
     static let prompt: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
-        default: Plan(stride: 4, offset: 0, explicit: nil))
+        default: .off)
 
     /// The prompt plan of a forward on the pending-residual path (the tensor
     /// route's fused layer boundaries, see `Qwen35FusedBoundaryQ8`), which
@@ -309,7 +315,7 @@ enum Qwen35TrunkSubmission {
     /// sets the plan (same syntax); `0` submits the forward as one graph.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [4, 16, 32, 48]))
+        default: .off)  // `4,16,32,48` restores the record's plan; see `prompt`
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
