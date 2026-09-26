@@ -5833,13 +5833,32 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // i = 0, 4, 8, 12. mh and nq are constant on each group and c is
+          // 0, 1, 2, 3, so the four outputs are consecutive columns. The sum
+          // is still acc, then red[0], red[1], red[2], each folded on its own
+          // partial. OutT is half or float; both stores are 4-element aligned
+          // because fn, n0 and N are multiples of 4.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
