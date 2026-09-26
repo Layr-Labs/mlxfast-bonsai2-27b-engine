@@ -727,6 +727,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     nonisolated(unsafe) public static var tensorPackedMatmulNarrow: TensorPackedMatmulNarrow?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowApplies:
         ((_ rows: Int, _ n: Int, _ k: Int) -> Bool)?
+
+    /// The vocabulary head at verify width, on the matrix route: the FP16
+    /// rotated activation (`[16, k]`, rows beyond the real ones zero) against
+    /// a head-sized packed weight, returning `[16, n]` in `outputDType`
+    /// (FP32 logits for the target's read, FP16 for the drafter's unwidened
+    /// read). Installed by the model file; nil declines.
+    public typealias TensorPackedMatmulHead = (
+        _ rotated: MLXArray, _ weight: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
+        _ groupSize: Int, _ outputDType: DType
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmulHead: TensorPackedMatmulHead?
     /// A verify window: at most this many rows take the narrow form.
     static let tensorRouteMaximumNarrowRows = 16
 
@@ -1138,6 +1149,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             float16Head
             ? .float16
             : Self.routeInputDType(rows: rows, n: n, sourceDType: sourceDType)
+        // The vocabulary head at a verify width takes the installed head
+        // kernel: the FP16 read of the rotated activation (the read every
+        // tower projection takes at this width), FP32 accumulation, and the
+        // logits stored in the plain output dtype without the core's FP16
+        // rounding. Declines back to the core's dispatch below.
+        if rows <= tensorRouteMaximumNarrowRows, n >= vocabularyHeadMinimumRows,
+            let head = Self.tensorPackedMatmulHead, let headBiases = biases
+        {
+            var headInput = x.reshaped(rows, k)
+            if headInput.dtype != .float16 {
+                headInput = headInput.asType(.float16)
+            }
+            let padded = tensorRouteMaximumNarrowRows
+            if rows < padded {
+                headInput = concatenated(
+                    [headInput, MLXArray.zeros([padded - rows, k], dtype: .float16)], axis: 0)
+            }
+            let plainDType: DType = sourceDType == .bfloat16 ? .float32 : sourceDType
+            let headOutputDType: DType = widenOutput ? plainDType : .float16
+            if let y = head(headInput, weight, scales, headBiases, groupSize, headOutputDType) {
+                let logits = rows < padded ? y[0 ..< rows] : y
+                return logits.reshaped(Array(x.shape.dropLast()) + [n])
+            }
+        }
         let routeScales: MLXArray
         let routeBiases: MLXArray?
         if inputDType == .float32 {
