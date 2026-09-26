@@ -6526,6 +6526,31 @@ enum Qwen35FusedBoundaryQ8 {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
+    /// Four-wide loads and stores of the FP16 residual add. The four lanes
+    /// are the ones the scalar loop already owned (`NR = 4`, `W` a multiple
+    /// of 4). `MLXFAST_BOUNDARY_VEC=0` reads and writes one half at a time.
+    static let vectorResiduals: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_BOUNDARY_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    /// Cleared when the vector form fails its self-test, so the scalar form
+    /// is retested and the fused boundary stays on.
+    nonisolated(unsafe) private static var vectorLive = true
+    static var useVector: Bool { vectorResiduals && vectorLive }
+    /// Four-wide loads of the FP32 gain and sign vector. The four lanes are
+    /// the ones the scalar loop already owned, multiplied in increasing
+    /// index order, then stored one element at a time into the threadgroup
+    /// butterfly buffer. `MLXFAST_BOUNDARY_GAIN_VEC=0` keeps the scalar
+    /// loads. A failed self-test clears this and retests, so the fused
+    /// boundary stays on.
+    static let gainVectorResiduals: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_BOUNDARY_GAIN_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var gainVectorLive = true
+    static var useGainVector: Bool { gainVectorResiduals && gainVectorLive }
     /// True when a verify window of `rows` rows can take the kernel at every
     /// boundary: a full window on the int8-activation narrow route, and no
     /// failed 16-row self-test.
@@ -6545,9 +6570,21 @@ enum Qwen35FusedBoundaryQ8 {
         lock.lock()
         defer { lock.unlock() }
         if let narrowVerdict { return narrowVerdict }
-        let report = selfTest(
+        var report = selfTest(
             unsignedGain: unsignedGain, eps: eps, transform: transform,
             cases: [(16, 43), (16, 44)])
+        if !report.passed, gainVectorResiduals, gainVectorLive {
+            gainVectorLive = false
+            report = selfTest(
+                unsignedGain: unsignedGain, eps: eps, transform: transform,
+                cases: [(16, 43), (16, 44)])
+        }
+        if !report.passed, vectorResiduals, vectorLive {
+            vectorLive = false
+            report = selfTest(
+                unsignedGain: unsignedGain, eps: eps, transform: transform,
+                cases: [(16, 43), (16, 44)])
+        }
         narrowVerdict = report.passed
         FileHandle.standardError.write(
             ("bonsai fused boundary q8 (verify window): " + report.summary
@@ -6561,7 +6598,15 @@ enum Qwen35FusedBoundaryQ8 {
         lock.lock()
         defer { lock.unlock() }
         if let verdict { return verdict }
-        let report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        var report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        if !report.passed, gainVectorResiduals, gainVectorLive {
+            gainVectorLive = false
+            report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        }
+        if !report.passed, vectorResiduals, vectorLive {
+            vectorLive = false
+            report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        }
         verdict = report.passed
         FileHandle.standardError.write(
             ("bonsai fused boundary q8: " + report.summary
@@ -6582,6 +6627,8 @@ enum Qwen35FusedBoundaryQ8 {
             ("W", width), ("PRESIGNED", gainSigned), ("PERM", perm),
             ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0),
             ("SIGNED", Qwen35TensorPackedMatmul.signedCodes),
+            ("VEC", useVector ? 1 : 0),
+            ("GAINVEC", useGainVector ? 1 : 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -6755,10 +6802,17 @@ enum Qwen35FusedBoundaryQ8 {
         BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
           const uint r0 = p * LS * NR;
           if (r0 + lid * NR + NR <= uint(W)) {
+            const uint e0 = r0 + lid * NR;
+            half4 hs;
+            if (VEC) {
+              hs = *(const device half4*)(xa + base + e0)
+                  + *(const device half4*)(xb + base + e0);
+              *(device half4*)(hout + base + e0) = hs;
+            }
             BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
-              const uint e = r0 + lid * NR + i;
-              const half s = xa[base + e] + xb[base + e];
-              hout[base + e] = s;
+              const uint e = e0 + i;
+              const half s = VEC ? hs[i] : (xa[base + e] + xb[base + e]);
+              if (!VEC) { hout[base + e] = s; }
               hv[p * NR + i] = float(s);
               acc += hv[p * NR + i] * hv[p * NR + i];
             }
@@ -6782,15 +6836,42 @@ enum Qwen35FusedBoundaryQ8 {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv = local_inv[0];
 
-        // rms_looped's output `w * (x * inv)`, then the signs.
+        // rms_looped's output `w * (x * inv)`, then the signs. GAINVEC loads
+        // the four lanes this thread already owns (e0 is a multiple of 4, W
+        // is a multiple of 4) and multiplies in that same index order.
         BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
           const uint r0 = p * LS * NR;
           if (r0 + lid * NR + NR <= uint(W)) {
-            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
-              const uint e = r0 + lid * NR + i;
-              const float n = w[e] * (hv[p * NR + i] * inv);
-              BONSAI_STORE_NORMED(e, n);
-              buf[e] = PRESIGNED ? n : n * signs[e];
+            const uint e0 = r0 + lid * NR;
+            if (GAINVEC) {
+              const float4 wv = *(const device float4*)(w + e0);
+              float n0 = wv[0] * (hv[p * NR + 0] * inv);
+              float n1 = wv[1] * (hv[p * NR + 1] * inv);
+              float n2 = wv[2] * (hv[p * NR + 2] * inv);
+              float n3 = wv[3] * (hv[p * NR + 3] * inv);
+              float b0 = n0, b1 = n1, b2 = n2, b3 = n3;
+              if (!PRESIGNED) {
+                const float4 sv = *(const device float4*)(signs + e0);
+                b0 = n0 * sv[0];
+                b1 = n1 * sv[1];
+                b2 = n2 * sv[2];
+                b3 = n3 * sv[3];
+              }
+              BONSAI_STORE_NORMED(e0 + 0, n0);
+              BONSAI_STORE_NORMED(e0 + 1, n1);
+              BONSAI_STORE_NORMED(e0 + 2, n2);
+              BONSAI_STORE_NORMED(e0 + 3, n3);
+              buf[e0 + 0] = b0;
+              buf[e0 + 1] = b1;
+              buf[e0 + 2] = b2;
+              buf[e0 + 3] = b3;
+            } else {
+              BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                const uint e = e0 + i;
+                const float n = w[e] * (hv[p * NR + i] * inv);
+                BONSAI_STORE_NORMED(e, n);
+                buf[e] = PRESIGNED ? n : n * signs[e];
+              }
             }
           }
         }
@@ -6963,7 +7044,15 @@ extension Qwen35FusedBoundaryQ8 {
         verifyLock.lock()
         defer { verifyLock.unlock() }
         if let verifyVerdict { return verifyVerdict }
-        let report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        var report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        if !report.passed, gainVectorResiduals, gainVectorLive {
+            gainVectorLive = false
+            report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        }
+        if !report.passed, vectorResiduals, vectorLive {
+            vectorLive = false
+            report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        }
         verifyVerdict = report.passed
         FileHandle.standardError.write(
             ("bonsai verify boundary: " + report.summary
@@ -6978,6 +7067,8 @@ extension Qwen35FusedBoundaryQ8 {
         let rows = x.size / width
         let template: [(String, any KernelTemplateArg)] = [
             ("W", width), ("PRESIGNED", gainSigned), ("OutT", outputDType),
+            ("VEC", useVector ? 1 : 0),
+            ("GAINVEC", useGainVector ? 1 : 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -8427,24 +8518,11 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. Hot path:
-        // support==staged8 (signed + FACTORED). Alignment under tip N/nb guards.
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i++) {
+          const int c = i & 3; const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-          }
+          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
         }
         """
 
