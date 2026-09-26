@@ -240,7 +240,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
-///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
+///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 2).
 /// Plain decode and short forwards are untouched. Never over paged KV: its
 /// write faults are checked only after the whole forward is built, before
 /// anything may be evaluated.
@@ -299,7 +299,7 @@ enum Qwen35TrunkSubmission {
 
     static let prompt: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
-        default: Plan(stride: 4, offset: 0, explicit: nil))
+        default: Plan(stride: 2, offset: 0, explicit: nil))
 
     /// The plan for one trunk forward, or nil for a single submission.
     static func plan(
