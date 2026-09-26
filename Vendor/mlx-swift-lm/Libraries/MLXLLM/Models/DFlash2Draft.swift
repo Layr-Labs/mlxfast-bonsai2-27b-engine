@@ -454,9 +454,6 @@ final class DFlash2SlidingMaskMemo {
             blockLength: blockLength,
             slidingWindow: slidingWindow,
             isCausal: isCausal)
-        // The comparison graph is the same for every layer of every later
-        // round with this geometry. Realize it once, here, so those rounds
-        // read the stored mask instead of replaying the graph.
         eval(made)
         key = requested
         cached = made
@@ -1353,6 +1350,14 @@ enum DFlash2TopK {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Four-wide loads when a chunk length is a multiple of four.
+    /// `MLXFAST_DFLASH_TOPK_VEC=0` reads one logit at a time.
+    static let vectorScan: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let chunks = 8
     private static let threads = 128
 
@@ -1366,8 +1371,11 @@ enum DFlash2TopK {
             vocabularySize < Int(Int32.max)
         else { return nil }
         let flat = logits.reshaped([rows, vocabularySize])
+        let vector = vectorScan && vocabularySize % (chunks * 4) == 0
         let template: [(String, any KernelTemplateArg)] = [
             ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
+            ("VEC", vector ? 1 : 0),
+            ("HALF", logits.dtype == .float16 ? 1 : 0),
         ]
         let parts = chunkKernel(
             [flat], template: template,
@@ -1390,6 +1398,20 @@ enum DFlash2TopK {
                 if (isnan(x)) return 0xffffffffu;
                 uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
                 return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+            }
+            // Insert one (key, index). The caller offers indices in increasing
+            // order, so an equal key keeps the higher index.
+            template <int KK>
+            inline void mlxfast_topk_consider(thread uint (&k)[KK], thread uint (&id)[KK],
+                                               uint kx, uint ix) {
+                if (kx >= k[KK - 1]) {
+                    for (int j = 0; j < KK; j++) {
+                        bool sw = kx >= k[j];
+                        uint tk = k[j], ti = id[j];
+                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
+                        kx = sw ? tk : kx; ix = sw ? ti : ix;
+                    }
+                }
             }
             // Entries rank by (key, idx): the stable ascending sort keeps equal values in
             // index order, so among ties the higher index ranks higher.
@@ -1431,16 +1453,26 @@ enum DFlash2TopK {
             auto x = logits + size_t(row) * NV;
             uint k[KK], id[KK];
             for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            for (uint v = lo + t; v < hi; v += TPG) {
-                uint kx = mlxfast_topk_key(x[v]);
-                if (kx >= k[KK - 1]) {   // this thread visits indices in increasing order
-                    uint ix = v;
-                    for (int j = 0; j < KK; j++) {
-                        bool sw = kx >= k[j];
-                        uint tk = k[j], ti = id[j];
-                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
-                        kx = sw ? tk : kx; ix = sw ? ti : ix;
+            if (VEC && (CH % 4u) == 0u) {
+                // Increasing indices, four-wide. CH % 4 covers the chunk.
+                for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                    if (HALF) {
+                        const half4 q = *(const device half4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u);
+                    } else {
+                        const float4 q = *(const device float4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u);
                     }
+                }
+            } else {
+                for (uint v = lo + t; v < hi; v += TPG) {
+                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v);
                 }
             }
             uint ok = 0u, oi = 0u;
@@ -1508,6 +1540,15 @@ enum DFlash2GreedyWalk {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Four-wide loads of the rank-256 dot. Each product is still added in
+    /// increasing index order, so the edge equals the scalar chain.
+    /// `MLXFAST_DFLASH_WALK_VEC=0` reads one rank element at a time.
+    static let vectorRank: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static func select(
         candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
@@ -1533,7 +1574,10 @@ enum DFlash2GreedyWalk {
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
-            template: [("L", length), ("K", k), ("R", rank)],
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1559,9 +1603,21 @@ enum DFlash2GreedyWalk {
                     const device float* proj_ptr = projected + i * R;
                     const device float* succ_ptr = next + succ_base;
                     float edge = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (uint d = 0; d < R; d++) {
-                        edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                    if (WALKVEC && (R % 4u) == 0u) {
+                        for (uint d = 0; d < R; d += 4u) {
+                            const float4 pd = *(const device float4*)(pred_ptr + d);
+                            const float4 qd = *(const device float4*)(proj_ptr + d);
+                            const float4 sd = *(const device float4*)(succ_ptr + d);
+                            edge += (pd[0] * qd[0]) * sd[0];
+                            edge += (pd[1] * qd[1]) * sd[1];
+                            edge += (pd[2] * qd[2]) * sd[2];
+                            edge += (pd[3] * qd[3]) * sd[3];
+                        }
+                    } else {
+                        #pragma clang loop unroll(full)
+                        for (uint d = 0; d < R; d++) {
+                            edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                        }
                     }
                     score = unary[i * K + c] + edge;
                 }
@@ -1576,6 +1632,15 @@ enum DFlash2GreedyWalk {
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
+    /// The mask columns of a proposal are not embedded (the bind-time mask
+    /// row is broadcast). `MLXFAST_DFLASH_ANCHOR_COLUMN=0` builds the full
+    /// token block again.
+    static let anchorColumnOnly: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ANCHOR_COLUMN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
     public let config: DFlash2Configuration
 
     @ModuleInfo(key: "fc") public var fc: Linear
@@ -1704,7 +1769,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0,
+        maskColumns: Int = 0
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -1725,11 +1791,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // time; broadcast that exact value across the block. Keep the general
         // one-row case unchanged.
         let embeddedInputs: MLXArray
-        if inputs.dim(1) > 1 {
+        // `maskColumns > 0` means `inputs` is the anchor column only. The mask
+        // positions are the bind-time embedding, never read from token ids.
+        if inputs.dim(1) > 1 || maskColumns > 0 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
             let batch = inputs.dim(0)
-            let cols = inputs.dim(1) - 1
+            let cols = maskColumns > 0 ? maskColumns : inputs.dim(1) - 1
             let repeatedMasks: MLXArray
             if batch == 1,
                 let cached = cachedMaskEmbeddingBlock,
@@ -1810,17 +1878,30 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
-        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
-        let rows = anchor.flatMap { [Int32($0)] + masks }
-        let block = MLXArray(rows, [anchor.count, blockSize])
+        // The mask columns of the block are never embedded: `hiddenStates`
+        // broadcasts the bind-time mask row. Building those token ids (and
+        // the GPU array that holds them) is host work on every round. The
+        // anchor ids are one array, also the greedy path's start token.
+        let anchorIds = MLXArray(anchor.map { Int32($0) })
+        let block: MLXArray
+        let maskColumns: Int
+        if Self.anchorColumnOnly {
+            block = anchorIds.reshaped([anchor.count, 1])
+            maskColumns = blockSize - 1
+        } else {
+            let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+            let rows = anchor.flatMap { [Int32($0)] + masks }
+            block = MLXArray(rows, [anchor.count, blockSize])
+            maskColumns = 0
+        }
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
-            submittingLeadingLayers: leadingLayers)
+            submittingLeadingLayers: leadingLayers, maskColumns: maskColumns)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: MLXArray(anchor.map { Int32($0) }))
+            anchor: anchorIds)
     }
 
     /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
