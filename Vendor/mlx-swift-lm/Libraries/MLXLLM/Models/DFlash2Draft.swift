@@ -647,6 +647,14 @@ private final class DFlash2QKVStack {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    // At long contexts most Q rows of the combined product are discarded.
+    // Keep the joint launch for small contexts; project Q only for the block
+    // when the context is at least seven times the block width.
+    private static let longContextKVOnlyEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LONG_CONTEXT_KV_ONLY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
     private var weight: MLXArray?
     private var qEnd = 0
     private var kEnd = 0
@@ -673,8 +681,20 @@ private final class DFlash2QKVStack {
             qEnd = q.weight.dim(0)
             kEnd = qEnd + k.weight.dim(0)
         }
-        let y = matmul(rows, weight!.T)
         let n = rows.dim(1)
+        if Self.longContextKVOnlyEnabled, n >= Swift.max(128, 8 * blockRows) {
+            // K/V is a contiguous row slice of the already held stack, so
+            // this path neither duplicates nor re-encodes checkpoint weights.
+            // Ordinary MLX matmul retains BF16 outputs, but a changed tile
+            // selection may alter rounding; official draft acceptance must
+            // validate that tradeoff rather than assume identical proposals.
+            let block = rows[0..., (n - blockRows)..., 0...]
+            let qOut = matmul(block, q.weight.T)
+            let kv = matmul(rows, weight![qEnd..., 0...].T)
+            let kWidth = kEnd - qEnd
+            return (qOut, kv[.ellipsis, ..<kWidth], kv[.ellipsis, kWidth...])
+        }
+        let y = matmul(rows, weight!.T)
         return (
             y[0..., (n - blockRows)..., ..<qEnd],
             y[.ellipsis, qEnd ..< kEnd],
