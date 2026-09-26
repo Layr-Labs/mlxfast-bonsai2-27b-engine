@@ -683,6 +683,16 @@ private final class DFlash2QKVStack {
     }
 }
 
+/// Drafter submission slices, off by default (`MLXFAST_DFLASH_SLICES=1`
+/// commits the context projection and the first layer early). The ranked box
+/// measured the verify round longer with drafter and verify slices (see
+/// `Qwen35TextModelInner.verifySlices`).
+private let dflash2SubmitSlices: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SLICES"]
+    else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Kill switch for the one-projection context+block K/V (default on).
 private let dflash2KVConcatEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
@@ -1108,6 +1118,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
 
 private final class DFlash2DecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: DFlash2Attention
+
     @ModuleInfo var mlp: DFlash2MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
@@ -1157,6 +1168,19 @@ private final class DFlash2DecoderLayer: Module {
 /// not here.
 final class DFlash2CandidateSelector: Module {
     let topK: Int
+
+    /// The weight of the low-rank edge term against the unary logit in the
+    /// greedy walk (`MLXFAST_DFLASH_EDGE_SCALE`, default 1: the reference
+    /// selector exactly). Over eight 512-token windows of the public capture
+    /// 0.5 took 126 verify rounds against the reference's 130 with identical
+    /// tokens, but the ranked box's window took 13 rounds at 0.5 (`ec9b754d`)
+    /// against 12 at the reference weight on the same drafter, so the
+    /// default is the reference.
+    static let edgeScale: Float = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_EDGE_SCALE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.flatMap { Float($0) } ?? 1
+    }()
 
     @ParameterInfo(key: "predecessor_codebook") var predecessorCodebook: MLXArray
     @ParameterInfo(key: "successor_codebook") var successorCodebook: MLXArray
@@ -1213,7 +1237,8 @@ final class DFlash2CandidateSelector: Module {
                     * projected[0..., position, 0...].expandedDimensions(axis: 1)
                     * take(successorCodebook, positionCandidates, axis: 0))
                 .sum(axis: -1)
-            let selected = (unary[0..., position, 0...] + edges).argMax(axis: -1)
+            let selected =
+                (unary[0..., position, 0...] + Self.edgeScale * edges).argMax(axis: -1)
             predecessor = takeAlong(
                 positionCandidates, selected.expandedDimensions(axis: -1), axis: -1)[0..., 0]
             path.append(predecessor)
@@ -1420,7 +1445,8 @@ enum DFlash2GreedyWalk {
         let scores = unary[0].asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds,
+             MLXArray(DFlash2CandidateSelector.edgeScale)],
             template: [("L", length), ("K", k), ("R", rank)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
@@ -1432,7 +1458,7 @@ enum DFlash2GreedyWalk {
     private static let kernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_fused_greedy_walk",
         inputNames: [
-            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand", "alpha",
         ],
         outputNames: ["path"],
         source: """
@@ -1449,7 +1475,7 @@ enum DFlash2GreedyWalk {
                             ? anchor_predecessor[d] : previous[pred_base + d];
                         edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
                     }
-                    score = unary[i * K + c] + edge;
+                    score = unary[i * K + c] + alpha * edge;
                 }
                 float m = simd_max(score);
                 uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
@@ -1471,10 +1497,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
-    // Sliding masks depend only on block geometry. Keep the memo with the
-    // drafter so repeated speculative forwards can reuse the same graph
-    // (ercumentyildirim / terrapinelf `ff96d1e`).
-    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1616,16 +1638,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
+        // Submission slices: when this forward starts behind an idle GPU (the
+        // early block at finalize), committing the context projection and the
+        // first layer lets the GPU start while the host builds the remaining
+        // layers, the head and the selector. Same kernels, same order.
+        if dflash2SubmitSlices { asyncEval([context, h]) }
 
-        let submitAfter = DFlash2DraftSubmission.layers
+        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
-            // EARLY SUBMISSION: hand the GPU the drafter layers built so far
-            // while the host builds the rest and the head. Same kernels, same
-            // order; only command-buffer boundaries move.
-            if !submitAfter.isEmpty, submitAfter.contains(index + 1) {
-                asyncEval([h])
-            }
+            if dflash2SubmitSlices, index == 0, layers.count > 2 { asyncEval([h]) }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
@@ -1725,23 +1747,4 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         eval(drafter)
         return drafter
     }
-}
-
-/// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
-/// Default: after the first layer, so the GPU starts the block (it has been
-/// idle since the verify readback) while the host builds the other layers and
-/// the head; measured locally ~0.2-0.4% decode. `MLXFAST_DRAFT_SLICE_LAYERS`
-/// overrides it with a `,`/`;` list of counts (a count equal to the layer
-/// count submits the trunk before the head); `0`/`off` turns it off.
-enum DFlash2DraftSubmission {
-    static let layers: [Int] = {
-        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            !raw.isEmpty
-        else { return [] }  // off by default here: submission slices lengthened the window on this lineage
-        if ["0", "off", "false", "no"].contains(raw) { return [] }
-        return raw.split(whereSeparator: { $0 == "," || $0 == ";" }).compactMap {
-            Int($0.trimmingCharacters(in: .whitespaces))
-        }.filter { $0 > 0 }
-    }()
 }

@@ -139,79 +139,106 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// load leaves.
     func warmSpeculativeShapes() {
         guard Self.speculativeWarmEnabled else { return }
-        warmTargetPrefill()
         warmDrafter()
+        if Self.targetWarmEnabled { warmTargetRound() }
         Stream().synchronize()
         Memory.clearCache()
     }
 
-    /// `MLXFAST_SEED_PREFILL_WARM=0` skips `warmTargetPrefill`.
-    static let seedPrefillWarmEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_SEED_PREFILL_WARM"]?
+    /// Kill switch for the load-time TARGET round warm (default on).
+    static let targetWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_SPEC_TARGET_WARM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// The scored seed width.
-    static let warmPromptRows = 512
-
-    /// Runs the ENGINE's prompt forward once, at load, on throwaway state.
+    /// The target's side of a scored round, once per shape, at load.
     ///
-    /// A decode window's seed prefill is the engine's prompt seam
-    /// (`forwardWithHiddenForPrefill`: the DFlash 2 tap armed, the final layer
-    /// narrowed to the last row, the tapped context cast for the drafter).
-    /// Nothing before the timed decode phase runs that seam: the resident's
-    /// boot warm and the benchmarker's warm-up prefill both go through the
-    /// teacher-forced stepper, whose forward is full width with the tap off.
-    /// So every scored window paid the seam's first-use costs inside the
-    /// timed seed window. On every published leg the seed window reads
-    /// 30-42 ms slower than the timed prefill of the same 512 tokens, even
-    /// though it does less work (and ~36 ms on the serial control leg too).
+    /// The resident's boot warm runs the plain stepper (a 1024-row prompt and
+    /// single-row decodes) and the drafter warm above runs the drafter, but
+    /// nothing before the timed window runs the target at the round's own
+    /// shapes: the engine prompt with the context tap armed, the 16-row
+    /// capture-verify forward, and the recurrent prefix replay at each
+    /// accepted length. A fresh resident therefore built those kernels'
+    /// pipelines (MLX JIT libraries, custom kernels, compiled graphs) inside
+    /// the first timed window. Measured locally, the first 128-token window of
+    /// a process ran ~1 s longer than every later one.
     ///
-    /// The prompt is a fixed token pattern (the resident warm's), the caches
-    /// and recurrent state are fresh and released here, the tap is restored,
-    /// and `warmSpeculativeShapes` drains the buffer cache afterwards, so the
-    /// served phases start from the footprint a cold load leaves. Nothing here
-    /// depends on any request's input.
-    private func warmTargetPrefill() {
-        guard Self.seedPrefillWarmEnabled else { return }
-        let rows = Self.warmPromptRows
-        let adapter = CBv2SteppableLanguageModelAdapter(target)
-        guard let spec = adapter.recurrentStateSpec else { return }
-        let backend = CBv2ContiguousKVBackend(
-            config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
-        guard
-            let caches = try? target.newCacheV2(makeLayerCache: { index, kind in
+    /// This drives exactly those seams (`forwardWithHiddenForPrefill`,
+    /// `forwardWithHiddenCaptured`, `commit(keepPositions:)`) on a throwaway
+    /// contiguous backend, throwaway layer caches and a throwaway recurrent
+    /// state, with a synthetic prompt of ordinary ids. The tap is disarmed
+    /// again afterwards (the engine build arms it per leg), every result is
+    /// evaluated and dropped, and the caller drains the buffer cache, so the
+    /// served phases start from the footprint a cold load leaves. Nothing is
+    /// keyed on, or kept from, any request.
+    private func warmTargetRound() {
+        let promptRows = 512
+        let block = Self.warmBlockSize
+        do {
+            try setBlockContextArmed(true)
+            defer {
+                target.dFlash2TapLayerIds = nil
+                target.model.dFlash2Tap.tappedHidden = nil
+            }
+            let adapter = CBv2SteppableLanguageModelAdapter(target)
+            let kinds = target.cbv2LayerKinds
+            let backend = CBv2ContiguousKVBackend(
+                config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
+            let layerCaches = try target.newCacheV2 { index, kind in
                 CBv2LayerCache(layerIndex: index, kind: kind)
-            }),
-            let rowState = try? backend.makeSequenceState(
-                layerKinds: target.cbv2LayerKinds, promptLength: 0, maxLength: rows + 32),
-            let recurrent = try? CBv2RecurrentRequestState(spec: spec)
-        else { return }
-        let bank = CBv2LayerCacheBank(caches: caches)
-        let previousTap = target.dFlash2TapLayerIds
-        target.dFlash2TapLayerIds = drafter.config.targetLayerIds
-        defer {
-            target.dFlash2TapLayerIds = previousTap
-            target.model.dFlash2Tap.tappedHidden = nil
-            bank.releaseBoundRows()
-            backend.release(rowState)
-            if !recurrent.isReleased { try? recurrent.release() }
+            }
+            let bank = CBv2LayerCacheBank(caches: layerCaches)
+            let rowState = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 0, maxLength: promptRows + block * (block + 2))
+            defer {
+                bank.releaseBoundRows()
+                backend.release(rowState)
+            }
+            let recurrent = try CBv2RecurrentRequestState(spec: target.cbv2RecurrentStateSpec)
+            defer { try? recurrent.release() }
+            let caches = bank.layerCaches(rowStates: [rowState])
+            let innerState: () -> [MLXArray] = {
+                caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+            }
+            func ids(_ count: Int, _ salt: Int) -> MLXArray {
+                MLXArray((0 ..< count).map { Int32(100 + (($0 + salt) &* 7919) % 20_000) })
+                    .reshaped([1, count])
+            }
+
+            // The seed: the engine's prompt forward with the tap armed.
+            let seed = try recurrent.bind()
+            let prompt = adapter.forwardWithHiddenForPrefill(
+                tokens: ids(promptRows, 0), caches: caches, recurrentState: [seed],
+                positionIds: nil, requirement: .lastPositionLogits)
+            var roots = try seed.evaluate()
+            eval([prompt.logits, prompt.lastHidden] + roots + innerState()
+                + [target.dFlash2TappedHidden].compactMap { $0 })
+            try seed.commit()
+
+            // One capture-verify window per accepted length: the full block
+            // commits its last captured state; every shorter one replays.
+            for keep in (1 ... block).reversed() {
+                let window = try recurrent.bind()
+                let verify = adapter.forwardWithHiddenCaptured(
+                    tokens: ids(block, keep), caches: caches, recurrentState: [window],
+                    positionIds: nil)
+                roots = try window.evaluate()
+                eval([verify.logits.argMax(axis: -1), verify.lastHidden] + roots + innerState()
+                    + [target.dFlash2TappedHidden].compactMap { $0 })
+                try window.commit(keepPositions: keep)
+            }
+            // Materialize the last committed (replayed) state.
+            let close = try recurrent.bind()
+            let tail = adapter.forwardWithHidden(
+                tokens: ids(1, 1), caches: caches, recurrentState: [close], positionIds: nil)
+            roots = try close.evaluate()
+            eval([tail.logits, tail.lastHidden] + roots + innerState())
+            try close.commit()
+        } catch {
+            // A warm that cannot run changes nothing: the first timed round
+            // builds its pipelines as before.
         }
-        guard let evaluation = try? recurrent.bind() else { return }
-        let tokens = MLXArray((0 ..< rows).map { Int32(100 + ($0 &* 7919) % 20_000) })
-            .reshaped([1, rows])
-        let forward = adapter.forwardWithHiddenForPrefill(
-            tokens: tokens, caches: bank.layerCaches(rowStates: [rowState]),
-            recurrentState: [evaluation], positionIds: nil,
-            requirement: .lastPositionLogits)
-        guard let roots = try? evaluation.evaluate() else { return }
-        var targets = [argMax(forward.logits, axis: -1), forward.lastHidden] + roots
-        if let tapped = target.dFlash2TappedHidden {
-            targets.append(tapped.asType(drafter.dtype))
-        }
-        eval(targets)
-        try? evaluation.commit()
     }
 
     private func warmDrafter() {
@@ -219,7 +246,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0
-        for rows in [513] + Array(1 ... block) {
+        for rows in [512, 513] + Array(1 ... block) {
             let context = MLXArray.zeros([1, rows, width], dtype: drafter.dtype)
             guard
                 let tokens = try? drafter.propose(
