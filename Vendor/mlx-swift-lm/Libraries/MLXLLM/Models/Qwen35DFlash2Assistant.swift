@@ -334,6 +334,24 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             offset += rows
             drafter.trimCache(caches, toCommittedLength: offset)
         }
+        warmContextPrefetch()
+    }
+
+    /// The prefetch path's own shapes, on fresh throwaway caches: a prompt's
+    /// context absorbed without a block, then a block over the cache alone.
+    private func warmContextPrefetch() {
+        guard Self.contextPrefetchEnabled, let caches = try? drafter.makeCache() else { return }
+        let block = Self.warmBlockSize
+        let context = MLXArray.zeros(
+            [1, Self.warmPromptRows, drafter.config.targetHiddenSize], dtype: drafter.dtype)
+        guard (try? drafter.absorbContext(targetHidden: context, cache: caches)) == true
+        else { return }
+        eval(caches.flatMap { $0.innerState() })
+        guard
+            let tokens = try? drafter.propose(
+                anchor: [0], targetHidden: nil, cache: caches, blockSize: block)
+        else { return }
+        eval([tokens] + caches.flatMap { $0.innerState() })
     }
 
     private static func qwen35TextTarget(
@@ -376,6 +394,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// The caches start at the first pending row's position, which is not
         /// zero when the prompt was longer than the context window.
         var cacheSeeded = false
+        /// True when every committed row was absorbed into the caches ahead
+        /// of the next block (`prefetchCommittedContext`).
+        var contextPrefetched = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var isReleased = false
@@ -429,6 +450,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
             pendingRows = 0
+            contextPrefetched = false
             isReleased = true
         }
     }
@@ -480,27 +502,78 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
-        guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
-        let context =
-            state.pending.count == 1
-            ? state.pending[0] : concatenated(state.pending, axis: 1)
-        if !state.cacheSeeded {
-            // The cache must sit where the retained context actually starts.
-            // This is the reference's `cache.offset = prompt.size - rows`: a
-            // prompt longer than the context window leaves the first retained
-            // row at a positive position, and the block's rotations follow it.
-            for cache in state.caches {
-                guard let base = cache as? BaseKVCache else { continue }
-                base.offset = state.firstPendingPosition
-            }
-            state.cacheSeeded = true
+        // A state whose committed rows were all absorbed ahead of this round
+        // (`prefetchCommittedContext`) proposes over its cache alone.
+        guard !state.pending.isEmpty || state.contextPrefetched else {
+            throw DFlash2Error.emptyBlockContext
         }
+        let context: MLXArray? =
+            state.pending.isEmpty
+            ? nil
+            : (state.pending.count == 1
+                ? state.pending[0] : concatenated(state.pending, axis: 1))
+        seedCacheOffsets(state)
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
             blockSize: depth + 1)
         state.absorbPending()
+        state.contextPrefetched = false
         state.roots.append(tokens)
         return tokens
+    }
+
+    /// The cache must sit where the retained context actually starts. This is
+    /// the reference's `cache.offset = prompt.size - rows`: a prompt longer
+    /// than the context window leaves the first retained row at a positive
+    /// position, and the block's rotations follow it.
+    private func seedCacheOffsets(_ state: RequestState) {
+        guard !state.cacheSeeded else { return }
+        for cache in state.caches {
+            guard let base = cache as? BaseKVCache else { continue }
+            base.offset = state.firstPendingPosition
+        }
+        state.cacheSeeded = true
+    }
+
+    // MARK: - Context prefetch
+
+    /// Kill switch for absorbing a prompt's context ahead of the first block
+    /// (default on): `MLXFAST_DFLASH_CONTEXT_PREFETCH=0`.
+    static let contextPrefetchEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONTEXT_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Only a prompt's worth of rows is worth a separate submission.
+    static let contextPrefetchMinimumRows = 64
+
+    /// Absorb the committed context rows this state holds into the drafter's
+    /// cache now, instead of inside the next block's forward.
+    ///
+    /// A layer's context keys and values are a function of the context rows
+    /// alone; only the block needs the anchor. The engine calls this right
+    /// after the prompt forward that produced the rows, and evaluates the
+    /// result in its own submission behind the prompt's, so the prompt's
+    /// sampled token never waits for it and the first round's block forward
+    /// covers the block rows only. Returns the arrays to evaluate, or nothing
+    /// when the rows stay pending for the block as before.
+    public func prefetchCommittedContext(
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        guard Self.contextPrefetchEnabled else { return [] }
+        let state = self.state(requestState)
+        guard !state.isReleased, state.pendingRows >= Self.contextPrefetchMinimumRows
+        else { return [] }
+        let context =
+            state.pending.count == 1
+            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        seedCacheOffsets(state)
+        guard (try? drafter.absorbContext(targetHidden: context, cache: state.caches)) == true
+        else { return [] }
+        state.absorbPending()
+        state.contextPrefetched = true
+        return state.caches.flatMap { $0.innerState() }
     }
 
     public func trimBlockState(

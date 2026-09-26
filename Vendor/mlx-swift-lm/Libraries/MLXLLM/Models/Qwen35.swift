@@ -553,14 +553,14 @@ enum Qwen35GatedDeltaV3 {
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
     }()
 
-    /// Dv rows per lane (template `DVPL`): 4 by default (samfenwick
-    /// `41a687f6`, carried in terrapinelf `2e0f5f12`; rows never mix, so the
-    /// values are the same bit for bit); `BONSAI_GDN_V3_DVPL=2` restores the
-    /// two-row layout. A threadgroup covers `16 * DVPL` dv rows.
+    /// Dv rows per lane (template `DVPL`): 2 by default; `BONSAI_GDN_V3_DVPL=4`
+    /// selects the four-row layout (samfenwick `41a687f6`, carried in
+    /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
+    /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
     static let rowsPerLane: Int = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "2" ? 2 : 4
+        return value == "4" ? 4 : 2
     }()
 
     private static let source = """
@@ -6246,13 +6246,14 @@ enum Qwen35TensorPackedMatmul {
         const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sp * WPP;
         auto stage = [&](int g, int buf) {
           threadgroup uint32_t* dst = bs[sg][buf] + sc * 32 + sp * (WPP * 4);
+          // One word's four planes are four contiguous uint32s at a 4-word
+          // aligned offset: one uint4 store, same values and positions.
           #pragma clang loop unroll(full)
           for (int j = 0; j < WPP; j++) {
             const uint32_t wv = wrow[g * 8 + j];
-            dst[4 * j + 0] = wv & 0x03030303u;
-            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
           }
         };
         stage(g0, 0);
@@ -6302,7 +6303,9 @@ enum Qwen35TensorPackedMatmul {
     // 128-group slice of the weight tile as int8 in its own threadgroup
     // buffer, the op `int8 x int8 -> int32` at the int8 rate of the tensor
     // unit (about twice the FP16 rate), the affine map in FP32 from the
-    // activation's per-group scale and scaled sum.
+    // activation's per-group scale and scaled sum. Template `NEG` takes the
+    // offset as `-scale` (proven per constant pair; no offset load) and `F32S`
+    // reads FP32-widened scales; see `NarrowEpilogue`. Both are exact.
     private static let sourceNarrowInt8 = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
@@ -6333,13 +6336,13 @@ enum Qwen35TensorPackedMatmul {
             const int sc = int(lane) + 32 * cc;
             const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
             threadgroup uint32_t* dst = bs[sg][buf] + sc * 32;
+            // As in the prompt kernel's staging: one uint4 store per word.
             #pragma clang loop unroll(full)
             for (int j = 0; j < 8; j++) {
               const uint32_t wv = wrow[j];
-              dst[4 * j + 0] = wv & 0x03030303u;
-              dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-              dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-              dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
             }
           }
         };
@@ -6353,8 +6356,20 @@ enum Qwen35TensorPackedMatmul {
           float4 sv[32 / 16], bv[32 / 16];
           #pragma clang loop unroll(full)
           for (int q = 0; q < 32 / 16; q++) {
-            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
-            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+            // F32S: scalesT holds the FP16 scales widened to FP32 at load
+            // (exact), so `sv` is the same value without the conversion.
+            if constexpr (F32S) {
+              sv[q] = *(const device float4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q);
+            } else {
+              sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
+            }
+            // NEG: every offset is the negated scale (FP16 bits proven at
+            // load), so `-sv` is the offset's exact FP32 value; no load.
+            if constexpr (NEG) {
+              bv[q] = -sv[q];
+            } else {
+              bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+            }
           }
           const float as0 = ascale[(size_t)fm * Kg + g], as1 = ascale[(size_t)(fm + 8) * Kg + g];
           const float rs0 = rowsum[(size_t)fm * Kg + g];
@@ -6387,6 +6402,176 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         """
+
+    // The verify int8 kernel software-pipelined through registers (K2): the
+    // same threadgroup (four simdgroups splitting K into contiguous quarters,
+    // one 16 x 32 x 128 int8 op per group and 32-column half, the partials
+    // summed in simdgroup order) and the same arithmetic in the same order, so
+    // the output is bitwise that of `sourceNarrowInt8` (self-tested at load).
+    // What changes is when the loads are issued: the 2-bit words of the next
+    // PD groups and the next group's epilogue constants are loaded into
+    // registers before the current group's op and epilogue run, so they are in
+    // flight while it computes, instead of the stage -> op -> epilogue chain
+    // waiting on each load in turn. The threadgroup staging buffer (4 KB per
+    // simdgroup and half) is unchanged, so the bytes in flight per core grow
+    // without costing occupancy. TN = 64 runs two 32-column halves per
+    // threadgroup (two ops per group, the known 16 x 32 destination layout).
+    // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD (1 or 2), TN (32
+    // or 64). grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
+    private static let sourceNarrowInt8Pipelined = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int gper = Kg / 4;
+        const int g0 = int(sg) * gper;
+        const int g1 = g0 + gper;
+        constexpr int NH = TN / 32;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
+        threadgroup uint32_t bs[4][NH][32 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][NH - 1], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32 / 2;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[NH][CAP];
+        #pragma clang loop unroll(full)
+        for (int h = 0; h < NH; h++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
+        }
+        // lane -> column lane of each 32-column half, all 8 words of a group
+        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
+        const size_t hstride = (size_t)32 * (K / 16);
+        auto getw = [&](int g, thread uint32_t (&v)[NH][8]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)g * 8);
+            const uint4 u0 = src[0]; const uint4 u1 = src[1];
+            v[h][0] = u0.x; v[h][1] = u0.y; v[h][2] = u0.z; v[h][3] = u0.w;
+            v[h][4] = u1.x; v[h][5] = u1.y; v[h][6] = u1.z; v[h][7] = u1.w;
+          }
+        };
+        auto putw = [&](thread const uint32_t (&v)[NH][8]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            threadgroup uint32_t* dst = bs[sg][h] + int(lane) * 32;
+            // As in the prompt kernel's staging: one uint4 store per word.
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 8; j++) {
+              const uint32_t wv = v[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        // epilogue constants of one group, kept in their stored types until use
+        auto getc = [&](int g, thread half4 (&sh)[NH][2], thread half4 (&bh)[NH][2],
+                        thread float4 (&sf)[NH][2], thread float (&c)[4]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              const size_t o = (size_t)g * N + n0 + 32 * h + fn + 16 * q;
+              if constexpr (F32S) { sf[h][q] = *(const device float4*)(scalesT + o); }
+              else { sh[h][q] = *(const device half4*)(scalesT + o); }
+              if constexpr (!NEG) { bh[h][q] = *(const device half4*)(biasesT + o); }
+            }
+          }
+          c[0] = ascale[(size_t)fm * Kg + g]; c[1] = ascale[(size_t)(fm + 8) * Kg + g];
+          c[2] = rowsum[(size_t)fm * Kg + g]; c[3] = rowsum[(size_t)(fm + 8) * Kg + g];
+        };
+        uint32_t wa[NH][8], wb[NH][8];
+        half4 sha[NH][2], shb[NH][2], bha[NH][2], bhb[NH][2];
+        float4 sfa[NH][2], sfb[NH][2];
+        float ca[4], cb[4];
+        auto body = [&](int g, thread uint32_t (&ws)[NH][8],
+                        thread half4 (&shc)[NH][2], thread half4 (&bhc)[NH][2], thread float4 (&sfc)[NH][2], thread float (&cc)[4],
+                        thread half4 (&shn)[NH][2], thread half4 (&bhn)[NH][2], thread float4 (&sfn)[NH][2], thread float (&cn)[4]) {
+          if (g + 1 < g1) { getc(g + 1, shn, bhn, sfn, cn); }
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          op.run(tA, B0, cT0);
+          if constexpr (NH == 2) {
+          op.run(tA, B1, cT1);
+          }
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            float4 sv[2], bv[2];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              if constexpr (F32S) { sv[q] = sfc[h][q]; } else { sv[q] = float4(shc[h][q]); }
+              if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhc[h][q]); }
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+              const int32_t ci = (h == 0) ? cT0[i] : cT1[i];
+              acc[h][i] = fma(mh ? cc[1] : cc[0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cc[3] : cc[2], acc[h][i]));
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (g + 1 < g1) {
+            putw(ws);
+            if (g + 1 + PD < g1) { getw(g + 1 + PD, ws); }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        };
+        {
+          uint32_t w0[NH][8];
+          getw(g0, w0);
+          if (g0 + 1 < g1) { getw(g0 + 1, wa); }
+          if (PD == 2 && g0 + 2 < g1) { getw(g0 + 2, wb); }
+          getc(g0, sha, bha, sfa, ca);
+          putw(w0);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = g0; g < g1; g += 2) {
+          body(g, wa, sha, bha, sfa, ca, shb, bhb, sfb, cb);
+          if (g + 1 < g1) {
+            if constexpr (PD == 2) { body(g + 1, wb, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
+            else { body(g + 1, wa, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
+          }
+        }
+        // the reduction reuses the staging buffers, in simdgroup order
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)&bs[0][0][0];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              float v = acc[h][i];
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
+            }
+          }
+        }
+        """
+
+    private static let kernelNarrowInt8Pipelined = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_i8p",
+        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowInt8Pipelined,
+        header: header,
+        ensureRowContiguous: true)
 
     private static let kernelNarrowInt8 = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8",
@@ -6549,13 +6734,18 @@ enum Qwen35TensorPackedMatmul {
           const device uint4* src = (const device uint4*)(wrow + g * 8);
           const uint4 v = *src;
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+          // One word's four planes are four contiguous uint32s (16 codes).
+          // The base is 16-uint32 aligned, so each plane group is one uint4
+          // store. Values and positions match the four scalar stores.
           #pragma clang loop unroll(full)
           for (int j = 0; j < 4; j++) {
             const uint32_t wv = v[j];
-            dst[4 * j + 0] = wv & 0x03030303u;
-            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
-            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
-            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            const uint4 codes = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+            *(threadgroup uint4*)(dst + 4 * j) = codes;
           }
         };
         stage(0, 0);
@@ -6737,6 +6927,330 @@ enum Qwen35TensorPackedMatmul {
         return perWord.reshaped(n, k / 128, 8).sum(axis: -1).asType(.float32)
     }
 
+    // MARK: - Verify int8 kernel choice (epilogue form x pipeline)
+
+    /// The epilogue of the verify int8 kernel. `base` loads the FP16 scale and
+    /// offset of every group. `negativeBias` loads the scale only and takes
+    /// `-scale` as the offset: exact wherever every offset's FP16 bits are its
+    /// scale's with the sign flipped, which
+    /// `HadamardConstantLayoutCache.biasesAreNegativeScales` proves per
+    /// constant pair (all 402 pairs of this checkpoint). `negativeBiasF32Scales`
+    /// also reads the scales pre-widened to FP32 (exact), one 16-byte load
+    /// per four columns and no conversion. The products are the same FP32
+    /// values bit for bit in every form.
+    enum NarrowEpilogue: Int {
+        case base = 0
+        case negativeBias = 1
+        case negativeBiasF32Scales = 2
+    }
+
+    /// The kernel body. `v0` is `sourceNarrowInt8` as recorded; `pd1` / `pd2`
+    /// are `sourceNarrowInt8Pipelined` with the next one / two groups' words
+    /// (and the next group's constants) loaded into registers ahead of the op;
+    /// `tn64` is the pipelined body over 64 columns per threadgroup (only on
+    /// request: it doubles the threadgroup memory). All bitwise identical.
+    enum NarrowVariant: Int {
+        case v0 = 0
+        case pd1 = 1
+        case pd2 = 2
+        case tn64 = 3
+    }
+
+    struct NarrowKernel: Hashable, CustomStringConvertible {
+        var variant: NarrowVariant
+        var form: NarrowEpilogue
+        static let original = NarrowKernel(variant: .v0, form: .base)
+        var description: String { "\(variant)/\(form)" }
+    }
+
+    /// The load-time choice (see `chooseNarrowKernels`): per production shape
+    /// `[k, n]`, and a default for every other shape. `original` until then
+    /// and wherever the int8 verify kernel is not installed.
+    nonisolated(unsafe) static var narrowDefault = NarrowKernel.original
+    nonisolated(unsafe) static var narrowByShape: [[Int]: NarrowKernel] = [:]
+    /// Whether any chosen kernel needs the per-projection proof / FP32 scales.
+    nonisolated(unsafe) static var narrowNeedsProof = false
+    nonisolated(unsafe) static var narrowNeedsF32 = false
+
+    /// The kernel for this projection: the chosen one for its shape when its
+    /// constants pass the proof (or it needs none), else `original`.
+    /// `materialize` evaluates the FP32 scales now (the prompt route's
+    /// load-time call); the verify route leaves them lazy.
+    static func narrowKernel(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
+        k: Int, n: Int, materialize: Bool
+    ) -> NarrowKernel {
+        let choice = narrowByShape[[k, n]] ?? narrowDefault
+        if choice.variant == .tn64 && n % 64 != 0 { return .original }
+        guard choice.form != .base else { return choice }
+        guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
+        if choice.form == .negativeBiasF32Scales {
+            _ = narrowScalesF32(cache, scales, materialize: materialize)
+        }
+        return choice
+    }
+
+    /// The prompt route's load-time preparation of the verify operands: the
+    /// proof and, when any chosen kernel reads them, the FP32 scales.
+    static func prepareNarrowOperands(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray
+    ) {
+        guard narrowNeedsProof, cache.biasesAreNegativeScales(scales, biases) else { return }
+        if narrowNeedsF32 { _ = narrowScalesF32(cache, scales, materialize: true) }
+    }
+
+    /// The FP16 scales widened to FP32 and transposed to `[groups, rows]`.
+    static func narrowScalesF32(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, materialize: Bool
+    ) -> MLXArray {
+        cache.derived(scales, tag: 4) { s in
+            let widened = s.asType(.float32).transposed(1, 0).contiguous()
+            if materialize { eval(widened) }
+            return widened
+        }
+    }
+
+    /// One launch of the verify int8 kernel. For the negated-offset forms
+    /// `biasesT` is not read (callers pass `scalesT`).
+    static func launchNarrowInt8(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, outputDType: DType,
+        kernel: NarrowKernel
+    ) -> MLXArray {
+        let m = 16
+        let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
+            ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
+        ]
+        switch kernel.variant {
+        case .v0:
+            return kernelNarrowInt8(
+                inputs, template: template,
+                grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        case .pd1, .pd2, .tn64:
+            let tn = kernel.variant == .tn64 ? 64 : 32
+            return kernelNarrowInt8Pipelined(
+                inputs, template: template + [("PD", kernel.variant == .pd2 ? 2 : 1), ("TN", tn)],
+                grid: (n / tn * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+    }
+
+    /// Synthetic operands for the verify int8 kernel: signed codes, random
+    /// 2-bit words, FP16 scales of both signs (zeros and signed zeros
+    /// included) with offsets that are their FP16 negations bit for bit,
+    /// FP32 activation scales and scaled sums. Nothing depends on a request.
+    private struct NarrowOperands {
+        let k: Int, n: Int
+        let codes: MLXArray, weight: MLXArray
+        let scalesT: MLXArray, biasesT: MLXArray, scalesT32: MLXArray
+        let ascale: MLXArray, rowsum: MLXArray
+
+        init(k: Int, n: Int, seed: UInt64) {
+            self.k = k
+            self.n = n
+            let kg = k / 128
+            codes = MLXRandom.randInt(
+                Int32(-127) ..< Int32(128), [16, k], key: MLXRandom.key(seed)
+            ).asType(.int8)
+            weight = MLXRandom.randInt(
+                Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+            ).asType(.uint16).view(dtype: .uint32)
+            var s = MLXRandom.uniform(
+                Float(-0.05) ..< Float(0.05), [n, kg], key: MLXRandom.key(seed + 2))
+            let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [n, kg], key: MLXRandom.key(seed + 3))
+            s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+            s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+            let scales = s.asType(.float16)
+            let biases = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            scalesT = scales.transposed(1, 0).contiguous()
+            biasesT = biases.transposed(1, 0).contiguous()
+            scalesT32 = scales.asType(.float32).transposed(1, 0).contiguous()
+            ascale = MLXRandom.uniform(
+                Float(0.0001) ..< Float(0.05), [16, kg], key: MLXRandom.key(seed + 4))
+            rowsum = MLXRandom.normal([16, kg], key: MLXRandom.key(seed + 5)) * Float(50)
+            eval(codes, weight, scalesT, biasesT, scalesT32, ascale, rowsum)
+        }
+
+        func run(_ kernel: NarrowKernel, _ outputDType: DType) -> MLXArray {
+            let (s, b): (MLXArray, MLXArray)
+            switch kernel.form {
+            case .base: (s, b) = (scalesT, biasesT)
+            case .negativeBias: (s, b) = (scalesT, scalesT)
+            case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
+            }
+            return launchNarrowInt8(
+                codes, weight, s, b, ascale, rowsum, k: k, n: n, outputDType: outputDType,
+                kernel: kernel)
+        }
+    }
+
+    /// The verify window's production shapes `(k, n)`: qkv|z, gate|up, down
+    /// and attention qkv, 16 rows each.
+    static let narrowTunedShapes = [(5120, 16384), (5120, 34816), (17408, 5120), (5120, 14336)]
+
+    /// Chooses the verify int8 kernels once, at load, on the running GPU.
+    ///
+    /// Self-test: every candidate runs against `original` on synthetic
+    /// operands (gate-, down- and an odd-quarter width) and must match every
+    /// output bit (FP16 for all; FP32 as well for each kernel that is then
+    /// chosen); a mismatch or any MLX error drops it. Timing: the survivors
+    /// and `original` run alternately on the four production shapes, each
+    /// over distinct weight sets of >= 96 MB (so every launch streams its
+    /// weights), best of five trials; each shape keeps its fastest kernel and
+    /// every other shape takes the fastest in total. A deadline keeps the
+    /// whole choice near 2 s (a candidate not started by then is skipped).
+    /// Runs at model init, before any timed phase, and builds the chosen
+    /// pipelines, so the first verify round compiles nothing.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
+    /// (master kill switch); `neg` / `f32` force that epilogue.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
+    /// body (`v0`); `pd1` / `pd2` / `tn64` force that body.
+    private static func chooseNarrowKernels() -> (NarrowKernel, [[Int]: NarrowKernel]) {
+        let environment = ProcessInfo.processInfo.environment
+        func knob(_ name: String) -> String? {
+            environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let forms: [NarrowEpilogue]
+        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
+        case "off", "0", "false", "no", "base": return (.original, [:])
+        case "neg": forms = [.negativeBias]
+        case "f32": forms = [.negativeBiasF32Scales]
+        default: forms = [.negativeBias, .negativeBiasF32Scales]
+        }
+        let variants: [NarrowVariant]
+        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
+        case "off", "0", "false", "no", "v0": variants = []
+        case "pd1": variants = [.pd1]
+        case "pd2": variants = [.pd2]
+        case "tn64": variants = [.tn64]
+        default: variants = [.pd1, .pd2]
+        }
+        let pipelinedForm = forms.contains(.negativeBias) ? NarrowEpilogue.negativeBias : forms[0]
+        let candidates = forms.map { NarrowKernel(variant: .v0, form: $0) }
+            + variants.map { NarrowKernel(variant: $0, form: pipelinedForm) }
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+        var log = "bonsai verify int8 kernels:"
+        var passed: [NarrowKernel] = []
+        var failedF32 = Set<NarrowKernel>()
+        var timings: [NarrowKernel: [Double]] = [:]
+        var byShape: [[Int]: NarrowKernel] = [:]
+        var fallback = NarrowKernel.original
+        do {
+            try withError { error in
+                let testShapes = [(5120, 4096, UInt64(71)), (17408, 1024, UInt64(72)), (2560, 512, UInt64(73))]
+                let testOps = testShapes.map { NarrowOperands(k: $0.0, n: $0.1, seed: $0.2) }
+                func matches(_ kernel: NarrowKernel, _ outputDType: DType) throws -> Bool {
+                    let bits: DType = outputDType == .float16 ? .uint16 : .uint32
+                    var same = true
+                    for ops in testOps {
+                        let reference = ops.run(.original, outputDType)
+                        let y = ops.run(kernel, outputDType)
+                        let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        if differ.item(Int32.self) != 0 { same = false }
+                    }
+                    return same
+                }
+                var skipped: [NarrowKernel] = []
+                for kernel in candidates {
+                    if elapsedMs() > 1200 { skipped.append(kernel); continue }
+                    if try matches(kernel, .float16) { passed.append(kernel) }
+                }
+                log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
+                if !skipped.isEmpty {
+                    log += " skipped [" + skipped.map(\.description).joined(separator: " ") + "]"
+                }
+                guard !passed.isEmpty else { return }
+
+                let kernels = [NarrowKernel.original] + passed
+                let sets = narrowTunedShapes.enumerated().map { (index, shape) -> [NarrowOperands] in
+                    let bytes = shape.0 * shape.1 / 4
+                    let copies = min(6, max(2, (96 << 20) / bytes + 1))
+                    return (0 ..< copies).map {
+                        NarrowOperands(k: shape.0, n: shape.1, seed: 100 + UInt64(index * 8 + $0))
+                    }
+                }
+                for kernel in kernels { eval(sets.flatMap { $0.map { $0.run(kernel, .float16) } }) }
+                try error.check()
+                for kernel in kernels { timings[kernel] = Array(repeating: .infinity, count: sets.count) }
+                for _ in 0 ..< 5 {
+                    for (index, shapeSets) in sets.enumerated() {
+                        for kernel in kernels {
+                            let outs = shapeSets.map { $0.run(kernel, .float16) }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
+                                / Double(outs.count)
+                            timings[kernel]![index] = min(timings[kernel]![index], us)
+                        }
+                    }
+                }
+                try error.check()
+
+                // Picks, then the FP32 self-test of each picked kernel; a
+                // kernel failing it is dropped and the picks redone.
+                while true {
+                    let usable = kernels.filter { !failedF32.contains($0) }
+                    func fastest(_ cost: (NarrowKernel) -> Double) -> NarrowKernel {
+                        usable.min { cost($0) < cost($1) } ?? .original
+                    }
+                    fallback = fastest { timings[$0]!.reduce(0, +) }
+                    byShape = [:]
+                    for (index, shape) in narrowTunedShapes.enumerated() {
+                        byShape[[shape.0, shape.1]] = fastest { timings[$0]![index] }
+                    }
+                    let picked = Set([fallback] + Array(byShape.values)).subtracting([.original])
+                    var clean = true
+                    for kernel in picked {
+                        if try !matches(kernel, .float32) {
+                            failedF32.insert(kernel)
+                            clean = false
+                        }
+                    }
+                    if clean { break }
+                }
+            }
+        } catch {
+            passed = []
+            byShape = [:]
+            fallback = .original
+            log += " error \(error)"
+        }
+        if !timings.isEmpty {
+            log += "; us/launch per shape (qkv|z gate|up down attn):"
+            for kernel in [NarrowKernel.original] + passed {
+                guard let row = timings[kernel] else { continue }
+                log += " \(kernel)=" + row.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            }
+        }
+        if !failedF32.isEmpty {
+            log += "; FP32 self-test failed [" + failedF32.map(\.description).joined(separator: " ") + "]"
+        }
+        Memory.clearCache()
+        log += "; using default \(fallback), per shape ["
+            + narrowTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
+            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
+        FileHandle.standardError.write(log.data(using: .utf8)!)
+        return (fallback, byShape)
+    }
+
+    /// Installs the choice.
+    private static func installNarrowChoice() {
+        let (fallback, byShape) = chooseNarrowKernels()
+        narrowDefault = fallback
+        narrowByShape = byShape
+        let all = [fallback] + Array(byShape.values)
+        narrowNeedsProof = all.contains { $0.form != .base }
+        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
+    }
+
     nonisolated(unsafe) private static var installed = false
 
     static func installIfNeeded() {
@@ -6768,15 +7282,25 @@ enum Qwen35TensorPackedMatmul {
                     activation.scaledSums.shape == [m, k / 128],
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
-                let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-                let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                return kernelNarrowInt8(
-                    [codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
-                     dimsArray(k: k, m: m, n: n)],
-                    template: [("OutT", outputDType)],
-                    grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
-                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                let choice = narrowKernel(cache, scales, biases, k: k, n: n, materialize: false)
+                let scalesT: MLXArray
+                let biasesT: MLXArray
+                switch choice.form {
+                case .negativeBiasF32Scales:
+                    scalesT = narrowScalesF32(cache, scales, materialize: false)
+                    biasesT = scalesT
+                case .negativeBias:
+                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                    biasesT = scalesT
+                case .base:
+                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                    biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
+                }
+                return launchNarrowInt8(
+                    codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
+                    k: k, n: n, outputDType: outputDType, kernel: choice)
             }
+            installNarrowChoice()
         } else if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
@@ -6827,6 +7351,10 @@ enum Qwen35TensorPackedMatmul {
                 activation.scaledSums.shape == [m, k / 128],
                 scales.shape == [n, k / 128], biases.shape == [n, k / 128]
             else { return nil }
+            // The verify int8 kernel's per-projection proof and FP32 scales are
+            // built here, at the first prompt forward (the load-time warm), so
+            // no verify round pays the readback or the widening.
+            prepareNarrowOperands(cache, scales, biases)
             let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
             let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
             let foldedSums = cache.derived(scales, tag: 3) { s in
