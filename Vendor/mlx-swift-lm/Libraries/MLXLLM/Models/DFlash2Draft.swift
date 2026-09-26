@@ -1077,6 +1077,14 @@ private final class DFlash2GateUpStack {
 }
 
 private final class DFlash2MLP: Module, UnaryLayer {
+    // Keep the existing dtype at each operation while allowing MLX to fuse
+    // the final multiply with SiLU and avoid its intermediate array.
+    private static let activation: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        compile(shapeless: true) { gate, up in
+            (gate * sigmoid(gate)) * up
+        }
+    }()
+
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
@@ -1100,9 +1108,9 @@ private final class DFlash2MLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return DFlash2TensorMatmul.linear(down, silu(g) * u)
+            return DFlash2TensorMatmul.linear(down, Self.activation(g, u))
         }
-        return DFlash2TensorMatmul.linear(down, silu(gate(x)) * up(x))
+        return DFlash2TensorMatmul.linear(down, Self.activation(gate(x), up(x)))
     }
 }
 
@@ -1401,7 +1409,7 @@ enum DFlash2GreedyWalk {
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
     ) -> MLXArray? {
         guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
-            unary.dtype == .float32
+            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
@@ -1471,6 +1479,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
 
     private let rope: RoPELayer
+    // Sliding masks depend only on block geometry. Keep the memo with the
+    // drafter so repeated speculative forwards can reuse the same graph
+    // (ercumentyildirim / terrapinelf `ff96d1e`).
+    private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
 
@@ -1613,7 +1625,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
 
-        let masks = DFlash2SlidingMaskMemo()
         let submitAfter = DFlash2DraftSubmission.layers
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
