@@ -300,11 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // One leading submission after layer 16 (see the type's comment);
-        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        // Submit the first 8 layers once while the host builds the rest.
+        // Keep explicit plans and both existing disable switches available.
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 0, offset: 0, explicit: [16]))
+            default: Plan(stride: 0, offset: 0, explicit: [8]))
     }()
 
     static let prompt: Plan = Plan.parse(
