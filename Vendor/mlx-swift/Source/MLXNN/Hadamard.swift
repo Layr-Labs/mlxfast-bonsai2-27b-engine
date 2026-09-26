@@ -870,7 +870,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let k = transform.width
         guard tensorRouteTakesPrompt(rows: rows, siblings: siblings),
             leading.reduce(1, *) == rows,
-            activation.codes.dtype == .uint8, activation.codes.shape == [rows, k],
+            activation.codes.dtype == .uint8 || activation.codes.dtype == .int8,
+            activation.codes.shape == [rows, k],
             activation.scales.dtype == .float32, activation.scales.shape == [rows, k / 128],
             activation.scaledSums.dtype == .float32,
             activation.scaledSums.shape == [rows, k / 128]
