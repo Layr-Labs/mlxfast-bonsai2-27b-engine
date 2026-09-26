@@ -553,14 +553,14 @@ enum Qwen35GatedDeltaV3 {
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
     }()
 
-    /// Dv rows per lane (template `DVPL`): 4 by default (samfenwick
-    /// `41a687f6`, carried in terrapinelf `2e0f5f12`; rows never mix, so the
-    /// values are the same bit for bit); `BONSAI_GDN_V3_DVPL=2` restores the
-    /// two-row layout. A threadgroup covers `16 * DVPL` dv rows.
+    /// Dv rows per lane (template `DVPL`): 2 by default; `BONSAI_GDN_V3_DVPL=4`
+    /// selects the four-row layout (samfenwick `41a687f6`, carried in
+    /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
+    /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
     static let rowsPerLane: Int = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "2" ? 2 : 4
+        return value == "4" ? 4 : 2
     }()
 
     private static let source = """
@@ -2740,7 +2740,38 @@ final class Qwen35Attention: Module {
             Qwen35AttentionPrework.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
                 ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
+            Qwen35AttentionPreworkExplicit.prepare(
+                hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: mrope.rotaryDim,
+                epsQ: args.rmsNormEps, epsK: args.rmsNormEps, mrope: mrope)
         }
+    }
+
+    /// q/k RMSNorm, the head transpose and the table-driven partial rotary
+    /// embedding in one launch (`Qwen35AttentionPreworkExplicit`) for explicit
+    /// per-row positions; nil keeps the op chain.
+    private func fusedExplicitPrework(
+        _ q: MLXArray, _ k: MLXArray, positionIds: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+            ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+            let (cosine, sine) = mrope.defaultTables(
+                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+        else { return nil }
+        return Qwen35AttentionPreworkExplicit.run(
+            q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
+            epsQ: qNorm.eps, epsK: kNorm.eps,
+            cosine: cosine, sine: sine, ropeDims: ropeDims)
+    }
+
+    /// `positionIds` normalized to 3 planes, shared with `Qwen35MRoPE.apply`.
+    private func normalizedExplicitPositions(_ positionIds: MLXArray) -> MLXArray {
+        var positions = positionIds
+        if positions.ndim == 2 {
+            positions = broadcast(
+                positions[.newAxis, 0..., 0...],
+                to: [3, positions.dim(0), positions.dim(1)])
+        }
+        return positions
     }
 
     /// q/k RMSNorm, the head transpose and the partial rotary embedding in one
@@ -2869,6 +2900,14 @@ final class Qwen35Attention: Module {
                 offsets: cache.positionOffsets)
         {
             (queries, keys) = fused
+        } else if let positionIds, !exactTargetVerify,
+            let fused = fusedExplicitPrework(
+                qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
+                positionIds: positionIds, ropeDims: mrope.rotaryDim)
+        {
+            // Norms, transpose and table-driven rotation in one launch; the
+            // composed norms below are skipped, not computed and discarded.
+            (queries, keys) = fused
         } else {
             queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
             keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
@@ -2954,7 +2993,7 @@ final class Qwen35Attention: Module {
 /// inputs; the module retains configuration only.
 final class Qwen35MRoPE {
     private let rope: RoPELayer
-    private let rotaryDim: Int
+    let rotaryDim: Int
     private let defaultInvFreq: MLXArray?
     private let sections: [Int]
     // Which of the three position planes (t/h/w) owns each frequency,
@@ -3006,6 +3045,21 @@ final class Qwen35MRoPE {
         return 0
     }
 
+    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
+    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
+    /// the non-default (per-frequency) path applies. The fused explicit
+    /// prework kernel consumes these same arrays, so one builder serves both.
+    func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
+        guard let defaultInvFreq else { return nil }
+        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        let angles = concatenated([frequency, frequency], axis: -1)
+        return (
+            cos(angles).asType(dtype).expandedDimensions(axis: 1),
+            sin(angles).asType(dtype).expandedDimensions(axis: 1))
+    }
+
     func apply(
         queries: MLXArray, keys: MLXArray, positionIds: MLXArray
     ) -> (MLXArray, MLXArray) {
@@ -3018,13 +3072,7 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let defaultInvFreq {
-            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
-            let angles = concatenated([frequency, frequency], axis: -1)
-            let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
-            let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
             func applyDefault(_ value: MLXArray) -> MLXArray {
                 let rotating = value[.ellipsis, ..<rotaryDim]
                 let half = rotating.dim(-1) / 2
@@ -4615,6 +4663,259 @@ enum Qwen35AttentionPrework {
                     q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
                     ropeDims: geo.rd, ropeBase: ropeBase),
                 refQ.shape == newQ.shape, refK.shape == newK.shape,
+                refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
+            else { return false }
+            same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
+                .&& all(refK.view(dtype: .uint32) .== newK.view(dtype: .uint32))
+        }
+        return same.item(Bool.self)
+    }
+}
+
+// MARK: - Fused q/k norm + table-driven rotation for explicit positions
+
+/// q/k RMSNorm, the head transpose and the partial rotary embedding in one
+/// launch for forwards that carry explicit per-row positions (the speculative
+/// verify), driven by the same (cosine, sine) tables the op chain builds.
+///
+/// This mirrors `Qwen35AttentionPrework` exactly -- same grid, same
+/// `rms_single_row` replication with the same two roundings, same transposed
+/// outputs -- except the rotation reads the chain's own cosine/sine tables
+/// instead of deriving angles from a scalar offset, so it applies wherever
+/// `Qwen35MRoPE.apply` applies, with no consecutiveness assumption. The
+/// rotation math is the chain's `applyDefault` in the same order
+/// (`rotating * cosine + rotatedHalf * sine`, pair `(j, j + HALF)`), over the
+/// same table values, so a prepared geometry is bit-identical to the chain;
+/// anything else keeps the chain. Like the offset prework, one geometry is
+/// compiled and checked bit for bit at model construction, on the box that
+/// runs it, before any timed forward.
+enum Qwen35AttentionPreworkExplicit {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_QKROPE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // grid (TPG * (HQ + HK), L, B), threadgroup (TPG, 1, 1), TPG = D / 4.
+    // Inputs: q [B, L, HQ, D] and k [B, L, HK, D] (any strides, same dtype),
+    // wq/wk [D] FP32, cos/sin [B, 1, L, RD] (the chain's expanded tables, any
+    // strides, same dtype as q), epsq/epsk/axis (= D) FP32 scalars.
+    // Outputs qo [B, HQ, L, D], ko [B, HK, L, D] FP32.
+    private static let source = """
+        constexpr int NR = 4;
+        constexpr int HALF = RD / 2;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hh = threadgroup_position_in_grid.x;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint bb = threadgroup_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int Ln = int(q_shape[1]);
+        const bool isq = hh < uint(HQ);
+        const uint h = isq ? hh : hh - uint(HQ);
+
+        threadgroup float local_sums[32];
+        threadgroup float local_inv[1];
+        threadgroup float rot[RD];
+
+        // rms_single_row: lane lid holds channels NR*lid .. NR*lid+NR-1.
+        const int64_t base = isq
+            ? int64_t(bb) * q_strides[0] + int64_t(t) * q_strides[1] + int64_t(h) * q_strides[2]
+            : int64_t(bb) * k_strides[0] + int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
+        const int64_t cs = isq ? q_strides[3] : k_strides[3];
+        auto src = isq ? q : k;
+        float acc = 0;
+        float thread_x[NR];
+        for (int i = 0; i < NR; i++) {
+          thread_x[i] = static_cast<float>(src[base + int64_t(lid * NR + i) * cs]);
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) {
+          local_sums[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+          local_sums[sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          acc = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            const float eps = isq ? epsq : epsk;
+            local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto w = isq ? wq : wk;
+        auto dst = isq ? qo : ko;
+        const size_t obase =
+            ((size_t(bb) * size_t(isq ? HQ : HK) + size_t(h)) * size_t(Ln) + size_t(t)) * size_t(D);
+        const float inv = local_inv[0];
+        for (int i = 0; i < NR; i++) {
+          const uint c = lid * NR + uint(i);
+          const float n = w[c] * static_cast<float>(thread_x[i] * inv);
+          if (c < uint(RD)) {
+            rot[c] = n;
+          } else {
+            dst[obase + c] = n;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Table-driven rotation on channels [0, RD): pair (j, j + HALF), the
+        // chain's applyDefault in the same order.
+        if (lid < uint(HALF)) {
+          const size_t toff =
+              size_t(bb) * size_t(cos_table_strides[0]) + size_t(t) * size_t(cos_table_strides[2])
+              + size_t(lid) * size_t(cos_table_strides[3]);
+          const float c = static_cast<float>(cos_table[toff]);
+          const float s = static_cast<float>(sin_table[toff]);
+          const float x1 = rot[lid];
+          const float x2 = rot[lid + HALF];
+          dst[obase + lid] = x1 * c - x2 * s;
+          dst[obase + lid + HALF] = x1 * s + x2 * c;
+        }
+        """;
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_attn_qkrope_tables",
+        inputNames: ["q", "k", "wq", "wk", "cos_table", "sin_table", "epsq", "epsk", "axis"],
+        outputNames: ["qo", "ko"],
+        source: source,
+        ensureRowContiguous: false)
+
+    /// `(rope(qNorm(q).transposed(0, 2, 1, 3)), rope(kNorm(k).transposed(0, 2, 1,
+    /// 3)))` for explicit `positionIds`, in one launch; nil keeps the op chain.
+    static func run(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        cosine: MLXArray, sine: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, q.ndim == 4, k.ndim == 4,
+            verified(
+                Geometry(
+                    hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims,
+                    dtype: "\(q.dtype)"))
+        else { return nil }
+        return runUnchecked(
+            q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK,
+            cosine: cosine, sine: sine, ropeDims: ropeDims)
+    }
+
+    private static func runUnchecked(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        cosine: MLXArray, sine: MLXArray, ropeDims: Int
+    ) -> (MLXArray, MLXArray)? {
+        let B = q.dim(0)
+        let L = q.dim(1)
+        let HQ = q.dim(2)
+        let HK = k.dim(2)
+        let D = q.dim(3)
+        guard k.dim(0) == B, k.dim(1) == L, k.dim(3) == D,
+            q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
+            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
+            cosine.dtype == q.dtype, sine.dtype == q.dtype,
+            cosine.shape == [B, 1, L, ropeDims], sine.shape == [B, 1, L, ropeDims],
+            L > 0, L < 65536
+        else { return nil }
+        let outputs = kernel(
+            [q, k, wq, wk, cosine, sine,
+             MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D))],
+            template: [
+                ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
+            ],
+            grid: ((D / 4) * (HQ + HK), L, B), threadGroup: (D / 4, 1, 1),
+            outputShapes: [[B, HQ, L, D], [B, HK, L, D]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private struct Geometry: Hashable {
+        let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static func verified(_ geometry: Geometry) -> Bool {
+        lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Compile the kernel and check it bit for bit against the op chain for one
+    /// attention geometry, once per process, at model construction (before
+    /// any timed forward). A geometry or dtype that was not prepared, or that
+    /// disagrees, keeps the op chain.
+    static func prepare(
+        hq: Int, hk: Int, d: Int, ropeDims rd: Int, epsQ: Float, epsK: Float,
+        mrope: Qwen35MRoPE
+    ) {
+        guard enabled, d % 128 == 0, d <= 4096, rd > 0, rd % 4 == 0, rd <= d,
+            rd / 2 <= d / 4
+        else { return }
+        lock.withLock {
+            for dtype in [DType.float32] {
+                let geometry = Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)")
+                if verdicts[geometry] != nil { continue }
+                let verdict = selfCheck(geometry, dtype: dtype, epsQ: epsQ, epsK: epsK, mrope: mrope)
+                verdicts[geometry] = verdict
+                if !verdict {
+                    FileHandle.standardError.write(
+                        "qwen35: table-driven attention prework disagrees with the op chain on this device (\(dtype)); using the op chain\n"
+                            .data(using: .utf8)!)
+                }
+            }
+        }
+    }
+
+    private static func selfCheck(
+        _ geo: Geometry, dtype: DType, epsQ: Float, epsK: Float, mrope: Qwen35MRoPE
+    ) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x716b_726f), into: 6)
+        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
+        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
+        // The op chain as `Qwen35Attention.cbv2Forward` composes it on the
+        // explicit-positions path (norms, transpose, `mrope.apply`).
+        func chain(_ x: MLXArray, _ other: MLXArray, _ positions: MLXArray)
+            -> (MLXArray, MLXArray)
+        {
+            let q = MLXFast.rmsNorm(x, weight: wq, eps: epsQ).transposed(0, 2, 1, 3)
+            let k = MLXFast.rmsNorm(other, weight: wk, eps: epsK).transposed(0, 2, 1, 3)
+            return mrope.apply(queries: q, keys: k, positionIds: positions)
+        }
+        var same = MLXArray(true)
+        // Consecutive blocks (the drafter's rectangles) and ragged positions
+        // (never taken on this track, covered anyway): wide magnitude spread
+        // so the reductions see real rounding.
+        for (index, (rows, base, stride)) in [(16, 611, 1), (1, 4093, 1), (16, 100, 3), (5, 200_003, 1)].enumerated() {
+            // The q|gate, k and v projections stacked as the verify produces
+            // them (q strided by the gate split, exactly as `cbv2Forward`
+            // hands them to the fused path); wide magnitude spread so the
+            // reductions see real rounding.
+            let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+            let wide = (MLXRandom.normal([1, rows, width], key: keys[2 + index % 4])
+                * exp(MLXRandom.normal([1, rows, width], key: keys[(3 + index) % 6])))
+                .asType(dtype)
+            let parts = MLX.split(
+                wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d],
+                axis: -1)
+            let q = parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0]
+            let k = parts[1].reshaped(1, rows, geo.hk, -1)
+            var planeValues = [Int32]()
+            for p in 0 ..< rows {
+                planeValues.append(Int32(base + p * stride))
+            }
+            // Scalar-equivalent text positions: all three planes identical.
+            let positions = MLXArray(planeValues + planeValues + planeValues)
+                .reshaped([3, 1, rows])
+            guard let (cosine, sine) = mrope.defaultTables(
+                    positions: positions, dtype: dtype),
+                let (newQ, newK) = runUnchecked(
+                    q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK,
+                    cosine: cosine, sine: sine, ropeDims: geo.rd)
+            else { return false }
+            let (refQ, refK) = chain(q, k, positions)
+            guard refQ.shape == newQ.shape, refK.shape == newK.shape,
                 refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
             else { return false }
             same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
@@ -6303,7 +6604,9 @@ enum Qwen35TensorPackedMatmul {
     // 128-group slice of the weight tile as int8 in its own threadgroup
     // buffer, the op `int8 x int8 -> int32` at the int8 rate of the tensor
     // unit (about twice the FP16 rate), the affine map in FP32 from the
-    // activation's per-group scale and scaled sum.
+    // activation's per-group scale and scaled sum. Template `NEG` takes the
+    // offset as `-scale` (proven per constant pair; no offset load) and `F32S`
+    // reads FP32-widened scales; see `NarrowEpilogue`. Both are exact.
     private static let sourceNarrowInt8 = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
@@ -6354,8 +6657,20 @@ enum Qwen35TensorPackedMatmul {
           float4 sv[32 / 16], bv[32 / 16];
           #pragma clang loop unroll(full)
           for (int q = 0; q < 32 / 16; q++) {
-            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
-            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+            // F32S: scalesT holds the FP16 scales widened to FP32 at load
+            // (exact), so `sv` is the same value without the conversion.
+            if constexpr (F32S) {
+              sv[q] = *(const device float4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q);
+            } else {
+              sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
+            }
+            // NEG: every offset is the negated scale (FP16 bits proven at
+            // load), so `-sv` is the offset's exact FP32 value; no load.
+            if constexpr (NEG) {
+              bv[q] = -sv[q];
+            } else {
+              bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+            }
           }
           const float as0 = ascale[(size_t)fm * Kg + g], as1 = ascale[(size_t)(fm + 8) * Kg + g];
           const float rs0 = rowsum[(size_t)fm * Kg + g];
@@ -6378,16 +6693,205 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // i = 0, 4, 8, 12. mh and nq are constant on each group and c is
+          // 0, 1, 2, 3, so the four outputs are consecutive columns. The sum
+          // is still acc, then red[0], red[1], red[2], each folded on its own
+          // partial. OutT is half or float; both stores are 4-element aligned
+          // because fn, n0 and N are multiples of 4.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
+
+    // The verify int8 kernel software-pipelined through registers (K2): the
+    // same threadgroup (four simdgroups splitting K into contiguous quarters,
+    // one 16 x 32 x 128 int8 op per group and 32-column half, the partials
+    // summed in simdgroup order) and the same arithmetic in the same order, so
+    // the output is bitwise that of `sourceNarrowInt8` (self-tested at load).
+    // What changes is when the loads are issued: the 2-bit words of the next
+    // PD groups and the next group's epilogue constants are loaded into
+    // registers before the current group's op and epilogue run, so they are in
+    // flight while it computes, instead of the stage -> op -> epilogue chain
+    // waiting on each load in turn. The threadgroup staging buffer (4 KB per
+    // simdgroup and half) is unchanged, so the bytes in flight per core grow
+    // without costing occupancy. TN = 64 runs two 32-column halves per
+    // threadgroup (two ops per group, the known 16 x 32 destination layout).
+    // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD (1 or 2), TN (32
+    // or 64). grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
+    private static let sourceNarrowInt8Pipelined = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int gper = Kg / 4;
+        const int g0 = int(sg) * gper;
+        const int g1 = g0 + gper;
+        constexpr int NH = TN / 32;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
+        threadgroup uint32_t bs[4][NH][32 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][NH - 1], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32 / 2;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[NH][CAP];
+        #pragma clang loop unroll(full)
+        for (int h = 0; h < NH; h++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
+        }
+        // lane -> column lane of each 32-column half, all 8 words of a group
+        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
+        const size_t hstride = (size_t)32 * (K / 16);
+        auto getw = [&](int g, thread uint32_t (&v)[NH][8]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)g * 8);
+            const uint4 u0 = src[0]; const uint4 u1 = src[1];
+            v[h][0] = u0.x; v[h][1] = u0.y; v[h][2] = u0.z; v[h][3] = u0.w;
+            v[h][4] = u1.x; v[h][5] = u1.y; v[h][6] = u1.z; v[h][7] = u1.w;
+          }
+        };
+        auto putw = [&](thread const uint32_t (&v)[NH][8]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            threadgroup uint32_t* dst = bs[sg][h] + int(lane) * 32;
+            // As in the prompt kernel's staging: one uint4 store per word.
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 8; j++) {
+              const uint32_t wv = v[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        // epilogue constants of one group, kept in their stored types until use
+        auto getc = [&](int g, thread half4 (&sh)[NH][2], thread half4 (&bh)[NH][2],
+                        thread float4 (&sf)[NH][2], thread float (&c)[4]) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              const size_t o = (size_t)g * N + n0 + 32 * h + fn + 16 * q;
+              if constexpr (F32S) { sf[h][q] = *(const device float4*)(scalesT + o); }
+              else { sh[h][q] = *(const device half4*)(scalesT + o); }
+              if constexpr (!NEG) { bh[h][q] = *(const device half4*)(biasesT + o); }
+            }
+          }
+          c[0] = ascale[(size_t)fm * Kg + g]; c[1] = ascale[(size_t)(fm + 8) * Kg + g];
+          c[2] = rowsum[(size_t)fm * Kg + g]; c[3] = rowsum[(size_t)(fm + 8) * Kg + g];
+        };
+        uint32_t wa[NH][8], wb[NH][8];
+        half4 sha[NH][2], shb[NH][2], bha[NH][2], bhb[NH][2];
+        float4 sfa[NH][2], sfb[NH][2];
+        float ca[4], cb[4];
+        auto body = [&](int g, thread uint32_t (&ws)[NH][8],
+                        thread half4 (&shc)[NH][2], thread half4 (&bhc)[NH][2], thread float4 (&sfc)[NH][2], thread float (&cc)[4],
+                        thread half4 (&shn)[NH][2], thread half4 (&bhn)[NH][2], thread float4 (&sfn)[NH][2], thread float (&cn)[4]) {
+          if (g + 1 < g1) { getc(g + 1, shn, bhn, sfn, cn); }
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          op.run(tA, B0, cT0);
+          if constexpr (NH == 2) {
+          op.run(tA, B1, cT1);
+          }
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            float4 sv[2], bv[2];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              if constexpr (F32S) { sv[q] = sfc[h][q]; } else { sv[q] = float4(shc[h][q]); }
+              if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhc[h][q]); }
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+              const int32_t ci = (h == 0) ? cT0[i] : cT1[i];
+              acc[h][i] = fma(mh ? cc[1] : cc[0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cc[3] : cc[2], acc[h][i]));
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (g + 1 < g1) {
+            putw(ws);
+            if (g + 1 + PD < g1) { getw(g + 1 + PD, ws); }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        };
+        {
+          uint32_t w0[NH][8];
+          getw(g0, w0);
+          if (g0 + 1 < g1) { getw(g0 + 1, wa); }
+          if (PD == 2 && g0 + 2 < g1) { getw(g0 + 2, wb); }
+          getc(g0, sha, bha, sfa, ca);
+          putw(w0);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = g0; g < g1; g += 2) {
+          body(g, wa, sha, bha, sfa, ca, shb, bhb, sfb, cb);
+          if (g + 1 < g1) {
+            if constexpr (PD == 2) { body(g + 1, wb, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
+            else { body(g + 1, wa, shb, bhb, sfb, cb, sha, bha, sfa, ca); }
+          }
+        }
+        // the reduction reuses the staging buffers, in simdgroup order
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)&bs[0][0][0];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              float v = acc[h][i];
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4 - 1; q++) { v += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)]; }
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nq] = OutT(v);
+            }
+          }
+        }
+        """
+
+    private static let kernelNarrowInt8Pipelined = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_i8p",
+        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowInt8Pipelined,
+        header: header,
+        ensureRowContiguous: true)
 
     private static let kernelNarrowInt8 = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8",
@@ -6743,6 +7247,330 @@ enum Qwen35TensorPackedMatmul {
         return perWord.reshaped(n, k / 128, 8).sum(axis: -1).asType(.float32)
     }
 
+    // MARK: - Verify int8 kernel choice (epilogue form x pipeline)
+
+    /// The epilogue of the verify int8 kernel. `base` loads the FP16 scale and
+    /// offset of every group. `negativeBias` loads the scale only and takes
+    /// `-scale` as the offset: exact wherever every offset's FP16 bits are its
+    /// scale's with the sign flipped, which
+    /// `HadamardConstantLayoutCache.biasesAreNegativeScales` proves per
+    /// constant pair (all 402 pairs of this checkpoint). `negativeBiasF32Scales`
+    /// also reads the scales pre-widened to FP32 (exact), one 16-byte load
+    /// per four columns and no conversion. The products are the same FP32
+    /// values bit for bit in every form.
+    enum NarrowEpilogue: Int {
+        case base = 0
+        case negativeBias = 1
+        case negativeBiasF32Scales = 2
+    }
+
+    /// The kernel body. `v0` is `sourceNarrowInt8` as recorded; `pd1` / `pd2`
+    /// are `sourceNarrowInt8Pipelined` with the next one / two groups' words
+    /// (and the next group's constants) loaded into registers ahead of the op;
+    /// `tn64` is the pipelined body over 64 columns per threadgroup (only on
+    /// request: it doubles the threadgroup memory). All bitwise identical.
+    enum NarrowVariant: Int {
+        case v0 = 0
+        case pd1 = 1
+        case pd2 = 2
+        case tn64 = 3
+    }
+
+    struct NarrowKernel: Hashable, CustomStringConvertible {
+        var variant: NarrowVariant
+        var form: NarrowEpilogue
+        static let original = NarrowKernel(variant: .v0, form: .base)
+        var description: String { "\(variant)/\(form)" }
+    }
+
+    /// The load-time choice (see `chooseNarrowKernels`): per production shape
+    /// `[k, n]`, and a default for every other shape. `original` until then
+    /// and wherever the int8 verify kernel is not installed.
+    nonisolated(unsafe) static var narrowDefault = NarrowKernel.original
+    nonisolated(unsafe) static var narrowByShape: [[Int]: NarrowKernel] = [:]
+    /// Whether any chosen kernel needs the per-projection proof / FP32 scales.
+    nonisolated(unsafe) static var narrowNeedsProof = false
+    nonisolated(unsafe) static var narrowNeedsF32 = false
+
+    /// The kernel for this projection: the chosen one for its shape when its
+    /// constants pass the proof (or it needs none), else `original`.
+    /// `materialize` evaluates the FP32 scales now (the prompt route's
+    /// load-time call); the verify route leaves them lazy.
+    static func narrowKernel(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
+        k: Int, n: Int, materialize: Bool
+    ) -> NarrowKernel {
+        let choice = narrowByShape[[k, n]] ?? narrowDefault
+        if choice.variant == .tn64 && n % 64 != 0 { return .original }
+        guard choice.form != .base else { return choice }
+        guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
+        if choice.form == .negativeBiasF32Scales {
+            _ = narrowScalesF32(cache, scales, materialize: materialize)
+        }
+        return choice
+    }
+
+    /// The prompt route's load-time preparation of the verify operands: the
+    /// proof and, when any chosen kernel reads them, the FP32 scales.
+    static func prepareNarrowOperands(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray
+    ) {
+        guard narrowNeedsProof, cache.biasesAreNegativeScales(scales, biases) else { return }
+        if narrowNeedsF32 { _ = narrowScalesF32(cache, scales, materialize: true) }
+    }
+
+    /// The FP16 scales widened to FP32 and transposed to `[groups, rows]`.
+    static func narrowScalesF32(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, materialize: Bool
+    ) -> MLXArray {
+        cache.derived(scales, tag: 4) { s in
+            let widened = s.asType(.float32).transposed(1, 0).contiguous()
+            if materialize { eval(widened) }
+            return widened
+        }
+    }
+
+    /// One launch of the verify int8 kernel. For the negated-offset forms
+    /// `biasesT` is not read (callers pass `scalesT`).
+    static func launchNarrowInt8(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, outputDType: DType,
+        kernel: NarrowKernel
+    ) -> MLXArray {
+        let m = 16
+        let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
+            ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
+        ]
+        switch kernel.variant {
+        case .v0:
+            return kernelNarrowInt8(
+                inputs, template: template,
+                grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        case .pd1, .pd2, .tn64:
+            let tn = kernel.variant == .tn64 ? 64 : 32
+            return kernelNarrowInt8Pipelined(
+                inputs, template: template + [("PD", kernel.variant == .pd2 ? 2 : 1), ("TN", tn)],
+                grid: (n / tn * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+    }
+
+    /// Synthetic operands for the verify int8 kernel: signed codes, random
+    /// 2-bit words, FP16 scales of both signs (zeros and signed zeros
+    /// included) with offsets that are their FP16 negations bit for bit,
+    /// FP32 activation scales and scaled sums. Nothing depends on a request.
+    private struct NarrowOperands {
+        let k: Int, n: Int
+        let codes: MLXArray, weight: MLXArray
+        let scalesT: MLXArray, biasesT: MLXArray, scalesT32: MLXArray
+        let ascale: MLXArray, rowsum: MLXArray
+
+        init(k: Int, n: Int, seed: UInt64) {
+            self.k = k
+            self.n = n
+            let kg = k / 128
+            codes = MLXRandom.randInt(
+                Int32(-127) ..< Int32(128), [16, k], key: MLXRandom.key(seed)
+            ).asType(.int8)
+            weight = MLXRandom.randInt(
+                Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+            ).asType(.uint16).view(dtype: .uint32)
+            var s = MLXRandom.uniform(
+                Float(-0.05) ..< Float(0.05), [n, kg], key: MLXRandom.key(seed + 2))
+            let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [n, kg], key: MLXRandom.key(seed + 3))
+            s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+            s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+            let scales = s.asType(.float16)
+            let biases = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            scalesT = scales.transposed(1, 0).contiguous()
+            biasesT = biases.transposed(1, 0).contiguous()
+            scalesT32 = scales.asType(.float32).transposed(1, 0).contiguous()
+            ascale = MLXRandom.uniform(
+                Float(0.0001) ..< Float(0.05), [16, kg], key: MLXRandom.key(seed + 4))
+            rowsum = MLXRandom.normal([16, kg], key: MLXRandom.key(seed + 5)) * Float(50)
+            eval(codes, weight, scalesT, biasesT, scalesT32, ascale, rowsum)
+        }
+
+        func run(_ kernel: NarrowKernel, _ outputDType: DType) -> MLXArray {
+            let (s, b): (MLXArray, MLXArray)
+            switch kernel.form {
+            case .base: (s, b) = (scalesT, biasesT)
+            case .negativeBias: (s, b) = (scalesT, scalesT)
+            case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
+            }
+            return launchNarrowInt8(
+                codes, weight, s, b, ascale, rowsum, k: k, n: n, outputDType: outputDType,
+                kernel: kernel)
+        }
+    }
+
+    /// The verify window's production shapes `(k, n)`: qkv|z, gate|up, down
+    /// and attention qkv, 16 rows each.
+    static let narrowTunedShapes = [(5120, 16384), (5120, 34816), (17408, 5120), (5120, 14336)]
+
+    /// Chooses the verify int8 kernels once, at load, on the running GPU.
+    ///
+    /// Self-test: every candidate runs against `original` on synthetic
+    /// operands (gate-, down- and an odd-quarter width) and must match every
+    /// output bit (FP16 for all; FP32 as well for each kernel that is then
+    /// chosen); a mismatch or any MLX error drops it. Timing: the survivors
+    /// and `original` run alternately on the four production shapes, each
+    /// over distinct weight sets of >= 96 MB (so every launch streams its
+    /// weights), best of five trials; each shape keeps its fastest kernel and
+    /// every other shape takes the fastest in total. A deadline keeps the
+    /// whole choice near 2 s (a candidate not started by then is skipped).
+    /// Runs at model init, before any timed phase, and builds the chosen
+    /// pipelines, so the first verify round compiles nothing.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
+    /// (master kill switch); `neg` / `f32` force that epilogue.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
+    /// body (`v0`); `pd1` / `pd2` / `tn64` force that body.
+    private static func chooseNarrowKernels() -> (NarrowKernel, [[Int]: NarrowKernel]) {
+        let environment = ProcessInfo.processInfo.environment
+        func knob(_ name: String) -> String? {
+            environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let forms: [NarrowEpilogue]
+        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
+        case "off", "0", "false", "no", "base": return (.original, [:])
+        case "neg": forms = [.negativeBias]
+        case "f32": forms = [.negativeBiasF32Scales]
+        default: forms = [.negativeBias, .negativeBiasF32Scales]
+        }
+        let variants: [NarrowVariant]
+        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
+        case "off", "0", "false", "no", "v0": variants = []
+        case "pd1": variants = [.pd1]
+        case "pd2": variants = [.pd2]
+        case "tn64": variants = [.tn64]
+        default: variants = [.pd1, .pd2]
+        }
+        let pipelinedForm = forms.contains(.negativeBias) ? NarrowEpilogue.negativeBias : forms[0]
+        let candidates = forms.map { NarrowKernel(variant: .v0, form: $0) }
+            + variants.map { NarrowKernel(variant: $0, form: pipelinedForm) }
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+        var log = "bonsai verify int8 kernels:"
+        var passed: [NarrowKernel] = []
+        var failedF32 = Set<NarrowKernel>()
+        var timings: [NarrowKernel: [Double]] = [:]
+        var byShape: [[Int]: NarrowKernel] = [:]
+        var fallback = NarrowKernel.original
+        do {
+            try withError { error in
+                let testShapes = [(5120, 4096, UInt64(71)), (17408, 1024, UInt64(72)), (2560, 512, UInt64(73))]
+                let testOps = testShapes.map { NarrowOperands(k: $0.0, n: $0.1, seed: $0.2) }
+                func matches(_ kernel: NarrowKernel, _ outputDType: DType) throws -> Bool {
+                    let bits: DType = outputDType == .float16 ? .uint16 : .uint32
+                    var same = true
+                    for ops in testOps {
+                        let reference = ops.run(.original, outputDType)
+                        let y = ops.run(kernel, outputDType)
+                        let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        if differ.item(Int32.self) != 0 { same = false }
+                    }
+                    return same
+                }
+                var skipped: [NarrowKernel] = []
+                for kernel in candidates {
+                    if elapsedMs() > 1200 { skipped.append(kernel); continue }
+                    if try matches(kernel, .float16) { passed.append(kernel) }
+                }
+                log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
+                if !skipped.isEmpty {
+                    log += " skipped [" + skipped.map(\.description).joined(separator: " ") + "]"
+                }
+                guard !passed.isEmpty else { return }
+
+                let kernels = [NarrowKernel.original] + passed
+                let sets = narrowTunedShapes.enumerated().map { (index, shape) -> [NarrowOperands] in
+                    let bytes = shape.0 * shape.1 / 4
+                    let copies = min(6, max(2, (96 << 20) / bytes + 1))
+                    return (0 ..< copies).map {
+                        NarrowOperands(k: shape.0, n: shape.1, seed: 100 + UInt64(index * 8 + $0))
+                    }
+                }
+                for kernel in kernels { eval(sets.flatMap { $0.map { $0.run(kernel, .float16) } }) }
+                try error.check()
+                for kernel in kernels { timings[kernel] = Array(repeating: .infinity, count: sets.count) }
+                for _ in 0 ..< 5 {
+                    for (index, shapeSets) in sets.enumerated() {
+                        for kernel in kernels {
+                            let outs = shapeSets.map { $0.run(kernel, .float16) }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
+                                / Double(outs.count)
+                            timings[kernel]![index] = min(timings[kernel]![index], us)
+                        }
+                    }
+                }
+                try error.check()
+
+                // Picks, then the FP32 self-test of each picked kernel; a
+                // kernel failing it is dropped and the picks redone.
+                while true {
+                    let usable = kernels.filter { !failedF32.contains($0) }
+                    func fastest(_ cost: (NarrowKernel) -> Double) -> NarrowKernel {
+                        usable.min { cost($0) < cost($1) } ?? .original
+                    }
+                    fallback = fastest { timings[$0]!.reduce(0, +) }
+                    byShape = [:]
+                    for (index, shape) in narrowTunedShapes.enumerated() {
+                        byShape[[shape.0, shape.1]] = fastest { timings[$0]![index] }
+                    }
+                    let picked = Set([fallback] + Array(byShape.values)).subtracting([.original])
+                    var clean = true
+                    for kernel in picked {
+                        if try !matches(kernel, .float32) {
+                            failedF32.insert(kernel)
+                            clean = false
+                        }
+                    }
+                    if clean { break }
+                }
+            }
+        } catch {
+            passed = []
+            byShape = [:]
+            fallback = .original
+            log += " error \(error)"
+        }
+        if !timings.isEmpty {
+            log += "; us/launch per shape (qkv|z gate|up down attn):"
+            for kernel in [NarrowKernel.original] + passed {
+                guard let row = timings[kernel] else { continue }
+                log += " \(kernel)=" + row.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            }
+        }
+        if !failedF32.isEmpty {
+            log += "; FP32 self-test failed [" + failedF32.map(\.description).joined(separator: " ") + "]"
+        }
+        Memory.clearCache()
+        log += "; using default \(fallback), per shape ["
+            + narrowTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
+            .joined(separator: " ") + "]; \(String(format: "%.0f", elapsedMs())) ms\n"
+        FileHandle.standardError.write(log.data(using: .utf8)!)
+        return (fallback, byShape)
+    }
+
+    /// Installs the choice.
+    private static func installNarrowChoice() {
+        let (fallback, byShape) = chooseNarrowKernels()
+        narrowDefault = fallback
+        narrowByShape = byShape
+        let all = [fallback] + Array(byShape.values)
+        narrowNeedsProof = all.contains { $0.form != .base }
+        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
+    }
+
     nonisolated(unsafe) private static var installed = false
 
     static func installIfNeeded() {
@@ -6774,15 +7602,25 @@ enum Qwen35TensorPackedMatmul {
                     activation.scaledSums.shape == [m, k / 128],
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
-                let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-                let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                return kernelNarrowInt8(
-                    [codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
-                     dimsArray(k: k, m: m, n: n)],
-                    template: [("OutT", outputDType)],
-                    grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
-                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                let choice = narrowKernel(cache, scales, biases, k: k, n: n, materialize: false)
+                let scalesT: MLXArray
+                let biasesT: MLXArray
+                switch choice.form {
+                case .negativeBiasF32Scales:
+                    scalesT = narrowScalesF32(cache, scales, materialize: false)
+                    biasesT = scalesT
+                case .negativeBias:
+                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                    biasesT = scalesT
+                case .base:
+                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                    biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
+                }
+                return launchNarrowInt8(
+                    codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
+                    k: k, n: n, outputDType: outputDType, kernel: choice)
             }
+            installNarrowChoice()
         } else if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
@@ -6833,6 +7671,10 @@ enum Qwen35TensorPackedMatmul {
                 activation.scaledSums.shape == [m, k / 128],
                 scales.shape == [n, k / 128], biases.shape == [n, k / 128]
             else { return nil }
+            // The verify int8 kernel's per-projection proof and FP32 scales are
+            // built here, at the first prompt forward (the load-time warm), so
+            // no verify round pays the readback or the widening.
+            prepareNarrowOperands(cache, scales, biases)
             let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
             let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
             let foldedSums = cache.derived(scales, tag: 3) { s in
