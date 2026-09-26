@@ -338,6 +338,32 @@ enum Qwen35TrunkSubmission {
     }
 }
 
+/// Host work on the capture-verify encode. This record submits that forward
+/// as one graph unless `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan. None of
+/// these change a kernel or a dtype. `leadEmbed` is the only new command
+/// buffer: the token embedding, before the layer loop.
+/// Missing env, or any value other than `0`/`off`/`false`/`no`, leaves the
+/// cut on.
+enum Qwen35VerifyHost {
+    private static func on(_ name: String) -> Bool {
+        guard
+            let raw = ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            !raw.isEmpty
+        else { return true }
+        return !["0", "off", "false", "no"].contains(raw)
+    }
+
+    /// `asyncEval` the token embedding before the first verify layer is built.
+    static let leadEmbed = on("MLXFAST_VERIFY_LEAD_EMBED")
+    /// Batch-1 recurrent state is already one row; do not wrap it in arrays.
+    static let singleRow = on("MLXFAST_VERIFY_SINGLE_ROW")
+    /// One slot table for the drafter taps, instead of a search per layer.
+    static let tapIndex = on("MLXFAST_VERIFY_TAP_INDEX")
+    /// Keep the packed-sibling lists resolved on the layer after the first use.
+    static let siblingCache = on("MLXFAST_VERIFY_SIBLING_CACHE")
+}
+
 // MARK: - GatedDeltaNet
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
@@ -3313,23 +3339,40 @@ final class Qwen35GatedDeltaNet: Module {
             (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, rotated: rotatedInput)
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
+        let convState: MLXArray
+        let ssmState: MLXArray
+        // One ranked row is already the state tensor. Building two arrays and
+        // concatenating a single element is host work on every linear layer
+        // of the verify, ahead of the caller's eval.
+        if Qwen35VerifyHost.singleRow, B == 1, let only = recurrentState.first {
+            let state = only.inputState(modelLayerIndex: modelLayerIndex)
+            convState =
                 state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
+                ?? MLXArray.zeros(
+                    [1, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            ssmState =
                 state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+                ?? MLXArray.zeros(
+                    [1, numVHeads, headVDim, headKDim], dtype: .float32)
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -4227,12 +4270,17 @@ extension Qwen3NextMLP {
     /// stacked matmul and the down projection's tail is unchanged, so `h` and
     /// the output are the composed path's values. Nil when it does not apply.
     fileprivate func qwen35ForwardBoundaryVerify(
-        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain,
+        prefetchedGateUp: [HadamardQuantizedLinear]? = nil,
+        gateUpPrefetched: Bool = false
     ) -> (h: MLXArray, out: MLXArray)? {
+        let resolvedGateUp = gateUpPrefetched
+            ? prefetchedGateUp
+            : sharedHadamardSiblings([gateProj, upProj])
         guard Qwen35FusedBoundaryQ8.verifyEnabled,
             ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
             let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
-            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let siblings = resolvedGateUp,
             let transform = siblings.first?.transform,
             norm.weight.ndim == 1, norm.weight.dim(0) == transform.width,
             x.ndim >= 2, x.dim(-1) == transform.width,
@@ -4274,13 +4322,29 @@ final class Qwen35DecoderLayer: Module {
 
     /// The post-attention gain with the MLP's gate/up signs folded in.
     private let signedGain = Qwen35SignedGain()
+    /// Packed input siblings (q|k|v or qkv|z) after the first resolve.
+    private var cachedInputSiblings: [HadamardQuantizedLinear]?
+    private var inputSiblingsReady = false
+    /// MLP gate|up siblings after the first resolve. Nil is a real answer.
+    private var cachedGateUp: [HadamardQuantizedLinear]?
+    private var gateUpReady = false
+
+    private func clearSiblingCache() {
+        cachedInputSiblings = nil
+        inputSiblingsReady = false
+        cachedGateUp = nil
+        gateUpReady = false
+    }
 
     @discardableResult
     override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
-        defer { signedGain.clear() }
+        defer {
+            signedGain.clear()
+            clearSiblingCache()
+        }
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
@@ -4290,7 +4354,10 @@ final class Qwen35DecoderLayer: Module {
         modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
-        defer { signedGain.clear() }
+        defer {
+            signedGain.clear()
+            clearSiblingCache()
+        }
         return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 
@@ -4405,11 +4472,14 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: exactTargetVerify)
         }
         // A verify window's post-attention boundary as one kernel.
-        if captureRecurrentWindow, !exactTargetVerify, let dense = mlp as? Qwen3NextMLP,
-            let fused = dense.qwen35ForwardBoundaryVerify(
-                x, r, norm: postAttentionLayerNorm, gain: signedGain)
-        {
-            return fused.h + fused.out
+        if captureRecurrentWindow, !exactTargetVerify, let dense = mlp as? Qwen3NextMLP {
+            let gateUp = prefetchedGateUp(of: dense)
+            if let fused = dense.qwen35ForwardBoundaryVerify(
+                x, r, norm: postAttentionLayerNorm, gain: signedGain,
+                prefetchedGateUp: gateUp.siblings, gateUpPrefetched: gateUp.ready)
+            {
+                return fused.h + fused.out
+            }
         }
         let h = x + r
         let feedForward: MLXArray
@@ -4435,7 +4505,30 @@ final class Qwen35DecoderLayer: Module {
     /// The projections that read this layer's normed input through one shared
     /// rotation: the attention's q|k|v or the GDN's qkv|z.
     private var inputRotationSiblings: [HadamardQuantizedLinear]? {
-        isLinear ? linearAttn?.inputRotationSiblings : selfAttn?.inputRotationSiblings
+        if Qwen35VerifyHost.siblingCache, inputSiblingsReady {
+            return cachedInputSiblings
+        }
+        let siblings = isLinear
+            ? linearAttn?.inputRotationSiblings
+            : selfAttn?.inputRotationSiblings
+        if Qwen35VerifyHost.siblingCache {
+            cachedInputSiblings = siblings
+            inputSiblingsReady = true
+        }
+        return siblings
+    }
+
+    /// Gate|up list for `qwen35ForwardBoundaryVerify`. `ready` means this
+    /// layer already resolved it, including the answer nil.
+    private func prefetchedGateUp(of dense: Qwen3NextMLP) -> (
+        siblings: [HadamardQuantizedLinear]?, ready: Bool
+    ) {
+        guard Qwen35VerifyHost.siblingCache else { return (nil, false) }
+        if !gateUpReady {
+            cachedGateUp = sharedHadamardSiblings([dense.gateProj, dense.upProj])
+            gateUpReady = true
+        }
+        return (cachedGateUp, true)
     }
 
     /// `x + pending` (the previous layer's last residual add), `inputLayerNorm`
@@ -4555,14 +4648,20 @@ final class Qwen35DecoderLayer: Module {
                 layerInput, cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: false, quantizedInput: quantized, rotatedInput: rotated)
         }
-        if let dense = mlp as? Qwen3NextMLP,
-            let fused = captureRecurrentWindow
-                ? dense.qwen35ForwardBoundaryVerify(
+        if let dense = mlp as? Qwen3NextMLP {
+            let fused: (h: MLXArray, out: MLXArray)?
+            if captureRecurrentWindow {
+                let gateUp = prefetchedGateUp(of: dense)
+                fused = dense.qwen35ForwardBoundaryVerify(
+                    input, r, norm: postAttentionLayerNorm, gain: signedGain,
+                    prefetchedGateUp: gateUp.siblings, gateUpPrefetched: gateUp.ready)
+            } else {
+                fused = dense.qwen35ForwardBoundaryQ8(
                     input, r, norm: postAttentionLayerNorm, gain: signedGain)
-                : dense.qwen35ForwardBoundaryQ8(
-                    input, r, norm: postAttentionLayerNorm, gain: signedGain)
-        {
-            return (input, fused.h, fused.out)
+            }
+            if let fused {
+                return (input, fused.h, fused.out)
+            }
         }
         let h = input + r
         let feedForward: MLXArray
@@ -4759,9 +4858,35 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // The verify is one graph unless a slice plan is set, so nothing is
+        // queued until the caller evals. The embedding is already a graph;
+        // commit it now so that lookup runs while the host builds the tower.
+        // A slice plan, when one is set, is unchanged and still fires at its
+        // own layers.
+        if captureRecurrentWindow, Qwen35VerifyHost.leadEmbed {
+            asyncEval([hiddenStates])
+        }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
+        // The tap list is a handful of ids searched on every layer. One table
+        // answers the same question before the loop, including the layers
+        // built before the leading submission.
+        let tapSlotByLayer: [Int]? = {
+            guard Qwen35VerifyHost.tapIndex, let tapLayerIds else { return nil }
+            var slots = [Int](repeating: -1, count: layers.count)
+            for (slot, id) in tapLayerIds.enumerated() where id >= 0 && id < slots.count {
+                slots[id] = slot
+            }
+            return slots
+        }()
+        func tapSlot(of layer: Int) -> Int? {
+            if let tapSlotByLayer {
+                let slot = tapSlotByLayer[layer]
+                return slot >= 0 ? slot : nil
+            }
+            return tapLayerIds?.firstIndex(of: layer)
+        }
         var tapped = [MLXArray?](
             repeating: nil, count: tapLayerIds?.count ?? 0)
         var attentionIndex = 0
@@ -4818,7 +4943,7 @@ public class Qwen35TextModelInner: Module {
                 }
                 hiddenStates = out.h
                 pending = out.f
-                if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+                if let slot = tapSlot(of: modelLayerIndex) {
                     if pending == nil {
                         tapped[slot] = hiddenStates
                     } else {
@@ -4847,7 +4972,7 @@ public class Qwen35TextModelInner: Module {
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
-            if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+            if let slot = tapSlot(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
             }
             // EARLY SUBMISSION (verify slices / prompt pipelining): hand
