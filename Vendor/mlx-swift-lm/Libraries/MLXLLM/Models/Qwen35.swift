@@ -557,7 +557,7 @@ func qwen35GatedDelta(
 /// recurrence contractive). `DARKBLOOM_QWEN35_GDN_KERNEL=v1` keeps the stock
 /// kernel; the masked (chain-verify) path always does.
 enum Qwen35GatedDeltaV3 {
-    fileprivate static let enabled: Bool = {
+    static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_GDN_KERNEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
@@ -738,7 +738,7 @@ enum Qwen35GatedDeltaV3 {
     /// state load), the step loop itself, and the trailing state store; nil
     /// when the stock text no longer ends in exactly that store after one
     /// step loop. The derived kernels below reassemble these pieces.
-    fileprivate static let sourceParts: (head: String, loop: String, store: String)? = {
+    static let sourceParts: (head: String, loop: String, store: String)? = {
         let text = source
         let loopHead = "for (int t = 0; t < T; ++t) {"
         guard text.components(separatedBy: loopHead).count == 2,
@@ -920,7 +920,7 @@ enum Qwen35GDNReplayBatch {
 
     /// MLX's functors (`binary_ops.h` LogAddExp, `unary_ops.h` Sigmoid) as
     /// `Qwen35FusedElementwise.gatedDeltaGates` evaluates them in FP32.
-    private static let header = """
+    static let header = """
         inline float qwen35_replay_logaddexp(float x, float y) {
           if (metal::isnan(x) || metal::isnan(y)) {
             return metal::numeric_limits<float>::quiet_NaN();
@@ -1051,7 +1051,7 @@ enum Qwen35GDNReplayBatch {
 
     /// Row-major strides of `array`, ignoring its leading (size-1) axis.
     @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
-    private static func rowContiguousAfterLeading(_ array: MLXArray) -> Bool {
+    static func rowContiguousAfterLeading(_ array: MLXArray) -> Bool {
         let shape = array.shape
         let strides = array.strides
         guard shape.count == strides.count, shape.count >= 2 else { return false }
@@ -1066,7 +1066,7 @@ enum Qwen35GDNReplayBatch {
     /// The row stride of a `[1, S, Hv]` gate input read in place, or nil
     /// when its last axis is not unit-stride.
     @available(*, deprecated, message: "reads strides; call on evaluated arrays only")
-    private static func gateRowStride(_ array: MLXArray) -> Int32? {
+    static func gateRowStride(_ array: MLXArray) -> Int32? {
         let shape = array.shape
         let strides = array.strides
         guard shape.count == 3, strides.count == 3, shape[2] == 1 || strides[2] == 1,
@@ -2476,6 +2476,15 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
+            // At verify width on the int8 route: the norm and the gated tail
+            // in one launch (`Qwen35GatedNormTail`), the same values.
+            if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
+                let signed = Qwen35GatedNormTail.apply(
+                    out, gate: gate, weight: norm.weight, eps: norm.eps,
+                    signs: packed.transform.signVector)
+            {
+                return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+            }
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
             let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
@@ -2534,6 +2543,7 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GDNReplayBatch.prepare(layer: self)
         Qwen35GDNVerifyStateSkip.prepare(layer: self)
+        Qwen35GDNReplayFused.prepare(layer: self)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -3074,7 +3084,7 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// `aLog`/`dtBias` stand in for the layer's own parameters in
     /// `Qwen35GDNReplayBatch`'s self-test only.
-    fileprivate func replayedPrefixState(
+    func replayedPrefixState(
         tape: ArraysCache.PrefixReplayTape, committedRows: Int,
         aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil,
         fullWindow: Bool = false
@@ -3325,23 +3335,13 @@ final class Qwen35GatedDeltaNet: Module {
                 inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        // The rows' SSMs are read after the prework: a deferred replay is
+        // then either computed by the fused scan or built by reading it.
+        let convRows = recurrentState.map {
+            $0.inputState(modelLayerIndex: modelLayerIndex)?.conv
+                ?? MLXArray.zeros([1, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
         let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -3398,6 +3398,23 @@ final class Qwen35GatedDeltaNet: Module {
             kNormed = MLXFast.rmsNorm(k, weight: scales.k, eps: 1e-6)
             convOutBackingAll = convOut
         }
+        // One row whose SSM is this layer's pending deferred replay: the
+        // fused scan computes it and this window's output rows in one launch.
+        let fused = pre.flatMap { pre in
+            B == 1
+                ? Qwen35GDNReplayFused.run(
+                    layer: self,
+                    input: recurrentState[0].inputState(modelLayerIndex: modelLayerIndex),
+                    pre: pre)
+                : nil
+        }
+        let ssmRows =
+            fused.map { [$0.state] }
+            ?? recurrentState.map {
+                $0.inputState(modelLayerIndex: modelLayerIndex)?.ssm
+                    ?? MLXArray.zeros([1, numVHeads, headVDim, headKDim], dtype: .float32)
+            }
+        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         let out: MLXArray
         if S >= 3 {
@@ -3406,7 +3423,9 @@ final class Qwen35GatedDeltaNet: Module {
             // window from the tape instead.
             let recurrence: (MLXArray, MLXArray?)
             if let pre {
-                if let chunked = Qwen35GatedDeltaChunked.runVerify(
+                if let fused {
+                    recurrence = (fused.y, nil)
+                } else if let chunked = Qwen35GatedDeltaChunked.runVerify(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
                 {
                     recurrence = (chunked.0, chunked.1)
@@ -3503,6 +3522,15 @@ final class Qwen35GatedDeltaNet: Module {
                 let fullAcceptanceRetainedRoots =
                     finalSSM == nil ? strictReplayRoots : [tape.convInput]
                 let fullAcceptanceRetainedBytes = checkedByteCount(fullAcceptanceRetainedRoots)
+                // A single row's replayed commit is left for the next verify's
+                // fused scan (`Qwen35GDNReplayFused`), conv rows as a slice.
+                var deferral: ((Int) -> (conv: MLXArray, inputs: AnyObject)?)? = nil
+                if B == 1, Qwen35GDNReplayFused.applies(to: self) {
+                    let inputs: AnyObject = Qwen35GDNReplayFused.Inputs(layer: self, tape: tape)
+                    deferral = { keep in
+                        (conv: tape.convInput[0..., keep ..< (keep + nKeep), 0...], inputs: inputs)
+                    }
+                }
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -3529,6 +3557,7 @@ final class Qwen35GatedDeltaNet: Module {
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
                         },
+                        deferral: deferral,
                         replay: { [unowned self] keepPositions in
                             replaySlot?.state(keep: keepPositions)
                                 ?? self.replayedPrefixState(
@@ -3675,7 +3704,7 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: normalizedExplicitPositions(positionIds), dtype: q.dtype)
+                positions: positionIds, dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3880,6 +3909,22 @@ final class Qwen35Attention: Module {
             {
                 return y
             }
+            // The int8 verify route (neither form above takes it): the gate and
+            // the projection's signs in one elementwise launch that reads the
+            // head-transposed output and the gate half of each q|gate head
+            // through their strides, so neither is reshaped into a copy first.
+            // Same elements, same compiled program; its output is contiguous.
+            if !exactTargetVerify, Qwen35FusedElementwise.foldsHadamardSigns,
+                let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+                attended.dtype == qSplit[1].dtype, attended.shape == qSplit[1].shape,
+                attended.dim(2) * attended.dim(3) == packed.transform.width,
+                HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * L)
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    attended, qSplit[1],
+                    packed.transform.signVector.reshaped(attended.dim(2), attended.dim(3)))
+                return packed.forwardPreSigned(signed.reshaped(B, L, -1), widenOutput: false)
+            }
             output = attended.reshaped(B, L, -1)
             attendedGate = gate
         }
@@ -3965,19 +4010,43 @@ final class Qwen35MRoPE {
         return 0
     }
 
-    /// Default-path (cosine, sine) tables for `positions`, normalized to 3
-    /// planes by the caller, in `dtype`, expanded for the rotation. Nil when
-    /// the non-default (per-frequency) path applies. The fused explicit
-    /// prework kernel consumes these same arrays, so one builder serves both.
+    nonisolated(unsafe) private static var cachedPositions: MLXArray?
+    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
+
+    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
+    /// for the rotation. Nil when the non-default (per-frequency) path applies.
+    /// The fused explicit prework kernel consumes these same arrays, so one
+    /// builder serves both. Cached across layers when `positions` is identical.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-        let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        if let cachedPositions = Self.cachedPositions,
+            cachedPositions === positions,
+            Self.cachedDType == dtype,
+            let cachedTables = Self.cachedTables
+        {
+            return cachedTables
+        }
+        let frequency: MLXArray
+        if positions.ndim == 2 {
+            frequency = positions.asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else if positions.strides[0] == 0 {
+            frequency = positions[0].asType(.float32)[0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, 0...]
+        } else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+        }
         let angles = concatenated([frequency, frequency], axis: -1)
-        return (
+        let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        Self.cachedPositions = positions
+        Self.cachedDType = dtype
+        Self.cachedTables = tables
+        return tables
     }
 
     func apply(
@@ -3992,18 +4061,20 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype) {
-            func applyDefault(_ value: MLXArray) -> MLXArray {
-                let rotating = value[.ellipsis, ..<rotaryDim]
-                let half = rotating.dim(-1) / 2
-                let rotatedHalf = concatenated(
-                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
-                let rotated = rotating * cosine + rotatedHalf * sine
-                return rotaryDim < value.dim(-1)
-                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                    : rotated
-            }
-            return (applyDefault(queries), applyDefault(keys))
+        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+            let queryHeads = queries.dim(1)
+            let combined = concatenated([queries, keys], axis: 1)
+            let rotating = combined[.ellipsis, ..<rotaryDim]
+            let half = rotaryDim / 2
+            let rotatedHalf = concatenated(
+                [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+            let rotated = rotating * cosine + rotatedHalf * sine
+            let rotatedCombined = rotaryDim < combined.dim(-1)
+                ? concatenated([rotated, combined[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+            return (
+                rotatedCombined[0..., ..<queryHeads, 0..., 0...],
+                rotatedCombined[0..., queryHeads..., 0..., 0...])
         }
 
         let queryHeads = queries.dim(1)
@@ -6526,31 +6597,6 @@ enum Qwen35FusedBoundaryQ8 {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
-    /// Four-wide loads and stores of the FP16 residual add. The four lanes
-    /// are the ones the scalar loop already owned (`NR = 4`, `W` a multiple
-    /// of 4). `MLXFAST_BOUNDARY_VEC=0` reads and writes one half at a time.
-    static let vectorResiduals: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_BOUNDARY_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-    /// Cleared when the vector form fails its self-test, so the scalar form
-    /// is retested and the fused boundary stays on.
-    nonisolated(unsafe) private static var vectorLive = true
-    static var useVector: Bool { vectorResiduals && vectorLive }
-    /// Four-wide loads of the FP32 gain and sign vector. The four lanes are
-    /// the ones the scalar loop already owned, multiplied in increasing
-    /// index order, then stored one element at a time into the threadgroup
-    /// butterfly buffer. `MLXFAST_BOUNDARY_GAIN_VEC=0` keeps the scalar
-    /// loads. A failed self-test clears this and retests, so the fused
-    /// boundary stays on.
-    static let gainVectorResiduals: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_BOUNDARY_GAIN_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-    nonisolated(unsafe) private static var gainVectorLive = true
-    static var useGainVector: Bool { gainVectorResiduals && gainVectorLive }
     /// True when a verify window of `rows` rows can take the kernel at every
     /// boundary: a full window on the int8-activation narrow route, and no
     /// failed 16-row self-test.
@@ -6570,21 +6616,9 @@ enum Qwen35FusedBoundaryQ8 {
         lock.lock()
         defer { lock.unlock() }
         if let narrowVerdict { return narrowVerdict }
-        var report = selfTest(
+        let report = selfTest(
             unsignedGain: unsignedGain, eps: eps, transform: transform,
             cases: [(16, 43), (16, 44)])
-        if !report.passed, gainVectorResiduals, gainVectorLive {
-            gainVectorLive = false
-            report = selfTest(
-                unsignedGain: unsignedGain, eps: eps, transform: transform,
-                cases: [(16, 43), (16, 44)])
-        }
-        if !report.passed, vectorResiduals, vectorLive {
-            vectorLive = false
-            report = selfTest(
-                unsignedGain: unsignedGain, eps: eps, transform: transform,
-                cases: [(16, 43), (16, 44)])
-        }
         narrowVerdict = report.passed
         FileHandle.standardError.write(
             ("bonsai fused boundary q8 (verify window): " + report.summary
@@ -6598,15 +6632,7 @@ enum Qwen35FusedBoundaryQ8 {
         lock.lock()
         defer { lock.unlock() }
         if let verdict { return verdict }
-        var report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        if !report.passed, gainVectorResiduals, gainVectorLive {
-            gainVectorLive = false
-            report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        }
-        if !report.passed, vectorResiduals, vectorLive {
-            vectorLive = false
-            report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        }
+        let report = selfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
         verdict = report.passed
         FileHandle.standardError.write(
             ("bonsai fused boundary q8: " + report.summary
@@ -6627,8 +6653,6 @@ enum Qwen35FusedBoundaryQ8 {
             ("W", width), ("PRESIGNED", gainSigned), ("PERM", perm),
             ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0),
             ("SIGNED", Qwen35TensorPackedMatmul.signedCodes),
-            ("VEC", useVector ? 1 : 0),
-            ("GAINVEC", useGainVector ? 1 : 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -6802,17 +6826,10 @@ enum Qwen35FusedBoundaryQ8 {
         BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
           const uint r0 = p * LS * NR;
           if (r0 + lid * NR + NR <= uint(W)) {
-            const uint e0 = r0 + lid * NR;
-            half4 hs;
-            if (VEC) {
-              hs = *(const device half4*)(xa + base + e0)
-                  + *(const device half4*)(xb + base + e0);
-              *(device half4*)(hout + base + e0) = hs;
-            }
             BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
-              const uint e = e0 + i;
-              const half s = VEC ? hs[i] : (xa[base + e] + xb[base + e]);
-              if (!VEC) { hout[base + e] = s; }
+              const uint e = r0 + lid * NR + i;
+              const half s = xa[base + e] + xb[base + e];
+              hout[base + e] = s;
               hv[p * NR + i] = float(s);
               acc += hv[p * NR + i] * hv[p * NR + i];
             }
@@ -6836,42 +6853,15 @@ enum Qwen35FusedBoundaryQ8 {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv = local_inv[0];
 
-        // rms_looped's output `w * (x * inv)`, then the signs. GAINVEC loads
-        // the four lanes this thread already owns (e0 is a multiple of 4, W
-        // is a multiple of 4) and multiplies in that same index order.
+        // rms_looped's output `w * (x * inv)`, then the signs.
         BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
           const uint r0 = p * LS * NR;
           if (r0 + lid * NR + NR <= uint(W)) {
-            const uint e0 = r0 + lid * NR;
-            if (GAINVEC) {
-              const float4 wv = *(const device float4*)(w + e0);
-              float n0 = wv[0] * (hv[p * NR + 0] * inv);
-              float n1 = wv[1] * (hv[p * NR + 1] * inv);
-              float n2 = wv[2] * (hv[p * NR + 2] * inv);
-              float n3 = wv[3] * (hv[p * NR + 3] * inv);
-              float b0 = n0, b1 = n1, b2 = n2, b3 = n3;
-              if (!PRESIGNED) {
-                const float4 sv = *(const device float4*)(signs + e0);
-                b0 = n0 * sv[0];
-                b1 = n1 * sv[1];
-                b2 = n2 * sv[2];
-                b3 = n3 * sv[3];
-              }
-              BONSAI_STORE_NORMED(e0 + 0, n0);
-              BONSAI_STORE_NORMED(e0 + 1, n1);
-              BONSAI_STORE_NORMED(e0 + 2, n2);
-              BONSAI_STORE_NORMED(e0 + 3, n3);
-              buf[e0 + 0] = b0;
-              buf[e0 + 1] = b1;
-              buf[e0 + 2] = b2;
-              buf[e0 + 3] = b3;
-            } else {
-              BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
-                const uint e = e0 + i;
-                const float n = w[e] * (hv[p * NR + i] * inv);
-                BONSAI_STORE_NORMED(e, n);
-                buf[e] = PRESIGNED ? n : n * signs[e];
-              }
+            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+              const uint e = r0 + lid * NR + i;
+              const float n = w[e] * (hv[p * NR + i] * inv);
+              BONSAI_STORE_NORMED(e, n);
+              buf[e] = PRESIGNED ? n : n * signs[e];
             }
           }
         }
@@ -6967,6 +6957,179 @@ enum Qwen35FusedBoundaryQ8 {
         ensureRowContiguous: true)
 }
 
+/// The GDN output's gated per-head RMSNorm and the output projection's
+/// Hadamard signs at verify width as ONE launch. The composed path runs
+/// `MLXFast.rmsNorm` over each 128-wide head (`rms_single_row`) and the
+/// compiled `gatedNormTailSigned` (`(z * sigmoid(z)) * normed * signs`): two
+/// launches per GDN layer. The arithmetic here is the int8 producer kernel's
+/// PROD 3 read, which already matches that composed chain bit for bit: per
+/// head, lane l squares elements 4l .. 4l + 3 in order, `simd_sum`,
+/// `precise::rsqrt(acc / 128 + eps)`, `w[d] * (x * inv)`, then `(z *
+/// sigmoid(z)) * xn` with MLX's `Sigmoid` and the signs. One simdgroup per
+/// (row, head), as `rms_single_row`: the launch keeps the norm's parallelism
+/// and the quantizing rotation stays its own launch. z is read through its
+/// strides (a slice of the qkv|z product), so it is not copied first.
+///
+/// Before first use a self-test on the running GPU compares the output bit for
+/// bit against the composed ops (FP32 and FP16 z, a strided z); a mismatch or
+/// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
+/// too.
+enum Qwen35GatedNormTail {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let header = """
+        // MLX `Sigmoid` (unary_ops.h), verbatim.
+        METAL_FUNC float bgn_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        // element (row, c) of a [B, L, heads, 128] view, through its strides
+        inline int64_t bgn_row(const constant int* shape, const constant int64_t* st, uint row) {
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        inline int64_t bgn_col(const constant int64_t* st, uint c) {
+          return int64_t(c / 128u) * st[2] + int64_t(c % 128u) * st[3];
+        }
+
+        """
+
+    // grid (32 * rows * H, 1, 1), threadgroup (256, 1, 1): one simdgroup per
+    // (row, head). Inputs: x float [B, L, H, 128], z float|half [B, L, H,
+    // 128] (any strides), w float [128], eps float [1], signs float [H * 128].
+    // Template: H, InZ. Output: out float [rows, H * 128].
+    private static let source = """
+        const uint gidx = thread_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint hr = gidx / 32u;
+        const uint row = hr / uint(H);
+        const uint head = hr % uint(H);
+        const int64_t xrow = bgn_row(x_shape, x_strides, row);
+        const int64_t zrow = bgn_row(z_shape, z_strides, row);
+        const uint c0 = head * 128u + lane * 4u;
+        float xv[4];
+        float acc = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          xv[r] = float(x[xrow + bgn_col(x_strides, c0 + uint(r))]);
+          acc += xv[r] * xv[r];
+        }
+        acc = simd_sum(acc);
+        const float inv = metal::precise::rsqrt(acc / float(128) + eps[0]);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const uint col = c0 + uint(r);
+          const float bv = float(z[zrow + bgn_col(z_strides, col)]);
+          const float xn = w[col % 128u] * (xv[r] * inv);
+          const float v = (bv * bgn_sigmoid(bv)) * xn;
+          out[size_t(row) * size_t(H * 128) + col] = v * signs[col];
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gdn_gated_norm_signed",
+        inputNames: ["x", "z", "w", "eps", "signs"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+
+    /// `gatedNormTailSigned(rmsNorm(x, weight, eps), z, signs)` flattened to
+    /// `[rows, H * 128]`, or nil when it does not apply.
+    static func apply(
+        _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray? {
+        guard enabled, x.dtype == .float32, z.dtype == .float32 || z.dtype == .float16,
+            x.ndim == 4, z.shape == x.shape, x.dim(3) == 128,
+            (x.dim(0) * x.dim(1) * x.dim(2)) % 8 == 0,
+            weight.dtype == .float32, weight.ndim == 1, weight.dim(0) == 128,
+            signs.dtype == .float32, signs.size == x.dim(2) * 128,
+            verified(eps: eps)
+        else { return nil }
+        return launch(x, z, weight: weight, eps: eps, signs: signs)
+    }
+
+    private static func launch(
+        _ x: MLXArray, _ z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray {
+        let rows = x.dim(0) * x.dim(1)
+        let heads = x.dim(2)
+        return kernel(
+            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            template: [("H", heads), ("InZ", z.dtype)],
+            grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    private static func verified(eps: Float) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict { return verdict }
+        let report = selfTest(eps: eps)
+        verdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify gated norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    static func selfTest(eps: Float) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        do {
+            try withError { error in
+                let rows = 16
+                let heads = 48
+                let width = heads * 128
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(121))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let weight = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [128], key: MLXRandom.key(122))
+                let scale = MLXRandom.uniform(
+                    Float(0.01) ..< Float(20), [1, rows, heads, 1], key: MLXRandom.key(123))
+                let x = MLXRandom.normal([1, rows, heads, 128], key: MLXRandom.key(124)) * scale
+                // z as the qkv|z product's slice: a strided view.
+                let wide = MLXRandom.normal([1, rows, 10240 + width], key: MLXRandom.key(125))
+                    * Float(3)
+                for zType in [DType.float32, .float16] {
+                    let z = wide.asType(zType)[0..., 0..., 10240...].reshaped(1, rows, heads, 128)
+                    let zw = z.dtype == x.dtype ? z : z.asType(x.dtype)
+                    let normed = MLXFast.rmsNorm(x, weight: weight, eps: eps)
+                    let reference = Qwen35FusedElementwise.gatedNormTailSigned(
+                        normed, zw, signs.reshaped(heads, 128)
+                    ).asType(x.dtype).reshaped(rows, width)
+                    let fused = launch(x, z, weight: weight, eps: eps, signs: signs)
+                    report.cases += 1
+                    guard fused.shape == reference.shape, fused.dtype == reference.dtype else {
+                        report.passed = false
+                        report.error = "output \(fused.dtype) \(fused.shape)"
+                        return
+                    }
+                    let differ = (fused.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    let count = Int(differ.item(Int32.self))
+                    report.values += fused.size
+                    report.mismatches += count
+                    if count != 0 { report.passed = false }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
 /// The verify window's decoder-layer boundary on the matrix route as ONE
 /// launch: the FP16 residual add `h = x + r`, the RMSNorm of `h` with its FP32
 /// gain, the input transform's signs, the 1024-block Walsh-Hadamard transform
@@ -7044,15 +7207,7 @@ extension Qwen35FusedBoundaryQ8 {
         verifyLock.lock()
         defer { verifyLock.unlock() }
         if let verifyVerdict { return verifyVerdict }
-        var report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        if !report.passed, gainVectorResiduals, gainVectorLive {
-            gainVectorLive = false
-            report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        }
-        if !report.passed, vectorResiduals, vectorLive {
-            vectorLive = false
-            report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
-        }
+        let report = verifySelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
         verifyVerdict = report.passed
         FileHandle.standardError.write(
             ("bonsai verify boundary: " + report.summary
@@ -7067,8 +7222,6 @@ extension Qwen35FusedBoundaryQ8 {
         let rows = x.size / width
         let template: [(String, any KernelTemplateArg)] = [
             ("W", width), ("PRESIGNED", gainSigned), ("OutT", outputDType),
-            ("VEC", useVector ? 1 : 0),
-            ("GAINVEC", useGainVector ? 1 : 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -8403,11 +8556,25 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. nb = n0 + 16*(sg&1)
+        // + fn with fn in {0,4,8,12} and N multiple of 64, so the base is
+        // 4-element aligned. Hot path: support==staged8 (signed + FACTORED).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -9827,10 +9994,31 @@ extension Qwen35TextModel: DFlash2TapTarget {
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {
-            return head.forwardUnwidened(hidden)
+            // FREQUENCY-RANKED DRAFT VOCABULARY. Byte-level BPE ids follow the
+            // merge order, so low ids are the frequent tokens; the tail of
+            // this 248,320-entry vocabulary is mostly rare multilingual
+            // pieces. The drafter scores only the leading rows (the same rows
+            // of the same head, computed the same way), which cuts its head
+            // read and its top-k scan by about 60%. A token past the prefix is
+            // never proposed, so that draft position falls to the target's
+            // own token, as any wrong draft does: the target decides every
+            // emitted token. On the public captures 99.9% of the expected
+            // tokens sit below id 100,000. `MLXFAST_DFLASH_VOCAB_ROWS` sets
+            // the prefix; 0 restores the full head.
+            let reading =
+                Self.drafterVocabularyRows > 0
+                ? (head.leadingRows(Self.drafterVocabularyRows) ?? head) : head
+            return reading.forwardUnwidened(hidden)
         }
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
+
+    /// 100,352 = 98 x 1024: the leading rows the drafter scores (see above).
+    static let drafterVocabularyRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_VOCAB_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(0, raw.flatMap { Int($0) } ?? 100_352)
+    }()
 }
 
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {

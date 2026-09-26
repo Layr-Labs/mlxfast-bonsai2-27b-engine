@@ -1353,14 +1353,6 @@ enum DFlash2TopK {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// Four-wide loads when a chunk length is a multiple of four.
-    /// `MLXFAST_DFLASH_TOPK_VEC=0` reads one logit at a time.
-    static let vectorScan: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     private static let chunks = 8
     private static let threads = 128
 
@@ -1374,11 +1366,8 @@ enum DFlash2TopK {
             vocabularySize < Int(Int32.max)
         else { return nil }
         let flat = logits.reshaped([rows, vocabularySize])
-        let vector = vectorScan && vocabularySize % (chunks * 4) == 0
         let template: [(String, any KernelTemplateArg)] = [
             ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
-            ("VEC", vector ? 1 : 0),
-            ("HALF", logits.dtype == .float16 ? 1 : 0),
         ]
         let parts = chunkKernel(
             [flat], template: template,
@@ -1401,20 +1390,6 @@ enum DFlash2TopK {
                 if (isnan(x)) return 0xffffffffu;
                 uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
                 return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-            }
-            // Insert one (key, index). The caller offers indices in increasing
-            // order, so an equal key keeps the higher index.
-            template <int KK>
-            inline void mlxfast_topk_consider(thread uint (&k)[KK], thread uint (&id)[KK],
-                                               uint kx, uint ix) {
-                if (kx >= k[KK - 1]) {
-                    for (int j = 0; j < KK; j++) {
-                        bool sw = kx >= k[j];
-                        uint tk = k[j], ti = id[j];
-                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
-                        kx = sw ? tk : kx; ix = sw ? ti : ix;
-                    }
-                }
             }
             // Entries rank by (key, idx): the stable ascending sort keeps equal values in
             // index order, so among ties the higher index ranks higher.
@@ -1456,26 +1431,16 @@ enum DFlash2TopK {
             auto x = logits + size_t(row) * NV;
             uint k[KK], id[KK];
             for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            if (VEC && (CH % 4u) == 0u) {
-                // Increasing indices, four-wide. CH % 4 covers the chunk.
-                for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
-                    if (HALF) {
-                        const half4 q = *(const device half4*)(x + v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u);
-                    } else {
-                        const float4 q = *(const device float4*)(x + v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u);
+            for (uint v = lo + t; v < hi; v += TPG) {
+                uint kx = mlxfast_topk_key(x[v]);
+                if (kx >= k[KK - 1]) {   // this thread visits indices in increasing order
+                    uint ix = v;
+                    for (int j = 0; j < KK; j++) {
+                        bool sw = kx >= k[j];
+                        uint tk = k[j], ti = id[j];
+                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
+                        kx = sw ? tk : kx; ix = sw ? ti : ix;
                     }
-                }
-            } else {
-                for (uint v = lo + t; v < hi; v += TPG) {
-                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v);
                 }
             }
             uint ok = 0u, oi = 0u;
@@ -1543,15 +1508,6 @@ enum DFlash2GreedyWalk {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// Four-wide loads of the rank-256 dot. Each product is still added in
-    /// increasing index order, so the edge equals the scalar chain.
-    /// `MLXFAST_DFLASH_WALK_VEC=0` reads one rank element at a time.
-    static let vectorRank: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     static func select(
         candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
@@ -1577,10 +1533,7 @@ enum DFlash2GreedyWalk {
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
-            template: [
-                ("L", length), ("K", k), ("R", rank),
-                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
-            ],
+            template: [("L", length), ("K", k), ("R", rank)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1606,21 +1559,9 @@ enum DFlash2GreedyWalk {
                     const device float* proj_ptr = projected + i * R;
                     const device float* succ_ptr = next + succ_base;
                     float edge = 0.0f;
-                    if (WALKVEC && (R % 4u) == 0u) {
-                        for (uint d = 0; d < R; d += 4u) {
-                            const float4 pd = *(const device float4*)(pred_ptr + d);
-                            const float4 qd = *(const device float4*)(proj_ptr + d);
-                            const float4 sd = *(const device float4*)(succ_ptr + d);
-                            edge += (pd[0] * qd[0]) * sd[0];
-                            edge += (pd[1] * qd[1]) * sd[1];
-                            edge += (pd[2] * qd[2]) * sd[2];
-                            edge += (pd[3] * qd[3]) * sd[3];
-                        }
-                    } else {
-                        #pragma clang loop unroll(full)
-                        for (uint d = 0; d < R; d++) {
-                            edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
-                        }
+                    #pragma clang loop unroll(full)
+                    for (uint d = 0; d < R; d++) {
+                        edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
                     }
                     score = unary[i * K + c] + edge;
                 }
