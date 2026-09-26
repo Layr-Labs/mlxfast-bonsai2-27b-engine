@@ -295,7 +295,12 @@ extension EngineLoopV2 {
                 let batch = output.logits.dim(0)
                 let width = output.logits.dim(1)
                 let vocabulary = output.logits.dim(2)
-                let flat = output.logits.reshaped([1, batch * width, vocabulary])
+                // A one-row batch is already [1, width, vocabulary]: pass the
+                // model's own array, so a provider that fused the top two into
+                // its head launch recognises its logits (same values either way).
+                let flat =
+                    batch == 1
+                    ? output.logits : output.logits.reshaped([1, batch * width, vocabulary])
                 let topTwo = provider.cbv2MTPTopTwo(flat)
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
