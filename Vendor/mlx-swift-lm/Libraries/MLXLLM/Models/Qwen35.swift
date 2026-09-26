@@ -937,7 +937,7 @@ enum Qwen35GDNReplayBatch {
 
     static let inputNames: [String] =
         (0 ..< layersPerLaunch).flatMap { j in layerInputs.map { "\($0)\(j)" } }
-        + ["alog", "dtb", "ab_rows", "T"]
+        + ["decay", "dtb", "ab_rows", "T"]
 
     /// `Qwen35GatedDeltaV3.source` with the layer index taking the batch
     /// index's place: the pointers come from the layer's own buffers, the
@@ -963,7 +963,7 @@ enum Qwen35GDNReplayBatch {
                 const device float* s_ = (\(select("s")));
                 const int a_rs = ab_rows[2 * b_idx];
                 const int b_rs = ab_rows[2 * b_idx + 1];
-                const float g_nexp = -metal::precise::exp(alog[n]);
+                const float g_nexp = decay[n];
                 const float g_dtb = dtb[n];
                 const device float* q_ = k_;
                 device float* y_ = state_out;
@@ -1067,12 +1067,13 @@ enum Qwen35GDNReplayBatch {
 
     /// The committed (conv, ssm) of each operand after `keep` rows, from one
     /// launch; nil when the group does not fit the kernel (the caller then
-    /// replays each layer on its own). `alog`/`dtb` are the operands' gate
-    /// parameters stacked in operand order (`[G * Hv]`, FP32). `keep` may be
+    /// replays each layer on its own). `decay`/`dtb` are the operands'
+    /// model-only -precise::exp(A_log) and dt_bias stacked in operand order
+    /// (`[G * Hv]`, FP32). `keep` may be
     /// the whole window: the full-acceptance replay of a verify that stored
     /// no final state (`Qwen35GDNVerifyStateSkip`, which self-tests it).
     static func launch(
-        _ operands: [Operand], keep: Int, alog: MLXArray, dtb: MLXArray,
+        _ operands: [Operand], keep: Int, decay: MLXArray, dtb: MLXArray,
         verifiedOnly: Bool = true
     ) -> [CBv2RecurrentLayerState]? {
         guard operands.count == layersPerLaunch, Qwen35GatedDeltaV3.enabled,
@@ -1097,8 +1098,8 @@ enum Qwen35GDNReplayBatch {
             !(Qwen35GatedDeltaChunked.enabled && keep >= Qwen35GatedDeltaChunked.minRows
                 && keep >= Qwen35GatedDeltaChunked.chunk),
             Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, NK >= 1,
-            alog.dtype == .float32, dtb.dtype == .float32,
-            alog.shape == [layersPerLaunch * Hv], dtb.shape == [layersPerLaunch * Hv]
+            decay.dtype == .float32, dtb.dtype == .float32,
+            decay.shape == [layersPerLaunch * Hv], dtb.shape == [layersPerLaunch * Hv]
         else { return nil }
         var inputs: [MLXArray] = []
         inputs.reserveCapacity(inputNames.count)
@@ -1133,7 +1134,7 @@ enum Qwen35GDNReplayBatch {
             else { return nil }
             rowStrides += [aRows, bRows]
         }
-        inputs += [alog, dtb, MLXArray(rowStrides), MLXArray(Int32(keep))]
+        inputs += [decay, dtb, MLXArray(rowStrides), MLXArray(Int32(keep))]
         let G = layersPerLaunch
         let outputs = kernel(
             inputs,
@@ -1154,14 +1155,14 @@ enum Qwen35GDNReplayBatch {
 
     private final class StackCache {
         var sources: [MLXArray] = []
-        var alog: MLXArray?
+        var decay: MLXArray?
         var dtb: MLXArray?
     }
 
     private static let stackLock = NSLock()
     nonisolated(unsafe) private static var stacks: [[ObjectIdentifier]: StackCache] = [:]
 
-    /// The group's A_log and dt_bias stacked in layer order, concatenated once
+    /// The group's -precise::exp(A_log) and dt_bias stacked in layer order, built once
     /// and rebuilt only when a layer's parameter array changes.
     private static func stackedGates(
         _ layers: [Qwen35GatedDeltaNet]
@@ -1171,17 +1172,18 @@ enum Qwen35GDNReplayBatch {
         return stackLock.withLock {
             let cache = stacks[key] ?? StackCache()
             stacks[key] = cache
-            if let alog = cache.alog, let dtb = cache.dtb, cache.sources.count == sources.count,
+            if let decay = cache.decay, let dtb = cache.dtb, cache.sources.count == sources.count,
                 zip(cache.sources, sources).allSatisfy({ $0 === $1 })
             {
-                return (alog, dtb)
+                return (decay, dtb)
             }
-            let alog = concatenated(layers.map { $0.aLog }, axis: 0)
+            let decay = Qwen35GDNDerived().decay(
+                concatenated(layers.map { $0.aLog }, axis: 0))
             let dtb = concatenated(layers.map { $0.dtBias }, axis: 0)
             cache.sources = sources
-            cache.alog = alog
+            cache.decay = decay
             cache.dtb = dtb
-            return (alog, dtb)
+            return (decay, dtb)
         }
     }
 
@@ -1289,11 +1291,11 @@ enum Qwen35GDNReplayBatch {
             if group.allSatisfy({
                 $0.layer.canReplayPrefix(tape: $0.tape, committedRows: keep, fullWindow: true)
             }) {
-                let (alog, dtb) = stackedGates(group.map(\.layer))
+                let (decay, dtb) = stackedGates(group.map(\.layer))
                 let operands = group.map {
                     Operand(tape: $0.tape, aLog: $0.layer.aLog, dtBias: $0.layer.dtBias)
                 }
-                if let states = launch(operands, keep: keep, alog: alog, dtb: dtb) {
+                if let states = launch(operands, keep: keep, decay: decay, dtb: dtb) {
                     for (j, state) in states.enumerated() { results[start + j] = state }
                 }
             }
@@ -1390,7 +1392,7 @@ enum Qwen35GDNReplayBatch {
                 mask: nil, rowCount: S, convStateRows: NK)
             operands.append(Operand(tape: tape, aLog: aLog, dtBias: dtBias))
         }
-        let alog = concatenated(operands.map(\.aLog), axis: 0)
+        let decay = Qwen35GDNDerived().decay(concatenated(operands.map(\.aLog), axis: 0))
         let dtb = concatenated(operands.map(\.dtBias), axis: 0)
         var cases = 0
         var values = 0
@@ -1400,7 +1402,7 @@ enum Qwen35GDNReplayBatch {
                 for keep in 1 ..< S {
                     guard
                         let batched = launch(
-                            operands, keep: keep, alog: alog, dtb: dtb, verifiedOnly: false)
+                            operands, keep: keep, decay: decay, dtb: dtb, verifiedOnly: false)
                     else { throw SelfTestFailure.message("no batched launch at \(keep) rows") }
                     var differ: [MLXArray] = []
                     for (j, operand) in operands.enumerated() {
@@ -1617,7 +1619,7 @@ enum Qwen35GDNVerifyStateSkip {
                     guard
                         let states = Qwen35GDNReplayBatch.launch(
                             operands, keep: S,
-                            alog: concatenated(operands.map(\.aLog), axis: 0),
+                            decay: Qwen35GDNDerived().decay(concatenated(operands.map(\.aLog), axis: 0)),
                             dtb: concatenated(operands.map(\.dtBias), axis: 0),
                             verifiedOnly: false)
                     else { throw SelfTestFailure.message("no batched full-window replay") }
