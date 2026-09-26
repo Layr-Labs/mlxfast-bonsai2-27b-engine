@@ -1531,6 +1531,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let masks = DFlash2SlidingMaskMemo()
     private var target: (any DFlash2Target)?
     private var maskTokenEmbedding: MLXArray?
+    /// Retained broadcast of `maskTokenEmbedding` for the common single-stream
+    /// block shape `[1, blockSize-1, hidden]` (dukemawex `e0630ead`). The
+    /// record's file dropped the retention; the broadcast is the same value.
+    private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1664,8 +1668,21 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if inputs.dim(1) > 1 {
             let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
             guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
-            let repeatedMasks = broadcast(
-                maskEmbedding, to: [inputs.dim(0), inputs.dim(1) - 1, config.hiddenSize])
+            let batch = inputs.dim(0)
+            let cols = inputs.dim(1) - 1
+            let repeatedMasks: MLXArray
+            if dflash2MaskEmbedCache, batch == 1,
+                let cached = cachedMaskEmbeddingBlock, cached.cols == cols
+            {
+                repeatedMasks = cached.array
+            } else {
+                repeatedMasks = broadcast(
+                    maskEmbedding, to: [batch, cols, config.hiddenSize])
+                if dflash2MaskEmbedCache, batch == 1 {
+                    eval(repeatedMasks)
+                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
+                }
+            }
             embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
@@ -1832,6 +1849,14 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// the head; measured locally ~0.2-0.4% decode. `MLXFAST_DRAFT_SLICE_LAYERS`
 /// overrides it with a `,`/`;` list of counts (a count equal to the layer
 /// count submits the trunk before the head); `0`/`off` turns it off.
+/// Retain the single-stream mask-embedding broadcast across propose rounds
+/// (dukemawex `e0630ead`). Default on. Off rebuilds the broadcast every round.
+private let dflash2MaskEmbedCache: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_MASK_EMBED"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 enum DFlash2DraftSubmission {
     static let layers: [Int] = {
         guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?

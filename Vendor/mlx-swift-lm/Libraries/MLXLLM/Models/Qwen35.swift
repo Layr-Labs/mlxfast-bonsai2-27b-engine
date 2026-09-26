@@ -232,12 +232,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// - VERIFY (a capture-verify forward). The drafter's block was submitted
 ///   before this graph was built, so without slices the GPU idles from the
 ///   drafter's last kernel until the host has built all 64 layers.
-///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan (default 2: measured flat
-///   from 2 to 32 layers, ~3% under one submission, 2 best by ~0.3%; MLX
-///   paces encoding against the GPU at 10 in-flight command buffers, so
-///   extra boundaries cost little, and a short first slice matters more as
-///   the GPU gets faster relative to the host build);
-///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` still turns it off.
+///   `MLXFAST_VERIFY_SLICE_LAYERS` sets the plan. The default is one explicit
+///   boundary after layer 16 (pochita0 `61cc526d`, the isolated form of
+///   ercumentyildirim `29b8e1e1`): the GPU runs that prefix while the host
+///   builds the other 48 layers. A stride plan measured longer on this
+///   lineage and is not the default. `DARKBLOOM_QWEN35_VERIFY_SLICES=0`
+///   still turns every verify boundary off.
 /// - PROMPT (a forward of at least `promptMinimumRows` rows). The seed
 ///   prefill starts its first layers while the host builds the rest.
 ///   `MLXFAST_PREFILL_PIPELINE` sets the plan (default 4).
@@ -292,9 +292,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // Off by default here (the ranked box measured verify slices as a
-        // longer window on this lineage); `MLXFAST_VERIFY_SLICE_LAYERS` sets a plan.
-        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: .off)
+        // One boundary after layer 16. A stride measured longer; this is not
+        // a stride. `MLXFAST_VERIFY_SLICE_LAYERS` overrides (`0`/`off` disables).
+        return Plan.parse(
+            env["MLXFAST_VERIFY_SLICE_LAYERS"],
+            default: Plan(stride: 0, offset: 0, explicit: [16]))
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -3879,10 +3881,18 @@ public class Qwen35TextModelInner: Module {
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
         // The pending path's own early-submission plan (prompt width only).
-        let fusedSubmission =
-            pendingPath
-            ? Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches)
-            : nil
+        // A verify window on the pending path uses the same one-boundary
+        // verify plan. A prompt keeps its fused prompt plan.
+        let fusedSubmission: Qwen35TrunkSubmission.Plan?
+        if pendingPath && verifyPending {
+            fusedSubmission = Qwen35TrunkSubmission.plan(
+                rows: hiddenStates.dim(1), captureRecurrentWindow: true, caches: caches)
+        } else if pendingPath {
+            fusedSubmission = Qwen35TrunkSubmission.fusedPromptPlan(
+                rows: hiddenStates.dim(1), caches: caches)
+        } else {
+            fusedSubmission = nil
+        }
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
@@ -6361,6 +6371,14 @@ enum Qwen35TensorPackedMatmul {
         return value == 4 ? 4 : 2
     }()
 
+    /// Four-wide stores of the head kernel's consecutive output columns.
+    /// Default on. Off keeps the scalar stores. Same OutT values.
+    private static let headVectorStores: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_HEAD_VECTOR_STORE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let headHeader = """
         #include <metal_tensor>
         #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -6372,7 +6390,7 @@ enum Qwen35TensorPackedMatmul {
         // 16-byte lines and dequantized straight into the right-operand
         // fragment, partials summed through threadgroup memory. Same
         // arithmetic as the core's body; the store is OutT instead of T.
-        template <typename T, int KS, typename OutT>
+        template <typename T, int KS, typename OutT, int VEC>
         METAL_FUNC void bonsai_head_block(
             const device uint32_t* w, const device T* scales, const device T* biases,
             const device T* x, device OutT* y, const int K, const int N, const int rows,
@@ -6499,13 +6517,38 @@ enum Qwen35TensorPackedMatmul {
             }
           }
           if (ks != 0) { return; }
-          #pragma unroll
-          for (int i = 0; i < 8; i++) {
-            const int v = int(fm) + (i / 4) * 8;
-            const int c = col0 + int(fn) + (i % 4);
-            if (v < rows) {
-              if (c < N) { y[v * N + c] = static_cast<OutT>(C0[i]); }
-              if (c + 16 < N) { y[v * N + c + 16] = static_cast<OutT>(C1[i]); }
+          if constexpr (VEC != 0) {
+            // i = 0..3 share row fm and four consecutive columns; i = 4..7
+            // share row fm+8. fn and col0 are multiples of 4, N is a multiple
+            // of 32, so each group is one aligned 4-wide store of the same
+            // OutT values the scalar stores wrote.
+            #pragma unroll
+            for (int row = 0; row < 2; row++) {
+              const int v = int(fm) + row * 8;
+              if (v >= rows) { continue; }
+              const int base = col0 + int(fn);
+              vec<OutT, 4> lo, hi;
+              #pragma unroll
+              for (int t = 0; t < 4; t++) {
+                lo[t] = static_cast<OutT>(C0[row * 4 + t]);
+                hi[t] = static_cast<OutT>(C1[row * 4 + t]);
+              }
+              if (base + 3 < N) {
+                *(device vec<OutT, 4>*)(y + (size_t)v * N + base) = lo;
+              }
+              if (base + 19 < N) {
+                *(device vec<OutT, 4>*)(y + (size_t)v * N + base + 16) = hi;
+              }
+            }
+          } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+              const int v = int(fm) + (i / 4) * 8;
+              const int c = col0 + int(fn) + (i % 4);
+              if (v < rows) {
+                if (c < N) { y[v * N + c] = static_cast<OutT>(C0[i]); }
+                if (c + 16 < N) { y[v * N + c + 16] = static_cast<OutT>(C1[i]); }
+              }
             }
           }
         }
@@ -6525,7 +6568,7 @@ enum Qwen35TensorPackedMatmul {
         const int col0 = (int(threadgroup_position_in_grid.x) * CB + int(cb)) * 32;
         threadgroup float red[CB][2][16 * 32];
         if (col0 >= N) { return; }
-        bonsai_head_block<half, KS, OutT>(w, scales, biases, x, out, K, N, 16, col0, 0, K, ks, lane, red[cb][0], red[cb][1]);
+        bonsai_head_block<half, KS, OutT, VEC>(w, scales, biases, x, out, K, N, 16, col0, 0, K, ks, lane, red[cb][0], red[cb][1]);
         """
 
     private static let kernelHead = MLXFast.metalKernel(
@@ -6545,7 +6588,10 @@ enum Qwen35TensorPackedMatmul {
         let blocks = (n / 32 + cb - 1) / cb
         return kernelHead(
             [x, weight, scales, biases, dimsArray(k: k, m: 16, n: n)],
-            template: [("OutT", outputDType), ("KS", ks), ("CB", cb)],
+            template: [
+                ("OutT", outputDType), ("KS", ks), ("CB", cb),
+                ("VEC", headVectorStores ? 1 : 0),
+            ],
             grid: (blocks * 32 * cb * ks, 1, 1), threadGroup: (32 * cb * ks, 1, 1),
             outputShapes: [[16, n]], outputDTypes: [outputDType])[0]
     }
@@ -6751,6 +6797,18 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The verify int8 epilogue in the prompt kernel's factored form when the
+    /// offset is the negated scale: `s * (as * C - rowsum)` instead of
+    /// `as * (s * C) + (-s) * rowsum`, one FMA fewer per output element and
+    /// group. Same identity the prompt kernel uses; the two orders can differ
+    /// by one FP32 rounding. Off keeps the two-FMA form. Applies only when
+    /// the negated-offset epilogue is selected.
+    static let factoredVerifyEpilogue: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_FACTORED_EPILOGUE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -6944,7 +7002,13 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
             const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            acc[i] = fma(mh ? as1 : as0, sv[nq][c] * float(cT[i]), fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
+            if constexpr (FACTORED != 0 && NEG) {
+              const float as = mh ? as1 : as0;
+              const float rs = mh ? rs1 : rs0;
+              acc[i] = fma(sv[nq][c], fma(as, float(cT[i]), -rs), acc[i]);
+            } else {
+              acc[i] = fma(mh ? as1 : as0, sv[nq][c] * float(cT[i]), fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
+            }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
@@ -7099,7 +7163,13 @@ enum Qwen35TensorPackedMatmul {
             for (int i = 0; i < CAP; i++) {
               const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
               const int32_t ci = (h == 0) ? cT0[i] : cT1[i];
-              acc[h][i] = fma(mh ? cc[1] : cc[0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cc[3] : cc[2], acc[h][i]));
+              if constexpr (FACTORED != 0 && NEG) {
+                const float as = mh ? cc[1] : cc[0];
+                const float rs = mh ? cc[3] : cc[2];
+                acc[h][i] = fma(sv[nq][c], fma(as, float(ci), -rs), acc[h][i]);
+              } else {
+                acc[h][i] = fma(mh ? cc[1] : cc[0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cc[3] : cc[2], acc[h][i]));
+              }
             }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -7607,13 +7677,16 @@ enum Qwen35TensorPackedMatmul {
     static func launchNarrowInt8(
         _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
         _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, outputDType: DType,
-        kernel: NarrowKernel
+        kernel: NarrowKernel, factored: Bool = false
     ) -> MLXArray {
         let m = 16
         let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
+        // The load-time self-test calls this with `factored` false so it still
+        // compares the unfactored bodies bit for bit. Production passes the switch.
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
+            ("FACTORED", factored && kernel.form != .base ? 1 : 0),
         ]
         switch kernel.variant {
         case .v0:
@@ -7912,7 +7985,8 @@ enum Qwen35TensorPackedMatmul {
                 }
                 return launchNarrowInt8(
                     codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
-                    k: k, n: n, outputDType: outputDType, kernel: choice)
+                    k: k, n: n, outputDType: outputDType, kernel: choice,
+                    factored: factoredVerifyEpilogue)
             }
             installNarrowChoice()
         } else if verifyEnabled, verifyForm != .none {
