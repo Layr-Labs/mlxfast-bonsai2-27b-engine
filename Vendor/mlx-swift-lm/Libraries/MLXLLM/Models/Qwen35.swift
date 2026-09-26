@@ -7122,11 +7122,24 @@ enum Qwen35TensorPackedMatmul {
             acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
           }
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. Alignment holds
+        // under tip N/nb guards (N multiple of 64; nb 4-element aligned).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -7194,13 +7207,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nq with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < SG - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < SG - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -7761,13 +7791,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nq with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -8365,11 +8412,24 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. Alignment holds
+        // under tip N/nb guards (N multiple of 64; nb 4-element aligned).
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -8462,11 +8522,23 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Groups of four consecutive i share mh and nh with c=0..3, so the
+          // four outputs are consecutive columns. Same values as scalar loop;
+          // float4/half4 stores match OutT. base is 4-element aligned.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const float v = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nh = (i >> 3) & 1;
+            const float v0 = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            const float v1 = acc[i + 1] + red[0][(i + 1) * 32 + lane] + red[1][(i + 1) * 32 + lane] + red[2][(i + 1) * 32 + lane];
+            const float v2 = acc[i + 2] + red[0][(i + 2) * 32 + lane] + red[1][(i + 2) * 32 + lane] + red[2][(i + 2) * 32 + lane];
+            const float v3 = acc[i + 3] + red[0][(i + 3) * 32 + lane] + red[1][(i + 3) * 32 + lane] + red[2][(i + 3) * 32 + lane];
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
