@@ -6485,6 +6485,18 @@ enum Qwen35TensorPackedMatmul {
     /// The dtype of the activation codes the quantizing rotations write.
     static var codesDType: DType { signedCodes ? .int8 : .uint8 }
 
+    /// The int8-staged prompt kernel's per-group epilogue in factored form when
+    /// the offsets are the negated scales and the codes are signed:
+    /// `s * (as * C - rsb)` instead of `as * (s * C) + (-s) * rsb`, one FMA
+    /// fewer per output element and 128-group (1-1.5% on the prompt-width
+    /// matmuls on an M5 Max). The values differ only by FP32 rounding.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE=0` keeps the unfactored form.
+    static let factoredPromptEpilogue: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -7100,8 +7112,14 @@ enum Qwen35TensorPackedMatmul {
             const float s = nh ? s1[c] : s0[c];
             const float b = nh ? b1[c] : b0[c];
             const float u = nh ? u1[c] : u0[c];
-            const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
-            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+              // offset = -scale: as*(s*C) + (-s)*rb == s*(as*C - rb), one
+              // FMA fewer per element and group.
+              acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
+            } else {
+              const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+              acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+            }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -7692,6 +7710,7 @@ enum Qwen35TensorPackedMatmul {
                 packedKernel = kernelStaged8
                 template.append(("NEGATIVE_SCALE_BIAS",
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             return packedKernel(
