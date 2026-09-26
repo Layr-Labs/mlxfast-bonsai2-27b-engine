@@ -5591,23 +5591,27 @@ enum Qwen35TensorPackedMatmul {
     /// True when the toolchain takes `tensor` operands at all (either form).
     static var tensorOperandsAvailable: Bool { support != .none }
 
-    /// The verify-width route's operand form: `native2b` (the 2-bit tensor
-    /// operand) where the toolchain has it, otherwise `none` (the record's
-    /// verify kernels): at 16 rows a weight byte feeds one op, so staging it
-    /// through threadgroup memory costs about what the op saves, and the
-    /// int8-staged form (`staged8`, the same kernel structure over
-    /// threadgroup-staged slices) measured 2% slower than the record's
-    /// kernels end to end. It stays available for measurement:
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM=native|staged8|off` forces one.
+    /// The verify-width route's operand form. `staged8`: the activation
+    /// quantized to signed int8 per 128-group (the prompt route's rotation)
+    /// and `int8 x int8 -> int32` ops over threadgroup-staged int8 weight
+    /// slices, which run at the tensor unit's int8 rate (about twice its
+    /// FP16 rate: 116 against 58 TF/s on an M5 Max); it beats both the
+    /// native 2-bit operand with an FP16 activation (-3% decode window) and
+    /// the record's verify kernels (-5%) and needs no packed format, so it is
+    /// the form wherever the int8 op compiles. `native2b`: the FP16
+    /// activation against the 2-bit operand, where the toolchain has it.
+    /// `none`: the record's verify kernels.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM=staged8|native|off` forces one.
     static let verifyForm: PackedOperandSupport = {
         let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch forced {
         case "native", "uint2b": return probe("bonsai_probe_uint2b", probeSourceNative) ? .native2b : .none
-        case "staged8", "uint8": return support == .staged8 ? .staged8 : .none
+        case "staged8", "uint8", "int8": return signedCodes ? .staged8 : .none
         case "off", "none", "0": return .none
         default: break
         }
+        if signedCodes { return .staged8 }
         if support == .native2b || probe("bonsai_probe_uint2b", probeSourceNative) { return .native2b }
         return .none
     }()
@@ -5746,6 +5750,106 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         """
+
+    // Verify width over the quantized rotation (signed int8 codes, as the
+    // prompt route's int8-staged kernel reads them): the same 32-column,
+    // four-simdgroup split-K structure, each simdgroup staging its
+    // 128-group slice of the weight tile as int8 in its own threadgroup
+    // buffer, the op `int8 x int8 -> int32` at the int8 rate of the tensor
+    // unit (about twice the FP16 rate), the affine map in FP32 from the
+    // activation's per-group scale and scaled sum.
+    private static let sourceNarrowInt8 = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int gper = Kg / 4;
+        const int g0 = int(sg) * gper;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
+        threadgroup uint32_t bs[4][1][32 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][1 - 1], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32 / 2;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        // staging: 32 columns x 8 words per group over 32 lanes: each lane stages 32/32 columns (all 8 words each)
+        constexpr int CPL = 32 / 32;
+        auto stage = [&](int g, int buf) {
+          #pragma clang loop unroll(full)
+          for (int cc = 0; cc < CPL; cc++) {
+            const int sc = int(lane) + 32 * cc;
+            const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
+            threadgroup uint32_t* dst = bs[sg][buf] + sc * 32;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 8; j++) {
+              const uint32_t wv = wrow[j];
+              dst[4 * j + 0] = wv & 0x03030303u;
+              dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
+              dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
+              dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+            }
+          }
+        };
+        stage(g0, 0);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = g0; g < g0 + gper; g++) {
+          const int cur = (1 == 2) ? ((g - g0) & 1) : 0;
+          if (1 == 2 && g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          float4 sv[32 / 16], bv[32 / 16];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 32 / 16; q++) {
+            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
+            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+          }
+          const float as0 = ascale[(size_t)fm * Kg + g], as1 = ascale[(size_t)(fm + 8) * Kg + g];
+          const float rs0 = rowsum[(size_t)fm * Kg + g];
+          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            acc[i] = fma(mh ? as1 : as0, sv[nq][c] * float(cT[i]), fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
+        }
+        // The reduction reuses the staging buffers (free after the K loop):
+        // 16 KB of threadgroup memory in all, two threadgroups per core.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float (*red)[CAP * 32] = (threadgroup float (*)[CAP * 32])&bs[0][0][0];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            float v = acc[i];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelNarrowInt8 = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_i8",
+        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowInt8,
+        header: header,
+        ensureRowContiguous: true)
 
     private static let kernelNarrowStaged8 = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_s8",
@@ -6096,6 +6200,34 @@ enum Qwen35TensorPackedMatmul {
             HadamardQuantizedLinear.tensorPackedMatmulNarrowApplies = { rows, n, k in
                 rows <= 16 && n % 64 == 0 && k % 512 == 0 && n <= verifyMaximumColumns
             }
+        }
+        if verifyEnabled, verifyForm == .staged8, signedCodes {
+            HadamardQuantizedLinear.tensorPackedMatmulNarrowInt8 = {
+                activation, weight, scales, biases, groupSize, outputDType, cache in
+                let codes = activation.codes
+                guard groupSize == 128, codes.dtype == .int8, codes.ndim == 2,
+                    activation.scales.dtype == .float32, activation.scaledSums.dtype == .float32,
+                    weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
+                    [DType.float16, .float32].contains(outputDType)
+                else { return nil }
+                let m = codes.dim(0)
+                let k = codes.dim(1)
+                let n = weight.dim(0)
+                guard m == 16, n % 32 == 0, k % 512 == 0, weight.dim(1) == k / 16,
+                    activation.scales.shape == [m, k / 128],
+                    activation.scaledSums.shape == [m, k / 128],
+                    scales.shape == [n, k / 128], biases.shape == [n, k / 128]
+                else { return nil }
+                let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
+                return kernelNarrowInt8(
+                    [codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
+                     dimsArray(k: k, m: m, n: n)],
+                    template: [("OutT", outputDType)],
+                    grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+            }
+        } else if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
                 guard groupSize == 128, rotated.dtype == .float16, rotated.ndim == 2,
