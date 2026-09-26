@@ -316,15 +316,25 @@ enum Qwen35TrunkSubmission {
     /// builds each layer through `cbv2ForwardPending` and so never reaches
     /// the plain loop's submissions. Newjordan's `9024f66b` pending path
     /// commits after layers 4, 16, 32 and 48; here the front is denser,
-    /// after layers 1, 2, 4, 8, 16, 32 and 48, so the GPU starts on the
-    /// first layer instead of waiting for the host to build four, and the
-    /// early command buffers stay short while the host is ahead of the GPU
-    /// by only a layer or two. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan
-    /// (same syntax, `4,16,32,48` restores the previous one); `0` submits the
-    /// forward as one graph.
+    /// after layers 1, 2, 4, 8, 16, 32 and 48 (ercumentyildirim `6e19fe1`,
+    /// row A), so the GPU starts on the first layer instead of waiting for
+    /// the host to build four, and the early command buffers stay short while
+    /// the host is ahead of the GPU by only a layer or two. Same kernels and
+    /// order; only command-buffer boundaries move.
+    /// `MLXFAST_RIDER_PROMPT_LEAD=0` restores `4,16,32,48`;
+    /// `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan (same syntax, it takes
+    /// precedence); `0` submits the forward as one graph.
+    static let promptLead: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_PROMPT_LEAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48]))
+        default: Plan(
+            stride: 0, offset: 0,
+            explicit: promptLead ? [1, 2, 4, 8, 16, 32, 48] : [4, 16, 32, 48]))
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
@@ -351,6 +361,41 @@ enum Qwen35TrunkSubmission {
         if plan.isOff || caches.contains(where: { $0 is PagedLayerCache }) { return nil }
         return plan
     }
+}
+
+/// Host work on the capture-verify encode (fkiene `e7e3ba6b`). The verify
+/// plan (`Qwen35TrunkSubmission.verify`, one leading submission after layer
+/// 16 by default) is unchanged. None of these change a kernel or a dtype.
+/// `leadEmbed` is the only new command buffer: the token embedding, before
+/// the layer loop.
+/// Missing env, or any value other than `0`/`off`/`false`/`no`, leaves the
+/// cut on.
+/// `MLXFAST_RIDER_HOSTCUT=0` turns all four off at once.
+enum Qwen35VerifyHost {
+    private static func knob(_ name: String) -> Bool {
+        guard
+            let raw = ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            !raw.isEmpty
+        else { return true }
+        return !["0", "off", "false", "no"].contains(raw)
+    }
+    /// Off by default here (`MLXFAST_RIDER_HOSTCUT=1` turns the four cuts on).
+    private static let rider: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_RIDER_HOSTCUT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "on", "true", "yes"].contains(raw ?? "")
+    }()
+    private static func on(_ name: String) -> Bool { rider && knob(name) }
+
+    /// `asyncEval` the token embedding before the first verify layer is built.
+    static let leadEmbed = on("MLXFAST_VERIFY_LEAD_EMBED")
+    /// Batch-1 recurrent state is already one row; do not wrap it in arrays.
+    static let singleRow = on("MLXFAST_VERIFY_SINGLE_ROW")
+    /// One slot table for the drafter taps, instead of a search per layer.
+    static let tapIndex = on("MLXFAST_VERIFY_TAP_INDEX")
+    /// Keep the packed-sibling lists resolved on the layer after the first use.
+    static let siblingCache = on("MLXFAST_VERIFY_SIBLING_CACHE")
 }
 
 // MARK: - GatedDeltaNet
@@ -878,7 +923,10 @@ enum Qwen35GatedDeltaV3 {
 }
 
 /// The strict-prefix commit replay of a verify round, batched across GDN
-/// layers (`MLXFAST_GDN_REPLAY_BATCH=0` keeps one replay per layer).
+/// layers. OFF by default (the ranked box read a longer decode window with it
+/// on: m34, the record plus this batching alone, 4.27-4.28 against the
+/// record's 4.23-4.26 ms per token); `MLXFAST_GDN_REPLAY_BATCH=1` turns it on.
+/// Off, every layer replays on its own and no self-test runs.
 ///
 /// A partially accepted verify commits each GDN layer by replaying the
 /// accepted prefix from the pre-verify state (`replayedPrefixState`): per
@@ -913,7 +961,7 @@ enum Qwen35GDNReplayBatch {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_REPLAY_BATCH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     static let layersPerLaunch = 4
@@ -1514,21 +1562,48 @@ enum Qwen35GDNVerifyStateSkip {
 
     /// Run the bitwise self-test for `layer`'s geometry once per process, at
     /// model construction, after `Qwen35GDNReplayBatch.prepare` (its batched
-    /// full-window replay is part of the test when batching is verified).
+    /// full-window replay is part of the test when batching is verified). The
+    /// same windows test the tail-free verify prework and the commit's
+    /// boundary rows (`Qwen35GDNVerifyNoCI`), which keep their own verdict.
     static func prepare(layer: Qwen35GatedDeltaNet) {
-        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
+        let stateSkip = enabled && Qwen35GatedDeltaV3.enabled
+        let noCI = Qwen35GDNVerifyNoCI.enabled && Qwen35GDNPrework.verifyStridedReads
+        guard stateSkip || noCI else { return }
         let key = geometry(layer)
         verdictLock.lock()
         defer { verdictLock.unlock() }
-        guard verdicts[key] == nil else { return }
-        let (passed, detail) = selfTest(layer: layer)
-        verdicts[key] = passed
+        guard !tested.contains(key) else { return }
+        tested.insert(key)
+        let result = selfTest(layer: layer, stateSkip: stateSkip, noCI: noCI)
         Memory.clearCache()
-        FileHandle.standardError.write(
-            ("qwen35 GDN verify state skip: self-test " + (passed ? "passed" : "FAILED") + " ("
-                + detail + ")"
-                + (passed ? "; verify stores no final state\n" : "; final-state store kept\n"))
-                .data(using: .utf8)!)
+        if let outcome = result.stateSkip {
+            let (passed, detail) = outcome
+            verdicts[key] = passed
+            FileHandle.standardError.write(
+                ("qwen35 GDN verify state skip: self-test " + (passed ? "passed" : "FAILED")
+                    + " (" + detail + ")"
+                    + (passed ? "; verify stores no final state\n" : "; final-state store kept\n"))
+                    .data(using: .utf8)!)
+        }
+        if let outcome = result.noCI {
+            let (passed, detail) = outcome
+            Qwen35GDNVerifyNoCI.record(layer: layer, passed: passed)
+            FileHandle.standardError.write(
+                ("qwen35 GDN verify prework without ci/tail: self-test "
+                    + (passed ? "passed" : "FAILED") + " (" + detail + ")"
+                    + (passed
+                        ? "; verify stores q/k/v/g/beta only, boundary rows from qkv\n"
+                        : "; conv input kept\n"))
+                    .data(using: .utf8)!)
+        }
+    }
+
+    nonisolated(unsafe) private static var tested: Set<Geometry> = []
+
+    /// One synthetic verify window's operands (`selfTest`).
+    private struct Window {
+        let qkvz: MLXArray, convState: MLXArray, convWeight: MLXArray
+        let a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray, ssmPre: MLXArray
     }
 
     /// Four synthetic verify windows shaped as the capture verify stages
@@ -1537,7 +1612,14 @@ enum Qwen35GDNVerifyStateSkip {
     /// `Qwen35GatedDeltaV3.run`; each window's stored final state is compared
     /// with the per-layer full-window replay of its tape and, when batching
     /// is verified, the batched one; its output rows with `runOutputOnly`'s.
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+    /// `noCI`: each window, with its qkv in FP32 and in FP16, also runs the
+    /// tail-free launch, whose q, k, v, g and beta are compared with the stock
+    /// launch's, and the boundary rows the commit forms for every kept row
+    /// count 1 ... S with the stock conv input's rows `keep ..< keep + NK`.
+    /// Every comparison is of unsigned integers.
+    private static func selfTest(
+        layer: Qwen35GatedDeltaNet, stateSkip: Bool, noCI: Bool
+    ) -> (stateSkip: (Bool, String)?, noCI: (Bool, String)?) {
         let G = Qwen35GDNReplayBatch.layersPerLaunch
         let S = selfTestRows
         let Hk = layer.numKHeads
@@ -1548,113 +1630,283 @@ enum Qwen35GDNVerifyStateSkip {
         let KS = layer.convKernelSize
         let NK = KS - 1
         guard KS == 4, Dk == 128, Dv == 128, Hv % Hk == 0, CD == 2 * Hk * Dk + Hv * Dv else {
-            return (false, "geometry outside the verify prework")
+            let outside = (false, "geometry outside the verify prework")
+            return (stateSkip ? outside : nil, noCI ? outside : nil)
         }
         let batched = Qwen35GDNReplayBatch.isVerified(layer: layer)
         let derived = Qwen35GDNDerived()
         let keys = MLXRandom.split(key: MLXRandom.key(0x5653_4b50), into: 8 * G)
-        var comparisons = 0
-        var values = 0
-        var mismatches = 0
-        do {
-            try withError { error in
-                var differ: [MLXArray] = []
-                func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
-                    guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
-                        a.dtype == .float32
-                    else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
-                    differ.append(
-                        (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
-                    values += a.size
-                    comparisons += 1
-                }
-                var operands: [Qwen35GDNReplayBatch.Operand] = []
-                var finals: [MLXArray] = []
-                var tails: [MLXArray] = []
-                for j in 0 ..< G {
-                    func key(_ i: Int) -> MLXArray { keys[8 * j + i] }
-                    let qkvz = MLXRandom.normal([1, S, CD + Hv * Dv], key: key(0))
-                    let qkv = qkvz[0..., 0..., ..<CD]
-                    let convState = MLXRandom.normal([1, NK, CD], key: key(1))
-                    let convWeight = MLXRandom.normal([CD, KS, 1], key: key(2)) * 0.5
-                    var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(3)) * 4
-                    let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
-                    let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
-                    let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
-                        .reshaped([1, S, 1])
-                    gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
-                    let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(4)))
-                    let dtBias = MLXRandom.normal([Hv], key: key(5))
-                    let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(6)))
-                    let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(7)) * spread * 0.05
-                    eval(qkvz, convState, convWeight, gatePair, aLog, dtBias, ssmPre)
-                    let b = gatePair[0..., 0..., ..<Hv]
-                    let a = gatePair[0..., 0..., Hv...]
-                    guard
-                        let pre = Qwen35GDNPrework.run(
-                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
-                            aDecay: derived.decay(aLog), dtBias: dtBias,
-                            normScales: derived.normScales(headKDim: Dk, dtype: .float32),
-                            keyHeads: Hk, valueHeads: Hv, headKDim: Dk, headVDim: Dv,
-                            writeConvInput: true,
-                            stridedReads: Qwen35GDNPrework.verifyStridedReads),
-                        let convInput = pre.convInput
-                    else { throw SelfTestFailure.message("no verify prework") }
-                    guard
-                        let (yStored, finalStored) = Qwen35GatedDeltaV3.run(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmPre),
-                        let yOnly = Qwen35GatedDeltaV3.runOutputOnly(
-                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
-                            state: ssmPre)
-                    else { throw SelfTestFailure.message("no verify recurrence") }
-                    eval(pre.q, pre.k, pre.v, pre.g, pre.beta, convInput, yStored, finalStored, yOnly)
-                    let tape = ArraysCache.PrefixReplayTape(
-                        convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
-                    guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
-                    else { throw SelfTestFailure.message("tape rejected") }
-                    let replayed = layer.replayedPrefixState(
-                        tape: tape, committedRows: S, aLog: aLog, dtBias: dtBias,
-                        fullWindow: true)
-                    // The stored full-acceptance conv is the window's last NK
-                    // conv input rows.
-                    let tail = convInput[0..., S ..< (S + NK), 0...]
-                    try compare(yOnly, yStored, "output rows")
-                    try compare(replayed.ssm, finalStored, "per-layer final state")
-                    try compare(replayed.conv, tail, "per-layer conv tail")
-                    operands.append(
-                        Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
-                    finals.append(finalStored)
-                    tails.append(tail)
-                }
-                if batched {
-                    guard
-                        let states = Qwen35GDNReplayBatch.launch(
-                            operands, keep: S,
-                            alog: concatenated(operands.map(\.aLog), axis: 0),
-                            dtb: concatenated(operands.map(\.dtBias), axis: 0),
-                            verifiedOnly: false)
-                    else { throw SelfTestFailure.message("no batched full-window replay") }
-                    for j in 0 ..< G {
-                        try compare(states[j].ssm, finals[j], "batched final state")
-                        try compare(states[j].conv, tails[j], "batched conv tail")
-                    }
-                }
-                let count = stacked(differ).sum()
-                eval(count)
-                try error.check()
-                mismatches += Int(count.item(Int32.self))
-            }
-        } catch {
-            return (false, "\(error)")
+        var windows: [Window] = []
+        for j in 0 ..< G {
+            func key(_ i: Int) -> MLXArray { keys[8 * j + i] }
+            let qkvz = MLXRandom.normal([1, S, CD + Hv * Dv], key: key(0))
+            let convState = MLXRandom.normal([1, NK, CD], key: key(1))
+            let convWeight = MLXRandom.normal([CD, KS, 1], key: key(2)) * 0.5
+            var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(3)) * 4
+            let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+            let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+            let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
+                .reshaped([1, S, 1])
+            gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
+            let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(4)))
+            let dtBias = MLXRandom.normal([Hv], key: key(5))
+            let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(6)))
+            let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(7)) * spread * 0.05
+            eval(qkvz, convState, convWeight, gatePair, aLog, dtBias, ssmPre)
+            let b = gatePair[0..., 0..., ..<Hv]
+            let a = gatePair[0..., 0..., Hv...]
+            windows.append(
+                Window(
+                    qkvz: qkvz, convState: convState, convWeight: convWeight, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, ssmPre: ssmPre))
         }
-        let expected = G * 3 + (batched ? G * 2 : 0)
-        let passed = mismatches == 0 && comparisons == expected
-        return (
-            passed,
-            "\(G) windows of \(S) rows, \(comparisons) comparisons, \(values) values, "
-                + "\(mismatches) mismatches" + (batched ? ", batched replay included" : ""))
+        func prework(
+            _ w: Window, qkv: MLXArray, convInput: Bool, stridedReads: Bool, tail: Bool = true
+        ) -> Qwen35GDNPrework.Outputs? {
+            Qwen35GDNPrework.run(
+                qkv: qkv, convState: w.convState, convWeight: w.convWeight, a: w.a, b: w.b,
+                aDecay: derived.decay(w.aLog), dtBias: w.dtBias,
+                normScales: derived.normScales(headKDim: Dk, dtype: .float32),
+                keyHeads: Hk, valueHeads: Hv, headKDim: Dk, headVDim: Dv,
+                writeConvInput: convInput, stridedReads: stridedReads, writeTail: tail)
+        }
+
+        var stateSkipResult: (Bool, String)? = nil
+        if stateSkip {
+            var comparisons = 0
+            var values = 0
+            var mismatches = 0
+            do {
+                try withError { error in
+                    var differ: [MLXArray] = []
+                    func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
+                        guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
+                            a.dtype == .float32
+                        else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
+                        differ.append(
+                            (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32)
+                                .sum())
+                        values += a.size
+                        comparisons += 1
+                    }
+                    var operands: [Qwen35GDNReplayBatch.Operand] = []
+                    var finals: [MLXArray] = []
+                    var tails: [MLXArray] = []
+                    for w in windows {
+                        let qkv = w.qkvz[0..., 0..., ..<CD]
+                        guard
+                            let pre = prework(
+                                w, qkv: qkv, convInput: true,
+                                stridedReads: Qwen35GDNPrework.verifyStridedReads),
+                            let convInput = pre.convInput
+                        else { throw SelfTestFailure.message("no verify prework") }
+                        guard
+                            let (yStored, finalStored) = Qwen35GatedDeltaV3.run(
+                                q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                                state: w.ssmPre),
+                            let yOnly = Qwen35GatedDeltaV3.runOutputOnly(
+                                q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                                state: w.ssmPre)
+                        else { throw SelfTestFailure.message("no verify recurrence") }
+                        eval(
+                            pre.q, pre.k, pre.v, pre.g, pre.beta, convInput, yStored, finalStored,
+                            yOnly)
+                        let tape = ArraysCache.PrefixReplayTape(
+                            convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: w.a, b: w.b,
+                            ssmPre: w.ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                        guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
+                        else { throw SelfTestFailure.message("tape rejected") }
+                        let replayed = layer.replayedPrefixState(
+                            tape: tape, committedRows: S, aLog: w.aLog, dtBias: w.dtBias,
+                            fullWindow: true)
+                        // The stored full-acceptance conv is the window's last NK
+                        // conv input rows.
+                        let tail = convInput[0..., S ..< (S + NK), 0...]
+                        try compare(yOnly, yStored, "output rows")
+                        try compare(replayed.ssm, finalStored, "per-layer final state")
+                        try compare(replayed.conv, tail, "per-layer conv tail")
+                        operands.append(
+                            Qwen35GDNReplayBatch.Operand(tape: tape, aLog: w.aLog, dtBias: w.dtBias))
+                        finals.append(finalStored)
+                        tails.append(tail)
+                    }
+                    if batched {
+                        guard
+                            let states = Qwen35GDNReplayBatch.launch(
+                                operands, keep: S,
+                                alog: concatenated(operands.map(\.aLog), axis: 0),
+                                dtb: concatenated(operands.map(\.dtBias), axis: 0),
+                                verifiedOnly: false)
+                        else { throw SelfTestFailure.message("no batched full-window replay") }
+                        for j in 0 ..< G {
+                            try compare(states[j].ssm, finals[j], "batched final state")
+                            try compare(states[j].conv, tails[j], "batched conv tail")
+                        }
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+                let expected = G * 3 + (batched ? G * 2 : 0)
+                stateSkipResult = (
+                    mismatches == 0 && comparisons == expected,
+                    "\(G) windows of \(S) rows, \(comparisons) comparisons, \(values) values, "
+                        + "\(mismatches) mismatches" + (batched ? ", batched replay included" : "")
+                )
+            } catch {
+                stateSkipResult = (false, "\(error)")
+            }
+        }
+
+        var noCIResult: (Bool, String)? = nil
+        if noCI {
+            var comparisons = 0
+            var values = 0
+            var mismatches = 0
+            do {
+                try withError { error in
+                    var differ: [MLXArray] = []
+                    func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
+                        guard let a, let b, a.shape == b.shape, a.dtype == b.dtype,
+                            a.dtype == .float32
+                        else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
+                        differ.append(
+                            (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32)
+                                .sum())
+                        values += a.size
+                        comparisons += 1
+                    }
+                    for w in windows {
+                        // The verify's qkv widths: FP32 and FP16, each a column
+                        // slice of its qkv|z product, read in place.
+                        for dtype in [DType.float32, .float16] {
+                            let qkvz = dtype == .float32 ? w.qkvz : w.qkvz.asType(dtype)
+                            let qkv = qkvz[0..., 0..., ..<CD]
+                            guard
+                                let stock = prework(w, qkv: qkv, convInput: true, stridedReads: true),
+                                let convInput = stock.convInput,
+                                let lean = prework(
+                                    w, qkv: qkv, convInput: false, stridedReads: true, tail: false),
+                                lean.tail == nil, lean.convInput == nil
+                            else { throw SelfTestFailure.message("no \(dtype) verify prework") }
+                            try compare(lean.q, stock.q, "q")
+                            try compare(lean.k, stock.k, "k")
+                            try compare(lean.v, stock.v, "v")
+                            try compare(lean.g, stock.g, "g")
+                            try compare(lean.beta, stock.beta, "beta")
+                            let source = Qwen35GDNVerifyNoCI.Source(convState: w.convState, qkv: qkv)
+                            for keep in 1 ... S {
+                                try compare(
+                                    source.rows(keep: keep),
+                                    convInput[0..., keep ..< (keep + NK), 0...],
+                                    "\(dtype) boundary rows after \(keep)")
+                            }
+                        }
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+                let expected = G * 2 * (5 + S)
+                noCIResult = (
+                    mismatches == 0 && comparisons == expected,
+                    "\(G) windows x FP32/FP16 qkv, q/k/v/g/beta + boundary rows for keep 1...\(S), "
+                        + "\(comparisons) comparisons, \(values) values, \(mismatches) mismatches")
+            } catch {
+                noCIResult = (false, "\(error)")
+            }
+        }
+        return (stateSkipResult, noCIResult)
+    }
+}
+
+/// The verify window's GDN prework without its conv input and tail stores
+/// (`BONSAI_PREWORK_VERIFY_NOCI=0` restores them).
+///
+/// Per GDN layer the capture verify's prework launch stored the FP32 conv
+/// input `ci = concatenated([convState, qkv], axis: 1)` (`[1, NK + S, CD]`,
+/// 778 KB at S = 16) for the replay tape, and the next conv tail (`[1, NK,
+/// CD]`), about 43 MB a round over the 48 GDN layers. The tail is never read
+/// on this path, and of `ci` the commit reads three rows: the conv state after
+/// the accepted prefix, `ci[keep ..< keep + NK]`. Here the verify runs the
+/// strided prework cut before those stores (`Qwen35GDNPrework.verifySource`,
+/// q, k, v, g and beta only), the tape's conv input is the lazy concatenation
+/// (never evaluated whole), and the commit forms the three rows it keeps
+/// from the state and the qkv rows (`Source.rows`): `ci[NK + t]` is
+/// `float(qkv[t])` and `ci[r < NK]` is `convState[r]`, so they are the same
+/// values bit for bit. The replay batching (`Qwen35GDNReplayBatch`) reads the
+/// stored `ci`, so a layer it takes keeps the stock launch. At model
+/// construction `Qwen35GDNVerifyStateSkip.selfTest` compares both launches'
+/// outputs and every kept row count's boundary rows as unsigned integers;
+/// any mismatch or MLX error keeps the stock launch.
+enum Qwen35GDNVerifyNoCI {
+    static let enabled: Bool = {
+        // Off by default here (`BONSAI_PREWORK_VERIFY_NOCI=1` enables it).
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_VERIFY_NOCI"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// One request's pre-verify conv state (`[B, NK, CD]`, FP32) and window
+    /// qkv (`[B, S, CD]`): the stock conv input is their FP32 concatenation.
+    struct Source {
+        let convState: MLXArray
+        let qkv: MLXArray
+
+        /// Rows `keep ..< keep + NK` of `concatenated([convState, qkv], axis:
+        /// 1)` in FP32: the conv state after `keep` window rows (1 ... S).
+        func rows(keep: Int) -> MLXArray {
+            let nk = convState.dim(1)
+            if keep >= nk {
+                return contiguous(qkv[0..., (keep - nk) ..< keep, 0...].asType(.float32))
+            }
+            return concatenated(
+                [convState[0..., keep..., 0...], qkv[0..., ..<keep, 0...].asType(.float32)],
+                axis: 1)
+        }
+    }
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, nk: Int
+    }
+
+    private static func geometry(_ layer: Qwen35GatedDeltaNet) -> Geometry {
+        Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            cd: layer.convDim, nk: layer.convKernelSize - 1)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    static func record(layer: Qwen35GatedDeltaNet, passed: Bool) {
+        let key = geometry(layer)
+        lock.withLock { verdicts[key] = passed }
+    }
+
+    nonisolated(unsafe) private static var announced = false
+
+    /// One line at the first verify that takes the path (the load-time warm).
+    static func announce(_ dtype: DType) {
+        guard !announced else { return }
+        announced = true
+        FileHandle.standardError.write(
+            "qwen35 GDN verify prework without ci/tail: in use (qkv \(dtype))\n"
+                .data(using: .utf8)!)
+    }
+
+    /// Whether `layer`'s verify may skip the conv input and tail stores: the
+    /// self-test passed on its geometry, the verify reads its inputs in place
+    /// (`verifyStridedReads`, the launch the cut derives from) and the replay
+    /// batching does not take the layer.
+    static func applies(to layer: Qwen35GatedDeltaNet) -> Bool {
+        guard enabled, Qwen35GDNPrework.verifyStridedReads,
+            !Qwen35GDNReplayBatch.isVerified(layer: layer)
+        else { return false }
+        let key = geometry(layer)
+        return lock.withLock { verdicts[key] ?? false }
     }
 }
 
@@ -2124,6 +2376,170 @@ enum Qwen35GatedDeltaChunked {
               simdgroup_store(St[d], state_out + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
         """
     // END GENERATED CHUNKED GDN SOURCES
+
+    // MARK: Fresh-state scan
+
+    /// znan2 `6d51ab45` GDN prompt pipeline (this fresh-state scan and the
+    /// row-tiled fresh prework, `Qwen35GDNPrework.rowTiledEnabled`).
+    /// `MLXFAST_RIDER_GDN_PROMPT_PIPE=0` turns both off; the rival's own
+    /// switches still act per piece.
+    static let promptPipeRider: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_GDN_PROMPT_PIPE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `BONSAI_GDN_CHUNKED_FRESH=0` keeps a new request's first prompt chunk
+    /// on `run` from a materialized zeros state.
+    static let freshEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_CHUNKED_FRESH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return promptPipeRider && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `scanSource` for a state known to be all zeros (a new request's first
+    /// prompt chunk, see `Qwen35GatedDeltaNet.freshPromptChunk`): each
+    /// simdgroup's state registers start as a zero matrix instead of loading a
+    /// zeros array, so the `[B, Hv, Dv, Dk]` zeros array is never
+    /// materialized. The registers hold the same values (+0.0f) the load would
+    /// have put there, and every later operation is the stock text. Derived
+    /// from `scanSource` by one checked replacement, so the stock kernel stays
+    /// as it is and this one follows it.
+    private static let scanFreshSource: String = {
+        let target =
+            "simdgroup_load(St[d], state_in + ((size_t)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);"
+        precondition(
+            scanSource.components(separatedBy: target).count == 2,
+            "Qwen35 chunked GDN: the fresh-state scan source no longer matches the stock kernel")
+        let text = scanSource.replacingOccurrences(
+            of: target, with: "St[d] = simdgroup_float8x8(0);")
+        precondition(!text.contains("state_in"))
+        return text
+    }()
+
+    private static let scanFreshKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_chunk_scan_fresh",
+        inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+        outputNames: ["y", "state_out"],
+        source: scanFreshSource)
+
+    /// `run` from an all-zero FP32 state of `stateShape`, which is not passed,
+    /// for a window of whole chunks (a remainder's sequential tail reads the
+    /// state array, so such a window stays on `run`); nil when this does not
+    /// apply or the geometry did not pass its check, and the caller takes the
+    /// stock path.
+    static func runFresh(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
+        let B = k.dim(0)
+        let T = k.dim(1)
+        guard T >= minRows, T >= chunk, T % chunk == 0,
+            q.shape == k.shape, k.dim(3) == 128, v.dim(1) == T, v.dim(3) % 8 == 0,
+            v.dim(2) % k.dim(2) == 0,
+            g.shape == [B, T, v.dim(2)], beta.shape == [B, T, v.dim(2)],
+            stateShape == [B, v.dim(2), v.dim(3), 128],
+            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            g.dtype == .float32, beta.dtype == .float32,
+            freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
+        else { return nil }
+        return freshChunks(q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+    }
+
+    /// `chunks` with `scanFreshKernel` in place of `scanKernel`: the same prep
+    /// launch, the same scan launch geometry, no state input.
+    private static func freshChunks(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+    ) -> (MLXArray, MLXArray) {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let C = chunk
+        let NC = T / C
+        let rowCount = MLXArray(Int32(T))
+        let prepared = prepKernel(
+            [q, k, g, beta, rowCount],
+            template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, NC, B * Hk),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
+            outputDTypes: [.float32, .float32, .float32])
+        let outputs = scanFreshKernel(
+            [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
+            template: [
+                ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("NS", scanSimdgroups),
+            ],
+            grid: (32, Dv / 8, B * Hv),
+            threadGroup: (32, scanSimdgroups, 1),
+            outputShapes: [[B, T, Hv, Dv], stateShape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private static let freshLock = NSLock()
+    nonisolated(unsafe) private static var freshVerdicts: [[Int]: Bool] = [:]
+
+    /// Verdict lookup only (the check runs in `prepareFresh`, never inside a
+    /// forward); a geometry that was not prepared, or failed, keeps `run`.
+    private static func freshVerified(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        freshLock.withLock { freshVerdicts[[hk, dk, hv, dv, chunk]] ?? false }
+    }
+
+    /// Compile the fresh-state scan for this geometry and check it bit for bit
+    /// against `chunks` from a zeros state, once per process, at model
+    /// construction. A mismatch prints one line and keeps `run`. Called from
+    /// the layer's init.
+    static func prepareFresh(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard enabled, freshEnabled, hk > 0, dk == 128, dv % 8 == 0, hv % hk == 0
+        else { return }
+        let key = [hk, dk, hv, dv, chunk]
+        if freshLock.withLock({ freshVerdicts[key] != nil }) { return }
+        let verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        let recorded = freshLock.withLock { () -> Bool in
+            guard freshVerdicts[key] == nil else { return false }
+            freshVerdicts[key] = verdict
+            return true
+        }
+        if recorded && !verdict {
+            FileHandle.standardError.write(
+                "qwen35: chunked GDN fresh-state scan disagrees with the stock scan on this device; using the stock scan\n"
+                    .data(using: .utf8)!)
+        }
+    }
+
+    private static func freshSelfCheck(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6673_7368), into: 8)
+        for T in [minRows, 512] where T % chunk == 0 && T >= chunk {
+            // Wide magnitude spread; rows 8..15 of every head have g == 0 (the
+            // prep's underflow mask), rows 16..23 a subnormal g.
+            func spread(_ shape: [Int], _ i: Int) -> MLXArray {
+                MLXRandom.normal(shape, key: keys[i]) * exp(MLXRandom.normal(shape, key: keys[i + 3]))
+            }
+            let q = spread([1, T, hk, dk], 0) * 0.1
+            let k = spread([1, T, hk, dk], 1) * 0.1
+            let v = spread([1, T, hv, dv], 2)
+            let rowIndex = MLXArray.arange(T).reshaped(1, T, 1)
+            let g0 = MLXRandom.uniform(0.5 ..< 1.0, [1, T, hv], key: keys[6])
+            let g = which(
+                (rowIndex .>= 8) .&& (rowIndex .< 16), Float(0),
+                which((rowIndex .>= 16) .&& (rowIndex .< 24), Float(1e-39), g0))
+            let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[7])
+            let stateShape = [1, hv, dv, dk]
+            let (yRef, sRef) = chunks(
+                q: q, k: k, v: v, g: g, beta: beta,
+                state: MLXArray.zeros(stateShape, dtype: .float32))
+            let (yNew, sNew) = freshChunks(
+                q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+            let same = all(yRef.view(dtype: .uint32) .== yNew.view(dtype: .uint32))
+                .&& all(sRef.view(dtype: .uint32) .== sNew.view(dtype: .uint32))
+            if !same.item(Bool.self) { return false }
+        }
+        return true
+    }
 }
 
 /// Wide-window (prefill) variant of the unmasked gated-delta kernel.
@@ -2481,6 +2897,16 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
+            // At verify width on the int8 route: the norm and the gated tail
+            // in one launch (`Qwen35GatedNormTail`), the same values
+            // (terrapinelf `a3e6b77`).
+            if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
+                let signed = Qwen35GatedNormTail.apply(
+                    out, gate: gate, weight: norm.weight, eps: norm.eps,
+                    signs: packed.transform.signVector)
+            {
+                return packed.forwardPreSigned(signed.reshaped(B, S, -1), widenOutput: false)
+            }
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             let signs = packed.transform.signVector.reshaped(numVHeads, headVDim)
             let signed = Qwen35FusedElementwise.gatedNormTailSigned(normed, gate, signs)
@@ -2539,6 +2965,10 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GDNReplayBatch.prepare(layer: self)
         Qwen35GDNVerifyStateSkip.prepare(layer: self)
+        Qwen35GDNPrework.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35GatedDeltaChunked.prepareFresh(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -2877,7 +3307,7 @@ final class Qwen35GatedDeltaNet: Module {
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssm)
                 ?? gatedDeltaKernel(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssm, mask: nil)
-            return (out, pre.tail, newSsmState)
+            return (out, pre.tail!, newSsmState)
         }
 
         let convInput = concatenated([convState, qkv], axis: 1)
@@ -2948,6 +3378,13 @@ final class Qwen35GatedDeltaNet: Module {
                 headVDim: headVDim)
         else { return nil }
         let stateShape = [B, numVHeads, headVDim, headKDim]
+        // Whole chunks from the zero state without the zeros array
+        // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
+        if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
+        {
+            return (out, pre.tail!, newSsmState)
+        }
         // The record's chunked recurrence takes prompt windows; keep it (from
         // a zero state) and only replace the prework in front of it.
         if Qwen35GatedDeltaChunked.enabled,
@@ -2955,17 +3392,17 @@ final class Qwen35GatedDeltaNet: Module {
                 q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
                 state: MLXArray.zeros(stateShape, dtype: .float32))
         {
-            return (out, pre.tail, newSsmState)
+            return (out, pre.tail!, newSsmState)
         }
         if let (out, newSsmState) = Qwen35GatedDeltaV3.runFreshState(
             q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
         {
-            return (out, pre.tail, newSsmState)
+            return (out, pre.tail!, newSsmState)
         }
         let (out, newSsmState) = gatedDeltaKernel(
             q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
             state: MLXArray.zeros(stateShape, dtype: .float32), mask: nil)
-        return (out, pre.tail, newSsmState)
+        return (out, pre.tail!, newSsmState)
     }
 
     /// Run one legacy-cache verify chunk while retaining only the transformed
@@ -3078,11 +3515,14 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     /// `aLog`/`dtBias` stand in for the layer's own parameters in
-    /// `Qwen35GDNReplayBatch`'s self-test only.
+    /// `Qwen35GDNReplayBatch`'s self-test only. `boundarySource` (a verify
+    /// that stored no conv input, `Qwen35GDNVerifyNoCI`) forms the boundary
+    /// conv rows from the pre-verify state and the qkv rows instead of
+    /// slicing the tape's conv input, which is then never evaluated.
     fileprivate func replayedPrefixState(
         tape: ArraysCache.PrefixReplayTape, committedRows: Int,
         aLog aLogOverride: MLXArray? = nil, dtBias dtBiasOverride: MLXArray? = nil,
-        fullWindow: Bool = false
+        fullWindow: Bool = false, boundarySource: Qwen35GDNVerifyNoCI.Source? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows, fullWindow: fullWindow),
@@ -3100,6 +3540,10 @@ final class Qwen35GatedDeltaNet: Module {
             mask: tape.mask.map { $0[0..., rows] },
             outputNeeded: false
         ).1
+        if let boundarySource {
+            return CBv2RecurrentLayerState(
+                conv: boundarySource.rows(keep: committedRows), ssm: boundarySsm)
+        }
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -3330,23 +3774,40 @@ final class Qwen35GatedDeltaNet: Module {
                 inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
+        let convState: MLXArray
+        let ssmState: MLXArray
+        // One ranked row is already the state tensor. Building two arrays and
+        // concatenating a single element is host work on every linear layer
+        // of the verify, ahead of the caller's eval.
+        if Qwen35VerifyHost.singleRow, B == 1, let only = recurrentState.first {
+            let state = only.inputState(modelLayerIndex: modelLayerIndex)
+            convState =
                 state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
+                ?? MLXArray.zeros(
+                    [1, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            ssmState =
                 state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+                ?? MLXArray.zeros(
+                    [1, numVHeads, headVDim, headKDim], dtype: .float32)
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -3358,6 +3819,14 @@ final class Qwen35GatedDeltaNet: Module {
         // concatenated conv input for its boundary rows, which the prework
         // kernel also writes (the same FP32 values as the concatenation of the
         // state with the widened qkv, without its cast and copy launches).
+        // With `Qwen35GDNVerifyNoCI` the launch stores neither that input nor
+        // the tail: the commit forms its three boundary rows from the state
+        // and the qkv rows, and the tape's conv input stays a lazy
+        // concatenation that nothing evaluates.
+        let omitsConvInput =
+            !exactTargetVerify && S >= 3 && convKernelSize == 4
+            && (qkv.dtype == .float32 || qkv.dtype == .float16) && convState.dtype == .float32
+            && Qwen35GDNVerifyNoCI.applies(to: self)
         let pre: Qwen35GDNPrework.Outputs? =
             (!exactTargetVerify && S >= 3 && convKernelSize == 4)
             ? Qwen35GDNPrework.run(
@@ -3366,10 +3835,13 @@ final class Qwen35GatedDeltaNet: Module {
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim,
-                writeConvInput: Self.preworkWritesConvInput
+                writeConvInput: !omitsConvInput && Self.preworkWritesConvInput
                     && qkv.dtype != .bfloat16 && convState.dtype == .float32,
-                stridedReads: Qwen35GDNPrework.verifyStridedReads)
+                stridedReads: Qwen35GDNPrework.verifyStridedReads,
+                writeTail: !omitsConvInput)
             : nil
+        let noCI = omitsConvInput && pre != nil
+        if noCI { Qwen35GDNVerifyNoCI.announce(qkv.dtype) }
         let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
@@ -3448,7 +3920,17 @@ final class Qwen35GatedDeltaNet: Module {
 
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
-                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
+                // Without a stored conv input the staged final conv is a view
+                // of the qkv rows (no launch); the commit never reads it, as
+                // full acceptance forms its rows itself.
+                let boundarySource =
+                    noCI
+                    ? Qwen35GDNVerifyNoCI.Source(
+                        convState: convState[rowRange], qkv: qkv[rowRange])
+                    : nil
+                let finalConv =
+                    boundarySource.map { $0.qkv[0..., (S - nKeep) ..< S, 0...] }
+                    ?? convInput[rowRange, S ..< (S + nKeep), 0...]
                 let finalSSM = finalSsmState?[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
@@ -3467,8 +3949,11 @@ final class Qwen35GatedDeltaNet: Module {
                 // already-accounted committed generation when it existed before
                 // this verify. `v` retains the whole conv output backing.
                 let convOutBacking = convOutBackingAll[rowRange]
+                // Without a stored conv input the replay reads the qkv rows
+                // (and, for fewer than NK kept rows, the pre-verify state).
+                let convRoot = boundarySource?.qkv ?? tape.convInput
                 var roots = [
-                    tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
+                    convRoot, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
@@ -3480,6 +3965,10 @@ final class Qwen35GatedDeltaNet: Module {
                     // The pending baseline already charges this state. After
                     // strict acceptance it becomes an additional replay input.
                     strictReplayRoots.append(inputSSM)
+                }
+                if let boundarySource {
+                    // Likewise the pre-verify conv state for a short prefix.
+                    strictReplayRoots.append(boundarySource.convState)
                 }
 
                 func checkedByteCount(_ arrays: [MLXArray]) -> Int {
@@ -3498,15 +3987,17 @@ final class Qwen35GatedDeltaNet: Module {
                 }
                 // A strict-prefix commit replays this layer inside its round's
                 // batched launch when batching is on and verified.
-                let replaySlot = Qwen35GDNReplayBatch.register(
-                    owner: evaluation, layer: self, tape: tape)
+                let replaySlot =
+                    noCI
+                    ? nil
+                    : Qwen35GDNReplayBatch.register(owner: evaluation, layer: self, tape: tape)
                 // A skipped final state is still charged as if stored (the
                 // full-acceptance replay materializes one), and full acceptance
                 // then retains the replay's inputs as a strict prefix does.
                 let materializedBytes = checkedByteCount(roots + [finalSSM ?? tape.ssmPre!])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
                 let fullAcceptanceRetainedRoots =
-                    finalSSM == nil ? strictReplayRoots : [tape.convInput]
+                    finalSSM == nil ? strictReplayRoots : [convRoot]
                 let fullAcceptanceRetainedBytes = checkedByteCount(fullAcceptanceRetainedRoots)
                 do {
                     try evaluation.stagePrefixReplay(
@@ -3527,17 +4018,20 @@ final class Qwen35GatedDeltaNet: Module {
                                 // did not store (self-tested at load).
                                 return replaySlot?.state(keep: S)
                                     ?? self.replayedPrefixState(
-                                        tape: tape, committedRows: S, fullWindow: true)
+                                        tape: tape, committedRows: S, fullWindow: true,
+                                        boundarySource: boundarySource)
                             }
-                            let detachedConv = finalConv + MLXArray.zeros(
-                                finalConv.shape, dtype: finalConv.dtype)
+                            let tailRows = boundarySource?.rows(keep: S) ?? finalConv
+                            let detachedConv = tailRows + MLXArray.zeros(
+                                tailRows.shape, dtype: tailRows.dtype)
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
                         },
                         replay: { [unowned self] keepPositions in
                             replaySlot?.state(keep: keepPositions)
                                 ?? self.replayedPrefixState(
-                                    tape: tape, committedRows: keepPositions)
+                                    tape: tape, committedRows: keepPositions,
+                                    boundarySource: boundarySource)
                         })
                 } catch {
                     preconditionFailure(
@@ -3615,6 +4109,17 @@ final class Qwen35Attention: Module {
     /// fused prework reproduces; nil otherwise.
     private let fusedRope: (dims: Int, base: Float)?
 
+    /// On the int8 verify route the output gate reads the head-transposed
+    /// output and the q|gate head's gate half through their strides, no
+    /// reshape copies (terrapinelf `a3e6b77`, row S). Layout only, same
+    /// compiled program over the same elements. `MLXFAST_RIDER_ATTN_GATE_STRIDES=0`
+    /// keeps the reshaped operands.
+    static let stridedVerifyGate: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_ATTN_GATE_STRIDES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -3680,7 +4185,9 @@ final class Qwen35Attention: Module {
         guard ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
             let (cosine, sine) = mrope.defaultTables(
-                positions: positionIds, dtype: q.dtype)
+                positions: Qwen35MRoPE.memoEnabled
+                    ? positionIds : normalizedExplicitPositions(positionIds),
+                dtype: q.dtype)
         else { return nil }
         return Qwen35AttentionPreworkExplicit.run(
             q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
@@ -3885,6 +4392,24 @@ final class Qwen35Attention: Module {
             {
                 return y
             }
+            // The int8 verify route (neither form above takes it): the gate and
+            // the projection's signs in one elementwise launch that reads the
+            // head-transposed output and the gate half of each q|gate head
+            // through their strides, so neither is reshaped into a copy first.
+            // Same elements, same compiled program; its output is contiguous
+            // (terrapinelf `a3e6b77`, row S).
+            if !exactTargetVerify, Self.stridedVerifyGate,
+                Qwen35FusedElementwise.foldsHadamardSigns,
+                let packed = oProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
+                attended.dtype == qSplit[1].dtype, attended.shape == qSplit[1].shape,
+                attended.dim(2) * attended.dim(3) == packed.transform.width,
+                HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * L)
+            {
+                let signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                    attended, qSplit[1],
+                    packed.transform.signVector.reshaped(attended.dim(2), attended.dim(3)))
+                return packed.forwardPreSigned(signed.reshaped(B, L, -1), widenOutput: false)
+            }
             output = attended.reshaped(B, L, -1)
             attendedGate = gate
         }
@@ -3921,6 +4446,7 @@ final class Qwen35MRoPE {
     let rotaryDim: Int
     private let defaultInvFreq: MLXArray?
     private let sections: [Int]
+    private let base: Float
     // Which of the three position planes (t/h/w) owns each frequency,
     // precomputed as [1, 1, 1, rotaryDim/2] so the default path interleaves
     // with one takeAlong instead of a per-frequency slice loop.
@@ -3932,6 +4458,7 @@ final class Qwen35MRoPE {
     ) {
         self.rope = rope
         self.rotaryDim = max(1, dim)
+        self.base = base
         let ropeType: String = {
             if let value = scalingConfig?["type"] ?? scalingConfig?["rope_type"],
                 case .string(let type) = value
@@ -3970,22 +4497,61 @@ final class Qwen35MRoPE {
         return 0
     }
 
+    /// DrCleverHans `864ff5e9` on the explicit-positions path:
+    /// - `defaultTables` keeps the last `(cosine, sine)` pair, returned while
+    ///   the next caller passes the IDENTICAL positions array (`===`) for
+    ///   the same table configuration and dtype: the attention layers of one
+    ///   forward share one positions array, so the first builds the tables
+    ///   and the rest reuse them. The cache holds a strong reference to that
+    ///   array, so its identity cannot be taken by another array while it is
+    ///   cached, and a new request's positions are a new array (a miss).
+    ///   Keyed on `rotaryDim`, `base` and `sections` as well, since the cache
+    ///   is shared by every instance (one per attention layer).
+    /// - Positions `[B, L]` (and an evaluated three-plane broadcast, stride 0
+    ///   on the plane axis) are one plane: `float(p) * invFreq` directly,
+    ///   the values `takeAlong` picked from three identical planes.
+    /// - `apply` rotates q and k as one tensor (the rotation is elementwise
+    ///   against tables broadcast over the heads).
+    /// Same values in every case. `MLXFAST_RIDER_MROPE_MEMO=0` keeps the
+    /// record's path (callers normalize to three planes, no cache, two
+    /// rotations).
+    static let memoEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_MROPE_MEMO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private struct TableKey: Equatable {
+        let rotaryDim: Int, base: Float, sections: [Int], dtype: DType
+    }
+    private static let tableLock = NSLock()
     nonisolated(unsafe) private static var cachedPositions: MLXArray?
-    nonisolated(unsafe) private static var cachedDType: DType?
+    nonisolated(unsafe) private static var cachedKey: TableKey?
     nonisolated(unsafe) private static var cachedTables: (MLXArray, MLXArray)?
 
-    /// Default-path (cosine, sine) tables for `positions`, in `dtype`, expanded
-    /// for the rotation. Nil when the non-default (per-frequency) path applies.
-    /// The fused explicit prework kernel consumes these same arrays, so one
-    /// builder serves both. Cached across layers when `positions` is identical.
+    /// Default-path (cosine, sine) tables for `positions` in `dtype`,
+    /// expanded for the rotation: three planes (normalized by the caller
+    /// when the memo is off), or under the memo also `[B, L]`. Nil when the
+    /// non-default (per-frequency) path applies. The fused explicit prework
+    /// kernel consumes these same arrays, so one builder serves both.
     func defaultTables(positions: MLXArray, dtype: DType) -> (MLXArray, MLXArray)? {
         guard let defaultInvFreq else { return nil }
-        if let cachedPositions = Self.cachedPositions,
-            cachedPositions === positions,
-            Self.cachedDType == dtype,
-            let cachedTables = Self.cachedTables
-        {
-            return cachedTables
+        guard Self.memoEnabled else {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
+            let angles = concatenated([frequency, frequency], axis: -1)
+            return (
+                cos(angles).asType(dtype).expandedDimensions(axis: 1),
+                sin(angles).asType(dtype).expandedDimensions(axis: 1))
+        }
+        let key = TableKey(rotaryDim: rotaryDim, base: base, sections: sections, dtype: dtype)
+        if let cached = Self.tableLock.withLock({ () -> (MLXArray, MLXArray)? in
+            guard let held = Self.cachedPositions, held === positions, Self.cachedKey == key
+            else { return nil }
+            return Self.cachedTables
+        }) {
+            return cached
         }
         let frequency: MLXArray
         if positions.ndim == 2 {
@@ -4003,9 +4569,11 @@ final class Qwen35MRoPE {
         let tables = (
             cos(angles).asType(dtype).expandedDimensions(axis: 1),
             sin(angles).asType(dtype).expandedDimensions(axis: 1))
-        Self.cachedPositions = positions
-        Self.cachedDType = dtype
-        Self.cachedTables = tables
+        Self.tableLock.withLock {
+            Self.cachedPositions = positions
+            Self.cachedKey = key
+            Self.cachedTables = tables
+        }
         return tables
     }
 
@@ -4021,7 +4589,9 @@ final class Qwen35MRoPE {
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-        if let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype) {
+        if Self.memoEnabled,
+            let (cosine, sine) = defaultTables(positions: positionIds, dtype: queries.dtype)
+        {
             let queryHeads = queries.dim(1)
             let combined = concatenated([queries, keys], axis: 1)
             let rotating = combined[.ellipsis, ..<rotaryDim]
@@ -4035,6 +4605,21 @@ final class Qwen35MRoPE {
             return (
                 rotatedCombined[0..., ..<queryHeads, 0..., 0...],
                 rotatedCombined[0..., queryHeads..., 0..., 0...])
+        }
+        if !Self.memoEnabled,
+            let (cosine, sine) = defaultTables(positions: positions, dtype: queries.dtype)
+        {
+            func applyDefault(_ value: MLXArray) -> MLXArray {
+                let rotating = value[.ellipsis, ..<rotaryDim]
+                let half = rotating.dim(-1) / 2
+                let rotatedHalf = concatenated(
+                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+                let rotated = rotating * cosine + rotatedHalf * sine
+                return rotaryDim < value.dim(-1)
+                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
+                    : rotated
+            }
+            return (applyDefault(queries), applyDefault(keys))
         }
 
         let queryHeads = queries.dim(1)
@@ -4193,6 +4778,37 @@ extension Qwen3NextMLP {
         return downProj(silu(shared[0]) * shared[1])
     }
 
+    /// `h = x + r` and the MLP of `norm(h)` at verify width on the int8
+    /// verify route: the residual add and the norm (with gate|up's signs
+    /// folded into the gain, as `qwen35ForwardSignedNorm` folds them) in one
+    /// launch (`Qwen35FusedBoundaryQ8.applyAddNorm`), then exactly
+    /// `qwen35ForwardSignedNorm`'s tail. Same values as `h = x + r` followed
+    /// by `qwen35ForwardSignedNorm(h, ...)`. Nil when it does not apply.
+    fileprivate func qwen35ForwardAddNormVerify(
+        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain,
+        prefetchedGateUp: [HadamardQuantizedLinear]? = nil,
+        gateUpPrefetched: Bool = false
+    ) -> (h: MLXArray, out: MLXArray)? {
+        guard Qwen35FusedElementwise.foldsHadamardSigns,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
+            let siblings = gateUpPrefetched
+                ? prefetchedGateUp : sharedHadamardSiblings([gateProj, upProj]),
+            let transform = siblings.first?.transform,
+            norm.weight.ndim == 1, norm.weight.dim(0) == transform.width,
+            let boundary = Qwen35FusedBoundaryQ8.applyAddNorm(
+                x, r, gain: gain.gain(norm.weight, signs: transform.signVector), eps: norm.eps),
+            let shared = sharedHadamardProjectionsPreSigned(
+                boundary.normed, siblings, widenOutput: false)
+        else { return nil }
+        if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
+            return (boundary.h, y)
+        }
+        let signed = Qwen35FusedElementwise.swigluSigned(
+            shared[0], shared[1], down.transform.signVector)
+        return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
+    }
+
     /// `qwen35Forward(norm(h))` with gate and up's Hadamard signs folded into
     /// the norm's gain, so their shared rotation skips its sign multiply. The
     /// signed gain yields the plain norm's output times the signs exactly (see
@@ -4272,12 +4888,17 @@ extension Qwen3NextMLP {
     /// stacked matmul and the down projection's tail is unchanged, so `h` and
     /// the output are the composed path's values. Nil when it does not apply.
     fileprivate func qwen35ForwardBoundaryVerify(
-        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain
+        _ x: MLXArray, _ r: MLXArray, norm: RMSNorm, gain: Qwen35SignedGain,
+        prefetchedGateUp: [HadamardQuantizedLinear]? = nil,
+        gateUpPrefetched: Bool = false
     ) -> (h: MLXArray, out: MLXArray)? {
+        let resolvedGateUp = gateUpPrefetched
+            ? prefetchedGateUp
+            : sharedHadamardSiblings([gateProj, upProj])
         guard Qwen35FusedBoundaryQ8.verifyEnabled,
             ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
             let down = downProj as? HadamardQuantizedLinear, down.gdnLayout == nil,
-            let siblings = sharedHadamardSiblings([gateProj, upProj]),
+            let siblings = resolvedGateUp,
             let transform = siblings.first?.transform,
             norm.weight.ndim == 1, norm.weight.dim(0) == transform.width,
             x.ndim >= 2, x.dim(-1) == transform.width,
@@ -4319,13 +4940,29 @@ final class Qwen35DecoderLayer: Module {
 
     /// The post-attention gain with the MLP's gate/up signs folded in.
     private let signedGain = Qwen35SignedGain()
+    /// Packed input siblings (q|k|v or qkv|z) after the first resolve.
+    private var cachedInputSiblings: [HadamardQuantizedLinear]?
+    private var inputSiblingsReady = false
+    /// MLP gate|up siblings after the first resolve. Nil is a real answer.
+    private var cachedGateUp: [HadamardQuantizedLinear]?
+    private var gateUpReady = false
+
+    private func clearSiblingCache() {
+        cachedInputSiblings = nil
+        inputSiblingsReady = false
+        cachedGateUp = nil
+        gateUpReady = false
+    }
 
     @discardableResult
     override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
-        defer { signedGain.clear() }
+        defer {
+            signedGain.clear()
+            clearSiblingCache()
+        }
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
@@ -4335,7 +4972,10 @@ final class Qwen35DecoderLayer: Module {
         modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
         modulePath: [String] = []
     ) throws -> Self {
-        defer { signedGain.clear() }
+        defer {
+            signedGain.clear()
+            clearSiblingCache()
+        }
         return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 
@@ -4450,11 +5090,14 @@ final class Qwen35DecoderLayer: Module {
                 exactTargetVerify: exactTargetVerify)
         }
         // A verify window's post-attention boundary as one kernel.
-        if captureRecurrentWindow, !exactTargetVerify, let dense = mlp as? Qwen3NextMLP,
-            let fused = dense.qwen35ForwardBoundaryVerify(
-                x, r, norm: postAttentionLayerNorm, gain: signedGain)
-        {
-            return fused.h + fused.out
+        if captureRecurrentWindow, !exactTargetVerify, let dense = mlp as? Qwen3NextMLP {
+            let gateUp = prefetchedGateUp(of: dense)
+            if let fused = dense.qwen35ForwardBoundaryVerify(
+                x, r, norm: postAttentionLayerNorm, gain: signedGain,
+                prefetchedGateUp: gateUp.siblings, gateUpPrefetched: gateUp.ready)
+            {
+                return fused.h + fused.out
+            }
         }
         let h = x + r
         let feedForward: MLXArray
@@ -4480,7 +5123,30 @@ final class Qwen35DecoderLayer: Module {
     /// The projections that read this layer's normed input through one shared
     /// rotation: the attention's q|k|v or the GDN's qkv|z.
     private var inputRotationSiblings: [HadamardQuantizedLinear]? {
-        isLinear ? linearAttn?.inputRotationSiblings : selfAttn?.inputRotationSiblings
+        if Qwen35VerifyHost.siblingCache, inputSiblingsReady {
+            return cachedInputSiblings
+        }
+        let siblings = isLinear
+            ? linearAttn?.inputRotationSiblings
+            : selfAttn?.inputRotationSiblings
+        if Qwen35VerifyHost.siblingCache {
+            cachedInputSiblings = siblings
+            inputSiblingsReady = true
+        }
+        return siblings
+    }
+
+    /// Gate|up list for `qwen35ForwardBoundaryVerify`. `ready` means this
+    /// layer already resolved it, including the answer nil.
+    private func prefetchedGateUp(of dense: Qwen3NextMLP) -> (
+        siblings: [HadamardQuantizedLinear]?, ready: Bool
+    ) {
+        guard Qwen35VerifyHost.siblingCache else { return (nil, false) }
+        if !gateUpReady {
+            cachedGateUp = sharedHadamardSiblings([dense.gateProj, dense.upProj])
+            gateUpReady = true
+        }
+        return (cachedGateUp, true)
     }
 
     /// `x + pending` (the previous layer's last residual add), `inputLayerNorm`
@@ -4542,14 +5208,24 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?,
         lastRowOnly: Bool,
-        captureRecurrentWindow: Bool = false
+        captureRecurrentWindow: Bool = false,
+        addNormBoundary: Bool = false
     ) -> (input: MLXArray, h: MLXArray, f: MLXArray?) {
         var input = x
         var boundary: Qwen35FusedBoundaryQ8.Output? = nil
         // A verify window (`captureRecurrentWindow`) takes the verify boundary.
         var verifyBoundary: Qwen35FusedBoundaryQ8.VerifyOutput? = nil
+        var addNormed: MLXArray? = nil
         if let pending {
-            if captureRecurrentWindow {
+            if addNormBoundary,
+                ObjectIdentifier(type(of: inputLayerNorm)) == ObjectIdentifier(RMSNorm.self),
+                inputLayerNorm.weight.ndim == 1,
+                let fused = Qwen35FusedBoundaryQ8.applyAddNorm(
+                    x, pending, gain: inputLayerNorm.weight, eps: inputLayerNorm.eps)
+            {
+                input = fused.h
+                addNormed = fused.normed
+            } else if captureRecurrentWindow {
                 verifyBoundary = fusedInputBoundaryVerify(x, pending)
                 // On the int8-activation narrow route the verify window's
                 // boundary is the quantizing one (`fusedInputBoundary`).
@@ -4567,7 +5243,8 @@ final class Qwen35DecoderLayer: Module {
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
         // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed ?? addNormed ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -4608,14 +5285,32 @@ final class Qwen35DecoderLayer: Module {
                 layerInput, cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: false, quantizedInput: quantized, rotatedInput: rotated)
         }
-        if let dense = mlp as? Qwen3NextMLP,
-            let fused = (captureRecurrentWindow
-                ? dense.qwen35ForwardBoundaryVerify(
-                    input, r, norm: postAttentionLayerNorm, gain: signedGain) : nil)
-                ?? dense.qwen35ForwardBoundaryQ8(
+        if addNormBoundary, let dense = mlp as? Qwen3NextMLP {
+            let gateUp = prefetchedGateUp(of: dense)
+            if let fused = dense.qwen35ForwardAddNormVerify(
+                input, r, norm: postAttentionLayerNorm, gain: signedGain,
+                prefetchedGateUp: gateUp.siblings, gateUpPrefetched: gateUp.ready)
+            {
+                return (input, fused.h, fused.out)
+            }
+        }
+        if let dense = mlp as? Qwen3NextMLP {
+            var fused: (h: MLXArray, out: MLXArray)? = nil
+            if captureRecurrentWindow {
+                let gateUp = prefetchedGateUp(of: dense)
+                fused = dense.qwen35ForwardBoundaryVerify(
+                    input, r, norm: postAttentionLayerNorm, gain: signedGain,
+                    prefetchedGateUp: gateUp.siblings, gateUpPrefetched: gateUp.ready)
+            }
+            // A verify window on the int8 narrow route declines the verify
+            // boundary and takes the quantizing one (ercumentyildirim bf75675a).
+            if fused == nil {
+                fused = dense.qwen35ForwardBoundaryQ8(
                     input, r, norm: postAttentionLayerNorm, gain: signedGain)
-        {
-            return (input, fused.h, fused.out)
+            }
+            if let fused {
+                return (input, fused.h, fused.out)
+            }
         }
         let h = input + r
         let feedForward: MLXArray
@@ -4812,9 +5507,34 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // Nothing of the verify is queued before the plan's first boundary.
+        // The embedding is already a graph; commit it now so that lookup runs
+        // while the host builds the layers. The verify plan is unchanged and
+        // still fires at its own layers.
+        if captureRecurrentWindow, Qwen35VerifyHost.leadEmbed {
+            asyncEval([hiddenStates])
+        }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
+        // The tap list is a handful of ids searched on every layer. One table
+        // answers the same question before the loop, including the layers
+        // built before the leading submission.
+        let tapSlotByLayer: [Int]? = {
+            guard Qwen35VerifyHost.tapIndex, let tapLayerIds else { return nil }
+            var slots = [Int](repeating: -1, count: layers.count)
+            for (slot, id) in tapLayerIds.enumerated() where id >= 0 && id < slots.count {
+                slots[id] = slot
+            }
+            return slots
+        }()
+        func tapSlot(of layer: Int) -> Int? {
+            if let tapSlotByLayer {
+                let slot = tapSlotByLayer[layer]
+                return slot >= 0 ? slot : nil
+            }
+            return tapLayerIds?.firstIndex(of: layer)
+        }
         var tapped = [MLXArray?](
             repeating: nil, count: tapLayerIds?.count ?? 0)
         var attentionIndex = 0
@@ -4836,8 +5556,18 @@ public class Qwen35TextModelInner: Module {
             && ((Qwen35FusedBoundaryQ8.verifyMayApply(rows: windowRows)
                 && !HadamardQuantizedLinear.tensorRouteTakesNarrowRows(windowRows))
                 || Qwen35FusedBoundaryQ8.narrowMayApply(rows: windowRows))
+        // Where the int8 verify route takes the window and the quantizing
+        // boundary does not apply, the pending path still fuses each
+        // boundary's residual add into its norm
+        // (`Qwen35FusedBoundaryQ8.applyAddNorm`); the projections keep the
+        // route and their own quantizing rotations.
+        let verifyAddNorm =
+            captureRecurrentWindow && !exactTargetVerify && hiddenStates.ndim == 3
+            && !verifyPending
+            && Qwen35FusedBoundaryQ8.addNormMayApply(rows: windowRows)
+            && HadamardQuantizedLinear.tensorRouteTakesNarrowRows(windowRows)
         let pendingPath =
-            verifyPending
+            verifyPending || verifyAddNorm
             || (!captureRecurrentWindow && hiddenStates.ndim == 3
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
@@ -4846,7 +5576,7 @@ public class Qwen35TextModelInner: Module {
         // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
             pendingPath
-            ? (verifyPending
+            ? (verifyPending || verifyAddNorm
                 ? submission
                 : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
@@ -4870,14 +5600,15 @@ public class Qwen35TextModelInner: Module {
                     recurrentState: recurrentState,
                     positionIds: positionIds,
                     lastRowOnly: narrowFinalLayer && modelLayerIndex == lastLayerIndex,
-                    captureRecurrentWindow: verifyPending)
+                    captureRecurrentWindow: verifyPending || verifyAddNorm,
+                    addNormBoundary: verifyAddNorm)
                 if let slot = pendingTapSlot {
                     tapped[slot] = out.input
                     pendingTapSlot = nil
                 }
                 hiddenStates = out.h
                 pending = out.f
-                if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+                if let slot = tapSlot(of: modelLayerIndex) {
                     if pending == nil {
                         tapped[slot] = hiddenStates
                     } else {
@@ -4907,7 +5638,7 @@ public class Qwen35TextModelInner: Module {
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
-            if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+            if let slot = tapSlot(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
             }
             // EARLY SUBMISSION (verify slices / prompt pipelining): hand
@@ -4958,7 +5689,9 @@ enum Qwen35GDNPrework {
         let v: MLXArray
         let g: MLXArray
         let beta: MLXArray
-        let tail: MLXArray
+        /// The next convolution tail; nil from the verify launch that stores
+        /// none (`writeTail: false`, `Qwen35GDNVerifyNoCI`).
+        let tail: MLXArray?
         /// `concatenated([convState, qkv], axis: 1)` in FP32, when requested.
         var convInput: MLXArray? = nil
     }
@@ -5201,6 +5934,31 @@ enum Qwen35GDNPrework {
         source: withConvInput(stridedSource),
         ensureRowContiguous: false)
 
+    /// `stridedSource` cut at its convolution-tail stores (the anchor
+    /// `withConvInput` places `ci` at): the verify window's launch storing
+    /// q, k, v, g and beta only. The capture verify reads neither the tail
+    /// (its conv state after the window is a slice of the conv input) nor,
+    /// with `Qwen35GDNVerifyNoCI`, the conv input: the commit forms the
+    /// three boundary rows it keeps from the state and the qkv rows instead.
+    /// Everything before the anchor is the strided kernel's text, so the five
+    /// outputs are its values bit for bit (self-tested at load).
+    private static let verifySource: String = {
+        let anchor = "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+        let parts = stridedSource.components(separatedBy: anchor)
+        precondition(
+            parts.count == 2,
+            "Qwen35 GDN prework: the verify source no longer matches the strided kernel")
+        precondition(!parts[0].contains("tail[") && !parts[0].contains("ci["))
+        return parts[0]
+    }()
+
+    private static let verifyKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_verify",
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta"],
+        source: verifySource,
+        ensureRowContiguous: false)
+
     /// The verify window's launch reads its inputs in place (`stridedSource`).
     static let verifyStridedReads: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_STRIDED_VERIFY"]?
@@ -5212,9 +5970,11 @@ enum Qwen35GDNPrework {
         qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
         keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
-        writeConvInput: Bool = false, stridedReads: Bool = false
+        writeConvInput: Bool = false, stridedReads: Bool = false, writeTail: Bool = true
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3 else { return nil }
+        // The tail-free launch is the strided verify kernel without `ci`.
+        guard writeTail || (stridedReads && !writeConvInput) else { return nil }
         let B = qkv.dim(0)
         let S = qkv.dim(1)
         let CD = qkv.dim(2)
@@ -5233,6 +5993,24 @@ enum Qwen35GDNPrework {
             S > 0, S < 65536
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        if !writeTail {
+            let outputs = verifyKernel(
+                [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
+                 MLXArray(Int32(S))],
+                template: [
+                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                    ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ],
+                grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+                outputShapes: [
+                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                    [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                ],
+                outputDTypes: [.float32, .float32, .float32, .float32, .float32])
+            return Outputs(
+                q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+                tail: nil)
+        }
         // One shape and dtype per output name: six, or seven with `ci`.
         var outputShapes: [[Int]] = [
             [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
@@ -5371,6 +6149,16 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        if strided, B == 1, S % rowTile == 0,
+            rowTileVerified(
+                keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
+                dtype: qkv.dtype)
+        {
+            return freshStridedRows(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
+                normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim, rows: rowTile)
+        }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
             [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
@@ -5388,6 +6176,354 @@ enum Qwen35GDNPrework {
         return Outputs(
             q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
             tail: outputs[5])
+    }
+
+    // MARK: Row-tiled fresh strided prework
+
+    /// `BONSAI_GDN_PREWORK_ROWS=0` keeps `freshStridedKernel` (one row per
+    /// threadgroup) for every prompt chunk.
+    static let rowTiledEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return Qwen35GatedDeltaChunked.promptPipeRider
+            && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Rows per threadgroup of `freshStridedRowsKernel`: one fixed value, not
+    /// chosen per chip or at run time. A chunk whose row count it does not
+    /// divide takes `freshStridedKernel`.
+    static let rowTile = 4
+
+    /// `freshStridedSource` with one threadgroup per (key head, `RW`
+    /// consecutive rows) instead of per (key head, row). The stock launch reads
+    /// every chunk element from the threadgroups of four neighbouring rows and
+    /// a column's conv taps from every row's threadgroup; here each column's
+    /// `RW + NK` chunk rows and `KS` taps are read once per threadgroup.
+    /// Thread c still owns channel c, so every simdgroup holds the same
+    /// channels in the same lanes and `simd_sum` sees the same operands; row
+    /// t0 + i accumulates the same taps in the same order (`fma` over
+    /// j = 0..KS-1 on chunk row t0 + i + j - NK, the stock kernel's r); each
+    /// row's norms reduce through the same `(r0 + r1) + (r2 + r3)` tree. Every
+    /// formula (the chunk-row load, the tap load and `fma`, SiLU, the norms,
+    /// the gates, the tail) is cut from `freshStridedSource` by checked spans,
+    /// so the arithmetic is the stock kernel's text and follows it; only the
+    /// row bookkeeping around it is new. Checked bit for bit against the stock
+    /// launch at model construction (`prepare`).
+    private static let freshStridedRowsSource: String = {
+        let src = freshStridedSource
+        func fail(_ what: String) -> Never {
+            preconditionFailure(
+                "Qwen35 GDN prework rows: the strided fresh source no longer matches (\(what))")
+        }
+        func occurrences(_ s: String, in text: String) -> Int {
+            text.components(separatedBy: s).count - 1
+        }
+        func once(_ s: String) -> String {
+            if occurrences(s, in: src) != 1 { fail(s) }
+            return s
+        }
+        // The text of `src` from the unique `start` through the first `end` after it.
+        func span(_ start: String, through end: String) -> String {
+            let head = src.range(of: once(start))!
+            guard let stop = src.range(of: end, range: head.upperBound ..< src.endIndex)
+            else { fail(end) }
+            return String(src[head.lowerBound ..< stop.upperBound])
+        }
+        func replacing(
+            _ text: String, _ target: String, _ replacement: String, count: Int = 1
+        ) -> String {
+            if occurrences(target, in: text) != count { fail(target) }
+            return text.replacingOccurrences(of: target, with: replacement)
+        }
+
+        // Constants, thread ids, strides; the row id becomes the tile's first
+        // row and the row-dependent a/b bases move into the gates' row scope.
+        let abBase = span("const int64_t ab = ", through: ";")
+        let bBase = span("const int64_t bbase = ", through: ";")
+        var header = span("constexpr int GRP", through: "threadgroup float red[8];")
+        header = replacing(
+            header, "const uint t = threadgroup_position_in_grid.y;",
+            "const uint t0 = threadgroup_position_in_grid.y * uint(RW);")
+        header = replacing(header, abBase, "")
+        header = replacing(header, bBase, "")
+        header = replacing(header, "threadgroup float red[8];", "threadgroup float red[8 * RW];")
+        if header.range(of: "\\bt\\b", options: .regularExpression) != nil { fail("row id") }
+
+        let silu = span("// MLX's silu", through: "return acc * sig;")
+        let chunkLoad = span("const float xv = (r < 0)", through: ";")
+        let tap = span("acc = fma(xv, ", through: ";")
+        guard tap.hasSuffix(", acc);") else { fail(tap) }
+        let tapWeight = String(tap.dropFirst("acc = fma(xv, ".count).dropLast(", acc);".count))
+        let tapFma = replacing(tap, tapWeight, "wt[j]")
+
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        var normPartial = span("float sq = simd_sum(xq * xq);", through: barrier)
+        normPartial = replacing(String(normPartial.dropLast(barrier.count)), "red[", "rd[", count: 2)
+        let normApply = replacing(
+            span("sq = (red[0]", through: "* wk[c];"), "red[", "rd[", count: 8)
+
+        let vStore = replacing(
+            once("v[vrow * size_t(DV) + c] = conv_silu(colv);"), "conv_silu(colv)", "xvs[ri]")
+        let tailMarker = once("// Next convolution tail")
+        let tail = String(src[src.range(of: tailMarker)!.lowerBound...])
+
+        var text = """
+            @HEADER@
+
+            auto silu = [&](float acc) -> float {
+              @SILU@
+            };
+
+            // Column `col` for rows t0 .. t0+RW-1: window element m is chunk row
+            // t0 + m - NK (the stock kernel's r), row t0 + i takes tap j on
+            // window element i + j.
+            auto conv_silu_rows = [&](uint col, thread float* out) {
+              float wt[KS];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) {
+                wt[j] = @TAPWEIGHT@;
+              }
+              float xw[RW + NK];
+              #pragma clang loop unroll(full)
+              for (int m = 0; m < RW + NK; m++) {
+                const int r = int(t0) + m - NK;
+                @CHUNKLOAD@
+                xw[m] = xv;
+              }
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < RW; i++) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) {
+                  const float xv = xw[i + j];
+                  @TAPFMA@
+                }
+                out[i] = silu(acc);
+              }
+            };
+
+            // q and k channel c of key head h, rows t0 .. t0+RW-1.
+            @COLQ@
+            @COLK@
+            float xqs[RW];
+            float xks[RW];
+            conv_silu_rows(colq, xqs);
+            conv_silu_rows(colk, xks);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              @NORMPARTIAL@
+            }
+
+            // The GRP value heads of this key head (they do not read the norms).
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GRP; i++) {
+              @VHEAD@
+              @COLV@
+              float xvs[RW];
+              conv_silu_rows(colv, xvs);
+              #pragma clang loop unroll(full)
+              for (int ri = 0; ri < RW; ri++) {
+                const uint t = t0 + uint(ri);
+                @VROW@
+                @VSTORE@
+              }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              float sq;
+              float sk;
+              @NORMAPPLY@
+            }
+
+            // Gates: thread c < GRP * RW takes row t0 + c / GRP, value head c % GRP.
+            if (c < uint(GRP * RW)) {
+              const uint t = t0 + c / uint(GRP);
+              const uint hv = h * GRP + c % uint(GRP);
+              @ABBASE@
+              @BBASE@
+              @GROW@
+              @GATES@
+            }
+
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              @TAIL@
+            }
+            """
+        for (placeholder, piece) in [
+            ("@HEADER@", header),
+            ("@SILU@", silu),
+            ("@TAPWEIGHT@", tapWeight),
+            ("@CHUNKLOAD@", chunkLoad),
+            ("@TAPFMA@", tapFma),
+            ("@COLQ@", span("const uint colq = ", through: ";")),
+            ("@COLK@", span("const uint colk = ", through: ";")),
+            ("@NORMPARTIAL@", normPartial),
+            ("@VHEAD@", once("const uint hv = h * GRP + uint(i);")),
+            ("@COLV@", once("const uint colv = VOFF + hv * DV + c;")),
+            ("@VROW@", span("const size_t vrow = ", through: ";")),
+            ("@VSTORE@", vStore),
+            ("@NORMAPPLY@", normApply),
+            ("@ABBASE@", abBase),
+            ("@BBASE@", bBase),
+            ("@GROW@", span("const size_t grow = ", through: ";")),
+            ("@GATES@", span(
+                "// g = exp(-exp(A_log)",
+                through: "beta[grow] = (bv < 0.0f) ? by : 1.0f - by;")),
+            ("@TAIL@", tail),
+        ] {
+            text = replacing(text, placeholder, piece)
+        }
+        if text.contains("@") || text.contains("conv_silu(") || text.contains("red[sg]") {
+            fail("assembly")
+        }
+        return text
+    }()
+
+    private static let freshStridedRowsKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_strided_rows",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: freshStridedRowsSource,
+        ensureRowContiguous: false)
+
+    /// The row-tiled launch on `runFreshState`'s arguments (after its guards
+    /// and dtype conversions), `rows` rows per threadgroup; `rows` must divide
+    /// the chunk. The outputs have `freshStridedKernel`'s shapes and dtypes.
+    static func freshStridedRows(
+        qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, rows: Int
+    ) -> Outputs {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        precondition(
+            headKDim == 128 && rows > 0 && S % rows == 0
+                && (valueHeads / keyHeads) * rows <= headKDim,
+            "Qwen35 GDN prework rows: unsupported launch")
+        let outputs = freshStridedRowsKernel(
+            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+            ],
+            grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5])
+    }
+
+    private struct RowTileGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
+    }
+
+    private static let rowTileLock = NSLock()
+    nonisolated(unsafe) private static var rowTileVerdicts: [RowTileGeometry: Bool] = [:]
+
+    /// Verdict lookup only (the check runs in `prepare`, never inside a
+    /// forward); a geometry or qkv dtype that was not prepared, or failed its
+    /// check, keeps the stock kernel.
+    private static func rowTileVerified(
+        keyHeads: Int, valueHeads: Int, convDim: Int, taps: Int, dtype: DType
+    ) -> Bool {
+        guard rowTiledEnabled else { return false }
+        let geometry = RowTileGeometry(
+            hk: keyHeads, hv: valueHeads, cd: convDim, ks: taps, dtype: "\(dtype)")
+        return rowTileLock.withLock { rowTileVerdicts[geometry] ?? false }
+    }
+
+    /// Compile the row-tiled kernel for this geometry and check it bit for bit
+    /// against the stock launch (`runFreshState` itself, which takes the stock
+    /// kernel while no verdict exists), once per process, at model
+    /// construction, for every qkv dtype `runFreshState` accepts. A mismatch
+    /// prints one line and keeps the stock kernel. Called from the layer's init.
+    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard enabled, freshStridedReads, rowTiledEnabled, dk == 128, dv == 128, hk > 0,
+            hv % hk == 0, (hv / hk) * rowTile <= dk, ks > 1
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            if rowTileLock.withLock({ rowTileVerdicts[geometry] != nil }) { continue }
+            let verdict = rowTileSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
+            let recorded = rowTileLock.withLock { () -> Bool in
+                guard rowTileVerdicts[geometry] == nil else { return false }
+                rowTileVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded && !verdict {
+                FileHandle.standardError.write(
+                    "qwen35: GDN row-tiled prework kernel disagrees with the stock kernel on this device (\(dtype)); using the stock kernel\n"
+                        .data(using: .utf8)!)
+            }
+        }
+    }
+
+    private static func rowTileSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> Bool {
+        let cd = 2 * hk * dk + hv * dv
+        // qkv is a column slice of a wider stack, as the model's qkv|z product.
+        let width = cd + hv * dv
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7277_7469), into: 8)
+        for T in [64, 512] where T % rowTile == 0 {
+            // A wide magnitude spread; rows 0..<ks of key head 0's q channels
+            // are zero, so those rows' q norm reduces exact zeros (eps only).
+            let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+            let zero = (MLXArray.arange(T).reshaped(1, T, 1) .< ks)
+                .&& (MLXArray.arange(width).reshaped(1, 1, width) .< dk)
+            let stack = which(zero, Float(0), spread).asType(dtype)
+            let qkv = stack[.ellipsis, ..<cd]
+            let ba = MLXRandom.normal([1, T, 2 * hv], key: keys[2]) * 2
+            let b = ba[.ellipsis, ..<hv]
+            let a = ba[.ellipsis, hv...]
+            let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[3]) * 0.5
+            // The layer's decay coefficient, formed as the layer forms it.
+            let aDecay = Qwen35GDNDerived().decay(MLXRandom.normal([hv], key: keys[4]) * 0.5)
+            let dtBias = MLXRandom.normal([hv], key: keys[5])
+            let normScales = (
+                q: MLXRandom.normal([dk], key: keys[6]), k: MLXRandom.normal([dk], key: keys[7])
+            )
+            guard
+                let stock = runFreshState(
+                    qkv: qkv, convStateShape: [1, ks - 1, cd], convWeight: convWeight,
+                    a: a, b: b, aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv)
+            else { return false }
+            let tiled = freshStridedRows(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
+                normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                headVDim: dv, rows: rowTile)
+            var same = MLXArray(true)
+            for (x, y) in [
+                (stock.q, tiled.q), (stock.k, tiled.k), (stock.v, tiled.v),
+                (stock.g, tiled.g), (stock.beta, tiled.beta), (stock.tail!, tiled.tail!),
+            ] {
+                same = same .&& all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
+            }
+            if !same.item(Bool.self) { return false }
+        }
+        return true
     }
 }
 
@@ -6465,17 +7601,24 @@ enum Qwen35FusedHadamard {
 /// 16 rows, bit for bit against the composed ops production runs (the
 /// compiled chain with the signs, then the pre-signed `forwardInt8`), on
 /// operands laid out as production lays them out; a mismatch keeps the
-/// composed path. `BONSAI_VERIFY_SWIGLU_Q8=0`, `BONSAI_VERIFY_GATED_NORM_Q8=0`
-/// and `BONSAI_VERIFY_ATTN_GATE_Q8=0` keep it per kind.
+/// composed path (ercumentyildirim `6e19fe1`, row P). `MLXFAST_RIDER_VPROD=0`
+/// keeps every kind composed (the approval is not installed);
+/// `MLXFAST_RIDER_VPROD_SWIGLU=0`, `MLXFAST_RIDER_VPROD_GNORM=0` and
+/// `MLXFAST_RIDER_VPROD_AGATE=0` keep it per kind (the rival's switches are
+/// `BONSAI_VERIFY_SWIGLU_Q8`, `BONSAI_VERIFY_GATED_NORM_Q8` and
+/// `BONSAI_VERIFY_ATTN_GATE_Q8`). Where a kind declines, the gated norm falls
+/// back to `Qwen35GatedNormTail` and the attention gate to the strided
+/// `sigmoidGateSigned` (terrapinelf `a3e6b77`), then to the composed chains.
 enum Qwen35VerifyProducerQ8 {
     private static func on(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }
-    static let swiglu = on("BONSAI_VERIFY_SWIGLU_Q8")
-    static let gatedNorm = on("BONSAI_VERIFY_GATED_NORM_Q8")
-    static let attentionGate = on("BONSAI_VERIFY_ATTN_GATE_Q8")
+    static let enabled = on("MLXFAST_RIDER_VPROD")
+    static let swiglu = on("MLXFAST_RIDER_VPROD_SWIGLU")
+    static let gatedNorm = on("MLXFAST_RIDER_VPROD_GNORM")
+    static let attentionGate = on("MLXFAST_RIDER_VPROD_AGATE")
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
@@ -7073,6 +8216,395 @@ enum Qwen35FusedBoundaryQ8 {
         ensureRowContiguous: true)
 }
 
+/// The verify window's decoder-layer boundary on the int8 verify route (the
+/// ranked box's verify-width route, where the fused verify boundary above
+/// declines) as ONE launch: the FP16 residual add `h = x + r` and the RMSNorm
+/// of `h` with its FP32 gain, the norm's output left in FP32 for the
+/// projections' own quantizing rotations. The composed path runs MLX's FP16
+/// `Add`, the `AsType` that `fast::rms_norm` inserts and `rms_looped`
+/// (5120 > 4096): three launches per boundary, two boundaries per layer.
+///
+/// The kernel is `Qwen35FusedBoundaryQ8`'s add and `rms_looped` replica, lane
+/// for lane (1024 lanes, four reads per lane per pass, the `acc += xi * xi`
+/// chain, `simd_sum`, 32 simdgroup partials, a second `simd_sum`,
+/// `precise::rsqrt(acc / axis_size + eps)`, the output `w * (x * inv)`), on
+/// `rms_looped`'s own grid: one 1024-lane threadgroup per row. The transform
+/// is NOT folded in: at verify width a fused transform runs one row per
+/// threadgroup and serializes its butterflies, which the box measured as a
+/// longer window; here every launch that remains keeps its grid, and only the
+/// add and the widen (two elementwise launches over 16 rows) disappear. It
+/// stores `h` (FP16) and the norm output (FP32).
+///
+/// Before first use a self-test on the running GPU compares both outputs bit
+/// for bit against the composed ops (`x + r`, `MLXFast.rmsNorm`) for both
+/// gains and 16 and 3 rows; a mismatch, or any MLX error, keeps the composed
+/// path. `BONSAI_VERIFY_ADDNORM=0` keeps it too.
+extension Qwen35FusedBoundaryQ8 {
+    static let addNormEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_ADDNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    struct AddNormOutput {
+        let h: MLXArray
+        let normed: MLXArray
+    }
+
+    // grid (1024 * rows, 1, 1), threadgroup (1024, 1, 1): one threadgroup per
+    // row, as `rms_looped`. Inputs: xa, xb half [rows, W] (h = xa + xb), w
+    // float [W] (the gain), eps, axis_size. Template: W. Outputs: hout half
+    // [rows, W], nout float [rows, W].
+    private static let addNormSource = """
+        constexpr uint NR = 4;
+        constexpr uint LS = 1024;
+        constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+        static_assert(W % 4 == 0 && W > 4096 && W <= 8192, "rms_looped width");
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const size_t base = size_t(row) * size_t(W);
+
+        threadgroup float local_sums[32];
+        threadgroup float local_inv[1];
+
+        // The FP16 residual add, and rms_looped's sum of squares of the
+        // promoted row: pass p covers elements p * 4096 + 4 * lid + i.
+        float hv[NP * NR];
+        float acc = 0;
+        BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+          const uint r0 = p * LS * NR;
+          if (r0 + lid * NR + NR <= uint(W)) {
+            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+              const uint e = r0 + lid * NR + i;
+              const half s = xa[base + e] + xb[base + e];
+              hout[base + e] = s;
+              hv[p * NR + i] = float(s);
+              acc += hv[p * NR + i] * hv[p * NR + i];
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) {
+          local_sums[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+          local_sums[sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          const float t = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            local_inv[0] = metal::precise::rsqrt(t / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv = local_inv[0];
+
+        // rms_looped's output `w * (x * inv)`.
+        BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+          const uint r0 = p * LS * NR;
+          if (r0 + lid * NR + NR <= uint(W)) {
+            BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+              const uint e = r0 + lid * NR + i;
+              nout[base + e] = w[e] * (hv[p * NR + i] * inv);
+            }
+          }
+        }
+        """
+
+    private static let addNormKernel = MLXFast.metalKernel(
+        name: "bonsai_boundary_add_rmsnorm",
+        inputNames: ["xa", "xb", "w", "eps", "axis_size"],
+        outputNames: ["hout", "nout"],
+        source: addNormSource,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// True when a verify window of `rows` rows may take the kernel: the
+    /// verify width, the switch on, and no failed self-test.
+    static func addNormMayApply(rows: Int) -> Bool {
+        guard addNormEnabled, rows >= 1, rows < BonsaiPromptWidth.minimumRows else { return false }
+        return addNormLock.withLock { addNormVerdict != false }
+    }
+
+    /// `(x + r, MLXFast.rmsNorm(x + r, weight: gain, eps: eps))` in one launch,
+    /// or nil when the kernel does not apply (the caller runs the composed ops).
+    static func applyAddNorm(
+        _ x: MLXArray, _ r: MLXArray, gain: MLXArray, eps: Float
+    ) -> AddNormOutput? {
+        guard addNormEnabled, x.dtype == .float16, r.dtype == .float16, x.shape == r.shape,
+            x.ndim >= 2, x.dim(-1) == width, addNormMayApply(rows: x.size / width),
+            gain.dtype == .float32, gain.shape == [width],
+            addNormVerified(eps: eps)
+        else { return nil }
+        return launchAddNorm(x, r, gain: gain, eps: eps)
+    }
+
+    private static let addNormLock = NSLock()
+    nonisolated(unsafe) private static var addNormVerdict: Bool?
+
+    private static func addNormVerified(eps: Float) -> Bool {
+        addNormLock.lock()
+        defer { addNormLock.unlock() }
+        if let addNormVerdict { return addNormVerdict }
+        let report = addNormSelfTest(eps: eps)
+        addNormVerdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify add+norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    private static func launchAddNorm(
+        _ x: MLXArray, _ r: MLXArray, gain: MLXArray, eps: Float
+    ) -> AddNormOutput {
+        let rows = x.size / width
+        let outs = addNormKernel(
+            [x, r, gain, MLXArray(eps), axisSize], template: [("W", width)],
+            grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape, x.shape],
+            outputDTypes: [.float16, .float32])
+        return AddNormOutput(h: outs[0], normed: outs[1])
+    }
+
+    /// Verify-width residual rows as production feeds them (FP16): per-row
+    /// scales from 0.05 to 30, outlier channels 100x larger (so the FP16 add
+    /// rounds), one row with `r = -x` (a zero row), against a unit-scale gain
+    /// and a gain with random signs and magnitudes.
+    static func addNormSelfTest(eps: Float) -> SelfTestReport {
+        var report = SelfTestReport()
+        do {
+            try withError { error in
+                let gainPlain = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [width], key: MLXRandom.key(UInt64(61)))
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(62))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let gainSigned = (gainPlain * signs).asType(.float32)
+                for (rows, seed) in [(16, 71), (3, 72)] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let outlier = MLXArray(
+                        (0 ..< width).map { $0 % 509 == 7 ? Float(100) : Float(1) })
+                    let x32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 100))) * scale * outlier
+                    var r32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 200))) * scale
+                        * Float(0.25)
+                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows / 3)))
+                        .reshaped(1, rows, 1)
+                    r32 = which(zeroRow, -x32, r32)
+                    let x = x32.asType(.float16)
+                    let r = r32.asType(.float16)
+                    let h0 = x + r
+                    for gain in [gainPlain.asType(.float32), gainSigned] {
+                        let n0 = MLXFast.rmsNorm(h0, weight: gain, eps: eps)
+                        let out = launchAddNorm(x, r, gain: gain, eps: eps)
+                        report.cases += 1
+                        for (a, b) in [(h0, out.h), (n0, out.normed)] {
+                            guard a.dtype == b.dtype, a.shape == b.shape else {
+                                report.passed = false
+                                report.error =
+                                    "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                                return
+                            }
+                            let bits: DType = a.dtype == .float16 ? .uint16 : .uint32
+                            let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
+                                .asType(.int32).sum()
+                            eval(differ)
+                            try error.check()
+                            let count = Int(differ.item(Int32.self))
+                            report.values += a.size
+                            report.mismatches += count
+                            if count != 0 { report.passed = false }
+                        }
+                    }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
+/// The GDN output's gated per-head RMSNorm and the output projection's
+/// Hadamard signs at verify width as ONE launch. The composed path runs
+/// `MLXFast.rmsNorm` over each 128-wide head (`rms_single_row`) and the
+/// compiled `gatedNormTailSigned` (`(z * sigmoid(z)) * normed * signs`): two
+/// launches per GDN layer. The arithmetic here is the int8 producer kernel's
+/// PROD 3 read, which already matches that composed chain bit for bit: per
+/// head, lane l squares elements 4l .. 4l + 3 in order, `simd_sum`,
+/// `precise::rsqrt(acc / 128 + eps)`, `w[d] * (x * inv)`, then `(z *
+/// sigmoid(z)) * xn` with MLX's `Sigmoid` and the signs. One simdgroup per
+/// (row, head), as `rms_single_row`: the launch keeps the norm's parallelism
+/// and the quantizing rotation stays its own launch. z is read through its
+/// strides (a slice of the qkv|z product), so it is not copied first.
+///
+/// Before first use a self-test on the running GPU compares the output bit for
+/// bit against the composed ops (FP32 and FP16 z, a strided z); a mismatch or
+/// any MLX error keeps the composed path. `MLXFAST_RIDER_GDN_GNORM=0` keeps it
+/// too (terrapinelf `a3e6b77`, row G, whose switch is `BONSAI_VERIFY_GATEDNORM`).
+enum Qwen35GatedNormTail {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_GDN_GNORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let header = """
+        // MLX `Sigmoid` (unary_ops.h), verbatim.
+        METAL_FUNC float bgn_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        // element (row, c) of a [B, L, heads, 128] view, through its strides
+        inline int64_t bgn_row(const constant int* shape, const constant int64_t* st, uint row) {
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        inline int64_t bgn_col(const constant int64_t* st, uint c) {
+          return int64_t(c / 128u) * st[2] + int64_t(c % 128u) * st[3];
+        }
+
+        """
+
+    // grid (32 * rows * H, 1, 1), threadgroup (256, 1, 1): one simdgroup per
+    // (row, head). Inputs: x float [B, L, H, 128], z float|half [B, L, H,
+    // 128] (any strides), w float [128], eps float [1], signs float [H * 128].
+    // Template: H, InZ. Output: out float [rows, H * 128].
+    private static let source = """
+        const uint gidx = thread_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint hr = gidx / 32u;
+        const uint row = hr / uint(H);
+        const uint head = hr % uint(H);
+        const int64_t xrow = bgn_row(x_shape, x_strides, row);
+        const int64_t zrow = bgn_row(z_shape, z_strides, row);
+        const uint c0 = head * 128u + lane * 4u;
+        float xv[4];
+        float acc = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          xv[r] = float(x[xrow + bgn_col(x_strides, c0 + uint(r))]);
+          acc += xv[r] * xv[r];
+        }
+        acc = simd_sum(acc);
+        const float inv = metal::precise::rsqrt(acc / float(128) + eps[0]);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const uint col = c0 + uint(r);
+          const float bv = float(z[zrow + bgn_col(z_strides, col)]);
+          const float xn = w[col % 128u] * (xv[r] * inv);
+          const float v = (bv * bgn_sigmoid(bv)) * xn;
+          out[size_t(row) * size_t(H * 128) + col] = v * signs[col];
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_gdn_gated_norm_signed",
+        inputNames: ["x", "z", "w", "eps", "signs"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+
+    /// `gatedNormTailSigned(rmsNorm(x, weight, eps), z, signs)` flattened to
+    /// `[rows, H * 128]`, or nil when it does not apply.
+    static func apply(
+        _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray? {
+        guard enabled, x.dtype == .float32, z.dtype == .float32 || z.dtype == .float16,
+            x.ndim == 4, z.shape == x.shape, x.dim(3) == 128,
+            (x.dim(0) * x.dim(1) * x.dim(2)) % 8 == 0,
+            weight.dtype == .float32, weight.ndim == 1, weight.dim(0) == 128,
+            signs.dtype == .float32, signs.size == x.dim(2) * 128,
+            verified(eps: eps)
+        else { return nil }
+        return launch(x, z, weight: weight, eps: eps, signs: signs)
+    }
+
+    private static func launch(
+        _ x: MLXArray, _ z: MLXArray, weight: MLXArray, eps: Float, signs: MLXArray
+    ) -> MLXArray {
+        let rows = x.dim(0) * x.dim(1)
+        let heads = x.dim(2)
+        return kernel(
+            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            template: [("H", heads), ("InZ", z.dtype)],
+            grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    private static func verified(eps: Float) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict { return verdict }
+        let report = selfTest(eps: eps)
+        verdict = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify gated norm: " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    static func selfTest(eps: Float) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        do {
+            try withError { error in
+                let rows = 16
+                let heads = 48
+                let width = heads * 128
+                let signs = which(
+                    MLXRandom.uniform(Float(0) ..< Float(1), [width], key: MLXRandom.key(121))
+                        .< Float(0.5), MLXArray(Float(-1)), MLXArray(Float(1)))
+                let weight = MLXRandom.uniform(
+                    Float(0.5) ..< Float(1.5), [128], key: MLXRandom.key(122))
+                let scale = MLXRandom.uniform(
+                    Float(0.01) ..< Float(20), [1, rows, heads, 1], key: MLXRandom.key(123))
+                let x = MLXRandom.normal([1, rows, heads, 128], key: MLXRandom.key(124)) * scale
+                // z as the qkv|z product's slice: a strided view.
+                let wide = MLXRandom.normal([1, rows, 10240 + width], key: MLXRandom.key(125))
+                    * Float(3)
+                for zType in [DType.float32, .float16] {
+                    let z = wide.asType(zType)[0..., 0..., 10240...].reshaped(1, rows, heads, 128)
+                    let zw = z.dtype == x.dtype ? z : z.asType(x.dtype)
+                    let normed = MLXFast.rmsNorm(x, weight: weight, eps: eps)
+                    let reference = Qwen35FusedElementwise.gatedNormTailSigned(
+                        normed, zw, signs.reshaped(heads, 128)
+                    ).asType(x.dtype).reshaped(rows, width)
+                    let fused = launch(x, z, weight: weight, eps: eps, signs: signs)
+                    report.cases += 1
+                    guard fused.shape == reference.shape, fused.dtype == reference.dtype else {
+                        report.passed = false
+                        report.error = "output \(fused.dtype) \(fused.shape)"
+                        return
+                    }
+                    let differ = (fused.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    let count = Int(differ.item(Int32.self))
+                    report.values += fused.size
+                    report.mismatches += count
+                    if count != 0 { report.passed = false }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
 /// The verify window's decoder-layer boundary on the matrix route as ONE
 /// launch: the FP16 residual add `h = x + r`, the RMSNorm of `h` with its FP32
 /// gain, the input transform's signs, the 1024-block Walsh-Hadamard transform
@@ -7290,2266 +8822,6 @@ extension Qwen35FusedBoundaryQ8 {
         ensureRowContiguous: true)
 }
 
-/// The prompt-width packed matmul on the tensor unit over the raw 2-bit codes
-/// (MetalPerformancePrimitives `matmul2d`, `uint8 x uint2b_format -> int32`),
-/// applying each 128-group's FP16 scale and offset in FP32:
-/// `y = sum_g as[m,g] * (s[n,g] * (C[m,n,g] - 128 * colsum[n,g]) + b[n,g] * rs[m,g])`
-/// where `C` is the integer product of the shifted codes `q + 128` with the
-/// weight codes, `colsum` the per-group sum of the weight codes, `as` and
-/// `rs` the activation's per-group scale and code sum. The weights are read
-/// as stored; the scales, offsets and folded code sums are read through a
-/// per-layer derived-constant cache. Installed into
-/// `HadamardQuantizedLinear.tensorPackedMatmul` when the model loads;
-/// `DARKBLOOM_BONSAI_TENSOR_ROUTE=0` keeps the dequantizing kernels.
-enum Qwen35TensorPackedMatmul {
-    private static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    // The trailing newline matters: the JIT appends the kernel signature
-    // directly after the header text.
-    private static let header = """
-        #include <metal_tensor>
-        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-
-        """
-
-    // grid: (N / 64 * 128, M / 64, 1), threadgroup (128, 1, 1). Inputs: xq
-    // uint8 [M, K], w uint32 [N, K / 16], scalesT / biasesT half [K / 128, N],
-    // uT float [K / 128, N] (= -128 * s * colsum), ascale / rsb float [M, K /
-    // 128], ksz int32 [K, M, N]. Template: OutT.
-    private static let source = """
-        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 64;
-        const int m0 = int(threadgroup_position_in_grid.y) * 64;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-        tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)xq, dextents<int, 2>(K, M));
-        tensor<device uint2b_format, dextents<int, 2>, tensor_inline> B((device uchar*)w, dextents<int, 2>(K, N));
-        auto tA0 = A.template slice<128, 64>(0, m0);
-        auto tB0 = B.template slice<128, 64>(0, n0);
-        auto cT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, int32_t>();
-        constexpr int CAP = 32;
-        // Destination layout (the NAX fragment layout): element i ->
-        //   n = n0 + 16 * (sg & 1) + fn + (i & 3) + 32 * ((i >> 3) & 1)
-        //   m = m0 + 16 * (sg >> 1) + fm + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1)
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        const int nb = n0 + 16 * int(sg & 1) + fn;
-        const int mb = m0 + 16 * int(sg >> 1) + fm;
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + nb);
-        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
-        const device half4* bp0 = (const device half4*)(biasesT + nb);
-        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
-        const device float4* up0 = (const device float4*)(uT + nb);
-        const device float4* up1 = (const device float4*)(uT + nb + 32);
-        const int NQ = N / 4;
-        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
-        // Row-tiled constants: this lane's four rows are adjacent in the tile.
-        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
-        for (int g = 0; g < Kg; g++) {
-          auto tA = A.template slice<128, 64>(g * 128, m0);
-          auto tB = B.template slice<128, 64>(g * 128, n0);
-          op.run(tA, tB, cT);
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
-          const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
-          float as[4], rb[4];
-          if (MPERM) {
-            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
-            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
-            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
-            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
-          } else {
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
-          }
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1;
-            const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float u = nh ? u1[c] : u0[c];
-            const float t = fma(s, float(cT[i]), u);
-            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
-          }
-        }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. Alignment holds
-        // under tip N/nb guards (N multiple of 64; nb 4-element aligned).
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-          }
-        }
-        """
-
-    private static let kernel = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_q8",
-        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
-        outputNames: ["out"],
-        source: source,
-        header: header,
-        ensureRowContiguous: true)
-
-    // Verify width (`half x uint2b_format -> float`, 16 rows): each threadgroup
-    // owns TN (64 or 32) output columns; its four simdgroups split K into four
-    // contiguous quarters (one 16 x 32 x 128 op per 128-group) and their
-    // partials are summed through threadgroup memory. grid: (N / 32 * 128, 1,
-    // 1), threadgroup (128, 1, 1). Inputs: x half [16, K], w uint32 [N, K / 16],
-    // scalesT / biasesT half [K / 128, N], rowsum float [16, K / 128], ksz.
-    private static let sourceNarrow = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * TN;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / SG;
-        const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            16, TN, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
-        tensor<device uint2b_format, dextents<int, 2>, tensor_inline> B((device uchar*)w, dextents<int, 2>(K, N));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto tB0 = B.template slice<128, TN>(0, n0);
-        auto cT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
-        constexpr int CAP = TN / 2;
-        // Destination layout: element i -> n = n0 + fn + (i & 3) + 16 * (i >> 3),
-        // m = fm + 8 * ((i >> 2) & 1).
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        for (int g = g0; g < g0 + gper; g++) {
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          auto tB = B.template slice<128, TN>(g * 128, n0);
-          op.run(tA, tB, cT);
-          float4 sv[TN / 16], bv[TN / 16];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < TN / 16; q++) {
-            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
-            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
-          }
-          const float rs0 = rowsum[(size_t)fm * Kg + g];
-          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            acc[i] = fma(sv[nq][c], cT[i], fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
-          }
-        }
-        threadgroup float red[SG - 1][CAP * 32];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < SG - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
-          }
-        }
-        """
-
-    private static let kernelNarrow = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16",
-        inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrow,
-        header: header,
-        ensureRowContiguous: true)
-
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY=0` keeps the record's verify-width
-    /// kernels (the few-row core and the split-K bodies) with the tensor route
-    /// still on at prompt width.
-    /// Columns per threadgroup at verify width: 32 (measured 1.5% faster on
-    /// the decode window than 64, which the isolated kernel preferred);
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_TN=64` selects 64.
-    private static let narrowTileColumns: Int = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_TN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "64" ? 64 : 32
-    }()
-
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_SG8=0` keeps four simdgroups per
-    /// threadgroup for every verify-width shape.
-    private static let narrowDeepSplit: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_SG8"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let verifyEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    // MARK: - The vocabulary head at verify width
-
-    /// The vocabulary head (`n >= 65536`) at verify width (<= 16 rows): the
-    /// core's few-row packed matmul body (`qmm_m16_block`, half operands
-    /// dequantized straight into the tensor unit's right-operand fragment)
-    /// with an FP32 output store, so the logits keep their FP32 accumulation
-    /// instead of the core's FP16 rounding, and eight simdgroups per
-    /// threadgroup (four 32-column blocks, each split in two over K). The
-    /// head's rotated activation is read in FP16, the read every tower
-    /// projection already takes at this width. Needs no packed operand
-    /// format, so it runs on a toolchain without `uint2b_format`; probed once
-    /// at init against the core's own product and declined on any error.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD=0` keeps the core's dispatch.
-    private static let headEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// 32-column blocks per threadgroup (`DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB`,
-    /// 1 to 8) and simdgroups splitting K per block (`..._HEAD_KS`, 2 or 4).
-    private static let headColumnBlocks: Int = {
-        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 4
-        return min(max(value, 1), 8)
-    }()
-    private static let headKSplit: Int = {
-        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_KS"] ?? "") ?? 2
-        return value == 4 ? 4 : 2
-    }()
-
-    private static let headHeader = """
-        #include <metal_tensor>
-        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-        using namespace metal;
-
-        // The core's few-row packed matmul (quantized_utils.h qmm_m16_block):
-        // one 16 x 32 output block over the K partition [k0, k0 + Kp), KS
-        // simdgroups splitting the 128-groups round-robin, weights read as
-        // 16-byte lines and dequantized straight into the right-operand
-        // fragment, partials summed through threadgroup memory. Same
-        // arithmetic as the core's body; the store is OutT instead of T.
-        template <typename T, int KS, typename OutT>
-        METAL_FUNC void bonsai_head_block(
-            const device uint32_t* w, const device T* scales, const device T* biases,
-            const device T* x, device OutT* y, const int K, const int N, const int rows,
-            const int col0, const int k0, const int Kp, const uint ks, const uint simd_lid,
-            threadgroup float* red0, threadgroup float* red1) {
-          constexpr int GS = 128;
-          typedef vec<T, 8> frag_t;
-          typedef vec<float, 8> cfrag_t;
-          const int K_w = K / 16;
-          const int K_g = K / GS;
-          const short qid = simd_lid >> 2;
-          const short fm = ((qid & 4) | ((simd_lid >> 1) & 3));
-          const short fn = ((qid & 2) | (simd_lid & 1)) * 4;
-          const ushort bsh = ushort(8 * (fn >> 2));
-          int wrow[4];
-          #pragma unroll
-          for (int j = 0; j < 4; j++) { wrow[j] = min(col0 + int(fm) + 8 * j, N - 1); }
-          const device T* xa0 = x + min(int(fm), rows - 1) * K + fn;
-          const device T* xa1 = x + min(int(fm) + 8, rows - 1) * K + fn;
-          constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-              16, 32, 16, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-          mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
-          auto ct_a = gemm_op.template get_left_input_cooperative_tensor<T, T, float>();
-          auto ct_b = gemm_op.template get_right_input_cooperative_tensor<T, T, float>();
-          auto ct_c = gemm_op.template get_destination_cooperative_tensor<
-              metal::remove_addrspace_t<decltype(ct_a)>, metal::remove_addrspace_t<decltype(ct_b)>, float>();
-          #pragma unroll
-          for (short i = 0; i < 16; i++) { ct_c[i] = 0.0f; }
-          const int g_begin = k0 / GS;
-          const int n_groups = Kp / GS;
-          const ushort wq = ushort(fn >> 2);
-          ushort qlane[4];
-          #pragma unroll
-          for (int st = 0; st < 4; st++) {
-            qlane[st] = ushort((simd_lid & ~0x9u) | uint(st & 1) | (uint(st >> 1) << 3));
-          }
-          const int n_blocks_total = (n_groups + 1) / 2;
-          const int my_blocks = max((n_blocks_total - int(ks) + KS - 1) / KS, 0);
-          auto block_line = [&](int i, int j) -> uint4 {
-            const int gb = g_begin + 2 * (int(ks) + i * KS);
-            return *((const device uint4*)(w + wrow[j] * K_w + gb * 8) + wq);
-          };
-          uint4 ring[2][4];
-          #pragma unroll
-          for (int r = 0; r < 2; r++) {
-            if (r < my_blocks) {
-              #pragma unroll
-              for (int j = 0; j < 4; j++) { ring[r][j] = block_line(r, j); }
-            }
-          }
-          for (int i = 0; i < my_blocks; i++) {
-            const int gb = g_begin + 2 * (int(ks) + i * KS);
-            volatile int compiler_barrier;
-            #pragma unroll
-            for (int gh = 0; gh < 2; gh++) {
-              const int g = gb + gh;
-              if (g - g_begin >= n_groups) { break; }
-              float s0[4]; float s1[4]; float s2[4]; float s3[4]; float b[4];
-              #pragma unroll
-              for (int j = 0; j < 4; j++) {
-                const float s = float(scales[wrow[j] * K_g + g]);
-                b[j] = float(biases[wrow[j] * K_g + g]);
-                s0[j] = s; s1[j] = s * 0.25f; s2[j] = s * 0.0625f; s3[j] = s * 0.015625f;
-              }
-              #pragma unroll
-              for (int st8 = 0; st8 < 8; st8++) {
-                const int st = gh * 8 + st8;
-                const int k = g * GS + st8 * 16;
-                frag_t B0; frag_t B1;
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                  const uint word = simd_shuffle(ring[0][j][st & 3], qlane[st >> 2]);
-                  const uint by = (word >> bsh) & 0xffu;
-                  const float v0 = s0[j] * float(by & 0x03u) + b[j];
-                  const float v1 = s1[j] * float(by & 0x0cu) + b[j];
-                  const float v2 = s2[j] * float(by & 0x30u) + b[j];
-                  const float v3 = s3[j] * float(by & 0xc0u) + b[j];
-                  if (j < 2) {
-                    B0[4 * j + 0] = T(v0); B0[4 * j + 1] = T(v1); B0[4 * j + 2] = T(v2); B0[4 * j + 3] = T(v3);
-                  } else {
-                    B1[4 * (j - 2) + 0] = T(v0); B1[4 * (j - 2) + 1] = T(v1); B1[4 * (j - 2) + 2] = T(v2); B1[4 * (j - 2) + 3] = T(v3);
-                  }
-                }
-                #pragma unroll
-                for (int q = 0; q < 4; q++) { ct_a[q] = xa0[k + q]; ct_a[4 + q] = xa1[k + q]; }
-                #pragma unroll
-                for (short q = 0; q < 8; q++) { ct_b[q] = B0[q]; ct_b[8 + q] = B1[q]; }
-                gemm_op.run(ct_a, ct_b, ct_c);
-              }
-            }
-            (void)compiler_barrier;
-            #pragma unroll
-            for (int j = 0; j < 4; j++) { ring[0][j] = ring[1][j]; }
-            if (i + 2 < my_blocks) {
-              #pragma unroll
-              for (int j = 0; j < 4; j++) { ring[1][j] = block_line(i + 2, j); }
-            }
-          }
-          cfrag_t C0; cfrag_t C1;
-          #pragma unroll
-          for (short i = 0; i < 8; i++) { C0[i] = ct_c[i]; C1[i] = ct_c[8 + i]; }
-          {
-            threadgroup float* red = (ks & 2) ? red1 : red0;
-            if (ks & 1) {
-              #pragma unroll
-              for (int i = 0; i < 8; i++) { red[i * 32 + simd_lid] = C0[i]; red[(8 + i) * 32 + simd_lid] = C1[i]; }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (!(ks & 1)) {
-              #pragma unroll
-              for (int i = 0; i < 8; i++) { C0[i] += red[i * 32 + simd_lid]; C1[i] += red[(8 + i) * 32 + simd_lid]; }
-            }
-            if (KS == 4) {
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-              if (ks == 2) {
-                #pragma unroll
-                for (int i = 0; i < 8; i++) { red0[i * 32 + simd_lid] = C0[i]; red0[(8 + i) * 32 + simd_lid] = C1[i]; }
-              }
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-              if (ks == 0) {
-                #pragma unroll
-                for (int i = 0; i < 8; i++) { C0[i] += red0[i * 32 + simd_lid]; C1[i] += red0[(8 + i) * 32 + simd_lid]; }
-              }
-            }
-          }
-          if (ks != 0) { return; }
-          #pragma unroll
-          for (int i = 0; i < 8; i++) {
-            const int v = int(fm) + (i / 4) * 8;
-            const int c = col0 + int(fn) + (i % 4);
-            if (v < rows) {
-              if (c < N) { y[v * N + c] = static_cast<OutT>(C0[i]); }
-              if (c + 16 < N) { y[v * N + c + 16] = static_cast<OutT>(C1[i]); }
-            }
-          }
-        }
-
-        """
-
-    // grid: (ceil(N / 32 / CB) * 32 * CB * KS, 1, 1), threadgroup (32 * CB * KS,
-    // 1, 1): CB 32-column blocks per threadgroup, KS simdgroups splitting K per
-    // block. Inputs: x half [16, K], w uint32 [N, K / 16], scales / biases half
-    // [N, K / 128], ksz int32 [K, M, N]. Template: OutT, KS, CB.
-    private static let sourceHead = """
-        const int K = ksz[0]; const int N = ksz[2];
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint cb = sg / KS;
-        const uint ks = sg % KS;
-        const int col0 = (int(threadgroup_position_in_grid.x) * CB + int(cb)) * 32;
-        threadgroup float red[CB][2][16 * 32];
-        if (col0 >= N) { return; }
-        bonsai_head_block<half, KS, OutT>(w, scales, biases, x, out, K, N, 16, col0, 0, K, ks, lane, red[cb][0], red[cb][1]);
-        """
-
-    private static let kernelHead = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_head",
-        inputNames: ["x", "w", "scales", "biases", "ksz"],
-        outputNames: ["out"],
-        source: sourceHead,
-        header: headHeader,
-        ensureRowContiguous: true)
-
-    private static func runHead(
-        _ x: MLXArray, _ weight: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
-        k: Int, n: Int, outputDType: DType
-    ) -> MLXArray {
-        let cb = headColumnBlocks
-        let ks = headKSplit
-        let blocks = (n / 32 + cb - 1) / cb
-        return kernelHead(
-            [x, weight, scales, biases, dimsArray(k: k, m: 16, n: n)],
-            template: [("OutT", outputDType), ("KS", ks), ("CB", cb)],
-            grid: (blocks * 32 * cb * ks, 1, 1), threadGroup: (32 * cb * ks, 1, 1),
-            outputShapes: [[16, n]], outputDTypes: [outputDType])[0]
-    }
-
-    /// Compiles and runs the head kernel on a small random product and checks
-    /// it against the core's own matmul; false on a JIT error or a mismatch.
-    nonisolated(unsafe) private static var headAnnounced = false
-
-    static let headAvailable: Bool = {
-        guard headEnabled, support != .none else { return false }
-        // `DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_PROBE_FAIL=1` compiles a broken
-        // kernel in place of the probe, to exercise the decline path.
-        if ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_PROBE_FAIL"] == "1" {
-            return probe("bonsai_probe_head_broken", "this is not a kernel;")
-        }
-        probeFailed = false
-        var ok = false
-        withErrorHandler({ _ in Qwen35TensorPackedMatmul.probeFailed = true }) {
-            let k = 512, n = 256
-            let x = MLXRandom.normal([16, k], key: MLXRandom.key(11)).asType(.float16)
-            let w = MLXRandom.randInt(low: 0, high: 1 << 30, [n, k / 16], key: MLXRandom.key(12)).asType(.uint32)
-            let s = MLXRandom.uniform(low: 0.002, high: 0.02, [n, k / 128], key: MLXRandom.key(13)).asType(.float16)
-            let b = MLXRandom.uniform(low: -0.02, high: 0.0, [n, k / 128], key: MLXRandom.key(14)).asType(.float16)
-            let reference = quantizedMM(
-                x.asType(.float32), w, scales: s.asType(.float32), biases: b.asType(.float32),
-                transpose: true, groupSize: 128, bits: 2)
-            let scale = abs(reference).max().item(Float.self)
-            // Both output forms the routes take, so the timed window compiles
-            // nothing: FP32 logits for the target's read, FP16 for the drafter's.
-            let y32 = runHead(x, w, s, b, k: k, n: n, outputDType: .float32)
-            let y16 = runHead(x, w, s, b, k: k, n: n, outputDType: .float16)
-            let error32 = abs(y32 - reference).max().item(Float.self)
-            let error16 = abs(y16.asType(.float32) - reference).max().item(Float.self)
-            ok = error32.isFinite && error32 <= 1e-2 * max(scale, 1e-3)
-                && error16.isFinite && error16 <= 2e-2 * max(scale, 1e-3)
-        }
-        return ok && !probeFailed
-    }()
-
-    // MARK: - Packed-operand support on this box's Metal toolchain
-
-    /// How the tensor unit reads the 2-bit codes: `native2b` as a
-    /// `uint2b_format` tensor over the stored bytes; `staged4b` on a toolchain
-    /// without the 2-bit format (the ranked box's, September 2026): the same
-    /// bytes expanded to `uint4b_format` in threadgroup memory per 128-group;
-    /// `none` when neither compiles (every route then stays off).
-    enum PackedOperandSupport { case native2b, staged8, staged4b, none }
-
-    private static let probeHeader = header
-
-    private static let probeSourceNative = """
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)a, dextents<int, 2>(128, 16));
-        tensor<device uint2b_format, dextents<int, 2>, tensor_inline> B((device uchar*)w, dextents<int, 2>(128, 32));
-        auto tA = A.template slice<128, 16>(0, 0);
-        auto tB = B.template slice<128, 32>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>, metal::remove_addrspace_t<decltype(tB)>, float>();
-        op.run(tA, tB, cT);
-        out[thread_position_in_grid.x] = cT[0];
-        """
-
-    private static let probeSourceStaged = """
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)a, dextents<int, 2>(128, 16));
-        threadgroup uint32_t bs[32 * 128 / 8];
-        const uint lane = thread_index_in_simdgroup;
-        #pragma clang loop unroll(full)
-        for (int j = 0; j < 16; j++) { bs[lane * 16 + j] = w[lane * 16 + j]; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B((threadgroup uchar*)bs, dextents<int, 2>(128, 32));
-        auto tA = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>, metal::remove_addrspace_t<decltype(B)>, float>();
-        op.run(tA, B, cT);
-        out[thread_position_in_grid.x] = cT[0];
-        """
-
-    private static let probeSourceStaged8 = """
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)a, dextents<int, 2>(128, 16));
-        threadgroup uint32_t bs[32 * 128 / 4];
-        const uint lane = thread_index_in_simdgroup;
-        #pragma clang loop unroll(full)
-        for (int j = 0; j < 32; j++) { bs[lane * 32 + j] = w[(lane * 32 + j) & 255]; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        tensor<threadgroup uint8_t, dextents<int, 2>, tensor_inline> B((threadgroup uint8_t*)bs, dextents<int, 2>(128, 32));
-        auto tA = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<
-            metal::remove_addrspace_t<decltype(tA)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
-        op.run(tA, B, cT);
-        out[thread_position_in_grid.x] = float(cT[0]);
-        """
-
-    nonisolated(unsafe) private static var probeFailed = false
-
-    /// Compiles and runs one tiny kernel; false when the toolchain rejects it
-    /// (the JIT error is caught by a scoped MLX error handler instead of
-    /// ending the process).
-    private static func probe(_ name: String, _ source: String, aDType: DType = .float16) -> Bool {
-        probeFailed = false
-        let kernel = MLXFast.metalKernel(
-            name: name, inputNames: ["a", "w"], outputNames: ["out"], source: source,
-            header: probeHeader, ensureRowContiguous: true)
-        withErrorHandler({ _ in Qwen35TensorPackedMatmul.probeFailed = true }) {
-            let a = MLXArray.zeros([16, 128], dtype: aDType)
-            let w = MLXArray.zeros([32 * 128 / 16], dtype: .uint32)
-            let y = kernel(
-                [a, w], template: [], grid: (32, 1, 1), threadGroup: (32, 1, 1),
-                outputShapes: [[32]], outputDTypes: [.float32])[0]
-            eval(y)
-        }
-        return !probeFailed
-    }
-
-    /// Decided once at model init. `DARKBLOOM_BONSAI_TENSOR_ROUTE_PACKED`
-    /// = `uint2b` / `uint4b` / `off` forces a form (for A/B on a box that has
-    /// both); otherwise the probes decide.
-    static let support: PackedOperandSupport = {
-        let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PACKED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch forced {
-        case "uint2b", "native": return probe("bonsai_probe_uint2b", probeSourceNative) ? .native2b : .none
-        case "uint8", "staged8": return probe("bonsai_probe_uint8", probeSourceStaged8, aDType: .uint8) ? .staged8 : .none
-        case "uint4b", "staged": return probe("bonsai_probe_uint4b", probeSourceStaged) ? .staged4b : .none
-        case "off", "none", "0": return .none
-        default: break
-        }
-        // Preferred order: the int8-staged form (fastest measured, no packed
-        // format needed), then the native 2-bit operand, then the 4-bit-staged form.
-        if probe("bonsai_probe_uint8", probeSourceStaged8, aDType: .uint8) { return .staged8 }
-        if probe("bonsai_probe_uint2b", probeSourceNative) { return .native2b }
-        if probe("bonsai_probe_uint4b", probeSourceStaged) { return .staged4b }
-        return .none
-    }()
-
-    /// True when the toolchain takes `tensor` operands at all (either form).
-    static var tensorOperandsAvailable: Bool { support != .none }
-
-    /// The verify-width route's operand form. `staged8`: the activation
-    /// quantized to signed int8 per 128-group (the prompt route's rotation)
-    /// and `int8 x int8 -> int32` ops over threadgroup-staged int8 weight
-    /// slices, which run at the tensor unit's int8 rate (about twice its
-    /// FP16 rate: 116 against 58 TF/s on an M5 Max); it beats both the
-    /// native 2-bit operand with an FP16 activation (-3% decode window) and
-    /// the record's verify kernels (-5%) and needs no packed format, so it is
-    /// the form wherever the int8 op compiles. `native2b`: the FP16
-    /// activation against the 2-bit operand, where the toolchain has it.
-    /// `none`: the record's verify kernels.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM=staged8|native|off` forces one.
-    static let verifyForm: PackedOperandSupport = {
-        let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch forced {
-        case "native", "uint2b": return probe("bonsai_probe_uint2b", probeSourceNative) ? .native2b : .none
-        case "staged8", "uint8", "int8": return signedCodes ? .staged8 : .none
-        case "off", "none", "0": return .none
-        default: break
-        }
-        if signedCodes { return .staged8 }
-        if support == .native2b || probe("bonsai_probe_uint2b", probeSourceNative) { return .native2b }
-        return .none
-    }()
-
-    static var verifyNativeAvailable: Bool { verifyForm == .native2b }
-
-    /// The int8-staged prompt kernel reads the activation codes as signed
-    /// int8 (`q`, not `q + 128`): its products then carry no `128 * colsum`
-    /// offset, so the epilogue's folded-offset term and its two 16-byte loads
-    /// per lane and group go away. Same values bit for bit: `fma(s, C, -128 s
-    /// colsum)` and `s * (C - 128 colsum)` each round once to the same
-    /// number (the offset is exact in FP32). Only that form takes it; the
-    /// native and 4-bit-staged forms keep the unsigned codes.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_SIGNED=0` keeps the unsigned codes.
-    static let signedCodes: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_SIGNED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if ["0", "false", "no", "off"].contains(value ?? "") { return false }
-        guard support == .staged8 else { return false }
-        return probe(
-            "bonsai_probe_int8",
-            probeSourceStaged8.replacingOccurrences(of: "uint8_t", with: "int8_t"), aDType: .int8)
-    }()
-
-    /// The dtype of the activation codes the quantizing rotations write.
-    static var codesDType: DType { signedCodes ? .int8 : .uint8 }
-
-    /// The int8-staged prompt kernel's per-group epilogue in factored form when
-    /// the offsets are the negated scales and the codes are signed:
-    /// `s * (as * C - rsb)` instead of `as * (s * C) + (-s) * rsb`, one FMA
-    /// fewer per output element and 128-group (1-1.5% on the prompt-width
-    /// matmuls on an M5 Max). The values differ only by FP32 rounding.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE=0` keeps the unfactored form.
-    /// Vector stores in the int8-staged prompt kernel. The native kernel
-    /// already stores float4/half4. `DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC=0`
-    /// keeps the scalar stores.
-    static let staged8VectorStores: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_STAGED8_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    static let factoredPromptEpilogue: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_FACTORED_EPILOGUE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// The widest projection the verify-width route takes: every tower
-    /// projection and the vocabulary head (n = 248320) by default. Excluding
-    /// gate|up (n = 34816) measured 3% slower in situ although the record's
-    /// few-row core streams it faster in isolation; the head on the route
-    /// measured 1.2% faster on the decode window.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_MAXN` overrides it.
-    static let verifyMaximumColumns: Int = {
-        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_MAXN"],
-            let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0
-        {
-            return value
-        }
-        return 262144
-    }()
-
-    /// Row-tiled activation constants for the prompt route: the quantizing
-    /// rotations store each 64-row tile's scales and scaled sums as
-    /// `[tile][group][64]` in the packed kernels' lane order, so a lane reads
-    /// its four rows' constants as one `float4` per group instead of eight
-    /// scalar loads. `DARKBLOOM_BONSAI_TENSOR_ROUTE_MPERM=0` keeps `[rows,
-    /// groups]`.
-    static let rowTiledConstants: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_MPERM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    // Verify width without the 2-bit operand: the native kernel's structure
-    // (32 columns per threadgroup, four simdgroups splitting K, a threadgroup
-    // reduce) with each simdgroup's 128-group slice of the 32 columns staged
-    // as int8 in its own threadgroup buffer (2-bit codes expanded, K
-    // permuted, simdgroup barriers only). The activation is read in the
-    // permuted K order the staged prompt kernel uses.
-    private static let sourceNarrowStaged8 = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
-        const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
-        threadgroup uint32_t bs[4][1][32 * 128 / 4];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][1 - 1], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, float>();
-        constexpr int CAP = 32 / 2;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        // staging: 32 columns x 8 words per group over 32 lanes: lane -> column lane % 32, word part lane / 32
-        constexpr int PARTS = 32 / 32;             // lanes per column (1 for 32=32, 2 for 32=16)
-        constexpr int WPP = 8 / PARTS;             // 2-bit words per lane per group
-        const int sc = int(lane) % 32; const int sp = int(lane) / 32;
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sp * WPP;
-        auto stage = [&](int g, int buf) {
-          threadgroup uint32_t* dst = bs[sg][buf] + sc * 32 + sp * (WPP * 4);
-          // One word's four planes are four contiguous uint32s at a 4-word
-          // aligned offset: one uint4 store, same values and positions.
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < WPP; j++) {
-            const uint32_t wv = wrow[g * 8 + j];
-            *(threadgroup uint4*)(dst + 4 * j) = uint4(
-                wv & 0x03030303u, (wv >> 2) & 0x03030303u,
-                (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
-          }
-        };
-        stage(g0, 0);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g0 + gper; g++) {
-          const int cur = (1 == 2) ? ((g - g0) & 1) : 0;
-          if (1 == 2 && g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          float4 sv[32 / 16], bv[32 / 16];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < 32 / 16; q++) {
-            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
-            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
-          }
-          const float rs0 = rowsum[(size_t)fm * Kg + g];
-          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            acc[i] = fma(sv[nq][c], cT[i], fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
-        }
-        threadgroup float red[4 - 1][CAP * 32];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
-          }
-        }
-        """
-
-    // Verify width over the quantized rotation (signed int8 codes, as the
-    // prompt route's int8-staged kernel reads them): the same 32-column,
-    // four-simdgroup split-K structure, each simdgroup staging its
-    // 128-group slice of the weight tile as int8 in its own threadgroup
-    // buffer, the op `int8 x int8 -> int32` at the int8 rate of the tensor
-    // unit (about twice the FP16 rate), the affine map in FP32 from the
-    // activation's per-group scale and scaled sum. Template `NEG` takes the
-    // offset as `-scale` (proven per constant pair; no offset load) and `F32S`
-    // reads FP32-widened scales; see `NarrowEpilogue`. Both are exact.
-    private static let sourceNarrowInt8 = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
-        const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
-        threadgroup uint32_t bs[4][1][32 * 128 / 4];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][1 - 1], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        constexpr int CAP = 32 / 2;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        // staging: 32 columns x 8 words per group over 32 lanes: each lane stages 32/32 columns (all 8 words each)
-        constexpr int CPL = 32 / 32;
-        auto stage = [&](int g, int buf) {
-          #pragma clang loop unroll(full)
-          for (int cc = 0; cc < CPL; cc++) {
-            const int sc = int(lane) + 32 * cc;
-            const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + (size_t)g * 8;
-            threadgroup uint32_t* dst = bs[sg][buf] + sc * 32;
-            // As in the prompt kernel's staging: one uint4 store per word.
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < 8; j++) {
-              const uint32_t wv = wrow[j];
-              *(threadgroup uint4*)(dst + 4 * j) = uint4(
-                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
-                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
-            }
-          }
-        };
-        stage(g0, 0);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g0 + gper; g++) {
-          const int cur = (1 == 2) ? ((g - g0) & 1) : 0;
-          if (1 == 2 && g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          float4 sv[32 / 16], bv[32 / 16];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < 32 / 16; q++) {
-            // F32S: scalesT holds the FP16 scales widened to FP32 at load
-            // (exact), so `sv` is the same value without the conversion.
-            if constexpr (F32S) {
-              sv[q] = *(const device float4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q);
-            } else {
-              sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
-            }
-            // NEG: every offset is the negated scale (FP16 bits proven at
-            // load), so `-sv` is the offset's exact FP32 value; no load.
-            if constexpr (NEG) {
-              bv[q] = -sv[q];
-            } else {
-              bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
-            }
-          }
-          const float as0 = ascale[(size_t)fm * Kg + g], as1 = ascale[(size_t)(fm + 8) * Kg + g];
-          const float rs0 = rowsum[(size_t)fm * Kg + g];
-          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            acc[i] = fma(mh ? as1 : as0, sv[nq][c] * float(cT[i]), fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
-        }
-        // The reduction reuses the staging buffers (free after the K loop):
-        // 16 KB of threadgroup memory in all, two threadgroups per core.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float (*red)[CAP * 32] = (threadgroup float (*)[CAP * 32])&bs[0][0][0];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          // i = 0, 4, 8, 12. mh and nq are constant on each group and c is
-          // 0, 1, 2, 3, so the four outputs are consecutive columns. The sum
-          // is still acc, then red[0], red[1], red[2], each folded on its own
-          // partial. OutT is half or float; both stores are 4-element aligned
-          // because fn, n0 and N are multiples of 4.
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i += 4) {
-            const int mh = (i >> 2) & 1;
-            const int nq = i >> 3;
-            float v0 = acc[i];
-            float v1 = acc[i + 1];
-            float v2 = acc[i + 2];
-            float v3 = acc[i + 3];
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) {
-              v0 += red[q][i * 32 + lane];
-              v1 += red[q][(i + 1) * 32 + lane];
-              v2 += red[q][(i + 2) * 32 + lane];
-              v3 += red[q][(i + 3) * 32 + lane];
-            }
-            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
-            if constexpr (sizeof(OutT) == sizeof(float)) {
-              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-            } else {
-              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-            }
-          }
-        }
-        """
-
-    // The verify int8 kernel software-pipelined through registers (K2, K3):
-    // the same threadgroup (four simdgroups splitting K into contiguous
-    // quarters, the 16 x 32 int8 products of each group and 32-column half,
-    // the partials summed in simdgroup order) and the same arithmetic in the
-    // same order, so the output is bitwise that of `sourceNarrowInt8`
-    // (self-tested at load). What changes is when the loads are issued and how
-    // much threadgroup memory a threadgroup holds:
-    // - PD (1..4): a static register ring of the 2-bit words of the next PD
-    //   groups, refilled as each group is staged, and a matching ring of
-    //   epilogue constants (depth max(PD, 2), loaded that many groups minus
-    //   one ahead). The group loop is unrolled by the ring depth, so every ring
-    //   index is a constant; remainder groups are guarded (10 groups per
-    //   simdgroup at K = 5120, 34 at down_proj).
-    // - KH (128 or 64): K per tensor op. 64 stages each group in two halves
-    //   (stage -> barrier -> op 16 x 32 x 64, accumulating into the group's
-    //   zeroed int32 tile, twice) and runs the epilogue once per group: 2 KB of
-    //   staging per simdgroup and half, 8 KB per threadgroup at TN = 32 (four
-    //   threadgroups per core instead of two). The integer sum of a group is
-    //   exact under any split, so the FP32 sequence is unchanged.
-    // - TN (32 or 64): 32-column halves per threadgroup (two ops per step).
-    // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD, TN, KH.
-    // grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
-    private static let sourceNarrowInt8Pipelined = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * TN;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
-        const int g0 = int(sg) * gper;
-        const int g1 = g0 + gper;
-        constexpr int NH = TN / 32;
-        constexpr int KW = KH / 16;           // 2-bit words per column per staged step
-        constexpr int NQ = KH / 64;           // uint4 word quads per staged step
-        constexpr int CD = PD < 2 ? 2 : PD;   // constants ring depth = group-loop unroll
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, KH, false, true, false, KH == 64 ? mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate : mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
-        threadgroup uint32_t bs[4][NH][32 * KH / 4];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(KH, 32));
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][NH - 1], dextents<int, 2>(KH, 32));
-        auto tA0 = A.template slice<KH, 16>(0, 0);
-        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        constexpr int CAP = 32 / 2;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[NH][CAP];
-        #pragma clang loop unroll(full)
-        for (int h = 0; h < NH; h++) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
-        }
-        // lane -> column lane of each 32-column half, 8 words (two quads) per group
-        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
-        const size_t hstride = (size_t)32 * (K / 16);
-        // quads [q0, q1) of group gg's words into v
-        auto getw = [&](int gg, thread uint32_t (&v)[NH][8], int q0, int q1) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            const device uint4* src = (const device uint4*)(wrow + h * hstride + (size_t)gg * 8);
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 2; q++) {
-              if (q < q0 || q >= q1) { continue; }
-              const uint4 u = src[q];
-              v[h][4 * q + 0] = u.x; v[h][4 * q + 1] = u.y; v[h][4 * q + 2] = u.z; v[h][4 * q + 3] = u.w;
-            }
-          }
-        };
-        // stages quads [q0, q1) of v: word j of the step at 4 * (j % KW) of its column
-        auto putw = [&](thread const uint32_t (&v)[NH][8], int q0, int q1) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            threadgroup uint32_t* dst = bs[sg][h] + int(lane) * (KH / 4);
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < 8; j++) {
-              if (j < 4 * q0 || j >= 4 * q1) { continue; }
-              // As in the prompt kernel's staging: one uint4 store per word.
-              const uint32_t wv = v[h][j];
-              *(threadgroup uint4*)(dst + 4 * (j % KW)) = uint4(
-                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
-                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
-            }
-          }
-        };
-        // epilogue constants of one group, kept in their stored types until use
-        auto getc = [&](int g, thread half4 (&sh)[NH][2], thread half4 (&bh)[NH][2],
-                        thread float4 (&sf)[NH][2], thread float (&c)[4]) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 2; q++) {
-              const size_t o = (size_t)g * N + n0 + 32 * h + fn + 16 * q;
-              if constexpr (F32S) { sf[h][q] = *(const device float4*)(scalesT + o); }
-              else { sh[h][q] = *(const device half4*)(scalesT + o); }
-              if constexpr (!NEG) { bh[h][q] = *(const device half4*)(biasesT + o); }
-            }
-          }
-          c[0] = ascale[(size_t)fm * Kg + g]; c[1] = ascale[(size_t)(fm + 8) * Kg + g];
-          c[2] = rowsum[(size_t)fm * Kg + g]; c[3] = rowsum[(size_t)(fm + 8) * Kg + g];
-        };
-        // Word ring: before group g runs, slot (g - g0 - 1) % PD holds group g + PD
-        // (KH = 64: its lower quad, the upper quad still holding group g's) and the
-        // other slots groups g + 1 .. g + PD - 1. Constants ring: slot (g - g0) % CD
-        // holds group g's, the next CD - 2 slots the following groups'.
-        uint32_t wr[PD][NH][8];
-        half4 shr[CD][NH][2], bhr[CD][NH][2];
-        float4 sfr[CD][NH][2];
-        float cr[CD][4];
-        // one K step of group g at offset ko: KH x 32 staged codes per half
-        auto mm = [&](int g, int ko) {
-          auto tA = A.template slice<KH, 16>(g * 128 + ko, 0);
-          op.run(tA, B0, cT0);
-          if constexpr (NH == 2) {
-          op.run(tA, B1, cT1);
-          }
-        };
-        // group g at unrolled position j (a constant): ring slots are static
-        auto body = [&](int g, int j) {
-          const int cs = j % CD;
-          if (g + CD - 1 < g1) {
-            const int cn = (j + CD - 1) % CD;
-            getc(g + CD - 1, shr[cn], bhr[cn], sfr[cn], cr[cn]);
-          }
-          if constexpr (KH == 64) {
-            const int wp = (j + PD - 1) % PD;  // slot holding group g's upper quad
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) { cT0[i] = 0; cT1[i] = 0; }
-            mm(g, 0);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            putw(wr[wp], 1, 2);
-            if (g + PD < g1) { getw(g + PD, wr[wp], 1, 2); }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            mm(g, 64);
-          } else {
-            mm(g, 0);
-          }
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            float4 sv[2], bv[2];
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 2; q++) {
-              if constexpr (F32S) { sv[q] = sfr[cs][h][q]; } else { sv[q] = float4(shr[cs][h][q]); }
-              if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhr[cs][h][q]); }
-            }
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) {
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-              const int32_t ci = (h == 0) ? cT0[i] : cT1[i];
-              acc[h][i] = fma(mh ? cr[cs][1] : cr[cs][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][3] : cr[cs][2], acc[h][i]));
-            }
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (g + 1 < g1) {
-            const int wn = j % PD;             // slot holding group g + 1 (its lower quad at KH = 64)
-            putw(wr[wn], 0, NQ);
-            if (g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn], 0, NQ); }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-          }
-        };
-        {
-          uint32_t w0[NH][8];
-          getw(g0, w0, 0, NQ);
-          #pragma clang loop unroll(full)
-          for (int i = 1; i < PD; i++) {
-            if (g0 + i < g1) { getw(g0 + i, wr[i - 1], 0, 2); }
-          }
-          if constexpr (KH == 64) { getw(g0, wr[PD - 1], 1, 2); }
-          if (g0 + PD < g1) { getw(g0 + PD, wr[PD - 1], 0, NQ); }
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CD - 1; i++) {
-            if (g0 + i < g1) { getc(g0 + i, shr[i], bhr[i], sfr[i], cr[i]); }
-          }
-          putw(w0, 0, NQ);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g1; g += CD) {
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < CD; j++) {
-            if (g + j < g1) { body(g + j, j); }
-          }
-        }
-        // the reduction reuses the staging buffers, in simdgroup order
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float* red = (threadgroup float*)&bs[0][0][0];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          // As in `sourceNarrowInt8` (fkiene 98f554ad): i = 0, 4, 8, 12. mh
-          // and nq are constant on each group and c is 0, 1, 2, 3, so the four
-          // outputs are consecutive columns. The sum is still acc, then
-          // red[0], red[1], red[2], each folded on its own partial. OutT is
-          // half or float; both stores are 4-element aligned because fn, n0,
-          // 32 * h and N are multiples of 4.
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i += 4) {
-              const int mh = (i >> 2) & 1;
-              const int nq = i >> 3;
-              float v0 = acc[h][i];
-              float v1 = acc[h][i + 1];
-              float v2 = acc[h][i + 2];
-              float v3 = acc[h][i + 3];
-              #pragma clang loop unroll(full)
-              for (int q = 0; q < 4 - 1; q++) {
-                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
-                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
-                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
-                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
-              }
-              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
-              if constexpr (sizeof(OutT) == sizeof(float)) {
-                *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-              } else {
-                *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-              }
-            }
-          }
-        }
-        """
-
-    private static let kernelNarrowInt8Pipelined = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_i8p",
-        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowInt8Pipelined,
-        header: header,
-        ensureRowContiguous: true)
-
-    private static let kernelNarrowInt8 = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_i8",
-        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowInt8,
-        header: header,
-        ensureRowContiguous: true)
-
-    private static let kernelNarrowStaged8 = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_s8",
-        inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowStaged8,
-        header: header,
-        ensureRowContiguous: true)
-
-    // The prompt-width kernel for a toolchain without `uint2b_format`: the
-    // same math, the 64 x 128 weight tile of each 128-group expanded from the
-    // stored 2-bit words to 4-bit codes in threadgroup memory (double-buffered,
-    // one barrier per group) and read by the op as a threadgroup
-    // `uint4b_format` tensor. Same inputs as `source`.
-    private static let sourceStaged = """
-        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 64;
-        const int m0 = int(threadgroup_position_in_grid.y) * 64;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = thread_position_in_threadgroup.x;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-        tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)xq, dextents<int, 2>(K, M));
-        // staged B: 64 columns x 128 codes as 4-bit, 2 per byte, k inner: byte index (n * 128 + k) / 2
-        threadgroup uint32_t bs[2][64 * 128 / 8];
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)bs[0], dextents<int, 2>(128, 64));
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)bs[1], dextents<int, 2>(128, 64));
-        auto tA0 = A.template slice<128, 64>(0, m0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        constexpr int CAP = 32;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        const int nb = n0 + 16 * int(sg & 1) + fn;
-        const int mb = m0 + 16 * int(sg >> 1) + fm;
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + nb);
-        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
-        const device half4* bp0 = (const device half4*)(biasesT + nb);
-        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
-        const device float4* up0 = (const device float4*)(uT + nb);
-        const device float4* up1 = (const device float4*)(uT + nb + 32);
-        const int NQ = N / 4;
-        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
-        // Row-tiled constants: this lane's four rows are adjacent in the tile.
-        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
-        // staging assignment: thread t -> column c = t >> 1, K half h = t & 1 (64 codes = 4 words -> 8 words of nibbles)
-        const int sc = int(tid >> 1); const int sh = int(tid & 1);
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v = *src;
-          threadgroup uint32_t* dst = bs[buf] + sc * 16 + sh * 8;
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < 4; j++) {
-            const uint32_t wv = v[j];
-            uint32_t lo = wv & 0xFFFFu; uint32_t hi = wv >> 16;
-            lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
-            hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
-            dst[2 * j] = lo; dst[2 * j + 1] = hi;
-          }
-        };
-        stage(0, 0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = 0; g < Kg; g++) {
-          const int cur = g & 1;
-          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 64>(g * 128, m0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
-          const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
-          float as[4], rb[4];
-          if (MPERM) {
-            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
-            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
-            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
-            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
-          } else {
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
-          }
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float u = nh ? u1[c] : u0[c];
-            const float t = fma(s, float(cT[i]), u);
-            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. nb = n0 + 16*(sg&1)
-        // + fn with fn in {0,4,8,12} and N multiple of 64, so the base is
-        // 4-element aligned. Hot path: support==staged8 (signed + FACTORED).
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-          }
-        }
-        """
-
-    // The prompt-width kernel with the 2-bit words expanded to int8 codes in
-    // threadgroup memory (`uint8 x uint8 -> int32`; no packed format needed):
-    // four AND/shift ops per word, the codes landing in a permuted K order
-    // inside each 16-block (position p holds code 4 * (p % 4) + p / 4), which
-    // the quantizing rotation writes its codes in (`PERM`), so the integer
-    // dot product is unchanged. Same inputs as `source`.
-    private static let sourceStaged8 = """
-        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 64;
-        const int m0 = int(threadgroup_position_in_grid.y) * 64;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = thread_position_in_threadgroup.x;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-        // SIGNED: the codes are int8 (q) and the products carry no offset.
-        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
-        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
-        // staged B: 64 columns x 128 codes as int8 bytes, k inner
-        threadgroup uint32_t bs[2][64 * 128 / 4];
-        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
-        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B1((threadgroup CodeT*)bs[1], dextents<int, 2>(128, 64));
-        auto tA0 = A.template slice<128, 64>(0, m0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        constexpr int CAP = 32;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        const int nb = n0 + 16 * int(sg & 1) + fn;
-        const int mb = m0 + 16 * int(sg >> 1) + fm;
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + nb);
-        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
-        const device half4* bp0 = (const device half4*)(biasesT + nb);
-        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
-        const device float4* up0 = (const device float4*)(uT + nb);
-        const device float4* up1 = (const device float4*)(uT + nb + 32);
-        const int NQ = N / 4;
-        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
-        // Row-tiled constants: this lane's four rows are adjacent in the tile.
-        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
-        // staging assignment: thread t -> column c = t >> 1, K half h = t & 1 (64 codes = 4 words -> 8 words of nibbles)
-        const int sc = int(tid >> 1); const int sh = int(tid & 1);
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v = *src;
-          threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
-          // One word's four planes are four contiguous uint32s (16 codes).
-          // The base is 16-uint32 aligned, so each plane group is one uint4
-          // store. Values and positions match the four scalar stores.
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < 4; j++) {
-            const uint32_t wv = v[j];
-            const uint4 codes = uint4(
-                wv & 0x03030303u,
-                (wv >> 2) & 0x03030303u,
-                (wv >> 4) & 0x03030303u,
-                (wv >> 6) & 0x03030303u);
-            *(threadgroup uint4*)(dst + 4 * j) = codes;
-          }
-        };
-        stage(0, 0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = 0; g < Kg; g++) {
-          const int cur = g & 1;
-          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 64>(g * 128, m0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          float4 b0, b1;
-          if constexpr (NEGATIVE_SCALE_BIAS) {
-            b0 = -s0; b1 = -s1;
-          } else {
-            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
-          }
-          float4 u0 = 0.0f, u1 = 0.0f;
-          if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
-          float as[4], rb[4];
-          if (MPERM) {
-            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
-            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
-            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
-            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
-          } else {
-            #pragma clang loop unroll(full)
-            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
-          }
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float u = nh ? u1[c] : u0[c];
-            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
-              // offset = -scale: as*(s*C) + (-s)*rb == s*(as*C - rb), one
-              // FMA fewer per element and group.
-              acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
-            } else {
-              const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
-              acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
-            }
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        // Same grouping as the native kernel's store: four consecutive i share
-        // mm and nh, c = 0..3, consecutive columns at nb + 32*nh. nb is
-        // 4-aligned (fn in {0,4,8,12}, n0 and N multiples of 64).
-        if constexpr (VEC != 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i += 4) {
-            const int nh = (i >> 3) & 1;
-            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-            const float v0 = acc[i];
-            const float v1 = acc[i + 1];
-            const float v2 = acc[i + 2];
-            const float v3 = acc[i + 3];
-            const size_t base = (size_t)mm * N + nb + 32 * nh;
-            if constexpr (sizeof(OutT) == sizeof(float)) {
-              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-            } else {
-              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-            }
-          }
-        } else {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1;
-            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-            out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
-          }
-        }
-        """
-
-    private static let kernelStaged8 = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_q8_u8",
-        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
-        outputNames: ["out"],
-        source: sourceStaged8,
-        header: header,
-        ensureRowContiguous: true)
-
-    private static let kernelStaged = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_q8_u4",
-        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
-        outputNames: ["out"],
-        source: sourceStaged,
-        header: header,
-        ensureRowContiguous: true)
-
-    // The verify-width kernel for the same toolchain: each simdgroup expands
-    // its own 32 x 128 tile per group into its threadgroup region
-    // (double-buffered, simdgroup-scoped sync). 32 columns, 4 simdgroups.
-    private static let sourceNarrowStaged = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
-        const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
-        // per-simdgroup staged tile: 32 columns x 128 codes as nibbles = 2 KB; double-buffered
-        threadgroup uint32_t bs[4][2][32 * 128 / 8];
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)bs[sg][1], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, float>();
-        constexpr int CAP = 16;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + n0 + fn);
-        const device half4* sp1 = (const device half4*)(scalesT + n0 + fn + 16);
-        const device half4* bp0 = (const device half4*)(biasesT + n0 + fn);
-        const device half4* bp1 = (const device half4*)(biasesT + n0 + fn + 16);
-        const int NQ = N / 4;
-        // staging: lane l -> column l (32 columns), all 128 codes of the group = 8 words -> 16 nibble words
-        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v0 = src[0]; const uint4 v1 = src[1];
-          threadgroup uint32_t* dst = bs[sg][buf] + int(lane) * 16;
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < 8; j++) {
-            const uint32_t wv = (j < 4) ? v0[j] : v1[j - 4];
-            uint32_t lo = wv & 0xFFFFu; uint32_t hi = wv >> 16;
-            lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
-            hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
-            dst[2 * j] = lo; dst[2 * j + 1] = hi;
-          }
-        };
-        stage(g0, 0);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g0 + gper; g++) {
-          const int cur = (g - g0) & 1;
-          if (g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
-          const float rs0 = rowsum[(size_t)fm * Kg + g];
-          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            acc[i] = fma(s, cT[i], fma(b, mh ? rs1 : rs0, acc[i]));
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        threadgroup float red[3][16 * 32];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const float v = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
-          }
-        }
-        """
-
-    private static let kernelNarrowStaged = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_u4",
-        inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowStaged,
-        header: header,
-        ensureRowContiguous: true)
-
-    private static let dimsLock = NSLock()
-    nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
-    private static func dimsArray(k: Int, m: Int, n: Int) -> MLXArray {
-        dimsLock.withLock {
-            if let cached = dims[[k, m, n]] { return cached }
-            let array = MLXArray([Int32(k), Int32(m), Int32(n)])
-            dims[[k, m, n]] = array
-            return array
-        }
-    }
-
-    /// The per-group sums of the 2-bit codes of `weight` (`[n, k / 16]`
-    /// UInt32, 16 codes per word, LSB first), `[n, k / 128]` FP32: the count
-    /// of set low bits plus twice the count of set high bits of each word.
-    private static func codeSums(_ weight: MLXArray, k: Int) -> MLXArray {
-        let n = weight.dim(0)
-        func popcount(_ v: MLXArray) -> MLXArray {
-            var x = v - ((v >> 1) & MLXArray(UInt32(0x5555_5555)))
-            x = (x & MLXArray(UInt32(0x3333_3333))) + ((x >> 2) & MLXArray(UInt32(0x3333_3333)))
-            x = (x + (x >> 4)) & MLXArray(UInt32(0x0F0F_0F0F))
-            return (x * MLXArray(UInt32(0x0101_0101))) >> 24
-        }
-        let low = popcount(weight & MLXArray(UInt32(0x5555_5555)))
-        let high = popcount((weight >> 1) & MLXArray(UInt32(0x5555_5555)))
-        let perWord = low + high * MLXArray(UInt32(2))
-        return perWord.reshaped(n, k / 128, 8).sum(axis: -1).asType(.float32)
-    }
-
-    // MARK: - Verify int8 kernel choice (epilogue form x pipeline)
-
-    /// The epilogue of the verify int8 kernel. `base` loads the FP16 scale and
-    /// offset of every group. `negativeBias` loads the scale only and takes
-    /// `-scale` as the offset: exact wherever every offset's FP16 bits are its
-    /// scale's with the sign flipped, which
-    /// `HadamardConstantLayoutCache.biasesAreNegativeScales` proves per
-    /// constant pair (all 402 pairs of this checkpoint). `negativeBiasF32Scales`
-    /// also reads the scales pre-widened to FP32 (exact), one 16-byte load
-    /// per four columns and no conversion. The products are the same FP32
-    /// values bit for bit in every form.
-    enum NarrowEpilogue: Int {
-        case base = 0
-        case negativeBias = 1
-        case negativeBiasF32Scales = 2
-    }
-
-    /// The kernel body. `v0` is `sourceNarrowInt8` as recorded; `pdN` is
-    /// `sourceNarrowInt8Pipelined` with a register ring of the next N groups'
-    /// words (and a matching constants ring) loaded ahead of the op; `k64pdN`
-    /// is the same with each group staged and multiplied in two K = 64 halves
-    /// (half the threadgroup memory, twice the threadgroups per core); `tn64`
-    /// is `pd1` over 64 columns per threadgroup (twice the threadgroup
-    /// memory). All bitwise identical.
-    enum NarrowVariant: Int, CaseIterable {
-        case v0 = 0
-        case pd1 = 1
-        case pd2 = 2
-        case tn64 = 3
-        case pd3 = 4
-        case pd4 = 5
-        case k64pd1 = 6
-        case k64pd2 = 7
-        case k64pd3 = 8
-        case k64pd4 = 9
-
-        /// Words ring depth, columns per threadgroup, K per op.
-        var pd: Int {
-            switch self {
-            case .v0, .pd1, .tn64, .k64pd1: return 1
-            case .pd2, .k64pd2: return 2
-            case .pd3, .k64pd3: return 3
-            case .pd4, .k64pd4: return 4
-            }
-        }
-        var tn: Int { self == .tn64 ? 64 : 32 }
-        var kh: Int { [.k64pd1, .k64pd2, .k64pd3, .k64pd4].contains(self) ? 64 : 128 }
-
-        init?(name: String) {
-            guard let v = Self.allCases.first(where: { "\($0)" == name }) else { return nil }
-            self = v
-        }
-    }
-
-    struct NarrowKernel: Hashable, CustomStringConvertible {
-        var variant: NarrowVariant
-        var form: NarrowEpilogue
-        static let original = NarrowKernel(variant: .v0, form: .base)
-        var description: String { "\(variant)/\(form)" }
-    }
-
-    /// The load-time choice (see `chooseNarrowKernels`): per production shape
-    /// `[k, n]`, and a default for every other shape. `original` until then
-    /// and wherever the int8 verify kernel is not installed.
-    nonisolated(unsafe) static var narrowDefault = NarrowKernel.original
-    nonisolated(unsafe) static var narrowByShape: [[Int]: NarrowKernel] = [:]
-    /// Whether any chosen kernel needs the per-projection proof / FP32 scales.
-    nonisolated(unsafe) static var narrowNeedsProof = false
-    nonisolated(unsafe) static var narrowNeedsF32 = false
-
-    /// One choice: a default kernel and per-shape kernels.
-    typealias NarrowChoice = (NarrowKernel, [[Int]: NarrowKernel])
-
-    /// The record's (dcaf489's) kernel bodies: its own autotune chooses among
-    /// these (and `original`), so the pick over them is the record's pick.
-    static let narrowRecordVariants: Set<NarrowVariant> = [.v0, .pd1, .pd2, .tn64]
-
-    /// Sets `narrowNeedsProof` / `narrowNeedsF32` for these choices.
-    static func setNarrowOperandNeeds(_ choices: [NarrowChoice]) {
-        let all = choices.flatMap { [$0.0] + Array($0.1.values) }
-        narrowNeedsProof = all.contains { $0.form != .base }
-        narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
-    }
-
-    /// The in-situ choice of the verify int8 kernels: a few candidate choices
-    /// (shortlisted by the synthetic self-test and timing at load) run in turn
-    /// on real speculative rounds of the load-time engine warm, and a
-    /// candidate replaces the record's pick only when its median round beats
-    /// the record's pick's by more than 0.5 %. The synthetic timing streams
-    /// each kernel for 0.5-0.7 ms bursts in which the GPU never reaches the
-    /// clock state of the decode window, so it mispicks; a whole round does
-    /// reach it. Every candidate passed the bitwise self-test (FP16 and FP32
-    /// outputs), so the rounds and their tokens are the same whichever runs.
-    ///
-    /// `roundBoundary()` runs at the top of every block proposal (one static
-    /// bool check when no trial is active): round r's time is the host time
-    /// from its proposal to the next one, and the choice installed at a
-    /// boundary is what the next verify graph build reads. The first round
-    /// after the seed is discarded. Runs only inside the deferred load warm
-    /// (`Qwen35DFlash2Assistant`), never in a served request.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps the record's
-    /// pick without a trial.
-    enum NarrowInSituTrial {
-        nonisolated(unsafe) static var active = false
-        nonisolated(unsafe) static var sets: [NarrowChoice] = []
-        nonisolated(unsafe) static var roundTimes: [[UInt64]] = []
-        nonisolated(unsafe) static var roundIndex = 0
-        nonisolated(unsafe) static var lastBoundary: UInt64 = 0
-        nonisolated(unsafe) static var onEnough: (() -> Void)?
-
-        /// Timed rounds per candidate.
-        static let roundsPerSet = 8
-        /// A candidate must beat the record's pick by more than this.
-        static let adoptMargin = 0.005
-        /// Rounds above this multiple of their candidate's median are dropped.
-        static let outlierFactor = 1.5
-
-        static let enabled: Bool = {
-            let value = ProcessInfo.processInfo.environment[
-                "DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return !["0", "false", "no", "off"].contains(value ?? "")
-        }()
-
-        /// Whether a trial is set up (two or more distinct candidates; the
-        /// first is the record's pick).
-        static var armed: Bool { enabled && sets.count >= 2 }
-
-        /// Proposals the trial needs: the discarded round, the seed-side
-        /// boundary, then `roundsPerSet` per candidate.
-        static var roundsNeeded: Int { 2 + roundsPerSet * sets.count }
-
-        @inline(__always) static func roundBoundary() {
-            guard active else { return }
-            boundary()
-        }
-
-        private static func boundary() {
-            let now = DispatchTime.now().uptimeNanoseconds
-            let count = sets.count
-            if roundIndex >= 2 {
-                roundTimes[(roundIndex - 1) % count].append(now - lastBoundary)
-            }
-            lastBoundary = now
-            let set = sets[roundIndex % count]
-            narrowDefault = set.0
-            narrowByShape = set.1
-            roundIndex += 1
-            if roundIndex >= roundsNeeded {
-                active = false
-                let enough = onEnough
-                onEnough = nil
-                enough?()
-            }
-        }
-
-        /// Arms the round hook. `onEnough` runs (on the engine's thread) once
-        /// every candidate has its rounds.
-        static func begin(onEnough: @escaping () -> Void) {
-            guard armed else { return }
-            roundTimes = Array(repeating: [], count: sets.count)
-            roundIndex = 0
-            lastBoundary = 0
-            self.onEnough = onEnough
-            active = true
-        }
-
-        private static func median(_ values: [UInt64]) -> Double? {
-            guard !values.isEmpty else { return nil }
-            let sorted = values.sorted()
-            let mid = sorted.count / 2
-            return sorted.count % 2 == 1
-                ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
-        }
-
-        private static func describe(_ set: NarrowChoice) -> String {
-            guard !set.1.isEmpty else { return "\(set.0)" }
-            return "\(set.0){"
-                + narrowTunedShapes.map { "\(set.1[[$0.0, $0.1]] ?? set.0)" }
-                .joined(separator: ",") + "}"
-        }
-
-        /// Ends the trial: installs the winner (or the record's pick), logs
-        /// one line and disarms. Safe to call when nothing ran.
-        static func finish(elapsedNanoseconds: UInt64) {
-            active = false
-            onEnough = nil
-            guard armed else { return }
-            if roundTimes.count != sets.count {
-                roundTimes = Array(repeating: [], count: sets.count)
-            }
-            let medians: [(Double?, Int, Int)] = roundTimes.map { times in
-                guard let first = median(times) else { return (nil, 0, 0) }
-                let kept = times.filter { Double($0) <= outlierFactor * first }
-                return (median(kept), kept.count, times.count)
-            }
-            var chosen = 0
-            if let record = medians[0].0 {
-                var best = record
-                for (index, entry) in medians.enumerated().dropFirst() {
-                    if let m = entry.0, m < best { best = m; chosen = index }
-                }
-                if chosen != 0, !(best < record * (1 - adoptMargin)) { chosen = 0 }
-            }
-            let set = sets[chosen]
-            narrowDefault = set.0
-            narrowByShape = set.1
-            setNarrowOperandNeeds([set])
-            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; median ms/round"
-            for (index, candidate) in sets.enumerated() {
-                let (m, kept, total) = medians[index]
-                log += (index == 0 ? " [record " : " | ") + describe(candidate) + " "
-                    + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
-            }
-            log += "]; "
-            if chosen == 0 {
-                log += "keeping the record's pick"
-            } else if let record = medians[0].0, let m = medians[chosen].0 {
-                log += "adopted " + describe(set)
-                    + String(format: " (%+.2f%%)", (m / record - 1) * 100)
-            }
-            log += String(format: "; %.0f ms\n", Double(elapsedNanoseconds) / 1e6)
-            FileHandle.standardError.write(log.data(using: .utf8)!)
-            sets = []
-            roundTimes = []
-        }
-    }
-
-    /// The kernel for this projection: the chosen one for its shape when its
-    /// constants pass the proof (or it needs none), else `original`.
-    /// `materialize` evaluates the FP32 scales now (the prompt route's
-    /// load-time call); the verify route leaves them lazy.
-    static func narrowKernel(
-        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
-        k: Int, n: Int, materialize: Bool
-    ) -> NarrowKernel {
-        let choice = narrowByShape[[k, n]] ?? narrowDefault
-        if n % choice.variant.tn != 0 { return .original }
-        guard choice.form != .base else { return choice }
-        guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
-        if choice.form == .negativeBiasF32Scales {
-            _ = narrowScalesF32(cache, scales, materialize: materialize)
-        }
-        return choice
-    }
-
-    /// The prompt route's load-time preparation of the verify operands: the
-    /// proof and, when any chosen kernel reads them, the FP32 scales.
-    static func prepareNarrowOperands(
-        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray
-    ) {
-        guard narrowNeedsProof, cache.biasesAreNegativeScales(scales, biases) else { return }
-        if narrowNeedsF32 { _ = narrowScalesF32(cache, scales, materialize: true) }
-    }
-
-    /// The FP16 scales widened to FP32 and transposed to `[groups, rows]`.
-    static func narrowScalesF32(
-        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, materialize: Bool
-    ) -> MLXArray {
-        cache.derived(scales, tag: 4) { s in
-            let widened = s.asType(.float32).transposed(1, 0).contiguous()
-            if materialize { eval(widened) }
-            return widened
-        }
-    }
-
-    /// One launch of the verify int8 kernel. For the negated-offset forms
-    /// `biasesT` is not read (callers pass `scalesT`).
-    static func launchNarrowInt8(
-        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
-        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, outputDType: DType,
-        kernel: NarrowKernel
-    ) -> MLXArray {
-        let m = 16
-        let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
-        let template: [(String, any KernelTemplateArg)] = [
-            ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
-            ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
-        ]
-        switch kernel.variant {
-        case .v0:
-            return kernelNarrowInt8(
-                inputs, template: template,
-                grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-        default:
-            let v = kernel.variant
-            return kernelNarrowInt8Pipelined(
-                inputs, template: template + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
-                grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-        }
-    }
-
-    /// Synthetic operands for the verify int8 kernel: signed codes, random
-    /// 2-bit words, FP16 scales of both signs (zeros and signed zeros
-    /// included) with offsets that are their FP16 negations bit for bit,
-    /// FP32 activation scales and scaled sums. Nothing depends on a request.
-    private struct NarrowOperands {
-        let k: Int, n: Int
-        let codes: MLXArray, weight: MLXArray
-        let scalesT: MLXArray, biasesT: MLXArray, scalesT32: MLXArray
-        let ascale: MLXArray, rowsum: MLXArray
-
-        init(k: Int, n: Int, seed: UInt64) {
-            self.k = k
-            self.n = n
-            let kg = k / 128
-            codes = MLXRandom.randInt(
-                Int32(-127) ..< Int32(128), [16, k], key: MLXRandom.key(seed)
-            ).asType(.int8)
-            weight = MLXRandom.randInt(
-                Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
-            ).asType(.uint16).view(dtype: .uint32)
-            var s = MLXRandom.uniform(
-                Float(-0.05) ..< Float(0.05), [n, kg], key: MLXRandom.key(seed + 2))
-            let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [n, kg], key: MLXRandom.key(seed + 3))
-            s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
-            s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
-            let scales = s.asType(.float16)
-            let biases = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
-            scalesT = scales.transposed(1, 0).contiguous()
-            biasesT = biases.transposed(1, 0).contiguous()
-            scalesT32 = scales.asType(.float32).transposed(1, 0).contiguous()
-            ascale = MLXRandom.uniform(
-                Float(0.0001) ..< Float(0.05), [16, kg], key: MLXRandom.key(seed + 4))
-            rowsum = MLXRandom.normal([16, kg], key: MLXRandom.key(seed + 5)) * Float(50)
-            eval(codes, weight, scalesT, biasesT, scalesT32, ascale, rowsum)
-        }
-
-        func run(_ kernel: NarrowKernel, _ outputDType: DType) -> MLXArray {
-            let (s, b): (MLXArray, MLXArray)
-            switch kernel.form {
-            case .base: (s, b) = (scalesT, biasesT)
-            case .negativeBias: (s, b) = (scalesT, scalesT)
-            case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
-            }
-            return launchNarrowInt8(
-                codes, weight, s, b, ascale, rowsum, k: k, n: n, outputDType: outputDType,
-                kernel: kernel)
-        }
-    }
-
-    /// The verify window's production shapes `(k, n)`: qkv|z, gate|up, down
-    /// and attention qkv, 16 rows each.
-    static let narrowTunedShapes = [(5120, 16384), (5120, 34816), (17408, 5120), (5120, 14336)]
-
-    /// Chooses the verify int8 kernels once, at load, on the running GPU.
-    ///
-    /// Self-test: every candidate runs against `original` on synthetic
-    /// operands (gate-, down- and two odd-quarter widths, so every ring's
-    /// remainder guards run) and must match every output bit (FP16 for all;
-    /// FP32 as well for each kernel that is then chosen); a mismatch or any
-    /// MLX error (a body the toolchain cannot compile) drops it. Candidates:
-    /// every body (`v0` and each pipelined variant) in each epilogue form.
-    /// Timing: the survivors and `original` run alternately on the four
-    /// production shapes, each over distinct weight sets of >= 96 MB (so
-    /// every launch streams its weights), best of five trials. The record's
-    /// pick: over the record's bodies (`narrowRecordVariants`), each shape
-    /// keeps its fastest kernel and every other shape takes the fastest in
-    /// total. That is what is installed; the timing only shortlists the
-    /// in-situ candidates (`NarrowInSituTrial`): the record's pick, `v0` with
-    /// the negated offset, and the two fastest K3 bodies in total, each after
-    /// its FP32 self-test, and every candidate kernel is then launched once
-    /// per production shape with FP16 and FP32 outputs. A candidate not
-    /// started within 4 s of the self-test is skipped (load time is not
-    /// timed). Runs at model init, before any timed phase, and builds every
-    /// candidate's pipelines, so no verify round (nor any trial round)
-    /// compiles anything.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE=off` keeps `original`
-    /// (master kill switch); `neg` / `f32` force that epilogue.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
-    /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd4`,
-    /// `tn64`, `k64pd1` .. `k64pd4`) limits the pipelined candidates to those.
-    private static func chooseNarrowKernels() -> (NarrowChoice, [NarrowChoice]) {
-        let environment = ProcessInfo.processInfo.environment
-        func knob(_ name: String) -> String? {
-            environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
-        let forms: [NarrowEpilogue]
-        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
-        case "off", "0", "false", "no", "base": return ((.original, [:]), [])
-        case "neg": forms = [.negativeBias]
-        case "f32": forms = [.negativeBiasF32Scales]
-        default: forms = [.negativeBias, .negativeBiasF32Scales]
-        }
-        // Default order = self-test order (what the deadline would cut last).
-        let defaultVariants: [NarrowVariant] = [
-            .pd1, .pd2, .k64pd1, .k64pd2, .pd3, .k64pd3, .pd4, .k64pd4, .tn64,
-        ]
-        var variants = defaultVariants
-        switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE") {
-        case "off", "0", "false", "no", "v0": variants = []
-        case .some(let value):
-            let named = value.split(separator: ",").map {
-                NarrowVariant(name: $0.trimmingCharacters(in: .whitespaces))
-            }
-            if !named.isEmpty, named.allSatisfy({ $0 != nil }) {
-                variants = named.compactMap { $0 }.filter { $0 != .v0 }
-            }
-        case nil: break
-        }
-        let candidates = forms.map { NarrowKernel(variant: .v0, form: $0) }
-            + variants.flatMap { v in forms.map { NarrowKernel(variant: v, form: $0) } }
-
-        let start = DispatchTime.now().uptimeNanoseconds
-        func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
-        var log = "bonsai verify int8 kernels:"
-        var passed: [NarrowKernel] = []
-        var failedF32 = Set<NarrowKernel>()
-        var timings: [NarrowKernel: [Double]] = [:]
-        var byShape: [[Int]: NarrowKernel] = [:]
-        var fallback = NarrowKernel.original
-        var trial: [NarrowChoice] = []
-        do {
-            try withError { error in
-                let testShapes = [
-                    (5120, 4096, UInt64(71)), (17408, 1024, UInt64(72)), (2560, 512, UInt64(73)),
-                    (3584, 512, UInt64(74)),
-                ]
-                let testOps = testShapes.map { NarrowOperands(k: $0.0, n: $0.1, seed: $0.2) }
-                func matches(_ kernel: NarrowKernel, _ outputDType: DType) throws -> Bool {
-                    let bits: DType = outputDType == .float16 ? .uint16 : .uint32
-                    var same = true
-                    for ops in testOps {
-                        let reference = ops.run(.original, outputDType)
-                        let y = ops.run(kernel, outputDType)
-                        let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
-                            .asType(.int32).sum()
-                        eval(differ)
-                        try error.check()
-                        if differ.item(Int32.self) != 0 { same = false }
-                    }
-                    return same
-                }
-                var skipped: [NarrowKernel] = []
-                for kernel in candidates {
-                    if elapsedMs() > 4000 { skipped.append(kernel); continue }
-                    if try matches(kernel, .float16) { passed.append(kernel) }
-                }
-                log += " self-test passed [" + passed.map(\.description).joined(separator: " ") + "]"
-                if !skipped.isEmpty {
-                    log += " skipped [" + skipped.map(\.description).joined(separator: " ") + "]"
-                }
-                guard !passed.isEmpty else { return }
-
-                let kernels = [NarrowKernel.original] + passed
-                let sets = narrowTunedShapes.enumerated().map { (index, shape) -> [NarrowOperands] in
-                    let bytes = shape.0 * shape.1 / 4
-                    let copies = min(6, max(2, (96 << 20) / bytes + 1))
-                    return (0 ..< copies).map {
-                        NarrowOperands(k: shape.0, n: shape.1, seed: 100 + UInt64(index * 8 + $0))
-                    }
-                }
-                for kernel in kernels { eval(sets.flatMap { $0.map { $0.run(kernel, .float16) } }) }
-                try error.check()
-                for kernel in kernels { timings[kernel] = Array(repeating: .infinity, count: sets.count) }
-                for _ in 0 ..< 5 {
-                    for (index, shapeSets) in sets.enumerated() {
-                        for kernel in kernels {
-                            let outs = shapeSets.map { $0.run(kernel, .float16) }
-                            let t0 = DispatchTime.now().uptimeNanoseconds
-                            eval(outs)
-                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
-                                / Double(outs.count)
-                            timings[kernel]![index] = min(timings[kernel]![index], us)
-                        }
-                    }
-                }
-                try error.check()
-
-                // The record's picks, then the FP32 self-test of each picked
-                // kernel; a kernel failing it is dropped and the picks redone.
-                var checkedF32 = Set<NarrowKernel>()
-                func exactF32(_ kernel: NarrowKernel) throws -> Bool {
-                    if kernel == .original || checkedF32.contains(kernel) {
-                        return !failedF32.contains(kernel)
-                    }
-                    checkedF32.insert(kernel)
-                    if try matches(kernel, .float32) { return true }
-                    failedF32.insert(kernel)
-                    return false
-                }
-                while true {
-                    let usable = kernels.filter {
-                        !failedF32.contains($0) && narrowRecordVariants.contains($0.variant)
-                    }
-                    func fastest(_ cost: (NarrowKernel) -> Double) -> NarrowKernel {
-                        usable.min { cost($0) < cost($1) } ?? .original
-                    }
-                    fallback = fastest { timings[$0]!.reduce(0, +) }
-                    byShape = [:]
-                    for (index, shape) in narrowTunedShapes.enumerated() {
-                        byShape[[shape.0, shape.1]] = fastest { timings[$0]![index] }
-                    }
-                    let picked = Set([fallback] + Array(byShape.values)).subtracting([.original])
-                    var clean = true
-                    for kernel in picked {
-                        if try !exactF32(kernel) { clean = false }
-                    }
-                    if clean { break }
-                }
-
-                // The in-situ candidates: the record's pick, v0 with the
-                // negated offset, and the two fastest K3 bodies in total, each
-                // exact at FP32 as well. Choices equal on every shape collapse.
-                guard NarrowInSituTrial.enabled else { return }
-                var shortlist: [NarrowChoice] = [(fallback, byShape)]
-                let v0Negative = NarrowKernel(variant: .v0, form: .negativeBias)
-                if passed.contains(v0Negative), try exactF32(v0Negative) {
-                    shortlist.append((v0Negative, [:]))
-                }
-                let k3 = passed.filter { !narrowRecordVariants.contains($0.variant) }
-                    .sorted { timings[$0]!.reduce(0, +) < timings[$1]!.reduce(0, +) }
-                var survivors = 0
-                for kernel in k3 where survivors < 2 {
-                    if try exactF32(kernel) {
-                        shortlist.append((kernel, [:]))
-                        survivors += 1
-                    }
-                }
-                func effective(_ choice: NarrowChoice) -> [NarrowKernel] {
-                    [choice.0] + narrowTunedShapes.map { choice.1[[$0.0, $0.1]] ?? choice.0 }
-                }
-                for choice in shortlist
-                where !trial.contains(where: { effective($0) == effective(choice) }) {
-                    trial.append(choice)
-                }
-                guard trial.count >= 2 else { trial = []; return }
-                // Every candidate kernel once per production shape, FP16 and
-                // FP32 outputs, so no pipeline compiles inside a trial round.
-                let trialKernels = Set(trial.flatMap { [$0.0] + Array($0.1.values) })
-                for kernel in trialKernels {
-                    for outputDType in [DType.float16, .float32] {
-                        eval(sets.map { $0[0].run(kernel, outputDType) })
-                    }
-                }
-                try error.check()
-            }
-        } catch {
-            passed = []
-            byShape = [:]
-            fallback = .original
-            trial = []
-            log += " error \(error)"
-        }
-        if !timings.isEmpty {
-            log += "; us/launch per shape (qkv|z gate|up down attn):"
-            for kernel in [NarrowKernel.original] + passed {
-                guard let row = timings[kernel] else { continue }
-                log += " \(kernel)=" + row.map { String(format: "%.1f", $0) }.joined(separator: ",")
-            }
-        }
-        if !failedF32.isEmpty {
-            log += "; FP32 self-test failed [" + failedF32.map(\.description).joined(separator: " ") + "]"
-        }
-        Memory.clearCache()
-        log += "; using default \(fallback), per shape ["
-            + narrowTunedShapes.map { "\($0.0)x\($0.1)=\(byShape[[$0.0, $0.1]] ?? fallback)" }
-            .joined(separator: " ") + "]"
-        if !trial.isEmpty {
-            log += "; in-situ candidates [record" + trial.dropFirst().map { " \($0.0)" }
-                .joined() + "]"
-        }
-        log += "; \(String(format: "%.0f", elapsedMs())) ms\n"
-        FileHandle.standardError.write(log.data(using: .utf8)!)
-        return ((fallback, byShape), trial)
-    }
-
-    /// Installs the record's pick and sets up the in-situ trial. The operands
-    /// every candidate reads (the per-projection proof, the FP32 scales) are
-    /// prepared at the load-time prompt forward, before any trial round.
-    private static func installNarrowChoice() {
-        let (choice, trial) = chooseNarrowKernels()
-        narrowDefault = choice.0
-        narrowByShape = choice.1
-        NarrowInSituTrial.sets = trial
-        setNarrowOperandNeeds([choice] + trial)
-    }
-
-    nonisolated(unsafe) private static var installed = false
-
-    static func installIfNeeded() {
-        guard enabled, !installed else { return }
-        installed = true
-        guard support != .none else { return }
-        HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
-            rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
-        }
-        if headAvailable {
-            HadamardQuantizedLinear.tensorPackedMatmulHead = {
-                rotated, weight, scales, biases, groupSize, outputDType in
-                guard groupSize == 128, rotated.dtype == .float16, rotated.ndim == 2,
-                    weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
-                    [DType.float16, .float32].contains(outputDType)
-                else { return nil }
-                let m = rotated.dim(0)
-                let k = rotated.dim(1)
-                let n = weight.dim(0)
-                guard m == 16, n >= 65536, n % 32 == 0, k % 256 == 0, weight.dim(1) == k / 16,
-                    scales.shape == [n, k / 128], biases.shape == [n, k / 128]
-                else { return nil }
-                if !headAnnounced {
-                    headAnnounced = true
-                    FileHandle.standardError.write(
-                        "bonsai head kernel: in use (k \(k), n \(n), \(outputDType))\n"
-                            .data(using: .utf8)!)
-                }
-                return runHead(rotated, weight, scales, biases, k: k, n: n, outputDType: outputDType)
-            }
-        }
-        if verifyEnabled, verifyForm != .none {
-            HadamardQuantizedLinear.tensorPackedMatmulNarrowApplies = { rows, n, k in
-                rows <= 16 && n % 64 == 0 && k % 512 == 0 && n <= verifyMaximumColumns
-            }
-        }
-        if verifyEnabled, verifyForm == .staged8, signedCodes {
-            HadamardQuantizedLinear.narrowProducerApproves = Qwen35VerifyProducerQ8.approves
-            HadamardQuantizedLinear.tensorPackedMatmulNarrowInt8 = {
-                activation, weight, scales, biases, groupSize, outputDType, cache in
-                let codes = activation.codes
-                guard groupSize == 128, codes.dtype == .int8, codes.ndim == 2,
-                    activation.scales.dtype == .float32, activation.scaledSums.dtype == .float32,
-                    weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
-                    [DType.float16, .float32].contains(outputDType)
-                else { return nil }
-                let m = codes.dim(0)
-                let k = codes.dim(1)
-                let n = weight.dim(0)
-                guard m == 16, n % 32 == 0, k % 512 == 0, weight.dim(1) == k / 16,
-                    activation.scales.shape == [m, k / 128],
-                    activation.scaledSums.shape == [m, k / 128],
-                    scales.shape == [n, k / 128], biases.shape == [n, k / 128]
-                else { return nil }
-                let choice = narrowKernel(cache, scales, biases, k: k, n: n, materialize: false)
-                let scalesT: MLXArray
-                let biasesT: MLXArray
-                switch choice.form {
-                case .negativeBiasF32Scales:
-                    scalesT = narrowScalesF32(cache, scales, materialize: false)
-                    biasesT = scalesT
-                case .negativeBias:
-                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-                    biasesT = scalesT
-                case .base:
-                    scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-                    biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                }
-                return launchNarrowInt8(
-                    codes, weight, scalesT, biasesT, activation.scales, activation.scaledSums,
-                    k: k, n: n, outputDType: outputDType, kernel: choice)
-            }
-            installNarrowChoice()
-        } else if verifyEnabled, verifyForm != .none {
-            HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
-                rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
-                guard groupSize == 128, rotated.dtype == .float16, rotated.ndim == 2,
-                    sums.dtype == .float32, weight.dtype == .uint32,
-                    scales.dtype == .float16, biases.dtype == .float16,
-                    [DType.float16, .float32].contains(outputDType)
-                else { return nil }
-                let m = rotated.dim(0)
-                let k = rotated.dim(1)
-                let n = weight.dim(0)
-                guard m == 16, n % 32 == 0, k % 512 == 0, weight.dim(1) == k / 16,
-                    sums.shape == [m, k / 128], scales.shape == [n, k / 128],
-                    biases.shape == [n, k / 128]
-                else { return nil }
-                let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-                let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                if verifyForm == .staged8 {
-                    return kernelNarrowStaged8(
-                        [rotated, weight, scalesT, biasesT, sums, dimsArray(k: k, m: m, n: n)],
-                        template: [("OutT", outputDType)],
-                        grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
-                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-                }
-                let tn = (narrowTileColumns == 64 && n % 64 == 0) ? 64 : 32
-                // Eight simdgroups split a long K (down_proj); four otherwise.
-                let sg = (narrowDeepSplit && k >= 8192 && (k / 128) % 8 == 0) ? 8 : 4
-                return kernelNarrow(
-                    [rotated, weight, scalesT, biasesT, sums, dimsArray(k: k, m: m, n: n)],
-                    template: [("OutT", outputDType), ("TN", tn), ("SG", sg)],
-                    grid: (n / tn * 32 * sg, 1, 1), threadGroup: (32 * sg, 1, 1),
-                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-            }
-        }
-        HadamardQuantizedLinear.tensorPackedMatmul = {
-            activation, weight, scales, biases, groupSize, outputDType, cache in
-            let codes = activation.codes
-            guard groupSize == 128, codes.dtype == codesDType, codes.ndim == 2,
-                activation.scales.dtype == .float32, activation.scaledSums.dtype == .float32,
-                weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
-                [DType.float16, .float32].contains(outputDType)
-            else { return nil }
-            let m = codes.dim(0)
-            let k = codes.dim(1)
-            let n = weight.dim(0)
-            guard m % 64 == 0, n % 64 == 0, k % 512 == 0, weight.dim(1) == k / 16,
-                activation.scales.shape == [m, k / 128],
-                activation.scaledSums.shape == [m, k / 128],
-                scales.shape == [n, k / 128], biases.shape == [n, k / 128]
-            else { return nil }
-            // The verify int8 kernel's per-projection proof and FP32 scales are
-            // built here, at the first prompt forward (the load-time warm), so
-            // no verify round pays the readback or the widening.
-            prepareNarrowOperands(cache, scales, biases)
-            let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
-            let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-            let foldedSums = cache.derived(scales, tag: 3) { s in
-                (s.asType(.float32) * codeSums(weight, k: k) * MLXArray(Float(-128)))
-                    .transposed(1, 0).contiguous()
-            }
-            let packedKernel: MLXFast.MLXFastKernel
-            var template: [(String, any KernelTemplateArg)] = [
-                ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
-                ("SIGNED", signedCodes ? 1 : 0),
-            ]
-            switch support {
-            case .native2b: packedKernel = kernel
-            case .staged8:
-                packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
-                template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
-                template.append(("VEC", staged8VectorStores ? 1 : 0))
-            default: packedKernel = kernelStaged
-            }
-            return packedKernel(
-                [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
-                 activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                template: template,
-                grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-        }
-    }
-}
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
@@ -9933,9 +9205,11 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
         let normalized = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
+            // The head's fused top two rides beside the lazy logits where the
+            // int8 route takes the rows (`Qwen35HeadTopTwo`).
             logits = model.exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
+                : Qwen35HeadTopTwo.capture { lmHead(normalized) }
         } else if model.exactTargetVerify, normalized.dim(1) > 1 {
             logits = qwen35A3BTimewiseProjection(normalized) {
                 model.embedTokens.asLinear($0)
@@ -9977,20 +9251,22 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
-        // The drafter's hidden is its own dtype (BF16 on this pack). The
-        // verify-width int8 kernel already serves the target's head; this
-        // read takes that same kernel (Subflatus3 `aa6a540a`). FP16 logits,
-        // which the drafter's top-k reads directly.
-        if let head = lmHead as? HadamardQuantizedLinear,
-            let routed = head.forwardDrafterInt8(hidden)
-        {
-            return routed
-        }
-        // The dequantizing head kernel, still FP16 logits
-        // (`HadamardQuantizedLinear.drafterHeadFloat16`).
+        // The drafter reads the head in FP16 and keeps the FP16 logits: its
+        // top-k reads them directly (see `HadamardQuantizedLinear.drafterHeadFloat16`).
         if HadamardQuantizedLinear.drafterHeadFloat16,
             let head = lmHead as? HadamardQuantizedLinear
         {
+            // On the int8 verify route the drafter's block-wide read takes the
+            // same kernel as the target's verify head: the BF16 hidden widened
+            // to FP32 exactly, rotated and quantized per 128-group, FP16 logits.
+            // Only where that route takes the rows (<= 16, route installed);
+            // anything else keeps the BF16 read below.
+            if Qwen35TensorPackedMatmul.drafterHeadInt8, hidden.dtype == .bfloat16,
+                hidden.ndim >= 2,
+                HadamardQuantizedLinear.tensorRouteTakesNarrowRows(hidden.size / hidden.dim(-1))
+            {
+                return head.forwardUnwidened(hidden.asType(.float32))
+            }
             return head.forwardUnwidened(hidden)
         }
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
@@ -10007,6 +9283,11 @@ extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
         let vocabularySize = logits.dim(2)
         precondition(batch > 0 && length > 0 && vocabularySize >= 2)
         let rows = batch * length
+        // The capture verify's own logits: the head launch's fused top two
+        // (the same ids and values, self-tested), the logits never read.
+        if let fused = Qwen35HeadTopTwo.lookup(logits, rows: rows) {
+            return (fused.ids.reshaped([batch, length, 2]), fused.values.reshaped([batch, length, 2]))
+        }
         let topTwo = qwen35MTPTopTwoRows(
             logits.reshaped([1, rows, vocabularySize]))
         return (

@@ -680,22 +680,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// On unless explicitly disabled: the drafter's shared-head read (a BF16
-    /// or FP16 activation, at most 16 rows) takes the verify-width int8
-    /// kernel the target's own head already uses. `MLXFAST_DFLASH_HEAD_INT8=0`
-    /// keeps `forwardUnwidened`.
-    public static let drafterHeadInt8: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_HEAD_INT8"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     /// On unless explicitly disabled: the zero rows that pad a verify-width
     /// activation up to 16 are one resident buffer per shape, not a fresh
-    /// zeros kernel on every projection. `MLXFAST_NARROW_ZERO_PAD=0` allocates
-    /// them again each call.
+    /// zeros kernel on every projection (ercumentyildirim `6e19fe1`).
+    /// `MLXFAST_RIDER_NARROW_ZERO_PAD=0` allocates them again each call.
     private static let narrowZeroPad: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_NARROW_ZERO_PAD"]?
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RIDER_NARROW_ZERO_PAD"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -817,7 +807,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// Whether a full verify window on the int8 narrow route may form this
     /// producer inside the quantizing rotation (`tensorRouteForwardNarrowProducer`);
     /// the model installs it behind its own 16-row bitwise self-test. Nil
-    /// keeps the composed chain.
+    /// keeps the composed chain (ercumentyildirim `6e19fe1`, row P).
     nonisolated(unsafe) public static var narrowProducerApproves:
         ((SignedBlockHadamard.Int8Producer, SignedBlockHadamard) -> Bool)?
     static var narrowRouteInstalled: Bool {
@@ -1232,29 +1222,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// as is instead of being widened first. The consumer's promotion widens
     /// the same values exactly, so the arithmetic is unchanged and one cast
     /// dispatch per call is saved.
-    /// The drafter's vocabulary-head read on the verify-width int8 kernel.
-    /// The tower's `tensorRouteForward` admits only FP32, so a BF16 or FP16
-    /// head activation (the drafter's dtype) was falling through to the
-    /// dequantizing head kernel. Nil when that kernel is not installed or
-    /// the shape is not a verify-width vocabulary head; the caller keeps
-    /// `forwardUnwidened`. The quantizer already accepts these dtypes, and
-    /// the matmul is the one the target's own head uses. Logits stay FP16,
-    /// which is what the drafter's top-k reads.
-    public func forwardDrafterInt8(_ x: MLXArray) -> MLXArray? {
-        guard Self.drafterHeadInt8, Self.tensorRouteEnabled, x.ndim >= 2,
-            x.dtype == .bfloat16 || x.dtype == .float16 || x.dtype == .float32
-        else { return nil }
-        let k = x.dim(-1)
-        let rows = x.size / k
-        guard rows >= 1, rows <= Self.tensorRouteMaximumNarrowRows,
-            weight.dim(0) >= Self.vocabularyHeadMinimumRows, tensorRouteTakes(self),
-            let y = tensorRouteForwardNarrow(
-                x.reshaped(rows, k), rows: rows, k: k, n: weight.dim(0), siblings: [self],
-                preSigned: false, outputDType: .float16, leading: Array(x.shape.dropLast()))
-        else { return nil }
-        return y[0]
-    }
-
     public func forwardUnwidened(_ x: MLXArray) -> MLXArray {
         if let routed = tensorRouteForward(x, siblings: [self], preSigned: false, widenOutput: false) {
             return routed[0]
