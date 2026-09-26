@@ -331,6 +331,11 @@ public final class DFlash2TapSlot {
     /// order the drafter's `fc` expects them. Nil turns the tap off.
     public var layerIds: [Int]?
 
+    /// The dtype the tower fuses tapped rows into, set once at `bind` from
+    /// the drafter's own dtype. Nil keeps the legacy wide path: the tower
+    /// fuses in the trunk dtype and the crossing casts downstream.
+    public var fusedDType: DType?
+
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
@@ -357,9 +362,18 @@ public protocol DFlash2TapTarget: DFlash2Target {
 
     /// How many layers the tower has, so the ids can be checked before a run.
     var dFlash2LayerCount: Int { get }
+
+    /// Aim the tower's tap fusion at the drafter's dtype. The default is a
+    /// no-op, which keeps the legacy path: the tower fuses in the trunk
+    /// dtype and every crossing below casts exactly once.
+    func setDFlash2TapFusedDType(_ dtype: DType?)
 }
 
 extension DFlash2TapTarget {
+    /// Legacy tap targets ignore the fused dtype: the tower keeps fusing in
+    /// the trunk dtype and every crossing below casts exactly once.
+    public func setDFlash2TapFusedDType(_ dtype: DType?) {}
+
     /// Check the ids against this target and turn the tap on.
     ///
     /// A bad id is a refusal, not a clamp: a drafter reading the wrong layers
@@ -460,6 +474,47 @@ final class DFlash2SlidingMaskMemo {
     }
 }
 
+/// The K and V projections' weights stacked along the output axis: the
+/// same BF16 bytes as the two loaded weights, concatenated once on first use
+/// and held in a plain class (never a stored `MLXArray` on the module, so
+/// reflection cannot add it to the parameter tree). On the fused concat path
+/// K and V share the `[context; block]` rows, so one matmul over the stack
+/// replaces two over the same input, and the rows fill one wider tensor tile
+/// instead of two. Each output row still dots one weight row over one input
+/// row, the same pairs the separate matmuls dot; the teacher-forced
+/// correctness gate (max_abs_diff 0.0) holds that claim on every local run.
+/// `DARKBLOOM_DFLASH2_STACK_KV=1` enables the one-matmul stack (default off:
+/// the stack is validated only at M = 8 and diverges from the two matmuls at
+/// wider verify shapes, so the two matmuls are the default).
+private final class DFlash2KVStack {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_KV"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+    private var weight: MLXArray?
+    private var boundary = 0
+
+    func clear() {
+        weight = nil
+        boundary = 0
+    }
+
+    /// `(kProj(x), vProj(x))` from one matmul, or nil when the stack does not apply.
+    func apply(_ x: MLXArray, kProj: Linear, vProj: Linear) -> (MLXArray, MLXArray)? {
+        guard Self.enabled, kProj.bias == nil, vProj.bias == nil,
+            kProj.weight.dtype == vProj.weight.dtype, kProj.weight.dim(1) == vProj.weight.dim(1),
+            kProj.weight.ndim == 2, vProj.weight.ndim == 2
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([kProj.weight, vProj.weight], axis: 0)
+            boundary = kProj.weight.dim(0)
+        }
+        let y = matmul(x, weight!.T)
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -476,6 +531,7 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    private let kvStack = DFlash2KVStack()
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
@@ -496,6 +552,15 @@ private final class DFlash2Attention: Module {
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         super.init()
+    }
+
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        kvStack.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     /// - Parameters:
@@ -541,10 +606,19 @@ private final class DFlash2Attention: Module {
             // offset rotates every row where the two separate ropes did.
             let rows = concatenated([context, x], axis: 1)
             let n = contextLength + L
-            let keys = rope(
-                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
-            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            let keys: MLXArray
+            let values: MLXArray
+            if let (k, v) = kvStack.apply(rows, kProj: kProj, vProj: vProj) {
+                keys = rope(
+                    kNorm(k.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                    offset: cache.offset)
+                values = v.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            } else {
+                keys = rope(
+                    kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                    offset: cache.offset)
+                values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            }
             contextKeys = keys[0..., 0..., ..<contextLength, 0...]
             contextValues = values[0..., 0..., ..<contextLength, 0...]
             blockKeys = keys[0..., 0..., contextLength..., 0...]
@@ -586,15 +660,42 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return dflash2PaddedOProj(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
 
-/// Kill switch for the one-projection context+block K/V (default on).
-private let dflash2KVConcatEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
+/// Kill switch for the M-padded o_proj at the scored block width (default on).
+private let dflash2PadOProjEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_PAD_OPROJ"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// The o_proj over a 16-row block zero-padded to 64 rows, sliced back.
+///
+/// At M = 16 the dense path takes regular steel with bm = 64, so the M tile
+/// is 1/4 full and every load takes the unaligned bounds-checked path. Over
+/// 64 rows the same kernel (same template, same K order, same per-output
+/// accumulation) takes the aligned path over the same in-bounds values, and
+/// the padded rows are sliced off. Bit-identical to the direct projection
+/// (teacher-forced max_abs_diff 0.0); the pad + slice cost one narrow
+/// concat. Applies only at L = 16, the scored block width: padding hurts at
+/// M = 8 and on the split-K projections, which are already M-aligned.
+private func dflash2PaddedOProj(_ oProj: Linear, _ x: MLXArray) -> MLXArray {
+    let rows = x.dim(1)
+    guard dflash2PadOProjEnabled, rows == 16, x.ndim == 3 else { return oProj(x) }
+    let pad = concatenated(
+        [x, MLXArray.zeros([x.dim(0), 64 - rows, x.dim(2)], dtype: x.dtype)], axis: 1)
+    return oProj(pad)[0..., 0 ..< rows, 0...]
+}
+
+/// Kill switch for the one-projection context+block K/V (default off: the
+/// fused path diverges from separate projections at wider verify shapes, so
+/// separate projections are the default; `MLXFAST_DFLASH_KV_CONCAT=1` re-enables).
+private let dflash2KVConcatEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
+    else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
 /// Kill switch for dropping a sliding mask that allows everything (default on).
@@ -846,6 +947,14 @@ private final class DFlash2GateUpStack {
 
     /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
     func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
+        guard let (y, boundary) = stacked(x, gate: gate, up: up) else { return nil }
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+
+    /// The stacked `[..., gateRows + upRows]` product and the gate boundary,
+    /// for kernels that fuse the split with the SwiGLU tail. Nil when the
+    /// stack does not apply.
+    func stacked(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, Int)? {
         guard Self.enabled, gate.bias == nil, up.bias == nil,
             gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
             gate.weight.ndim == 2, up.weight.ndim == 2
@@ -854,9 +963,115 @@ private final class DFlash2GateUpStack {
             weight = concatenated([gate.weight, up.weight], axis: 0)
             boundary = gate.weight.dim(0)
         }
-        let y = matmul(x, weight!.T)
-        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+        return (matmul(x, weight!.T), boundary)
     }
+}
+
+/// Kill switch for the one-launch stacked SwiGLU tail (default on).
+private let dflash2FusedSwiGLUEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_FUSED_SWIGLU"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One element of the drafter MLP tail, `silu(g) * u`: the silu launch and
+/// the product launch become one kernel. The stacked kernel reads the gate
+/// row and the up row straight out of the stack (no split views, no copies);
+/// the split kernel reads two separate contiguous projections.
+///
+/// Bit-identity: each element takes the chain's operations in the chain's
+/// order on the same `T`-typed values — `s = g * sigmoid(g)` rounded to `T`
+/// as the silu launch stores it, then `s * u` rounded to `T` as the product
+/// launch stores it — with contraction off, so no fma fuses the two
+/// roundings. The sigmoid is MLX's own `Sigmoid` (`unary_ops.h`): the
+/// abs/exp form with the sign branch, evaluated in `T`. The teacher-forced
+/// correctness gate (max_abs_diff 0.0) holds that claim on every local run.
+private let dflash2SwiGLUHeader = """
+    template <typename T>
+    inline T dflash2_swiglu(const T g, const T u) {
+    #pragma clang fp contract(off)
+      const T ax = metal::abs(g);
+      const T y = T(1) / (T(1) + metal::exp(ax));
+      const T s = (g < T(0)) ? y : T(1) - y;
+      const T sg = g * s;
+      return sg * u;
+    }
+    """
+
+private let dflash2StackedSwiGLUKernel = MLXFast.metalKernel(
+    name: "dflash2_stacked_swiglu",
+    inputNames: ["y"],
+    outputNames: ["out"],
+    source: """
+        // grid (INTER, L, B): one thread per SwiGLU output element. The gate
+        // row sits at column c of the stack, the up row INTER past it.
+        constexpr uint INTER = INTERW;
+        const uint c = thread_position_in_grid.x;
+        const uint l = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        const uint L = threads_per_grid.y;
+        const size_t row = (size_t(b) * L + l) * (2 * INTER) + c;
+        const size_t o = (size_t(b) * L + l) * INTER + c;
+        out[o] = dflash2_swiglu<T>(y[row], y[row + INTER]);
+        """,
+    header: dflash2SwiGLUHeader,
+    ensureRowContiguous: true)
+
+private let dflash2SplitSwiGLUKernel = MLXFast.metalKernel(
+    name: "dflash2_split_swiglu",
+    inputNames: ["g", "u"],
+    outputNames: ["out"],
+    source: """
+        // grid (INTER, L, B): one thread per SwiGLU output element. The two
+        // halves arrive as separate contiguous projections (the stack is
+        // off), so no split views and no copies stand between the matmuls
+        // and this launch.
+        const uint c = thread_position_in_grid.x;
+        const uint l = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        const uint H = threads_per_grid.x;
+        const uint L = threads_per_grid.y;
+        const size_t i = (size_t(b) * L + l) * H + c;
+        out[i] = dflash2_swiglu<T>(g[i], u[i]);
+        """,
+    header: dflash2SwiGLUHeader,
+    ensureRowContiguous: true)
+
+/// `silu(g) * u` over two separate same-shape projections, or nil when the
+/// fused tail does not apply (the caller keeps the chain).
+private func dflash2FusedSplitSwiGLU(_ g: MLXArray, _ u: MLXArray) -> MLXArray? {
+    guard dflash2FusedSwiGLUEnabled, g.ndim == 3,
+        g.shape == u.shape, g.dtype == u.dtype,
+        [.bfloat16, .float16, .float32].contains(g.dtype)
+    else { return nil }
+    let batch = g.dim(0)
+    let length = g.dim(1)
+    let width = g.dim(2)
+    guard batch > 0, length > 0, width > 0 else { return nil }
+    let template: [(String, any KernelTemplateArg)] = [("T", g.dtype)]
+    return dflash2SplitSwiGLUKernel(
+        [g, u], template: template, grid: (width, length, batch),
+        threadGroup: (256, 1, 1),
+        outputShapes: [g.shape], outputDTypes: [g.dtype])[0]
+}
+
+/// `silu(g) * u` read straight out of the stacked gate/up product, or nil
+/// when the fused tail does not apply (the caller keeps the chain).
+private func dflash2FusedStackedSwiGLU(_ y: MLXArray, boundary: Int) -> MLXArray? {
+    guard dflash2FusedSwiGLUEnabled, y.ndim == 3, boundary > 0,
+        y.dim(-1) == 2 * boundary,
+        [.bfloat16, .float16, .float32].contains(y.dtype)
+    else { return nil }
+    let batch = y.dim(0)
+    let length = y.dim(1)
+    guard batch > 0, length > 0 else { return nil }
+    let template: [(String, any KernelTemplateArg)] = [
+        ("T", y.dtype), ("INTERW", boundary),
+    ]
+    return dflash2StackedSwiGLUKernel(
+        [y], template: template, grid: (boundary, length, batch),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[batch, length, boundary]], outputDTypes: [y.dtype])[0]
 }
 
 private final class DFlash2MLP: Module, UnaryLayer {
@@ -882,10 +1097,18 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return down(silu(g) * u)
+        if let (y, boundary) = gateUp.stacked(x, gate: gate, up: up) {
+            if let fused = dflash2FusedStackedSwiGLU(y, boundary: boundary) {
+                return down(fused)
+            }
+            return down(silu(y[.ellipsis, ..<boundary]) * y[.ellipsis, boundary...])
         }
-        return down(silu(gate(x)) * up(x))
+        let g = gate(x)
+        let u = up(x)
+        if let fused = dflash2FusedSplitSwiGLU(g, u) {
+            return down(fused)
+        }
+        return down(silu(g) * u)
     }
 }
 
@@ -941,12 +1164,31 @@ private final class DFlash2DecoderLayer: Module {
 final class DFlash2CandidateSelector: Module {
     let topK: Int
 
+    /// The selector's candidate-list width.
+    ///
+    /// The shipped drafter config names 16, but the fused top-k kernel and
+    /// the fused greedy-walk kernel both support k <= 32, and the wider tail
+    /// covers the single greedy path's early misses over the 248320-wide
+    /// vocabulary. So a configured 16 runs at 32; any other configured value
+    /// (the unit tests use 2) passes through untouched.
+    /// `DARKBLOOM_DFLASH2_SELECTOR_TOPK=16` restores the configured width;
+    /// any 1...32 value there is honored as-is.
+    static func resolveTopK(_ configured: Int) -> Int {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_SELECTOR_TOPK"],
+            let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            (1...32).contains(v)
+        {
+            return v
+        }
+        return configured == 16 ? 32 : configured
+    }
+
     @ParameterInfo(key: "predecessor_codebook") var predecessorCodebook: MLXArray
     @ParameterInfo(key: "successor_codebook") var successorCodebook: MLXArray
     @ModuleInfo(key: "hidden_projection") var hiddenProjection: Linear
 
     init(_ config: DFlash2Configuration) {
-        self.topK = config.dflash.selectorTopK
+        self.topK = Self.resolveTopK(config.dflash.selectorTopK)
         _predecessorCodebook.wrappedValue = MLXArray.zeros([
             config.vocabularySize, config.dflash.selectorRank,
         ])
@@ -1253,6 +1495,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     private let rope: RoPELayer
     private var target: (any DFlash2Target)?
 
+    /// Fused logits epilogue (H4): output multiplier + final softcap baked as
+    /// one compiled elementwise kernel over `[B, k, vocab]`, replacing 2-3
+    /// separate passes. Constants come from the init config, which never
+    /// changes, so the graph cannot go stale.
+    private let fusedLogitsEpilogue: @Sendable (MLXArray) -> MLXArray
+
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
     /// the target into the drafter — the embedded block and the fused target
@@ -1275,6 +1523,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             traditional: false,
             scalingConfig: nil,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
+        let outputMultiplier = config.dflash.outputMultiplier
+        let softcap = config.dflash.finalLogitSoftcapping
+        self.fusedLogitsEpilogue = compile(shapeless: true) { (logits: MLXArray) -> MLXArray in
+            var out = logits
+            if outputMultiplier != 1 {
+                out = out * outputMultiplier
+            }
+            if let softcap = softcap, softcap > 0 {
+                out = tanh(out / softcap) * softcap
+            }
+            return out
+        }
         super.init()
     }
 
@@ -1288,6 +1548,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         guard target.dFlash2HiddenSize == config.hiddenSize else {
             throw DFlash2Error.hiddenSizeMismatch(
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
+        }
+        // Aim the tower's tap fusion at this drafter's dtype so tapped rows
+        // arrive already fused in BF16 and every crossing below is a
+        // same-dtype no-op. Tap targets without the hook keep the legacy
+        // wide path via the default no-op above.
+        if let tapTarget = target as? any DFlash2TapTarget {
+            tapTarget.setDFlash2TapFusedDType(dtype)
         }
         self.target = target
     }
@@ -1366,7 +1633,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        // The tap fuses to this dtype upstream, so on the fused path this
+        // crossing is a same-dtype no-op and the round's single cast already
+        // happened narrow, per tap shard; otherwise one cast here, as before.
+        let fusedTarget =
+            targetHidden.dtype == dtype ? targetHidden : targetHidden.asType(dtype)
+        let context = hiddenNorm(fc(fusedTarget))
 
         let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
@@ -1380,14 +1652,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        var logits = target.logitsForDFlash2Hidden(hidden)
-        if config.dflash.outputMultiplier != 1 {
-            logits = logits * config.dflash.outputMultiplier
+        let logits = target.logitsForDFlash2Hidden(hidden)
+        if config.dflash.outputMultiplier == 1,
+            (config.dflash.finalLogitSoftcapping ?? 0) <= 0
+        {
+            return logits
         }
-        if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
-            logits = tanh(logits / cap) * cap
-        }
-        return logits
+        return fusedLogitsEpilogue(logits)
     }
 
     // MARK: Proposing

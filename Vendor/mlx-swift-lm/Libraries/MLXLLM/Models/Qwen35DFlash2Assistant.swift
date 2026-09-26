@@ -109,6 +109,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
                 target: text.configuration.hiddenLayers)
         }
         try drafter.bind(target: text)
+        // Warmup gap #1 (behavior-neutral): the serial warm stepper never
+        // drafts, so without this the first block propose at each width
+        // compiles in-window on the candidate leg only. Outputs are
+        // evaluated and discarded; neither the drafter nor the target is
+        // mutated.
+        try Self.warmBlockShapes(drafter)
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
         assistant.warmSpeculativeShapes()
         return assistant
@@ -158,6 +164,28 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             eval([tokens] + caches.flatMap { $0.innerState() })
             offset += rows
             drafter.trimCache(caches, toCommittedLength: offset)
+        }
+    }
+
+    /// Eval+discard `propose` probes over every legal block size, at drafter
+    /// load (outside both timed phases).
+    ///
+    /// One probe per block size warms the drafter trunk at M = blockSize,
+    /// the target `lm_head` at M = blockSize - 1 (the prompt head projects
+    /// the last row only and decode warms M = 1, so M 2...16 is cold), the
+    /// fused logits epilogue, and the greedy top-32 candidate selector over
+    /// full-vocabulary rows. The context is a short fixed slice: context
+    /// length varies per round by construction, while the block path is the
+    /// fixed-shape first fire this warms. The scratch cache is dropped with
+    /// the probe.
+    private static func warmBlockShapes(_ drafter: DFlash2DraftModel) throws {
+        let context = MLXArray.zeros(
+            [1, 8, drafter.config.targetHiddenSize], dtype: drafter.dtype)
+        for blockSize in 2 ... (CBv2MTPConfig.testedMaxBlockDraftTokens + 1) {
+            let tokens = try drafter.propose(
+                anchor: [100], targetHidden: context,
+                cache: try drafter.makeCache(), blockSize: blockSize)
+            eval(tokens)
         }
     }
 
@@ -287,28 +315,80 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     }
 
     /// THE DTYPE CROSSING. The Bonsai trunk promotes activations to FP32 after
-    /// its FP32 norms; the drafter is BF16. The cast happens HERE rather than
-    /// at the drafter's `fc` input: it is the same one cast per context row,
-    /// and it additionally DETACHES the row from the whole prefill chunk it
-    /// was sliced out of, so a 2047-row window retains 2047 rows and not the
-    /// prompt. `DFlash2DraftModel.hiddenStates` casts again and that stays a
-    /// no-op for an already-BF16 tensor.
+    /// its FP32 norms; the drafter is BF16. Pending rows stay in the trunk's
+    /// dtype here and cross in `proposeBlock` (see `fusedProposeContext`), so
+    /// per-chunk casts never execute as their own elementwise passes at the
+    /// draft round's eval fence on top of the full-context cast
+    /// `DFlash2DraftModel.hiddenStates` already performs. Slice-then-cast
+    /// casts the same elements as cast-then-slice, so every assembly below is
+    /// bit-identical over the same elements.
+    ///
+    /// Fallback: `BONSAI_DFLASH2_EAGER_CAST=1` restores the legacy per-chunk
+    /// cast in `append`; `proposeBlock` then sees rows already in the
+    /// drafter's dtype and every cast below is a guarded no-op.
+    private static let eagerPerChunkCast: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_DFLASH2_EAGER_CAST"] == "1"
+
     private func append(_ hidden: MLXArray, to requestState: any CBv2MTPRequestState) {
         let state = self.state(requestState)
         guard hidden.dim(1) > 0 else { return }
-        state.append(hidden.asType(drafter.dtype), limit: contextRowLimit)
+        let rows = Self.eagerPerChunkCast ? hidden.asType(drafter.dtype) : hidden
+        state.append(rows, limit: contextRowLimit)
     }
 
     // MARK: - Proposing
+
+    /// Force the wide assembly below for parity A/B.
+    private static let forceWideConcat: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_DFLASH2_WIDE_CONCAT"] == "1"
+
+    /// Force the narrow assembly below for parity A/B.
+    private static let forceNarrowConcat: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_DFLASH2_NARROW_CONCAT"] == "1"
+
+    /// The round's fused context in the drafter's dtype: the tap-gather rows
+    /// (already fused across the tap layers upstream), concatenated along the
+    /// sequence axis, cast exactly once per element.
+    ///
+    /// Large round contexts assemble NARROW: one lazy cast per shard, then a
+    /// SINGLE `concatenated` in BF16. That moves ~10 bytes/element and never
+    /// materializes the wide FP32 intermediate (~14 bytes/element for
+    /// concat-then-cast at five tap layers). Small round contexts keep the
+    /// WIDE path — two launches beat C + 1 when there is almost nothing to
+    /// move. A lone pending chunk needs no concat at all: one guarded cast,
+    /// zero-copy when the rows already arrived in the drafter's dtype. The
+    /// choice reads shape metadata only, never a host sync, and the
+    /// `hiddenStates` cast stays a same-dtype no-op downstream either way.
+    private func fusedProposeContext(_ state: RequestState) -> MLXArray {
+        let dtype = drafter.dtype
+        if state.pending.count == 1 {
+            let only = state.pending[0]
+            return only.dtype == dtype ? only : only.asType(dtype)
+        }
+        let narrow: Bool
+        if Self.forceNarrowConcat {
+            narrow = true
+        } else if Self.forceWideConcat {
+            narrow = false
+        } else {
+            let elements = state.pendingRows * state.pending[0].dim(-1)
+            narrow = elements >= (state.pending.count - 1) * 2_000_000
+        }
+        if narrow {
+            return concatenated(
+                state.pending.map { $0.dtype == dtype ? $0 : $0.asType(dtype) },
+                axis: 1)
+        }
+        let fused = concatenated(state.pending, axis: 1)
+        return fused.dtype == dtype ? fused : fused.asType(dtype)
+    }
 
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
         guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
-        let context =
-            state.pending.count == 1
-            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        let context = fusedProposeContext(state)
         if !state.cacheSeeded {
             // The cache must sit where the retained context actually starts.
             // This is the reference's `cache.offset = prompt.size - rows`: a

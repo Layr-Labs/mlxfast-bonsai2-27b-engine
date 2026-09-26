@@ -63,14 +63,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     private var pagedRows: [PagedSequenceKV] = []
 
-    // Per-row absolute RoPE offsets `[B]` (int32, device array). REBUILT from
-    // host integers only on membership changes (`setRows`); ADVANCED
-    // on-device (`+ L`) inside `updateAndAttend`, mirroring `CBv2LayerCache`.
-    // The step loop therefore never uploads a fresh host array per layer per
-    // step, and never syncs — the model reads this each step and feeds it
-    // into the forward graph, which the step's `asyncEval` collapses so the
-    // lazy `+ L` chain cannot grow O(steps).
-    private var cachedPositionOffsets: MLXArray = MLXArray([] as [Int32])
+    // Per-row absolute RoPE offsets `[B]` (int32, device array), held by the
+    // owner box shared with every layer bound to the same composition (B2,
+    // same box type as `CBv2LayerCache` — see LayerCacheV2.swift). REBUILT
+    // from host integers only on membership changes (`setRows`, the
+    // broadcast below); ADVANCED on-device once per step by whichever
+    // sharing layer steps first (`advanceForStep`), mirroring
+    // `CBv2LayerCache`. The step loop therefore never uploads a fresh host
+    // array per layer per step, and never syncs — the model reads this each
+    // step and feeds it into the forward graph, which the step's
+    // `asyncEval` collapses so the lazy advance chain cannot grow O(steps).
+    private var sharedOffsets = CBv2SharedPositionOffsets(values: [])
     /// Times `positionOffsets` was rebuilt from host integers (test hook);
     /// must only move on batch membership changes, never inside the step loop.
     private(set) var positionOffsetsHostRebuilds = 0
@@ -189,13 +192,18 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// `updateAndAttend` for the step — it holds the PRE-update offsets of
     /// the tokens about to be processed (snapshot semantics). KV-shared
     /// layers own no rows, so their own value is empty (they reuse the
-    /// source layer's pre-update capture).
-    public var positionOffsets: MLXArray { cachedPositionOffsets }
+    /// source layer's pre-update capture); `attendBorrowing` never advances
+    /// the box.
+    public var positionOffsets: MLXArray { sharedOffsets.current }
 
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
-        cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
+        // Same broadcast as `CBv2LayerCache`: adopt the live box for this
+        // composition (or create it) and re-upload from host truth.
+        // Counters bump here (option (a)) — never on the step path.
+        sharedOffsets = CBv2SharedPositionOffsets.broadcast(
+            values: pagedRows.map { Int32($0.absoluteOffset) })
     }
 
     // MARK: - Attention
@@ -327,12 +335,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
             retainedPrefillKV = retainsChunkForBorrowers ? views : []
         }
-        // Advance offsets ON-DEVICE (uniform L for every row in the call:
-        // decode is [B,1], a prompt chunk is [1,chunk], and a packed group
-        // is [B,chunk] with one common chunk length) — the rows just
-        // advanced their absolute counters by exactly L, so the cached
-        // device array tracks them without a per-step host rebuild.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        // Advance the shared offsets ON-DEVICE through the single step
+        // helper (uniform L for every row in the call: decode is [B,1], a
+        // prompt chunk is [1,chunk], and a packed group is [B,chunk] with
+        // one common chunk length) — the rows just advanced their absolute
+        // counters by exactly L, so the box tracks them without a per-step
+        // host rebuild. Whichever sharing layer steps first performs the
+        // advance; the rest observe it and skip.
+        sharedOffsets.advanceForStep(
+            queries: queries, keys: keys,
+            rowOffsets: pagedRows.lazy.map { $0.absoluteOffset }, rowCount: pagedRows.count,
+            lastQuery: false, layerIndex: layerIndex)
         return output
     }
 
@@ -968,13 +981,14 @@ extension PagedLayerCache: KVCache {
     /// freshly written pages. Include that write explicitly in the step eval
     /// set, even when the prompt produces the terminal token: otherwise the
     /// lazy fence can retain source/segment arrays after the row is retired.
-    /// The position chain also rides this set so it cannot grow with steps.
+    /// The shared position chain also rides this set so it cannot grow with
+    /// steps.
     public func innerState() -> [MLXArray] {
         guard !pool.writeValidation.isFaulted else { return [] }
         guard kind.sharesKVWithLayer == nil, !pagedRows.isEmpty else {
-            return [cachedPositionOffsets]
+            return [sharedOffsets.current]
         }
-        return [cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence]
+        return [sharedOffsets.current, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence]
     }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
