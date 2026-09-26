@@ -780,23 +780,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x.reshaped(rows, k), rows: rows, k: k, n: n, siblings: siblings,
                 preSigned: preSigned, outputDType: outputDType, leading: leading)
         }
-        guard let applies = Self.tensorPackedMatmulApplies,
+        guard let matmul = Self.tensorPackedMatmul, let applies = Self.tensorPackedMatmulApplies,
             applies(rows, n, k),
             let activation = transform.forwardInt8(
                 x.reshaped(rows, k), gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
         else { return nil }
-        return tensorRoutePromptMatmul(
-            activation, siblings: siblings, n: n, outputDType: outputDType, leading: leading)
-    }
-
-    /// The prompt-width packed matmul of `tensorRouteForward` over an
-    /// activation already quantized for the route: one matmul for one
-    /// projection, or one over the stacked siblings split back per sibling.
-    private func tensorRoutePromptMatmul(
-        _ activation: SignedBlockHadamard.Int8Activation, siblings: [HadamardQuantizedLinear],
-        n: Int, outputDType: DType, leading: [Int]
-    ) -> [MLXArray]? {
-        guard let matmul = Self.tensorPackedMatmul else { return nil }
         if siblings.count == 1 {
             guard let y = matmul(
                 activation, weight, scales, biases!, groupSize, outputDType,
@@ -812,66 +800,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         return MLX.split(
             wide.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
-    }
-
-    /// True when the prompt-width tensor route is installed and on and `rows`
-    /// is a width its prompt branch takes (the per-projection guards of
-    /// `sharedHadamardTensorRouteTakesPrompt` still apply).
-    public static func tensorRouteTakesPromptRows(_ rows: Int) -> Bool {
-        tensorRouteEnabled && tensorPackedMatmul != nil && tensorPackedMatmulApplies != nil
-            && SignedBlockHadamard.fusedTransformInt8 != nil
-            && rows >= tensorRouteMinimumRows && rows % 64 == 0
-    }
-
-    /// True when `tensorRouteForward` takes `siblings` (self first) at prompt
-    /// width for an FP32 `[rows, transform.width]` activation: every guard of
-    /// its prompt branch, including the installed quantizing rotation that
-    /// `forwardInt8` needs. A caller that forms the quantized activation some
-    /// other way asks this before it launches anything.
-    fileprivate func tensorRouteTakesPrompt(
-        rows: Int, siblings: [HadamardQuantizedLinear]
-    ) -> Bool {
-        guard Self.tensorRouteEnabled, !siblings.isEmpty, siblings[0] === self,
-            Self.tensorPackedMatmul != nil, let applies = Self.tensorPackedMatmulApplies,
-            SignedBlockHadamard.fusedTransformInt8 != nil
-        else { return false }
-        let k = transform.width
-        guard rows >= Self.tensorRouteMinimumRows, rows % 64 == 0, k % 128 == 0 else {
-            return false
-        }
-        var n = 0
-        for sibling in siblings {
-            guard tensorRouteTakes(sibling) else { return false }
-            if sibling !== self {
-                guard gdnLayout == nil, sibling.sharesInputTransform(with: self) else {
-                    return false
-                }
-            }
-            n += sibling.weight.dim(0)
-        }
-        return applies(rows, n, k)
-    }
-
-    /// `tensorRouteForward`'s prompt branch on an activation that is exactly
-    /// what `forwardInt8` would have returned for the `[rows, k]` input: the
-    /// same guards, the same matmul, the result shaped `leading + [n]` and
-    /// split per sibling. Nil when the route does not take it.
-    fileprivate func tensorRouteForwardQuantized(
-        _ activation: SignedBlockHadamard.Int8Activation, rows: Int, leading: [Int],
-        siblings: [HadamardQuantizedLinear], widenOutput: Bool
-    ) -> [MLXArray]? {
-        let k = transform.width
-        guard tensorRouteTakesPrompt(rows: rows, siblings: siblings),
-            leading.reduce(1, *) == rows,
-            activation.codes.dtype == .uint8, activation.codes.shape == [rows, k],
-            activation.scales.dtype == .float32, activation.scales.shape == [rows, k / 128],
-            activation.scaledSums.dtype == .float32,
-            activation.scaledSums.shape == [rows, k / 128]
-        else { return nil }
-        let n = siblings.reduce(0) { $0 + $1.weight.dim(0) }
-        return tensorRoutePromptMatmul(
-            activation, siblings: siblings, n: n,
-            outputDType: widenOutput ? .float32 : .float16, leading: leading)
     }
 
     /// On unless explicitly disabled: `DARKBLOOM_BONSAI_TENSOR_ROUTE_PRODUCER=0`
@@ -1293,38 +1221,6 @@ public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantize
     return packed
 }
 
-/// True when `sharedHadamardProjections` (or its pre-signed form) over an FP32
-/// activation of `rows` rows would run these siblings on the prompt-width
-/// tensor route, quantizing the activation with `forwardInt8`. Siblings must
-/// share one ungrouped transform, as `sharedHadamardSiblings` returns them.
-public func sharedHadamardTensorRouteTakesPrompt(
-    _ siblings: [HadamardQuantizedLinear], rows: Int
-) -> Bool {
-    guard let first = siblings.first,
-        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
-    else { return false }
-    return first.tensorRouteTakesPrompt(rows: rows, siblings: siblings)
-}
-
-/// `sharedHadamardProjections` for an input whose quantized rotation is
-/// already formed: `activation` must be exactly the tuple `forwardInt8` would
-/// return for the FP32 input reshaped to `[rows, k]` (codes `[rows, k]`,
-/// scales and scaled sums `[rows, k / 128]`), and `leading` the input's shape
-/// without its last axis. The siblings read it through the same prompt-width
-/// matmul. Nil when the route does not take it (the caller then runs
-/// `sharedHadamardProjections` on the input itself).
-public func sharedHadamardProjectionsQuantized(
-    _ activation: SignedBlockHadamard.Int8Activation, leading: [Int],
-    _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
-) -> [MLXArray]? {
-    guard let first = siblings.first,
-        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
-    else { return nil }
-    return first.tensorRouteForwardQuantized(
-        activation, rows: leading.reduce(1, *), leading: leading, siblings: siblings,
-        widenOutput: widenOutput)
-}
-
 /// `sharedHadamardProjections` for an activation that already carries the
 /// shared transform's signs (see `SignedBlockHadamard.applyPreSigned`): the
 /// rotation skips its sign multiply, and every sibling reads the rotated
@@ -1408,20 +1304,6 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             transform(x), weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
     }
-}
-
-/// The row count from which a forward counts as prompt width: the timed
-/// prefill and the seed prefill, never a verify window (at most 17 rows).
-/// Paths measured at prompt width only gate on it (the composed causal
-/// attention of a prompt's query blocks, the fresh recurrent state of a new
-/// request's first chunk), so every verify-width path keeps its kernels.
-/// `BONSAI_PROMPT_MIN_ROWS` overrides the default of 64.
-public enum BonsaiPromptWidth {
-    public static let minimumRows: Int = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_MIN_ROWS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.flatMap { Int($0) } ?? 64
-    }()
 }
 
 /// ercumentyildirim's (`ade7529`) fused-INPUT rotations: the SwiGLU product,
