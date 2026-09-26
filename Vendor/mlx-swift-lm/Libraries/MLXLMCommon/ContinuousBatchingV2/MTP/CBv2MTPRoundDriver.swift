@@ -48,24 +48,6 @@ struct CBv2MTPCarry {
     /// `rec.numComputedTokens` at capture (== the row's KV absoluteOffset,
     /// the round anchor).
     let kvOffset: Int
-    /// A BLOCK drafter's proposal for the round this carry seeds, already
-    /// submitted at the previous round's finalize (see
-    /// `EngineLoopV2.finalizeMTPRound`). It is the exact `proposeBlock` the
-    /// next verify build would have made -- same anchor (`token`), same
-    /// committed context, same drafter cache -- issued before the rest of
-    /// finalize so the GPU is not idle while the host finishes the round.
-    /// nil: the next verify build proposes as before.
-    var earlyBlock: CBv2MTPEarlyBlockProposal? = nil
-}
-
-/// A block proposal issued at finalize for the NEXT round. `depth` is the
-/// block depth it was proposed at; a round may use a prefix of it, never more.
-struct CBv2MTPEarlyBlockProposal {
-    /// `[1, depth]` int32 draft ids, lazy and already submitted.
-    let tokens: MLXArray
-    let depth: Int
-    let anchor: Int
-    let kvOffset: Int
 }
 
 // MARK: - In-flight round payload
@@ -148,9 +130,6 @@ final class CBv2MTPRoundInFlight {
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
-    /// Prompt rows whose first sampled token becomes a round carry at
-    /// finalize (block drafters only; see `mtpPrefillCarryEnabled`).
-    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -168,15 +147,13 @@ final class CBv2MTPRoundInFlight {
         seedRows: [(id: CBv2RequestID, decodeIndex: Int)],
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
-        committedObservationRows: [CommittedObservationRow],
-        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
+        committedObservationRows: [CommittedObservationRow]
     ) {
         self.verify = verify
         self.seedRows = seedRows
         self.seedHidden = seedHidden
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
-        self.prefillCarries = prefillCarries
     }
 }
 
@@ -570,8 +547,7 @@ final class CBv2MTPRoundDriver {
         id: CBv2RequestID, token: Int, hidden: MLXArray,
         shortlist: MLXArray? = nil, previousTopTwoMargin: Double? = nil,
         needsHistoryTransition: Bool = false,
-        tokensCount: Int, kvOffset: Int,
-        earlyBlock: CBv2MTPEarlyBlockProposal? = nil
+        tokensCount: Int, kvOffset: Int
     ) {
         if tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter,
@@ -579,17 +555,11 @@ final class CBv2MTPRoundDriver {
         {
             assistantStates[id] = stateful.makeRequestState()
         }
-        if let earlyBlock {
-            precondition(
-                earlyBlock.anchor == token && earlyBlock.kvOffset == kvOffset,
-                "CBv2 block MTP: early proposal does not match the carry it rides")
-        }
         carries[id] = CBv2MTPCarry(
             token: token, hidden: hidden, shortlist: shortlist,
             previousTopTwoMargin: previousTopTwoMargin,
             needsHistoryTransition: needsHistoryTransition,
-            tokensCount: tokensCount, kvOffset: kvOffset,
-            earlyBlock: earlyBlock)
+            tokensCount: tokensCount, kvOffset: kvOffset)
     }
 
     var tracksPersistentHistory: Bool {

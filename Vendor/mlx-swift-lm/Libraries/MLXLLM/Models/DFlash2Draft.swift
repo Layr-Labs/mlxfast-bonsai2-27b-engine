@@ -823,47 +823,10 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 
 // MARK: - The decoder layer
 
-/// The gate and up projections' weights stacked along the output axis: the
-/// same BF16 bytes as the two loaded weights, concatenated once on first use
-/// and held in a plain class (never a stored `MLXArray` on the module, so
-/// reflection cannot add it to the parameter tree). One matmul over the
-/// stack replaces two over the same input, and the block's 16 rows fill one
-/// wider tensor tile instead of two. `DARKBLOOM_DFLASH2_STACK_GATEUP=0` keeps
-/// the two matmuls.
-private final class DFlash2GateUpStack {
-    private static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_GATEUP"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-    private var weight: MLXArray?
-    private var boundary = 0
-
-    func clear() {
-        weight = nil
-        boundary = 0
-    }
-
-    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
-    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
-        guard Self.enabled, gate.bias == nil, up.bias == nil,
-            gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
-            gate.weight.ndim == 2, up.weight.ndim == 2
-        else { return nil }
-        if weight == nil {
-            weight = concatenated([gate.weight, up.weight], axis: 0)
-            boundary = gate.weight.dim(0)
-        }
-        let y = matmul(x, weight!.T)
-        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
-    }
-}
-
 private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
-    private let gateUp = DFlash2GateUpStack()
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -872,20 +835,8 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
-    public override func update(
-        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
-        modulePath: [String] = []
-    ) throws -> Self {
-        gateUp.clear()
-        return try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return down(silu(g) * u)
-        }
-        return down(silu(gate(x)) * up(x))
+        down(silu(gate(x)) * up(x))
     }
 }
 
@@ -1185,23 +1136,28 @@ enum DFlash2GreedyWalk {
         else { return nil }
         let length = candidates.dim(1)
         let k = candidates.dim(2)
-        let rank = projected.dim(-1)
-        guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        guard length >= 1, k >= 1, k <= 32 else { return nil }
         let c = candidates[0]
-        // Gather only the codebook rows the candidate lists can visit. The
-        // fused kernel scores each edge and advances the greedy walk in one
-        // pass, instead of materializing an [L-1, K, K, rank] broadcast.
-        let anchorPredecessor = take(predecessorCodebook, anchor, axis: 0)
-            .asType(.float32).reshaped([-1])
-        let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
-            .asType(.float32).reshaped([-1])
-        let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
-        let projectedRows = projected[0].asType(.float32).reshaped([-1])
-        let scores = unary[0].asType(.float32).reshaped([-1])
-        let candidateIds = c.asType(.uint32).reshaped([-1])
+        let first =
+            (take(predecessorCodebook, anchor, axis: 0).expandedDimensions(axis: 1)
+                * projected[0..., 0, 0...].expandedDimensions(axis: 1)
+                * take(successorCodebook, c[0], axis: 0).expandedDimensions(axis: 0))
+            .sum(axis: -1)[0]
+        let later: MLXArray
+        if length > 1 {
+            let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            let next = take(successorCodebook, c[1...], axis: 0)
+            later =
+                ((previous * projected[0, 1..., 0...].expandedDimensions(axis: 1))
+                    .expandedDimensions(axis: 2)
+                    * next.expandedDimensions(axis: 1))
+                .sum(axis: -1)
+        } else {
+            later = MLXArray.zeros([1, k, k], dtype: first.dtype)
+        }
         let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
-            template: [("L", length), ("K", k), ("R", rank)],
+            [unary[0], first, later, c],
+            template: [("L", length), ("K", k)],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1210,30 +1166,22 @@ enum DFlash2GreedyWalk {
     }
 
     private static let kernel = MLXFast.metalKernel(
-        name: "mlxfast_dflash_fused_greedy_walk",
-        inputNames: [
-            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
-        ],
+        name: "mlxfast_dflash_greedy_walk",
+        inputNames: ["unary", "edge0", "edges", "cand"],
         outputNames: ["path"],
         source: """
             uint c = thread_index_in_simdgroup;
-            uint previous_slot = 0;
+            int prev = -1;
             for (uint i = 0; i < L; i++) {
                 float score = -INFINITY;
                 if (c < K) {
-                    const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
-                    const uint succ_base = (i * K + c) * R;
-                    float edge = 0.0f;
-                    for (uint d = 0; d < R; d++) {
-                        const float predecessor = i == 0
-                            ? anchor_predecessor[d] : previous[pred_base + d];
-                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
-                    }
-                    score = unary[i * K + c] + edge;
+                    float e = (i == 0) ? float(edge0[c])
+                                       : float(edges[((i - 1) * K + uint(prev)) * K + c]);
+                    score = unary[i * K + c] + e;
                 }
                 float m = simd_max(score);
                 uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
-                previous_slot = sel;
+                prev = int(sel);
                 if (c == 0) path[i] = int(cand[i * K + sel]);
             }
             """)
