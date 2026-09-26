@@ -203,11 +203,69 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
-    public let ssm: MLXArray?
+    private let storedSSM: MLXArray?
+    /// Non-nil when the SSM is the replay of a verify's accepted prefix that
+    /// has not been built yet (`CBv2DeferredRecurrentReplay`).
+    public let deferredReplay: CBv2DeferredRecurrentReplay?
+
+    /// The SSM. A deferred replay yields the state its fused consumer
+    /// produced, or else builds the replay now, on first read.
+    public var ssm: MLXArray? { deferredReplay?.ssm ?? storedSSM }
 
     public init(conv: MLXArray?, ssm: MLXArray?) {
         self.conv = conv
-        self.ssm = ssm
+        self.storedSSM = ssm
+        self.deferredReplay = nil
+    }
+
+    public init(conv: MLXArray, deferredReplay: CBv2DeferredRecurrentReplay) {
+        self.conv = conv
+        self.storedSSM = nil
+        self.deferredReplay = deferredReplay
+    }
+}
+
+/// A committed SSM that is the replay of a verify's accepted prefix (`keep`
+/// rows from the pre-verify state), left unbuilt at commit. The next verify of
+/// the layer may compute it inside its own scan from `inputs` (the model's
+/// replay inputs) and `resolve` it with that result; any other reader of
+/// `CBv2RecurrentLayerState.ssm` builds the ordinary replay instead. Both are
+/// the same values; exactly one of them is ever used.
+public final class CBv2DeferredRecurrentReplay {
+    public let keep: Int
+    public let inputs: AnyObject
+    private let lock = NSLock()
+    private var build: (() -> CBv2RecurrentLayerState)?
+    private var value: MLXArray?
+
+    init(keep: Int, inputs: AnyObject, build: @escaping () -> CBv2RecurrentLayerState) {
+        self.keep = keep
+        self.inputs = inputs
+        self.build = build
+    }
+
+    /// True until the state is resolved or built.
+    public var isPending: Bool { lock.withLock { value == nil } }
+
+    fileprivate var ssm: MLXArray? {
+        lock.withLock {
+            if value == nil, let build {
+                value = build().ssm
+                self.build = nil
+            }
+            return value
+        }
+    }
+
+    /// Adopt `ssm` as the committed state; false (nothing changes) when the
+    /// state was already resolved or built.
+    public func resolve(_ ssm: MLXArray) -> Bool {
+        lock.withLock {
+            guard value == nil else { return false }
+            value = ssm
+            build = nil
+            return true
+        }
     }
 }
 
@@ -234,6 +292,11 @@ public struct CBv2RecurrentPrefixReplayStage {
     /// rejectable exact-tail copies out of the verify graph.
     fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
+    /// Optional: the committed conv after `keep` rows and the replay inputs
+    /// a following verify can fuse (`CBv2DeferredRecurrentReplay`). A commit
+    /// that replays (a strict prefix, or full acceptance without a final
+    /// state) then leaves the SSM unbuilt.
+    fileprivate let deferral: ((Int) -> (conv: MLXArray, inputs: AnyObject)?)?
 
     public init(
         positions: Int,
@@ -246,6 +309,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        deferral: ((Int) -> (conv: MLXArray, inputs: AnyObject)?)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard positions >= 2 else {
@@ -272,7 +336,19 @@ public struct CBv2RecurrentPrefixReplayStage {
         self.fullAcceptanceRetainedByteCount = fullAcceptanceRetainedByteCount
         self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
         self.fullAcceptance = fullAcceptance
+        self.deferral = deferral
         self.replay = replay
+    }
+
+    /// The committed state after `keep` rows as a deferred replay whose
+    /// builder is `build` (the eager commit path), or nil without a deferral.
+    fileprivate func deferredState(
+        keep: Int, build: @escaping () -> CBv2RecurrentLayerState
+    ) -> CBv2RecurrentLayerState? {
+        guard let deferral, let (conv, inputs) = deferral(keep) else { return nil }
+        return CBv2RecurrentLayerState(
+            conv: conv,
+            deferredReplay: CBv2DeferredRecurrentReplay(keep: keep, inputs: inputs, build: build))
     }
 }
 
@@ -492,12 +568,23 @@ public final class CBv2RecurrentRequestState {
             }
             clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
+            // A replayed commit may stay deferred (`CBv2DeferredRecurrentReplay`):
+            // its builder is exactly the eager expression beside it.
             if fullAcceptance {
                 committed = replay.mapValues { stage in
-                    stage.fullAcceptance?() ?? stage.finalState
+                    if stage.finalState.ssm == nil,
+                        let deferred = stage.deferredState(
+                            keep: keep, build: { stage.fullAcceptance?() ?? stage.finalState })
+                    {
+                        return deferred
+                    }
+                    return stage.fullAcceptance?() ?? stage.finalState
                 }
             } else {
-                committed = replay.mapValues { $0.replay(keep) }
+                committed = replay.mapValues { stage in
+                    stage.deferredState(keep: keep, build: { stage.replay(keep) })
+                        ?? stage.replay(keep)
+                }
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []
@@ -670,6 +757,7 @@ public final class CBv2RecurrentStateEvaluation {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        deferral: ((Int) -> (conv: MLXArray, inputs: AnyObject)?)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
@@ -699,6 +787,7 @@ public final class CBv2RecurrentStateEvaluation {
             fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
             fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
             fullAcceptance: fullAcceptance,
+            deferral: deferral,
             replay: replay)
     }
 
