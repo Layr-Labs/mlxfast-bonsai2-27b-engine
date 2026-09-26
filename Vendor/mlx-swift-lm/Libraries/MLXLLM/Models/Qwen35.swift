@@ -5930,14 +5930,25 @@ enum Qwen35TensorPackedMatmul {
             #pragma clang loop unroll(full)
             for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
           }
+          // Four consecutive results share one nh and one mh, and c runs 0..3,
+          // so the scale, bias and folded-sum vectors apply as one float4.
+          // SIGNED multiplies; the unsigned path keeps the folded-sum FMA.
+          // Values match the scalar epilogue.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float u = nh ? u1[c] : u0[c];
-            const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
-            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          for (int i = 0; i < CAP; i += 4) {
+            const int nh = (i >> 3) & 1;
+            const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float4 s = nh ? s1 : s0;
+            const float4 b = nh ? b1 : b0;
+            const float4 u = nh ? u1 : u0;
+            const float4 ct = float4(float(cT[i]), float(cT[i + 1]), float(cT[i + 2]), float(cT[i + 3]));
+            const float4 t = SIGNED ? s * ct : fma(s, ct, u);
+            const float4 acc4 = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+            const float4 a = fma(b, float4(rb[mh]), fma(float4(as[mh]), t, acc4));
+            acc[i] = a.x;
+            acc[i + 1] = a.y;
+            acc[i + 2] = a.z;
+            acc[i + 3] = a.w;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
