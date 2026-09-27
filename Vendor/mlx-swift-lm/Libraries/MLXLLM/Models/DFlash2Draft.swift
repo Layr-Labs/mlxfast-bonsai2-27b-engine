@@ -797,6 +797,9 @@ extension DFlash2Attention {
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 
+    /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
+    func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
+
     var speculativeCapable: Bool {
         dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
             && qkv.applies(q: qProj, k: kProj, v: vProj)
@@ -914,6 +917,9 @@ private final class DFlash2QKVStack {
     static let kvOnlyMinimumRows = 256
 
     func applies(q: Linear, k: Linear, v: Linear) -> Bool { stacked(q: q, k: k, v: v) != nil }
+
+    /// The stacked weight (built on first use), or nil when the stack does not apply.
+    func stackWeight(q: Linear, k: Linear, v: Linear) -> MLXArray? { stacked(q: q, k: k, v: v) }
 
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
@@ -1497,6 +1503,168 @@ enum DFlash2TensorMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    /// `sourceSwapped` (on after its load-time self-test; `MLXFAST_DRAFT_SWAP=0`
+    /// keeps `source`): the same product with the operands' roles swapped.
+    /// Each simdgroup loads its 32-column weight slice for one KT-wide K
+    /// step (KT = 128) into a cooperative left operand (`[32, KT]`, K
+    /// contiguous as stored) and multiplies it by the transposed 16-row input
+    /// slice, so the op is `32 x 16 x KT` into a `[32 columns, 16 rows]` FP32
+    /// accumulator. The weight read is a plain cooperative load issued ahead
+    /// of the op instead of the op's own operand fetch. Each output element is
+    /// still the FP32 sum of the same BF16 products over each simdgroup's K
+    /// partition, accumulated in K order, and the partitions (`SPLITS`, the
+    /// same `K / SPLITS` slabs) are added in the same order as `source`, so
+    /// the output is bitwise `source`'s: `prepareSwapped` compares every
+    /// weight's output bit for bit at load and keeps `source` on any
+    /// mismatch. Stored layout only (no tiled copy is read).
+    private static let sourceSwapped = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          auto tX = X.template slice<KT, 16>(k, 0);
+          lw.load(tW);
+          op.run(lw, tX, cT);
+        }
+        threadgroup float red[SPLITS - 1][16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT.is_valid_element(i)) continue;
+            float v;
+            if constexpr (SPLITS == 2) {
+              v = cT[i] + red[0][i * 32 + lane];
+            } else {
+              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            }
+            // Destination coordinates: [0] the input row, [1] the column in the block.
+            auto idx = cT.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelSwapped = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m16s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// `source32` in `sourceSwapped`'s form: one cooperative `[32, KT]`
+    /// weight slice per K step, multiplied by the input's rows 0-15 and
+    /// 16-31 (two `32 x 16 x KT` ops into two accumulators), the same K
+    /// partitions and the same partial order as `source32`, so its bits
+    /// (`prepareSwapped` compares them at load).
+    private static let sourceSwapped32 = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT0.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          lw.load(tW);
+          auto tXlo = X.template slice<KT, 16>(k, 0);
+          op.run(lw, tXlo, cT0);
+          auto tXhi = X.template slice<KT, 16>(k, 16);
+          op.run(lw, tXhi, cT1);
+        }
+        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT0.is_valid_element(i)) continue;
+            float v0, v1;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
+                  + red[2][(16 + i) * 32 + lane];
+            }
+            auto idx = cT0.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+          }
+        }
+        """
+
+    private static let kernelSwapped32 = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m32s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped32,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// Whether 17-32-row launches take `sourceSwapped32` (set by `prepareSwapped`).
+    nonisolated(unsafe) static var swapped32Active = false
+
+    /// The K step of `sourceSwapped` (`MLXFAST_DRAFT_SWAP_KT`: 64 or 128, default 128).
+    private static let swappedKT: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_KT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw == "64" ? 64 : 128
+    }()
+
+    /// `MLXFAST_DRAFT_SWAP=0` keeps `source` for the stored layout.
+    private static let swappedSetting: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// Whether stored-layout launches take `sourceSwapped`: set once by
+    /// `prepareSwapped` when every weight's output matched bit for bit.
+    nonisolated(unsafe) static var swappedActive = false
+
     // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
     // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
     // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
@@ -1641,13 +1809,7 @@ enum DFlash2TensorMatmul {
                 a = concatenated(
                     [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
             }
-            let splits = n >= 16384 ? 2 : 4
-            let threads = splits * 32
-            let y = kernel32(
-                [a, weight, dimsArray(k: k, n: n)],
-                template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
-                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
-                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
+            let y = launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
             let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
             return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
         }
@@ -1657,7 +1819,10 @@ enum DFlash2TensorMatmul {
         }
         let chosen = current
         let y: MLXArray
-        if chosen.tiled, let tiled = tiledCopy(weight) {
+        if swappedActive {
+            // The swapped kernel reads the stored weight (no copy exists while it is on).
+            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+        } else if chosen.tiled, let tiled = tiledCopy(weight) {
             y = chosen.variant(n: n)
                 ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
                 : launch(a, tiled, k: k, n: n, tiled: true, outputDType: .bfloat16)
@@ -1695,11 +1860,130 @@ enum DFlash2TensorMatmul {
         // Keep the accepted four-way route for the smaller projections.
         let splits = Kernel.stockSplits(n: n)
         let threads = splits * 32
+        if !tiled && swappedActive {
+            return launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+        }
         return kernel(
             [a, w, dimsArray(k: k, n: n)],
             template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", tiled ? 1 : 0)],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `source32` (or `sourceSwapped32` when `swapped`) over a 32-row `a`.
+    private static func launch32(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, swapped: Bool, outputDType: DType
+    ) -> MLXArray {
+        let splits = n >= 16384 ? 2 : 4
+        let threads = splits * 32
+        if swapped {
+            return kernelSwapped32(
+                [a, w, dimsArray(k: k, n: n)],
+                template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernel32(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `sourceSwapped` over a 16-row `a` and the stored `[N, K]` weight, with
+    /// the stock kernel's K split.
+    private static func launchSwapped(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, splits: Int, outputDType: DType
+    ) -> MLXArray {
+        let threads = splits * 32
+        return kernelSwapped(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Runs `sourceSwapped` and the stock kernel on every one of `weights`
+    /// (stored layout) against the same random 16-row BF16 input, FP32 and
+    /// BF16 outputs, and compares every output bit; `swappedActive` only when
+    /// all match. One stderr line either way. Nothing runs when the kernel is
+    /// off, the toolchain has no tensor operands, or `MLXFAST_DRAFT_SWAP=0`.
+    static func prepareSwapped(_ weights: [MLXArray], rows32 weights32: [MLXArray] = []) -> Bool {
+        swappedActive = false
+        swapped32Active = false
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, swappedSetting else {
+            return false
+        }
+        let eligible = weights.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        guard !eligible.isEmpty else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var inputs: [Int: MLXArray] = [:]
+        var differing: [MLXArray] = []
+        var values = 0
+        for (index, w) in eligible.enumerated() {
+            let k = w.dim(1)
+            let n = w.dim(0)
+            let splits = n >= 16384 ? 2 : 4
+            let a = inputs[k] ?? MLXRandom.normal(
+                [rowsPerTile, k], key: MLXRandom.key(UInt64(9203 + index))
+            ).asType(.bfloat16)
+            inputs[k] = a
+            for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                let stock = kernel(
+                    [a, w, dimsArray(k: k, n: n)],
+                    template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", 0)],
+                    grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+                    outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+                let swapped = launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+                differing.append(
+                    (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                values += rowsPerTile * n
+            }
+            if differing.count >= 16 {
+                let partial = stacked(differing).sum()
+                eval(partial)
+                differing = [partial]
+            }
+        }
+        let mismatches = stacked(differing).sum().item(Int.self)
+        swappedActive = mismatches == 0
+        // The 32-row form, only while the 16-row one is on.
+        var mismatches32 = 0
+        var values32 = 0
+        let eligible32 = weights32.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        if swappedActive, rows32Enabled, !eligible32.isEmpty {
+            var differing32: [MLXArray] = []
+            for (index, w) in eligible32.enumerated() {
+                let k = w.dim(1)
+                let n = w.dim(0)
+                let a = MLXRandom.normal(
+                    [2 * rowsPerTile, k], key: MLXRandom.key(UInt64(9403 + index))
+                ).asType(.bfloat16)
+                for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                    let stock = launch32(a, w, k: k, n: n, swapped: false, outputDType: outputDType)
+                    let swapped = launch32(a, w, k: k, n: n, swapped: true, outputDType: outputDType)
+                    differing32.append(
+                        (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                    values32 += 2 * rowsPerTile * n
+                }
+            }
+            mismatches32 = stacked(differing32).sum().item(Int.self)
+            swapped32Active = mismatches32 == 0
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 swapped m16 kernel: self-test \(swappedActive ? "passed" : "FAILED") "
+                    + "(\(eligible.count) weights, \(values) values bitwise, \(mismatches) mismatches); "
+                    + (swappedActive ? "on, K step \(swappedKT)" : "stock kept")
+                    + "; 32-row form \(eligible32.count) weights, \(values32) values, "
+                    + "\(mismatches32) mismatches, " + (swapped32Active ? "on" : "off")
+                    + String(format: "; %.0f ms\n", elapsed)).utf8))
+        return swappedActive
     }
 
     // MARK: Tiled weights
@@ -1895,7 +2179,7 @@ enum DFlash2TensorMatmul {
     /// while `current` reads the tiled copies (`tiled` and every variant),
     /// the weight itself otherwise (`stock`, or a weight without a copy).
     static func readWeight(_ weight: MLXArray) -> MLXArray {
-        (current.tiled ? tiledCopy(weight) : nil) ?? weight
+        (current.tiled && !swappedActive ? tiledCopy(weight) : nil) ?? weight
     }
 
     /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
@@ -1933,7 +2217,9 @@ enum DFlash2TensorMatmul {
         dropTiledCopies()
         current = .stock
         passedBitwiseVariants = []
-        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false
+        // The swapped kernel reads the stored layout: no copy, no kernel trial.
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false,
+            !swappedActive
         else { return false }
         let eligible = weights.filter {
             $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
@@ -2463,6 +2749,12 @@ private final class DFlash2DecoderLayer: Module {
             !skipped.contains(ObjectIdentifier($0))
         }
         return (attention.read + feedForward.read + rest, replaced)
+    }
+
+    /// The two convolutions' tap projections (16-row tensor kernel too).
+    func projectionWeights() -> [MLXArray] {
+        [attentionConv.kernelProjection, mlpConv.kernelProjection]
+            .filter { $0.bias == nil }.map { $0.weight }
     }
 
     func callAsFunction(
@@ -3279,7 +3571,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// a copy only the rounds read would be one more array to make GPU-
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
-        DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
+        let layerWeights = layers.flatMap { $0.tensorWeights() }
+        _ = DFlash2TensorMatmul.prepareSwapped(
+            layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : []),
+            rows32: layers.compactMap { $0.selfAttn.stackedQKVWeight() })
+        return DFlash2TensorMatmul.prepareTiled(layerWeights)
     }
 
     /// Every array a block forward reads that this drafter owns, in forward

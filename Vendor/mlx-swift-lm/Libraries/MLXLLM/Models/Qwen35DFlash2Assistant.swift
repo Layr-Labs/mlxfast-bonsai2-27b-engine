@@ -161,6 +161,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
+                self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
             }
@@ -194,6 +195,20 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
     /// `=0` no self-test either). Nothing runs where the head is not on the
     /// int8 verify route or its fused form fails the self-test.
+    /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
+    /// after the verify kernels' trial, the same way: one engine request,
+    /// cancelled once both arms have their rounds, the choice, one stderr
+    /// line, the buffer cache drained.
+    private func runNarrowProducerTrial(serving: any LanguageModel) {
+        typealias Trial = Qwen35NarrowProducerTrial
+        guard Trial.armed else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded, producerTrial: true)
+        Stream().synchronize()
+        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
+        Memory.clearCache()
+    }
+
     private func runHeadTopTwoTrial(serving: any LanguageModel) {
         typealias Head = Qwen35HeadTopTwo
         guard Head.forced != false, Qwen35TensorPackedMatmul.prepareHeadTop2() else { return }
@@ -272,7 +287,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false
+        kernelTrial: Bool = false, producerTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -341,7 +356,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     guard let engine else { return }
                     DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
                 }
-                if headTrial {
+                if producerTrial {
+                    Qwen35NarrowProducerTrial.begin(onEnough: cancel)
+                } else if headTrial {
                     Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
                 } else if kernelTrial {
                     DFlash2KernelTrial.begin(onEnough: cancel)
@@ -360,6 +377,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             done.wait()
             if trialRounds > 0 {
                 Qwen35TensorPackedMatmul.NarrowInSituTrial.active = false
+                Qwen35NarrowProducerTrial.active = false
                 Qwen35HeadTopTwo.Trial.active = false
                 DFlash2KernelTrial.active = false
             }
@@ -748,6 +766,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
+        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         let state = self.state(requestState)
@@ -927,6 +946,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             plan.classes[confirmed] == s.block.contextRows
         else { return nil }
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
+        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         drafter.adoptSpeculative(s.block, confirmed: confirmed, cache: state.caches)
