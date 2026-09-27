@@ -646,6 +646,41 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// On the last 128-group of the int8 prompt kernel, write each lane's
+    /// 32 outputs before the K loop returns, with the parent's `float4` or
+    /// `half4` store, instead of in the store loop after it. Earlier groups
+    /// still only update `acc`: the sum is not final until `g + 1 >= Kg`.
+    /// `DARKBLOOM_QWEN35_PROMPT_STORE_LAST=0` keeps every store in the loop
+    /// after the K loop.
+    static let promptStoreLast: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_STORE_LAST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// With the last-group stores enabled, issue each `float4`/`half4` inside
+    /// that group's epilogue `fma` loop rather than in a block after all 32
+    /// `fma`s. `DARKBLOOM_QWEN35_PROMPT_STORE_INT=0` keeps the eight widened
+    /// stores together after the `fma` loop and before the closing barrier.
+    /// Ignored when `DARKBLOOM_QWEN35_PROMPT_STORE_LAST=0`.
+    static let promptStoreInterleave: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_STORE_INT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// With the stores inside the last group's `fma`, write two widened
+    /// stores (outputs `i-7..i`) after `i % 8 == 7` instead of one widened
+    /// store after `i % 4 == 3`. Same addresses, increasing `i`.
+    /// `DARKBLOOM_QWEN35_PROMPT_STORE_PAIR=0` stores each group of four on
+    /// the iteration that finished it. Ignored unless both switches above
+    /// are on.
+    static let promptStorePair: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_STORE_PAIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -1779,6 +1814,23 @@ enum Qwen35TensorPackedMatmul {
             *(threadgroup uint4*)(dst + 4 * j) = codes;
           }
         };
+        // The parent's widened store. ei is the first of four consecutive
+        // outputs (ei % 4 == 0). Used on the last group when SLAST is on,
+        // and after the K loop when SLAST is off.
+        auto emit4 = [&](int ei) {
+          const int nh = (ei >> 3) & 1;
+          const int mm = mb + 8 * ((ei >> 2) & 1) + 32 * ((ei >> 4) & 1);
+          const float v0 = acc[ei];
+          const float v1 = acc[ei + 1];
+          const float v2 = acc[ei + 2];
+          const float v3 = acc[ei + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
+        };
         stage(0, 0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int g = 0; g < Kg; g++) {
@@ -1819,27 +1871,33 @@ enum Qwen35TensorPackedMatmul {
               const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
               acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
             }
+            // SINT: on the last group the four outputs ending at i are final
+            // once c == 3. SPAIR waits until i % 8 == 7 and then writes both
+            // groups of four. The store does not write acc.
+            if constexpr (SLAST != 0 && SINT != 0) {
+              if (g + 1 >= Kg) {
+                if constexpr (SPAIR != 0) {
+                  if ((i & 7) == 7) { emit4(i - 7); emit4(i - 3); }
+                } else if ((i & 3) == 3) {
+                  emit4(i - 3);
+                }
+              }
+            }
+          }
+          // SLAST without SINT: the eight widened stores as one block, still
+          // on the last group only, still before the barrier.
+          if constexpr (SLAST != 0 && SINT == 0) {
+            if (g + 1 >= Kg) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i += 4) { emit4(i); }
+            }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. Hot path:
-        // support==staged8 (signed + FACTORED). Alignment under tip N/nb guards.
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-          }
+        // SLAST == 0: the recorded store loop, after every group has updated acc.
+        if constexpr (SLAST == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) { emit4(i); }
         }
         """
 
@@ -2318,6 +2376,9 @@ enum Qwen35TensorPackedMatmul {
                     ("OutT", DType.float32), ("MPERM", rowTiledConstants ? 1 : 0),
                     ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", 1),
                     ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", tiledFlag),
+                    ("SLAST", promptStoreLast ? 1 : 0),
+                    ("SINT", promptStoreInterleave ? 1 : 0),
+                    ("SPAIR", promptStorePair ? 1 : 0),
                 ],
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -3055,6 +3116,9 @@ enum Qwen35TensorPackedMatmul {
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
+                template.append(("SLAST", promptStoreLast ? 1 : 0))
+                template.append(("SINT", promptStoreInterleave ? 1 : 0))
+                template.append(("SPAIR", promptStorePair ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             // The prompt route reads the verify route's tiled copy too, so the
