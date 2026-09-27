@@ -181,30 +181,13 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          // Same fold as the scalar loop; store four consecutive columns as
-          // float4/half4. Layout: i groups of 4 share mh,nq with c=0..3.
-          // Alignment: fn in {0,4,8,12}, n0 multiple of TN, N multiple of 32.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i += 4) {
-            const int mh = (i >> 2) & 1;
-            const int nq = i >> 3;
-            float v0 = acc[i];
-            float v1 = acc[i + 1];
-            float v2 = acc[i + 2];
-            float v3 = acc[i + 3];
+          for (int i = 0; i < CAP; i++) {
+            float v = acc[i];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < SG - 1; q++) {
-              v0 += red[q][i * 32 + lane];
-              v1 += red[q][(i + 1) * 32 + lane];
-              v2 += red[q][(i + 2) * 32 + lane];
-              v3 += red[q][(i + 3) * 32 + lane];
-            }
-            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
-            if constexpr (sizeof(OutT) == sizeof(float)) {
-              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-            } else {
-              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-            }
+            for (int q = 0; q < SG - 1; q++) { v += red[q][i * 32 + lane]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
           }
         }
         """
@@ -3265,18 +3248,6 @@ enum Qwen35TensorPackedMatmul {
         _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
         k: Int, n: Int, outputDType: DType, materialize: Bool
     ) -> NarrowKernel {
-        let choice = narrowChoice(cache, scales, biases, k: k, n: n, outputDType: outputDType)
-        if choice.form == .negativeBiasF32Scales {
-            _ = narrowScalesF32(cache, scales, materialize: materialize)
-        }
-        return choice
-    }
-
-    /// `narrowKernel` without building the FP32 scales.
-    static func narrowChoice(
-        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
-        k: Int, n: Int, outputDType: DType
-    ) -> NarrowKernel {
         let choice = narrowByShape[[k, n]] ?? narrowDefault
         if n % choice.variant.tn != 0 { return .original }
         // zoo 3a: only on the production shapes its self-test ran (not the head)
@@ -3295,6 +3266,9 @@ enum Qwen35TensorPackedMatmul {
         }
         guard choice.form != .base else { return choice }
         guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
+        if choice.form == .negativeBiasF32Scales {
+            _ = narrowScalesF32(cache, scales, materialize: materialize)
+        }
         return choice
     }
 
@@ -4084,7 +4058,6 @@ enum Qwen35TensorPackedMatmul {
                     activation.scaledSums.shape == [m, k / 128],
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
-                recordVerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType)
                 let choice = narrowKernel(
                     cache, scales, biases, k: k, n: n, outputDType: outputDType, materialize: false)
                 let scalesT: MLXArray
@@ -4182,7 +4155,6 @@ enum Qwen35TensorPackedMatmul {
             // built here, at the first prompt forward (the load-time warm), so
             // no verify round pays the readback or the widening.
             prepareNarrowOperands(cache, weight, scales, biases)
-            cache.residencyMarks |= promptReadMark
             let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
             let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
             let foldedSums = cache.derived(scales, tag: 3) { s in
@@ -4216,88 +4188,6 @@ enum Qwen35TensorPackedMatmul {
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
-    }
-}
-
-// MARK: - Window-only verify operands (DFlash2ResidencyPrefetch)
-
-/// The verify int8 operands a decode window reads that its seed's prompt
-/// route does not, for `DFlash2ResidencyPrefetch` to make GPU-resident behind
-/// the seed. The prompt route binds each projection's words (the tiled copy
-/// where tiled), FP16 scales and offsets transposed (tags 1, 2) and folded
-/// sums (tag 3); the verify route binds the same words and, by the kernel
-/// chosen for the shape (the load-time pick, its in-situ trial, the zoo
-/// trials), tags 1 and 2, tag 1 alone, or the FP32-widened scales (tag 4),
-/// which nothing else reads. So a projection the prompt route reads adds only
-/// its tag 4 when its chosen form reads it; one it never reads (the head, the
-/// last layer's narrowed rows) adds every operand of its chosen kernel.
-extension Qwen35TensorPackedMatmul {
-    /// `HadamardConstantLayoutCache.residencyMarks` bits.
-    static let promptReadMark = 4
-
-    /// A verify int8 call site, held weakly: its layout cache and constants.
-    private final class VerifySite {
-        weak var cache: HadamardConstantLayoutCache?
-        weak var weight: MLXArray?
-        weak var scales: MLXArray?
-        weak var biases: MLXArray?
-        let k: Int, n: Int, outputDType: DType
-
-        init(
-            _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, _ scales: MLXArray,
-            _ biases: MLXArray, k: Int, n: Int, outputDType: DType
-        ) {
-            (self.cache, self.weight, self.scales, self.biases) = (cache, weight, scales, biases)
-            (self.k, self.n, self.outputDType) = (k, n, outputDType)
-        }
-    }
-
-    private static let siteLock = NSLock()
-    nonisolated(unsafe) private static var verifySites: [VerifySite] = []
-
-    /// Records a verify int8 site at its first graph build per output dtype
-    /// (a mark on its cache; later calls check the mark only).
-    static func recordVerifySite(
-        _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, _ scales: MLXArray,
-        _ biases: MLXArray, k: Int, n: Int, outputDType: DType
-    ) {
-        let mark = outputDType == .float32 ? 2 : 1
-        guard cache.residencyMarks & mark == 0 else { return }
-        siteLock.withLock {
-            guard cache.residencyMarks & mark == 0 else { return }
-            cache.residencyMarks |= mark
-            verifySites.append(
-                VerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType))
-        }
-    }
-
-    /// The window-only operands of every recorded site under the kernels
-    /// installed now (built ones only; nothing is built here).
-    static func windowResidencyArrays() -> [MLXArray] {
-        let sites = siteLock.withLock { verifySites }
-        var arrays: [MLXArray] = []
-        for site in sites {
-            guard let cache = site.cache, let weight = site.weight, let scales = site.scales,
-                let biases = site.biases
-            else { continue }
-            let choice = narrowChoice(
-                cache, scales, biases, k: site.k, n: site.n, outputDType: site.outputDType)
-            let promptRead = cache.residencyMarks & promptReadMark != 0
-            var reads: [MLXArray?] = []
-            if !promptRead { reads.append(narrowTiled ? cache.existing(weight, tag: 5) : weight) }
-            switch choice.form {
-            case .negativeBiasF32Scales:
-                reads.append(cache.existing(scales, tag: 4))
-            case .negativeBias:
-                if !promptRead { reads.append(cache.existing(scales, tag: 1)) }
-            case .base:
-                if !promptRead {
-                    reads += [cache.existing(scales, tag: 1), cache.existing(biases, tag: 2)]
-                }
-            }
-            arrays += reads.compactMap { $0 }
-        }
-        return arrays
     }
 }
 
