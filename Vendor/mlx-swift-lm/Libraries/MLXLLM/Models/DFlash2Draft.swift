@@ -1113,7 +1113,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
 /// Kill switch for the tap-0 convolution joined to its context rows (default on).
 private let dflash2ConvJoinEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_JOIN"]
-    else { return true }
+    else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
@@ -2737,7 +2737,7 @@ enum DFlash2GreedyWalk {
     static let narrowOperands: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_NARROW"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static func selectNarrow(
@@ -3423,7 +3423,7 @@ enum DFlash2Concat {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_ONE_LAUNCH_CONCAT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static let kernelLock = NSLock()
@@ -3575,7 +3575,7 @@ enum DFlash2StridedRMSNorm {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_STRIDED_NORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -3755,7 +3755,7 @@ enum DFlash2QKPrework {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_QK_PREWORK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -3943,7 +3943,7 @@ enum DFlash2SwiGLU {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SWIGLU"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
