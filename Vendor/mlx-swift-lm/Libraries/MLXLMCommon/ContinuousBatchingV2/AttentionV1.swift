@@ -991,11 +991,7 @@ package enum CBv2PromptCausalAttention {
 
     /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
     /// per thread (kL % 4 == 0, so they share a row).
-    private static let maskKernel = MLXFast.metalKernel(
-        name: "bonsai_prompt_causal_scale_select",
-        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
-        outputNames: ["out"],
-        source: """
+    private static let maskSource = """
             const uint base = thread_position_in_grid.x * 4;
             const uint kl = uint(c_kl);
             const int j = int(base % kl);
@@ -1005,8 +1001,7 @@ package enum CBv2PromptCausalAttention {
             for (int w = 0; w < 4; w++) {
               out[base + w] = (j + w <= last) ? scores[base + w] * c_scale : c_fill;
             }
-            """,
-        ensureRowContiguous: true)
+            """
 
     /// MLX's `softmax_single_row<float, float, 4>` (the precise FP32
     /// softmax `Softmax::eval_gpu` runs on a row of at most 4096 columns) with
@@ -1018,11 +1013,7 @@ package enum CBv2PromptCausalAttention {
     /// mode MLX builds its own kernels in. The one new contraction candidate,
     /// `s * scale - max`, has an exact product (a power-of-two scale), so an
     /// FMA would round it exactly as the stored product was.
-    private static let softmaxKernel = MLXFast.metalKernel(
-        name: "bonsai_prompt_causal_scale_select_softmax",
-        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
-        outputNames: ["out"],
-        source: """
+    private static let softmaxSource = """
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -1109,8 +1100,90 @@ package enum CBv2PromptCausalAttention {
                 }
               }
             }
-            """,
-        ensureRowContiguous: true)
+            """
+
+    private static let packedParametersEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_CAUSAL_PACKED_PARAMS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // Current-call geometry and Float bit patterns share one Int32 operand.
+    // Only kernel objects and the device verdict persist, never scores/outputs.
+    private static func makeKernel(
+        name: String, source: String, packed: Bool
+    ) -> MLXFast.MLXFastKernel {
+        let parameters = packed ? """
+            const int c_off = metadata[0];
+            const int c_ql = metadata[1];
+            const int c_kl = metadata[2];
+            const float c_scale = as_type<float>(metadata[3]);
+            const float c_fill = as_type<float>(metadata[4]);
+
+            """ : ""
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: packed ? ["scores", "metadata"]
+                : ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
+            outputNames: ["out"], source: parameters + source, ensureRowContiguous: true)
+    }
+
+    private static let maskKernel = makeKernel(
+        name: "bonsai_prompt_causal_scale_select", source: maskSource, packed: false)
+    private static let softmaxKernel = makeKernel(
+        name: "bonsai_prompt_causal_scale_select_softmax", source: softmaxSource, packed: false)
+    private static let packedMaskKernel = makeKernel(
+        name: "bonsai_prompt_causal_scale_select_packed", source: maskSource, packed: true)
+    private static let packedSoftmaxKernel = makeKernel(
+        name: "bonsai_prompt_causal_scale_select_softmax_packed", source: softmaxSource,
+        packed: true)
+
+    private static func operands(
+        scores: MLXArray, rows: Int, keyLength: Int, scale: Float, packed: Bool
+    ) -> [any ScalarOrArray] {
+        if packed {
+            return [scores, MLXArray([
+                Int32(keyLength - rows), Int32(rows), Int32(keyLength),
+                Int32(bitPattern: scale.bitPattern),
+                Int32(bitPattern: (-Float.greatestFiniteMagnitude).bitPattern),
+            ])]
+        }
+        return [scores, MLXArray(Int32(keyLength - rows)), MLXArray(Int32(rows)),
+            MLXArray(Int32(keyLength)), MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude)]
+    }
+
+    // First warm use checks both parameter decoders on the current device.
+    // A failed proof leaves the original scalar-operand kernels in service.
+    private static let packedParametersApproved: Bool = {
+        guard packedParametersEnabled else { return false }
+        return (try? withError { error in
+            for keyLength in [16, 33, 4096, 4100] {
+                let rows = 16
+                let data = (0..<(rows * keyLength)).map { Float(($0 * 17) % 257 - 128) / 16 }
+                let scores = MLXArray(data, [rows, keyLength])
+                for scale: Float in [0.0625, 0.125] {
+                    let singleRow = keyLength <= softmaxSingleRowLimit
+                    let threads = singleRow ? 32 * (((keyLength + 3) / 4 + 31) / 32) : 256
+                    let grid = singleRow ? rows * threads : scores.size / 4
+                    let old = (singleRow ? softmaxKernel : maskKernel)(
+                        operands(scores: scores, rows: rows, keyLength: keyLength, scale: scale,
+                            packed: false),
+                        grid: (grid, 1, 1), threadGroup: (threads, 1, 1),
+                        outputShapes: [scores.shape], outputDTypes: [.float32])[0]
+                    let new = (singleRow ? packedSoftmaxKernel : packedMaskKernel)(
+                        operands(scores: scores, rows: rows, keyLength: keyLength, scale: scale,
+                            packed: true),
+                        grid: (grid, 1, 1), threadGroup: (threads, 1, 1),
+                        outputShapes: [scores.shape], outputDTypes: [.float32])[0]
+                    eval(old, new)
+                    try error.check()
+                    guard old.view(dtype: .uint32).asArray(UInt32.self)
+                        == new.view(dtype: .uint32).asArray(UInt32.self) else { return false }
+                }
+            }
+            return true
+        }) ?? false
+    }()
 
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
     private static let softmaxSingleRowLimit = 4096
@@ -1172,21 +1245,20 @@ package enum CBv2PromptCausalAttention {
             v = v.expandedDimensions(axis: 2)
         }
         let scores = matmul(q, k.swappedAxes(-1, -2))
-        let operands: [any ScalarOrArray] = [
-            scores, MLXArray(Int32(kL - L)), MLXArray(Int32(L)), MLXArray(Int32(kL)),
-            MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude),
-        ]
+        let packed = packedParametersApproved
+        let operands = operands(scores: scores, rows: L, keyLength: kL, scale: scale,
+            packed: packed)
         let probabilities: MLXArray
         if kL <= softmaxSingleRowLimit {
             let threads = 32 * (((kL + 3) / 4 + 31) / 32)
-            probabilities = softmaxKernel(
+            probabilities = (packed ? packedSoftmaxKernel : softmaxKernel)(
                 operands,
                 grid: ((scores.size / kL) * threads, 1, 1),
                 threadGroup: (threads, 1, 1),
                 outputShapes: [scores.shape],
                 outputDTypes: [.float32])[0]
         } else {
-            let masked = maskKernel(
+            let masked = (packed ? packedMaskKernel : maskKernel)(
                 operands,
                 grid: (scores.size / 4, 1, 1),
                 threadGroup: (256, 1, 1),
