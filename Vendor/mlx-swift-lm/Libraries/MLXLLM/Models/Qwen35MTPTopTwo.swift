@@ -646,6 +646,43 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Stage the next 128-group of the int8 prompt kernel into `cur ^ 1`
+    /// after `op.run`, instead of before it. Group `g` occupies buffer
+    /// `g & 1`; the next iteration reads `(g + 1) & 1`, which is `cur ^ 1`.
+    /// After the op returns, buffer `cur` is dead and buffer `cur ^ 1` is the
+    /// one the next op needs, so the device load and nibble expand fall under
+    /// the epilogue. The end-of-iteration barrier still publishes that stage
+    /// before the next `op.run`. `DARKBLOOM_QWEN35_PROMPT_WEIGHT_STAGE=0`
+    /// keeps `stage(g + 1, cur ^ 1)` before `op.run`.
+    static let promptWeightStage: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_WEIGHT_STAGE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// With the weight stage after `op.run`, issue it between epilogue
+    /// outputs 0..<16 and 16..<32 so the `uint4` load sits inside the fma
+    /// rather than in a block before it. Same `stage` arguments, same
+    /// buffer, still only when `g + 1 < Kg`. `DARKBLOOM_QWEN35_PROMPT_STAGE_MID=0`
+    /// keeps that stage in one block immediately after `op.run`.
+    static let promptStageMid: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_STAGE_MID"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Skip the prompt kernel's closing threadgroup barrier on the last
+    /// 128-group. Nothing is staged for a successor, the kernel has no
+    /// cross-simdgroup reduction, and the four simdgroups store disjoint
+    /// columns (`nb` depends on `sg & 1`, `mm` on `sg >> 1`).
+    /// `DARKBLOOM_QWEN35_PROMPT_LAST_BARRIER=0` keeps the barrier after every
+    /// group, including the last.
+    static let promptSkipLastBarrier: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_LAST_BARRIER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -1783,9 +1820,17 @@ enum Qwen35TensorPackedMatmul {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int g = 0; g < Kg; g++) {
           const int cur = g & 1;
-          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          // Group g is in buffer cur. The next op reads cur ^ 1. WSTAGE
+          // writes that buffer after this op returns; WSTAGE == 0 writes it
+          // before the op, which is the recorded schedule.
+          if constexpr (WSTAGE == 0) {
+            if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          }
           auto tA = A.template slice<128, 64>(g * 128, m0);
           if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          if constexpr (WSTAGE != 0 && SMID == 0) {
+            if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          }
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
           float4 b0, b1;
           if constexpr (NEGATIVE_SCALE_BIAS) {
@@ -1807,6 +1852,11 @@ enum Qwen35TensorPackedMatmul {
           }
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
+            // SMID: same stage as the post-op block, between outputs 0..<16
+            // and 16..<32. The fma does not read the weight buffers.
+            if constexpr (WSTAGE != 0 && SMID != 0) {
+              if (i == (CAP / 2) && g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+            }
             const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
             const float s = nh ? s1[c] : s0[c];
             const float b = nh ? b1[c] : b0[c];
@@ -1820,26 +1870,19 @@ enum Qwen35TensorPackedMatmul {
               acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
             }
           }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        // Groups of four consecutive i share mm and nh with c=0..3, so the
-        // four outputs are consecutive columns at nb + 32*nh. Same values as
-        // the scalar loop; float4/half4 stores match OutT. Hot path:
-        // support==staged8 (signed + FACTORED). Alignment under tip N/nb guards.
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          const float v0 = acc[i];
-          const float v1 = acc[i + 1];
-          const float v2 = acc[i + 2];
-          const float v3 = acc[i + 3];
-          const size_t base = (size_t)mm * N + nb + 32 * nh;
-          if constexpr (sizeof(OutT) == sizeof(float)) {
-            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-          } else {
-            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          // LBAR: the last group stages nothing and no later read of
+          // threadgroup memory depends on this barrier. LBAR == 0 always bars.
+          if constexpr (LBAR == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          } else if (g + 1 < Kg) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
           }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) {
+          const int c = i & 3; const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
         }
         """
 
@@ -2318,6 +2361,9 @@ enum Qwen35TensorPackedMatmul {
                     ("OutT", DType.float32), ("MPERM", rowTiledConstants ? 1 : 0),
                     ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", 1),
                     ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", tiledFlag),
+                    ("WSTAGE", promptWeightStage ? 1 : 0),
+                    ("SMID", promptStageMid ? 1 : 0),
+                    ("LBAR", promptSkipLastBarrier ? 1 : 0),
                 ],
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -3055,6 +3101,9 @@ enum Qwen35TensorPackedMatmul {
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
+                template.append(("WSTAGE", promptWeightStage ? 1 : 0))
+                template.append(("SMID", promptStageMid ? 1 : 0))
+                template.append(("LBAR", promptSkipLastBarrier ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             // The prompt route reads the verify route's tiled copy too, so the
