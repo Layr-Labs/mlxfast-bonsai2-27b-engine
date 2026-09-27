@@ -928,7 +928,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         guard
             let block = try? drafter.proposeSpeculative(
                 anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                confirmed: accepted + DFlash2ConfirmedOne.value, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single)

@@ -743,16 +743,18 @@ extension DFlash2Attention {
     /// and the key tail past `held + c + L` is masked (exact zeros).
     func speculative(
         _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray,
+        start: MLXArray
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
         let (B, L, n) = (x.dim(0), x.dim(1), base.dim(1))
         guard B == 1, n == 2 * L, let held = cache.inPlaceRows else { return nil }
-        let start = confirmed.reshaped([1])
-        let rows = dynamicSliceUpdate(base, update: x, start: start, axes: [1])
+        let rowStart = DFlash2SpeculativeSlice.reuseStart ? start : confirmed.reshaped([1])
+        let rows = dynamicSliceUpdate(base, update: x, start: rowStart, axes: [1])
         guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
         else { return nil }
         let blockRows = dynamicSlice(
-            y, start: start, axes: [1], sliceSize: [Int32(B), Int32(L), Int32(y.dim(2))])
+            y, start: rowStart, axes: [1],
+            sliceSize: DFlash2SpeculativeSlice.sliceSize(batch: B, rows: L, width: y.dim(2)))
         let queries = rope(
             qNorm(blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
             offset: queryOffset)
@@ -2709,13 +2711,14 @@ private final class DFlash2DecoderLayer: Module {
     /// `callAsFunction` through `DFlash2Attention.speculative`.
     func speculative(
         _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray,
+        start: MLXArray
     ) -> (hidden: MLXArray, keys: MLXArray, values: MLXArray)? {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
         guard
             let a = selfAttn.speculative(
                 attentionInput, base: base, confirmed: confirmed, queryOffset: queryOffset,
-                rope: rope, cache: cache, keyMask: keyMask)
+                rope: rope, cache: cache, keyMask: keyMask, start: start)
         else { return nil }
         let attended = attentionConv.finish(a.output, projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
@@ -3493,6 +3496,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             codebook: candidateSelector.predecessorCodebook.dtype,
             projected: candidateSelector.hiddenProjection.weight.dtype, unary: .float32)
         DFlash2Concat.prepare(inputs: config.targetLayerIds.count, dtype: .float16)
+        DFlash2SpeculativeWordPad.prepare(dtype: dtype, hidden: config.hiddenSize, block: 16)
+        DFlash2ConfirmedOne.warm()
     }
 
     /// Builds and self-tests the tiled copies of the weights the block
@@ -3820,10 +3825,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
-        let base = concatenated(
-            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
-            axis: 1)
+        let base = DFlash2SpeculativeWordPad.base(context, rows: n)
         let c = confirmed.reshaped([]).asType(.int32)
+        let start = c.reshaped([1])
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
         let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
@@ -3835,7 +3839,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             guard
                 let out = layer.speculative(
                     h, base: base, confirmed: c, queryOffset: queryOffset, rope: rope,
-                    cache: caches[index], keyMask: keyMask)
+                    cache: caches[index], keyMask: keyMask, start: start)
             else { preconditionFailure("DFlash 2: a checked layer refused its speculative block") }
             h = out.hidden
             writes.append((out.keys, out.values))
@@ -3943,6 +3947,151 @@ public final class DFlash2SpeculativeBlock {
 
 enum DFlash2ContextPadding {
     static let enabled = ProcessInfo.processInfo.environment["BONSAI_DRAFT_CONTEXT_PAD16"] == "1"
+}
+
+private func dflash2Flag(_ name: String) -> Bool {
+    let value = ProcessInfo.processInfo.environment[name]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !["0", "false", "no", "off"].contains(value ?? "")
+}
+
+/// The speculative base `[context | zero tail]` in one launch. Each element
+/// is copied or cleared as an integer of the same width, so the bits match
+/// a concatenation with a zero fill. Off keeps that concatenation.
+enum DFlash2SpeculativeWordPad {
+    private static let wanted = dflash2Flag("DARKBLOOM_DFLASH_SPEC_WORDPAD")
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var passed: Bool?
+    private static let dimLock = NSLock()
+    nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
+    /// One evaluated `[words, copied]` int32 pair per geometry. Off builds a
+    /// fresh pair on every launch.
+    static let cacheDims = dflash2Flag("DARKBLOOM_DFLASH_SPEC_WORDPAD_DIMS")
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_spec_word_pad",
+        inputNames: ["src", "dims"],
+        outputNames: ["out"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint words = uint(dims[0]);
+            if (idx >= words) { return; }
+            if (idx < uint(dims[1])) { out[idx] = src[idx]; }
+            else { out[idx] = 0; }
+            """,
+        ensureRowContiguous: true)
+
+    static func base(_ context: MLXArray, rows n: Int) -> MLXArray {
+        let have = context.dim(1)
+        let hidden = context.dim(2)
+        guard wanted, passed != false, context.ndim == 3, context.dim(0) == 1,
+            n > have, hidden > 0,
+            [DType.bfloat16, .float16, .float32].contains(context.dtype)
+        else {
+            return concatenated(
+                [context, MLXArray.zeros([context.dim(0), n - have, hidden], dtype: context.dtype)],
+                axis: 1)
+        }
+        return launch(context, rows: n)
+    }
+
+    private static func wordType(_ dtype: DType) -> DType {
+        dtype == .float32 ? .uint32 : .uint16
+    }
+
+    private static func dimBuffer(words: Int, copied: Int) -> MLXArray {
+        let key = [words, copied]
+        guard cacheDims else { return MLXArray([Int32(words), Int32(copied)]) }
+        if let hit = dimLock.withLock({ dims[key] }) { return hit }
+        let made = MLXArray([Int32(words), Int32(copied)])
+        eval(made)
+        return dimLock.withLock {
+            if let hit = dims[key] { return hit }
+            dims[key] = made
+            return made
+        }
+    }
+
+    private static func launch(_ context: MLXArray, rows n: Int) -> MLXArray {
+        let hidden = context.dim(2)
+        let words = n * hidden
+        let copied = context.dim(1) * hidden
+        let word = wordType(context.dtype)
+        let out = kernel(
+            [context.view(dtype: word), dimBuffer(words: words, copied: copied)],
+            grid: (words, 1, 1), threadGroup: (min(256, words), 1, 1),
+            outputShapes: [[1, n, hidden]], outputDTypes: [word])[0]
+        return out.view(dtype: context.dtype)
+    }
+
+    /// Compiles the kernel and checks one shape against the concatenation,
+    /// then fills the scored block's dim pairs (context rows 1...block).
+    static func prepare(dtype: DType, hidden: Int, block: Int) {
+        guard wanted, hidden > 0, block > 1,
+            [DType.bfloat16, .float16, .float32].contains(dtype)
+        else { return }
+        let n = 2 * block
+        let ctx = MLXRandom.normal([1, 1, hidden], key: MLXRandom.key(0x5e1f)).asType(dtype)
+        let fused = launch(ctx, rows: n)
+        let reference = concatenated(
+            [ctx, MLXArray.zeros([1, n - 1, hidden], dtype: dtype)], axis: 1)
+        eval(fused, reference)
+        let bits = wordType(dtype)
+        let ok = all(fused.view(dtype: bits) .== reference.view(dtype: bits)).item(Bool.self)
+        lock.withLock { passed = ok }
+        guard ok, cacheDims else { return }
+        for rows in 1 ... block {
+            _ = dimBuffer(words: n * hidden, copied: rows * hidden)
+        }
+    }
+}
+
+/// The dynamic-slice start and the host `sliceSize` of a speculative layer.
+/// The start is one reshape of the confirmed count, shared by every layer.
+/// The size is one retained `[batch, rows, width]` triple per width.
+enum DFlash2SpeculativeSlice {
+    static let reuseStart = dflash2Flag("DARKBLOOM_DFLASH_SPEC_START")
+    static let reuseSize = dflash2Flag("DARKBLOOM_DFLASH_SLICE_SIZE")
+    private struct Key: Hashable { let batch, rows, width: Int }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var sizes: [Key: [Int32]] = [:]
+
+    static func sliceSize(batch: Int, rows: Int, width: Int) -> [Int32] {
+        guard reuseSize else { return [Int32(batch), Int32(rows), Int32(width)] }
+        let key = Key(batch: batch, rows: rows, width: width)
+        if let hit = lock.withLock({ sizes[key] }) { return hit }
+        let made = [Int32(batch), Int32(rows), Int32(width)]
+        return lock.withLock {
+            if let hit = sizes[key] { return hit }
+            sizes[key] = made
+            return made
+        }
+    }
+}
+
+/// `accepted + 1`, the confirmed count a speculative block is built with.
+/// One evaluated int32. Off allocates a fresh one on every round.
+enum DFlash2ConfirmedOne {
+    static let enabled = dflash2Flag("DARKBLOOM_DFLASH_CONFIRMED_ONE")
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var one: MLXArray?
+
+    static var value: MLXArray {
+        guard enabled else { return MLXArray(Int32(1)) }
+        if let hit = lock.withLock({ one }) { return hit }
+        let made = MLXArray(Int32(1))
+        eval(made)
+        return lock.withLock {
+            if let hit = one { return hit }
+            one = made
+            return made
+        }
+    }
+
+    static func warm() {
+        guard enabled else { return }
+        _ = value
+    }
 }
 
 /// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
