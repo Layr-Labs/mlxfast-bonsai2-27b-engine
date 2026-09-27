@@ -1863,7 +1863,7 @@ enum Qwen35GatedDeltaChunked {
         source: scanSource)
 
     // BEGIN GENERATED CHUNKED GDN SOURCES
-    private static let prepSource = """
+    static let prepSource = """
             // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
             // Q K^T are formed once and serve the Hv / Hk value heads of this key
             // head, which run side by side in lane groups of C lanes (lane = head
@@ -2284,7 +2284,8 @@ enum Qwen35GatedDeltaChunked {
     /// apply or the geometry did not pass its check, and the caller takes the
     /// stock path.
     static func runFresh(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
         let B = k.dim(0)
@@ -2298,13 +2299,30 @@ enum Qwen35GatedDeltaChunked {
             g.dtype == .float32, beta.dtype == .float32,
             freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
         else { return nil }
-        return freshChunks(q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+        return freshChunks(
+            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared)
+    }
+
+    /// The prep launch alone (`chunks`' first launch): T', P and the decay
+    /// factors of every chunk.
+    static func prep(q: MLXArray, k: MLXArray, g: MLXArray, beta: MLXArray) -> [MLXArray] {
+        let (B, T, Hk, Dk, Hv) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3), g.dim(2))
+        return prepKernel(
+            [q, k, g, beta, MLXArray(Int32(T))],
+            template: [("C", chunk), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, T / chunk, B * Hk), threadGroup: (32, 1, 1),
+            outputShapes: [
+                [B, Hv, T / chunk, chunk, chunk], [B, Hv, T / chunk, chunk, chunk],
+                [B, Hv, T / chunk, 2, chunk],
+            ],
+            outputDTypes: [.float32, .float32, .float32])
     }
 
     /// `chunks` with `scanFreshKernel` in place of `scanKernel`: the same prep
     /// launch, the same scan launch geometry, no state input.
     private static func freshChunks(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray) {
         let B = k.dim(0)
         let T = k.dim(1)
@@ -2315,7 +2333,7 @@ enum Qwen35GatedDeltaChunked {
         let C = chunk
         let NC = T / C
         let rowCount = MLXArray(Int32(T))
-        let prepared = prepKernel(
+        let prepared = prepared ?? prepKernel(
             [q, k, g, beta, rowCount],
             template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
             grid: (32, NC, B * Hk),
@@ -3249,7 +3267,8 @@ final class Qwen35GatedDeltaNet: Module {
         // Whole chunks from the zero state without the zeros array
         // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
         if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
-            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape,
+            prepared: pre.prepared)
         {
             return (out, pre.tail, newSsmState)
         }
@@ -5152,6 +5171,13 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // A prompt-width forward inside an engine step keeps the step's work
+        // interval running: renewed now and at each prompt submission below.
+        // Scheduling hint only (`CBv2EngineWorkInterval`).
+        let promptForward =
+            !captureRecurrentWindow
+            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
+        if promptForward { CBv2EngineWorkInterval.promptForwardBegan() }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -5237,6 +5263,7 @@ public class Qwen35TextModelInner: Module {
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
+                    if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
                     // Behind the layers just submitted: the drafter's weights
                     // for a request that will draft (`DFlash2ResidencyPrefetch`).
@@ -5266,6 +5293,7 @@ public class Qwen35TextModelInner: Module {
             if let submission,
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
+                if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
                 if promptPrefetch {
                     DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
@@ -5284,7 +5312,7 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            dFlash2Tap.tappedHidden = concatenated(tapped.map { $0! }, axis: -1)
+            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
         }
         return hiddenStates
     }
@@ -5318,6 +5346,9 @@ enum Qwen35GDNPrework {
         let tail: MLXArray
         /// `concatenated([convState, qkv], axis: 1)` in FP32, when requested.
         var convInput: MLXArray? = nil
+        /// The chunked scan's prep outputs (T', P, decay factors), when the
+        /// prework launch formed them (`freshStridedRows` form 3).
+        var prepared: [MLXArray]? = nil
     }
 
     static let enabled: Bool = {
