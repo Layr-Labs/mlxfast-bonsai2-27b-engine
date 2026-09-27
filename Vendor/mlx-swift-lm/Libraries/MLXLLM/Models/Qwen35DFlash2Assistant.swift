@@ -330,11 +330,34 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
     /// and `warmSpeculativeShapes` drains the buffer cache afterwards, so the
     /// served phases start from the footprint a cold load leaves. Nothing here
     /// depends on any request's input.
+    ///
+    /// Then the prompt int8 kernel's in-situ trial
+    /// (`Qwen35TensorPackedMatmul.PromptInSituTrial`): the same forward, on
+    /// fresh throwaway state each time, a few times per candidate kernel,
+    /// timed on the host; the record's kernel stays unless a tile is clearly
+    /// faster. Nothing runs when no trial is armed (no int8-staged prompt
+    /// route, or `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_INSITU=off`).
     private func warmTargetPrefill() {
         guard Self.seedPrefillWarmEnabled else { return }
+        runWarmPromptForward { adapter, caches, recurrent in
+            self.warmTargetVerify(adapter: adapter, caches: caches, recurrent: recurrent)
+        }
+        Qwen35TensorPackedMatmul.PromptInSituTrial.run { self.runWarmPromptForward() }
+    }
+
+    /// One engine prompt forward over the warm prompt on fresh throwaway
+    /// state (see `warmTargetPrefill`); `then` runs on that state after the
+    /// commit, before it is released. Returns the host nanoseconds from the
+    /// forward's graph build to the end of its evaluation, nil when it could
+    /// not run.
+    @discardableResult
+    private func runWarmPromptForward(
+        then: ((CBv2SteppableLanguageModelAdapter, [CBv2AttendingLayerCache],
+            CBv2RecurrentRequestState) -> Void)? = nil
+    ) -> UInt64? {
         let rows = Self.warmPromptRows
         let adapter = CBv2SteppableLanguageModelAdapter(target)
-        guard let spec = adapter.recurrentStateSpec else { return }
+        guard let spec = adapter.recurrentStateSpec else { return nil }
         let backend = CBv2ContiguousKVBackend(
             config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
         guard
@@ -344,7 +367,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
             let rowState = try? backend.makeSequenceState(
                 layerKinds: target.cbv2LayerKinds, promptLength: 0, maxLength: rows + 32),
             let recurrent = try? CBv2RecurrentRequestState(spec: spec)
-        else { return }
+        else { return nil }
         let bank = CBv2LayerCacheBank(caches: caches)
         let previousTap = target.dFlash2TapLayerIds
         target.dFlash2TapLayerIds = drafter.config.targetLayerIds
@@ -355,23 +378,24 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
             backend.release(rowState)
             if !recurrent.isReleased { try? recurrent.release() }
         }
-        guard let evaluation = try? recurrent.bind() else { return }
+        guard let evaluation = try? recurrent.bind() else { return nil }
         let tokens = MLXArray((0 ..< rows).map { Int32(100 + ($0 &* 7919) % 20_000) })
             .reshaped([1, rows])
+        let start = DispatchTime.now().uptimeNanoseconds
         let forward = adapter.forwardWithHiddenForPrefill(
             tokens: tokens, caches: bank.layerCaches(rowStates: [rowState]),
             recurrentState: [evaluation], positionIds: nil,
             requirement: .lastPositionLogits)
-        guard let roots = try? evaluation.evaluate() else { return }
+        guard let roots = try? evaluation.evaluate() else { return nil }
         var targets = [argMax(forward.logits, axis: -1), forward.lastHidden] + roots
         if let tapped = target.dFlash2TappedHidden {
             targets.append(tapped.asType(drafter.dtype))
         }
         eval(targets)
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
         try? evaluation.commit()
-        warmTargetVerify(
-            adapter: adapter, caches: bank.layerCaches(rowStates: [rowState]),
-            recurrent: recurrent)
+        then?(adapter, bank.layerCaches(rowStates: [rowState]), recurrent)
+        return elapsed
     }
 
     /// `MLXFAST_VERIFY_WARM=0` skips `warmTargetVerify`.
@@ -465,6 +489,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unche
             let flat = logits.reshaped([1, logits.dim(0) * logits.dim(1), logits.dim(2)])
             let topTwo = adapter.cbv2MTPTopTwo(flat)
             targets += [topTwo.ids.asType(.int32), topTwo.values.asType(.float32)]
+            if logits.dim(0) == 1 {
+                // As the round passes a one-row batch (its own array): the
+                // head's fused top two where it applies (`Qwen35HeadTopTwo`).
+                let fused = adapter.cbv2MTPTopTwo(logits)
+                targets += [fused.ids.asType(.int32), fused.values.asType(.float32)]
+            }
         }
         let configuration = target.configuration
         let headDim =

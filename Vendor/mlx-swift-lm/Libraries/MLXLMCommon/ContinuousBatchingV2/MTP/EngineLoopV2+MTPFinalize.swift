@@ -15,6 +15,21 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// Each verify row's audit record and tokens go out as soon as its
+    /// tokens, KV and scheduler accounting are final: before the next round's
+    /// early block proposal is built and submitted, not after it. That
+    /// submission waits in MLX's in-flight cap (at most 10 command buffers;
+    /// the proposal is ~30) until most of the drafter has run, so emitting
+    /// after it held every round's tokens behind the next drafter forward,
+    /// the free run's last round included, whose next block no window reads.
+    /// The same tokens, rounds and graphs; only the emit moves earlier.
+    /// `MLXFAST_MTP_EMIT_FIRST=0` restores emitting after the early block.
+    static let emitsRoundBeforeEarlyBlock: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_MTP_EMIT_FIRST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
     /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
     static let submitsCommittedRecurrentStateEarly: Bool =
         ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
@@ -305,6 +320,55 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            let observedAccepted = min(accepted, confirmed)
+            // Acceptance/rollback audit record (observability): every value is
+            // already on the host at this boundary. The scheduler fields are
+            // read AFTER recordSampled/rollbackComputed above, so the record
+            // states the row's post-round accounting — the boundary invariant
+            // a consumer checks is
+            // `numComputedAfter == tokensCountAfter - 1`. Nothing between here
+            // and the end of this row's finalize changes those fields.
+            func appendAuditRecord() {
+                mtp.recordRound(
+                    drafted: k, accepted: observedAccepted, emitted: confirmed,
+                    audit: CBv2MTPRoundAuditRecord(
+                        requestID: id.raw,
+                        k: k,
+                        draftTokens: Array(
+                            host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                        targetTokens: outcome.targets,
+                        accepted: accepted,
+                        confirmed: confirmed,
+                        rejected: rejected,
+                        tokensCountAfter: rec.tokens.count,
+                        numComputedAfter: rec.numComputedTokens,
+                        generatedAfter: rec.generatedTokenCount,
+                        finishReason: finishReason.map { String(describing: $0) }))
+            }
+            func emitTokens() {
+                if hasStopStrings {
+                    stream(for: id)?.emit(
+                        .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
+                } else {
+                    let stream = stream(for: id)
+                    stream?.reserveEmission()
+                    let endsWithStopToken = finishReason == .stop
+                    let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
+                    let allTokens = kept
+                    detokQueue.async {
+                        let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
+                        stream?.emit(
+                            .delta(text: text, tokens: allTokens, logprobs: nil),
+                            consumingReservation: true)
+                    }
+                }
+            }
+            // The record first, so a consumer that holds the tokens also holds
+            // the round (`emitsRoundBeforeEarlyBlock`).
+            if Self.emitsRoundBeforeEarlyBlock {
+                appendAuditRecord()
+                emitTokens()
+            }
             // EARLY BLOCK PROPOSAL. Everything the next round's block drafter
             // reads is final here: the anchor is the carry token stored below
             // (`kept[confirmed - 1]`), the committed context was just queued
@@ -409,24 +473,10 @@ extension EngineLoopV2 {
                 requestID: id,
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
-            if hasStopStrings {
-                stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
-            } else {
-                let stream = stream(for: id)
-                stream?.reserveEmission()
-                let endsWithStopToken = finishReason == .stop
-                let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
-                let allTokens = kept
-                detokQueue.async {
-                    let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: allTokens, logprobs: nil),
-                        consumingReservation: true)
-                }
+            if !Self.emitsRoundBeforeEarlyBlock {
+                emitTokens()
             }
 
-            let observedAccepted = min(accepted, confirmed)
             // Per-request timing: this verify row confirmed at the step's
             // readback-done instant (already read by `finalize`).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
@@ -435,27 +485,9 @@ extension EngineLoopV2 {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
-            // Acceptance/rollback audit record (observability): every value is
-            // already on the host at this boundary. The scheduler fields are
-            // read AFTER recordSampled/rollbackComputed above, so the record
-            // states the row's post-round accounting — the boundary invariant
-            // a consumer checks is
-            // `numComputedAfter == tokensCountAfter - 1`.
-            mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
-                audit: CBv2MTPRoundAuditRecord(
-                    requestID: id.raw,
-                    k: k,
-                    draftTokens: Array(
-                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
-                    targetTokens: outcome.targets,
-                    accepted: accepted,
-                    confirmed: confirmed,
-                    rejected: rejected,
-                    tokensCountAfter: rec.tokens.count,
-                    numComputedAfter: rec.numComputedTokens,
-                    generatedAfter: rec.generatedTokenCount,
-                    finishReason: finishReason.map { String(describing: $0) }))
+            if !Self.emitsRoundBeforeEarlyBlock {
+                appendAuditRecord()
+            }
             let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k

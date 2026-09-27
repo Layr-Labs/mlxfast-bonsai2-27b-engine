@@ -45,6 +45,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private var cachedPositionOffsets: MLXArray
+    /// Host copy of `cachedPositionOffsets`: set where it is rebuilt,
+    /// advanced by the same `+ L` (see `CBv2HostPositionOffsets`).
+    private var hostPositionOffsets: [Int32] = []
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -80,6 +83,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
+        self.hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
     }
 
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
@@ -152,7 +156,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             keepMask: keepMask, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2))
         return output
     }
 
@@ -174,7 +178,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        advancePositionOffsets(by: keys.dim(2))
         return output
     }
 
@@ -202,10 +206,71 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = Self.buildPositionOffsets(rows)
+        hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
+    }
+
+    /// `positionOffsets + n`: on the host (the same int32 values, no
+    /// launch; one array shared by every layer that holds them), or the
+    /// on-device add when `CBv2HostPositionOffsets` is off.
+    private func advancePositionOffsets(by n: Int) {
+        let advanced = hostPositionOffsets.map { $0 &+ Int32(n) }
+        if CBv2HostPositionOffsets.enabled,
+            CBv2HostPositionOffsets.agrees(
+                device: { self.cachedPositionOffsets + Int32(n) }, host: advanced)
+        {
+            cachedPositionOffsets = CBv2HostPositionOffsets.array(advanced)
+        } else {
+            cachedPositionOffsets = cachedPositionOffsets + Int32(n)
+        }
+        hostPositionOffsets = advanced
     }
 
     private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
         MLXArray(rows.map { Int32($0.absoluteOffset) })
+    }
+}
+
+/// The advanced `positionOffsets` of an attention layer's step, built from a
+/// host copy advanced by the same `+ L` instead of by an on-device add per
+/// layer (16 one-element launches per verify window of the 27B). The host
+/// copy is set wherever the array is rebuilt and advanced exactly as the
+/// device chain is, so the values are the chain's, stale or not. Every layer
+/// of a step holds the same values, so they share one array.
+/// `MLXFAST_HOST_POSITION_OFFSETS=0` keeps the on-device add.
+enum CBv2HostPositionOffsets {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_HOST_POSITION_OFFSETS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var last: (values: [Int32], array: MLXArray)?
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// The first advance also runs the device add and compares it with the
+    /// host values; a mismatch keeps the device add for the process.
+    static func agrees(device: () -> MLXArray, host: [Int32]) -> Bool {
+        lock.withLock {
+            if let verdict { return verdict }
+            let same = device().asArray(Int32.self) == host
+            FileHandle.standardError.write(
+                (same
+                    ? "mlxfast host position offsets: first advance equals the device add; host copy\n"
+                    : "mlxfast host position offsets: mismatch; on-device add kept\n")
+                    .data(using: .utf8)!)
+            verdict = same
+            return same
+        }
+    }
+
+    static func array(_ values: [Int32]) -> MLXArray {
+        lock.withLock {
+            if let last, last.values == values { return last.array }
+            let array = MLXArray(values)
+            last = (values, array)
+            return array
+        }
     }
 }
 
