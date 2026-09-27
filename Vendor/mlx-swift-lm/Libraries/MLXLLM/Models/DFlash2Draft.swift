@@ -689,45 +689,6 @@ extension DFlash2Attention {
             .transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
-
-    var speculativeCapable: Bool {
-        dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
-            && qkv.applies(q: qProj, k: kProj, v: vProj)
-    }
-
-    /// The block forward for a device-valued confirmed count `c`: `base`
-    /// (projected verify context, then zero rows) with the block written at
-    /// row `c` puts every row of today's `[context; block]` matmul at its row;
-    /// all `2L` key/value rows go to the cursor, the queries are rows `c..<c+L`
-    /// and the key tail past `held + c + L` is masked (exact zeros).
-    func speculative(
-        _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
-    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
-        let (B, L, n) = (x.dim(0), x.dim(1), base.dim(1))
-        guard B == 1, n == 2 * L, let held = cache.inPlaceRows else { return nil }
-        let start = confirmed.reshaped([1])
-        let rows = dynamicSliceUpdate(base, update: x, start: start, axes: [1])
-        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
-        else { return nil }
-        let blockRows = dynamicSlice(
-            y, start: start, axes: [1], sliceSize: [Int32(B), Int32(L), Int32(y.dim(2))])
-        let queries = rope(
-            qNorm(blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
-            offset: queryOffset)
-        let allKeys = rope(
-            kNorm(y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-            offset: cache.offset)
-        let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
-        guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
-        else { return nil }
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys[.ellipsis, ..<(held + n), 0...],
-            values: values[.ellipsis, ..<(held + n), 0...], scale: scale, mask: keyMask)
-        return (
-            DFlash2TensorMatmul.linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1)),
-            keys, values)
-    }
 }
 
 /// The q, k and v projections' weights stacked along the output axis, as
@@ -799,16 +760,6 @@ private final class DFlash2QKVStack {
 
     /// The row count at or below which `applyContext` keeps the full stack.
     static let kvOnlyMinimumRows = 256
-
-    func applies(q: Linear, k: Linear, v: Linear) -> Bool { stacked(q: q, k: k, v: v) != nil }
-
-    /// `apply`'s matmul, unsliced, with its q and k column ends.
-    func applyStacked(
-        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
-    ) -> (y: MLXArray, qEnd: Int, kEnd: Int)? {
-        guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
-        return (matmul(rows, weight.T), qEnd, kEnd)
-    }
 
     /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
     /// when the stack does not apply.
@@ -1307,22 +1258,6 @@ private final class DFlash2DecoderLayer: Module {
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
     }
-
-    /// `callAsFunction` through `DFlash2Attention.speculative`.
-    func speculative(
-        _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
-    ) -> (hidden: MLXArray, keys: MLXArray, values: MLXArray)? {
-        let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        guard
-            let a = selfAttn.speculative(
-                attentionInput, base: base, confirmed: confirmed, queryOffset: queryOffset,
-                rope: rope, cache: cache, keyMask: keyMask)
-        else { return nil }
-        let attended = attentionConv.finish(a.output, projection: attentionTaps, residual: x)
-        let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return (mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended), a.keys, a.values)
-    }
 }
 
 // MARK: - The candidate selector
@@ -1700,6 +1635,16 @@ enum DFlash2GreedyWalk {
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
+    /// The mask columns of a proposal are not embedded (the bind-time mask
+    /// row is broadcast), so `propose` builds only the anchor column
+    /// (ercumentyildirim `6e19fe1`). `MLXFAST_RIDER_ANCHOR_COLUMN=0` builds
+    /// the full token block again.
+    static let anchorColumnOnly: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_RIDER_ANCHOR_COLUMN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
     public let config: DFlash2Configuration
 
     @ModuleInfo(key: "fc") public var fc: Linear
@@ -1828,7 +1773,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0,
+        maskColumns: Int = 0
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -1849,9 +1795,28 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // time; broadcast that exact value across the block. Keep the general
         // one-row case unchanged.
         let embeddedInputs: MLXArray
-        if inputs.dim(1) > 1 {
-            embeddedInputs = try blockEmbedding(
-                anchorIDs: inputs[0..., ..<1], maskColumns: inputs.dim(1) - 1)
+        // `maskColumns > 0` means `inputs` is the anchor column only. The mask
+        // positions are the bind-time embedding, never read from token ids.
+        if inputs.dim(1) > 1 || maskColumns > 0 {
+            let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
+            guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
+            let batch = inputs.dim(0)
+            let cols = maskColumns > 0 ? maskColumns : inputs.dim(1) - 1
+            let repeatedMasks: MLXArray
+            if batch == 1,
+                let cached = cachedMaskEmbeddingBlock,
+                cached.cols == cols
+            {
+                repeatedMasks = cached.array
+            } else {
+                repeatedMasks = broadcast(
+                    maskEmbedding, to: [batch, cols, config.hiddenSize])
+                if batch == 1 {
+                    eval(repeatedMasks)
+                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
+                }
+            }
+            embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
         }
@@ -1859,7 +1824,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = targetHidden.map { contextProjection($0) }
+        let context = targetHidden.map {
+            hiddenNorm(DFlash2TensorMatmul.linear(fc, $0.asType(dtype)))
+        }
 
         let submitAfter = DFlash2DraftSubmission.layers
         let leadAt = leadingLayers > 0 ? min(leadingLayers, layers.count) : 0
@@ -1879,44 +1846,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return norm(h)
-    }
-
-    /// `[anchor; masks]` embedded (the anchor `[B, 1]`, host or device ids).
-    func blockEmbedding(anchorIDs: MLXArray, maskColumns cols: Int) throws -> MLXArray {
-        guard let target, let maskEmbedding = maskTokenEmbedding else {
-            throw DFlash2Error.notBound
-        }
-        let anchorEmbedding = target.embedTokensForDFlash2(anchorIDs)
-        let batch = anchorIDs.dim(0)
-        let repeatedMasks: MLXArray
-        if batch == 1,
-            let cached = cachedMaskEmbeddingBlock,
-            cached.cols == cols
-        {
-            repeatedMasks = cached.array
-        } else {
-            repeatedMasks = broadcast(
-                maskEmbedding, to: [batch, cols, config.hiddenSize])
-            if batch == 1 {
-                eval(repeatedMasks)
-                cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
-            }
-        }
-        return concatenated([anchorEmbedding, repeatedMasks], axis: 1)
-    }
-
-    /// `hiddenNorm(fc(rows))`. `BONSAI_DRAFT_CONTEXT_PAD16=1` (validation aid)
-    /// pads to 16 rows, as the tensor kernel does, so MLX's matmul (kernel by
-    /// row count) gets the tensor route's row independence.
-    func contextProjection(_ targetHidden: MLXArray) -> MLXArray {
-        let rows = targetHidden.asType(dtype)
-        if DFlash2ContextPadding.enabled, rows.ndim == 3, rows.dim(1) < 16 {
-            let padded = concatenated(
-                [rows, MLXArray.zeros([rows.dim(0), 16 - rows.dim(1), rows.dim(2)], dtype: rows.dtype)],
-                axis: 1)
-            return hiddenNorm(DFlash2TensorMatmul.linear(fc, padded)[0..., ..<rows.dim(1), 0...])
-        }
-        return hiddenNorm(DFlash2TensorMatmul.linear(fc, rows))
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
@@ -1953,17 +1882,30 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
-        let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
-        let rows = anchor.flatMap { [Int32($0)] + masks }
-        let block = MLXArray(rows, [anchor.count, blockSize])
+        // The mask columns of the block are never embedded: `hiddenStates`
+        // broadcasts the bind-time mask row. Building those token ids (and
+        // the GPU array that holds them) is host work on every round. The
+        // anchor ids are one array, also the greedy path's start token.
+        let anchorIds = MLXArray(anchor.map { Int32($0) })
+        let block: MLXArray
+        let maskColumns: Int
+        if Self.anchorColumnOnly {
+            block = anchorIds.reshaped([anchor.count, 1])
+            maskColumns = blockSize - 1
+        } else {
+            let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+            let rows = anchor.flatMap { [Int32($0)] + masks }
+            block = MLXArray(rows, [anchor.count, blockSize])
+            maskColumns = 0
+        }
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
-            submittingLeadingLayers: leadingLayers)
+            submittingLeadingLayers: leadingLayers, maskColumns: maskColumns)
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
-            anchor: MLXArray(anchor.map { Int32($0) }))
+            anchor: anchorIds)
     }
 
     /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
@@ -1995,108 +1937,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             precondition(absorbed, "DFlash 2: a checked cache refused its context rows")
         }
         return true
-    }
-
-    // MARK: The next block before the readback
-
-    /// `(held rows, offset)` of every layer when a speculative block fits
-    /// (today's block in place and unmasked for every count, room for 2x rows).
-    public func speculativeGeometry(cache: [KVCache], blockSize: Int) -> (rows: Int, offset: Int)? {
-        guard target != nil, cache.count == layers.count, dflash2NoMaskEnabled,
-            !config.isCausal, let window = config.slidingWindow,
-            config.layerTypes.allSatisfy({ $0 == .slidingAttention }),
-            layers.allSatisfy({ $0.selfAttn.speculativeCapable })
-        else { return nil }
-        var geometry: (rows: Int, offset: Int)?
-        for c in cache {
-            guard let block = c as? DFlash2BlockKVCache, let rows = block.inPlaceRows,
-                rows + blockSize <= block.contextRowLimit, rows + 2 * blockSize <= window,
-                rows + 2 * blockSize <= block.inPlaceCapacity,
-                geometry == nil || (geometry!.rows == rows && geometry!.offset == block.offset)
-            else { return nil }
-            geometry = (rows, block.offset)
-        }
-        return geometry
-    }
-
-    /// The next block from a device confirmed count and anchor over the whole
-    /// verify context (its leading `contextRows` projected). No cursor moves;
-    /// with `submitLead` the leading layers' writes are installed (donating
-    /// their buffers) and those layers submitted; otherwise the whole block is
-    /// submitted with the round's other drafter work after adoption.
-    public func proposeSpeculative(
-        anchor: MLXArray, confirmed: MLXArray, verifyContext: MLXArray, contextRows: Int,
-        cache: [KVCache], blockSize: Int, leadingLayers: Int, submitLead: Bool
-    ) throws -> DFlash2SpeculativeBlock? {
-        guard let geometry = speculativeGeometry(cache: cache, blockSize: blockSize),
-            anchor.size == 1, confirmed.size == 1,
-            verifyContext.shape == [1, blockSize, config.targetHiddenSize],
-            (1 ... blockSize).contains(contextRows)
-        else { return nil }
-        let caches = cache.map { $0 as! DFlash2BlockKVCache }
-        let n = 2 * blockSize
-        var h = try blockEmbedding(anchorIDs: anchor.reshaped([1, 1]), maskColumns: blockSize - 1)
-            .asType(dtype)
-        if config.dflash.inputEmbeddingScale != 1 {
-            h = h * config.dflash.inputEmbeddingScale
-        }
-        let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
-        let base = concatenated(
-            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
-            axis: 1)
-        let c = confirmed.reshaped([]).asType(.int32)
-        let queryOffset = MLXArray(Int32(geometry.offset)) + c
-        let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
-            .reshaped([1, keys])
-        let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
-        var writes: [(keys: MLXArray, values: MLXArray)] = []
-        var lead: MLXArray?
-        for (index, layer) in layers.enumerated() {
-            guard
-                let out = layer.speculative(
-                    h, base: base, confirmed: c, queryOffset: queryOffset, rope: rope,
-                    cache: caches[index], keyMask: keyMask)
-            else { preconditionFailure("DFlash 2: a checked layer refused its speculative block") }
-            h = out.hidden
-            writes.append((out.keys, out.values))
-            if index + 1 == leadAt { lead = h }
-        }
-        let hidden = norm(h[0..., 1..., 0...])
-        let tokens = candidateSelector.selectGreedy(
-            hidden: hidden, logits: try logits(hidden), anchor: anchor.reshaped([1]))
-        if let lead {
-            for i in 0 ..< leadAt { caches[i].installSpeculative(keys: writes[i].keys, values: writes[i].values) }
-            asyncEval([lead])
-        }
-        return DFlash2SpeculativeBlock(
-            tokens: tokens, writes: writes, installedLayers: leadAt, contextRows: contextRows)
-    }
-
-    /// Install the remaining writes; cursors advance as today's block's do.
-    public func adoptSpeculative(_ block: DFlash2SpeculativeBlock, confirmed: Int, cache: [KVCache]) {
-        for (index, c) in cache.enumerated() {
-            let blockCache = c as! DFlash2BlockKVCache
-            if index >= block.installedLayers {
-                blockCache.installSpeculative(keys: block.writes[index].keys, values: block.writes[index].values)
-            }
-            blockCache.commitSpeculativeContext(confirmed)
-        }
-    }
-
-    /// Per confirmed count `c`, the largest `m >= c` whose projection of `m`
-    /// rows gives the projection of `c` rows bit for bit (MLX's matmul picks
-    /// gemv, wide gemv or split-K by row count; the tensor kernel does not).
-    public func contextRowClasses(rows: Int) -> [Int] {
-        let probe = MLXRandom.normal([1, rows, config.targetHiddenSize], key: MLXRandom.key(0x5eed))
-            .asType(dtype)
-        let outputs = (1 ... rows).map { contextProjection(probe[0..., ..<$0, 0...]) }
-        eval(outputs)
-        let bits = outputs.map { $0.asType(.float32).asArray(Float.self).map(\.bitPattern) }
-        let width = config.hiddenSize
-        return [0] + (1 ... rows).map { c in
-            stride(from: rows, to: c, by: -1).first { Array(bits[$0 - 1][..<(c * width)]) == bits[c - 1] } ?? c
-        }
     }
 
     // MARK: Loading
@@ -2149,23 +1989,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     }
 }
 
-/// A block proposed before its round's readback.
-public final class DFlash2SpeculativeBlock {
-    public let tokens: MLXArray
-    let writes: [(keys: MLXArray, values: MLXArray)]
-    let installedLayers: Int
-    public let contextRows: Int  // its row class
-
-    init(tokens: MLXArray, writes: [(keys: MLXArray, values: MLXArray)], installedLayers: Int, contextRows: Int) {
-        (self.tokens, self.writes, self.installedLayers, self.contextRows) =
-            (tokens, writes, installedLayers, contextRows)
-    }
-}
-
-enum DFlash2ContextPadding {
-    static let enabled = ProcessInfo.processInfo.environment["BONSAI_DRAFT_CONTEXT_PAD16"] == "1"
-}
-
 /// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
 /// Default: after the first layer, so the GPU starts the block (it has been
 /// idle since the verify readback) while the host builds the other layers and
@@ -2184,3 +2007,4 @@ enum DFlash2DraftSubmission {
         }.filter { $0 > 0 }
     }()
 }
+private let gauntletRedraw_cc36b5c8_20260927T010933Z: Int = 0

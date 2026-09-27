@@ -887,37 +887,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         !rotating && contextRows >= 1 && rows + contextRows <= maxCacheSize
     }
 
-    // Speculative block writes (`DFlash2DraftModel.proposeSpeculative`).
-
-    /// Held context rows; nil once the rotating path owns the state.
-    public var inPlaceRows: Int? { rotating || self.keys == nil ? nil : rows }
-    public var inPlaceCapacity: Int {
-        rotating ? 0 : Swift.min(self.keys?.dim(2) ?? 0, self.values?.dim(2) ?? 0)
-    }
-    public var contextRowLimit: Int { maxCacheSize }
-
-    /// The buffers with `keys`/`values` written at the cursor as `updateBlock`
-    /// writes them, returned uninstalled; the cursor does not move.
-    public func speculativeRows(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)? {
-        guard !rotating, let k = self.keys, let v = self.values, values.dim(2) == keys.dim(2),
-            rows + keys.dim(2) <= Swift.min(k.dim(2), v.dim(2))
-        else { return nil }
-        return (Self.writeRows(k, keys, at: rows), Self.writeRows(v, values, at: rows))
-    }
-
-    public func installSpeculative(keys: MLXArray, values: MLXArray) {
-        self.keys!._updateInternal(keys)
-        self.values!._updateInternal(values)
-    }
-
-    /// Advance the cursor by `contextRows` confirmed rows, as `updateBlock` does.
-    public func commitSpeculativeContext(_ contextRows: Int) {
-        precondition(!rotating && rows + contextRows <= maxCacheSize)
-        rows += contextRows
-        idx = rows
-        offset += contextRows
-    }
-
     /// The parent's `updateConcat` expects the held rows as `keys`/`values`
     /// with `idx == keys.dim(2)`; the buffer's tail past `rows` is stale.
     private func handOverToRotation() {
