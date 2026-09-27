@@ -405,6 +405,21 @@ public enum DFlash2SlidingMask {
         slidingWindow: Int,
         isCausal: Bool
     ) -> MLXArray {
+        // The cached index reads the same ints. Off keeps the range literals.
+        if DFlash2SpeculativeIndex.arangeOn || DFlash2SpeculativeIndex.scalarOn {
+            let origin = DFlash2SpeculativeIndex.scalar(contextLength)
+            let query = (origin + DFlash2SpeculativeIndex.arange(blockLength))
+                .reshaped(blockLength, 1)
+            let key = DFlash2SpeculativeIndex.arange(contextLength + blockLength)
+                .reshaped(1, contextLength + blockLength)
+            let window = DFlash2SpeculativeIndex.scalar(slidingWindow)
+            let context = (key .< origin) .&& ((query - key) .< window)
+            var block = key .>= origin
+            if isCausal {
+                block = block .&& (key .<= query)
+            }
+            return context .|| block
+        }
         let query = MLXArray(Int32(contextLength) ..< Int32(contextLength + blockLength))
             .reshaped(blockLength, 1)
         let key = MLXArray(Int32(0) ..< Int32(contextLength + blockLength))
@@ -499,6 +514,92 @@ final class DFlash2SlidingMaskMemo {
 /// token, so the output is the target's greedy sequence either way.
 /// `MLXFAST_DFLASH_TRAINED_BLOCK_MASK=0` restores the plain block mask; `=all`
 /// lets the extension rows attend to every block row.
+/// One evaluated `0..<cap` int32 vector, sliced for the speculative key
+/// mask, the trained-block query column, and the query-offset scalar.
+/// A fresh timed process warms it at `bind`, before a round. Each switch
+/// defaults on; `0` / `false` / `no` / `off` restores that piece's fresh
+/// allocation.
+enum DFlash2SpeculativeIndex {
+    private static func flag(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }
+
+    /// The key-index vector. Off builds `MLXArray(0..<n)` at the call.
+    static let arangeOn = flag("DARKBLOOM_DFLASH_SPEC_ARANGE")
+    /// Host int32 scalars (query offset, row base, trained bound). Off
+    /// builds `MLXArray(Int32(n))` at the call.
+    static let scalarOn = flag("DARKBLOOM_DFLASH_SPEC_SCALAR")
+    /// The trained mask's `[block, 1]` query column. Off builds it at the call.
+    static let queryOn = flag("DARKBLOOM_DFLASH_SPEC_QUERY")
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var basis: MLXArray?
+    nonisolated(unsafe) private static var cap = 0
+    nonisolated(unsafe) private static var scalars: [Int: MLXArray] = [:]
+    nonisolated(unsafe) private static var queries: [Int: MLXArray] = [:]
+
+    /// `0, 1, ..., n-1`. A slice of one evaluated vector once `warm` has run.
+    static func arange(_ n: Int) -> MLXArray {
+        guard arangeOn, n > 0 else { return MLXArray(Int32(0) ..< Int32(n)) }
+        let (base, full): (MLXArray, Bool) = lock.withLock {
+            if let basis, cap >= n { return (basis, cap == n) }
+            let made = MLXArray(Int32(0) ..< Int32(n))
+            eval(made)
+            basis = made
+            cap = n
+            return (made, true)
+        }
+        return full ? base : base[0 ..< n]
+    }
+
+    /// A 0-d int32 of `n`. Inside the warmed vector this is an index, not a
+    /// new fill; a larger `n` (an absolute cache offset past the window) is
+    /// stored the first time it appears.
+    static func scalar(_ n: Int) -> MLXArray {
+        guard scalarOn else { return MLXArray(Int32(n)) }
+        if n >= 0 {
+            let base: MLXArray? = lock.withLock {
+                guard let basis, n < cap else { return nil }
+                return basis
+            }
+            if let base { return base[n].reshaped([]) }
+        }
+        if let hit = lock.withLock({ scalars[n] }) { return hit }
+        let made = MLXArray(Int32(n))
+        eval(made)
+        return lock.withLock {
+            if let hit = scalars[n] { return hit }
+            scalars[n] = made
+            return made
+        }
+    }
+
+    /// `[0, 1, ..., n-1]` as a column. One evaluated array per block length.
+    static func queryColumn(_ n: Int) -> MLXArray {
+        guard queryOn, n > 0 else {
+            return MLXArray(Int32(0) ..< Int32(n)).reshaped(n, 1)
+        }
+        if let hit = lock.withLock({ queries[n] }) { return hit }
+        let made = arange(n).reshaped(n, 1)
+        eval(made)
+        return lock.withLock {
+            if let hit = queries[n] { return hit }
+            queries[n] = made
+            return made
+        }
+    }
+
+    /// `keyCap` covers every in-place speculative key count
+    /// (`held + 2 * block`, held at most `sliding_window - 1`).
+    static func warm(block: Int, keyCap: Int, bound: Int) {
+        if arangeOn, keyCap > 0 { _ = arange(keyCap) }
+        if queryOn, block > 1 { _ = queryColumn(block) }
+        if scalarOn, bound > 0 { _ = scalar(bound) }
+    }
+}
+
 enum DFlash2TrainedBlockMask {
     private static let setting: String = ProcessInfo.processInfo
         .environment["MLXFAST_DFLASH_TRAINED_BLOCK_MASK"]?
@@ -514,12 +615,22 @@ enum DFlash2TrainedBlockMask {
     /// `k - blockStart` (negative for a context key, always allowed here; the
     /// caller ANDs in its own context and tail terms).
     static func make(
-        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int
+        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int,
+        keyIndex: MLXArray? = nil
     ) -> MLXArray {
-        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped(blockLength, 1)
-        let row = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount) - blockStart
+        let query = DFlash2SpeculativeIndex.queryColumn(blockLength)
+        let index = keyIndex ?? DFlash2SpeculativeIndex.arange(keyCount)
+        let row = index.reshaped(1, keyCount) - blockStart
         if causalExtension {
+            if DFlash2SpeculativeIndex.scalarOn {
+                let bound = DFlash2SpeculativeIndex.scalar(trained)
+                return (row .< bound) .|| ((query .>= bound) .&& (row .<= query))
+            }
             return (row .< Int32(trained)) .|| ((query .>= Int32(trained)) .&& (row .<= query))
+        }
+        if DFlash2SpeculativeIndex.scalarOn {
+            let bound = DFlash2SpeculativeIndex.scalar(trained)
+            return (row .< bound) .|| (query .>= bound)
         }
         return (row .< Int32(trained)) .|| (query .>= Int32(trained))
     }
@@ -3270,6 +3381,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             codebook: candidateSelector.predecessorCodebook.dtype,
             projected: candidateSelector.hiddenProjection.weight.dtype, unary: .float32)
         DFlash2Concat.prepare(inputs: config.targetLayerIds.count, dtype: .float16)
+        let window = config.slidingWindow ?? 0
+        DFlash2SpeculativeIndex.warm(
+            block: 16,
+            keyCap: max(0, window - 1) + 32,
+            bound: config.dflash.blockSize)
     }
 
     /// Builds and self-tests the tiled copies of the weights the block
@@ -3597,16 +3713,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
-        let queryOffset = MLXArray(Int32(geometry.offset)) + c
+        let queryOffset = DFlash2SpeculativeIndex.scalar(geometry.offset) + c
         let keys = geometry.rows + n
-        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        let positions = DFlash2SpeculativeIndex.arange(keys)
+        var keyMask = (positions .< (DFlash2SpeculativeIndex.scalar(geometry.rows + blockSize) + c))
             .reshaped([1, keys])
         if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
             // The block sits at row `held + c` of the keys, as in the plain
             // path it sits right after the cached context.
             keyMask = keyMask .&& DFlash2TrainedBlockMask.make(
-                keyCount: keys, blockStart: MLXArray(Int32(geometry.rows)) + c,
-                blockLength: blockSize, trained: config.dflash.blockSize)
+                keyCount: keys, blockStart: DFlash2SpeculativeIndex.scalar(geometry.rows) + c,
+                blockLength: blockSize, trained: config.dflash.blockSize,
+                keyIndex: DFlash2SpeculativeIndex.arangeOn ? positions : nil)
         }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         var writes: [(keys: MLXArray, values: MLXArray)] = []
