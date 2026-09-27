@@ -1853,7 +1853,7 @@ enum Qwen35GatedDeltaChunked {
         source: scanSource)
 
     // BEGIN GENERATED CHUNKED GDN SOURCES
-    private static let prepSource = """
+    static let prepSource = """
             // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
             // Q K^T are formed once and serve the Hv / Hk value heads of this key
             // head, which run side by side in lane groups of C lanes (lane = head
@@ -2166,13 +2166,116 @@ enum Qwen35GatedDeltaChunked {
         outputNames: ["y", "state_out"],
         source: scanFreshSource)
 
+    /// `scanFreshSource` with each chunk's K, Q, T' and P loaded into
+    /// registers while the previous chunk computes, then stored to the same
+    /// threadgroup tiles between the same two barriers: the chunk loop no
+    /// longer waits on device loads before its math. Only the staging moves;
+    /// every threadgroup value and every operation is the stock text's, so the
+    /// outputs are bit-identical (`prepareFresh` checks it; a mismatch drops
+    /// back to `scanFreshKernel`). `DARKBLOOM_GDN_SCAN_PREFETCH=0` keeps the
+    /// stock staging. Derived by checked replacements; nil if the text moved.
+    private static let scanFreshPrefetchSource: String? = {
+        var text = scanFreshSource
+        let stageStart = "// stage this chunk's K, Q, T', P (the previous chunk's readers are done)"
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        let loopHead = "for (int n = 0; n < NC; ++n) {"
+        guard text.components(separatedBy: stageStart).count == 2,
+            text.components(separatedBy: loopHead).count == 2,
+            let a = text.range(of: stageStart),
+            let b1 = text.range(of: barrier, range: a.upperBound ..< text.endIndex),
+            let b2 = text.range(of: barrier, range: b1.upperBound ..< text.endIndex)
+        else { return nil }
+        text.replaceSubrange(a.lowerBound ..< b2.upperBound, with: """
+            // chunk n's K, Q, T', P were loaded into registers during chunk n - 1
+                          threadgroup_barrier(mem_flags::mem_threadgroup);
+                          pf_store();
+                          threadgroup_barrier(mem_flags::mem_threadgroup);
+                          if (n + 1 < NC) { pf_load(n + 1); }
+            """)
+        guard let head = text.range(of: loopHead) else { return nil }
+        text.replaceSubrange(head.lowerBound ..< head.lowerBound, with: """
+            constexpr int RK = (KQ4 + NT - 1) / NT;
+                        constexpr int RT = (2 * TP4 + NT - 1) / NT;
+                        float4 pk_[RK], pq_[RK], pt_[RT];
+                        auto pf_load = [&](int nn) {
+                          const int tt0 = nn * C;
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RK; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < KQ4) {
+                              const int row = e / (Dk / 4);
+                              const int c4 = (e % (Dk / 4)) * 4;
+                              const size_t src = (size_t)(tt0 + row) * ks + c4;
+                              pk_[i] = *(const device float4*)(kbase + src);
+                              pq_[i] = *(const device float4*)(qbase + src);
+                            }
+                          }
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RT; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < 2 * TP4) {
+                              const int which = e / TP4;
+                              const int f = e % TP4;
+                              const device float* src = (which == 0 ? tbase : pbase) + (size_t)nn * C * C;
+                              pt_[i] = *(const device float4*)(src + f * 4);
+                            }
+                          }
+                        };
+                        auto pf_store = [&]() {
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RK; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < KQ4) {
+                              const int row = e / (Dk / 4);
+                              const int c4 = (e % (Dk / 4)) * 4;
+                              *(threadgroup float4*)(Ksh + row * LK + c4) = pk_[i];
+                              *(threadgroup float4*)(Qsh + row * LK + c4) = pq_[i];
+                            }
+                          }
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RT; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < 2 * TP4) {
+                              const int which = e / TP4;
+                              const int f = e % TP4;
+                              const int row = f / (C / 4);
+                              const int c4 = (f % (C / 4)) * 4;
+                              *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = pt_[i];
+                            }
+                          }
+                        };
+                        pf_load(0);
+
+            """)
+        return text
+    }()
+
+    private static let scanFreshPrefetchKernel: MLXFast.MLXFastKernel? = scanFreshPrefetchSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_gated_delta_chunk_scan_fresh_pf",
+            inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+            outputNames: ["y", "state_out"],
+            source: $0)
+    }
+
+    static let scanPrefetchEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_GDN_SCAN_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether `freshChunks` launches `scanFreshPrefetchKernel` (set by
+    /// `prepareFresh` before its check, cleared if the check fails with it).
+    nonisolated(unsafe) private static var scanPrefetchActive = false
+
     /// `run` from an all-zero FP32 state of `stateShape`, which is not passed,
     /// for a window of whole chunks (a remainder's sequential tail reads the
     /// state array, so such a window stays on `run`); nil when this does not
     /// apply or the geometry did not pass its check, and the caller takes the
     /// stock path.
     static func runFresh(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
         let B = k.dim(0)
@@ -2186,13 +2289,30 @@ enum Qwen35GatedDeltaChunked {
             g.dtype == .float32, beta.dtype == .float32,
             freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
         else { return nil }
-        return freshChunks(q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+        return freshChunks(
+            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared)
+    }
+
+    /// The prep launch alone (`chunks`' first launch): T', P and the decay
+    /// factors of every chunk.
+    static func prep(q: MLXArray, k: MLXArray, g: MLXArray, beta: MLXArray) -> [MLXArray] {
+        let (B, T, Hk, Dk, Hv) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3), g.dim(2))
+        return prepKernel(
+            [q, k, g, beta, MLXArray(Int32(T))],
+            template: [("C", chunk), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, T / chunk, B * Hk), threadGroup: (32, 1, 1),
+            outputShapes: [
+                [B, Hv, T / chunk, chunk, chunk], [B, Hv, T / chunk, chunk, chunk],
+                [B, Hv, T / chunk, 2, chunk],
+            ],
+            outputDTypes: [.float32, .float32, .float32])
     }
 
     /// `chunks` with `scanFreshKernel` in place of `scanKernel`: the same prep
     /// launch, the same scan launch geometry, no state input.
     private static func freshChunks(
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray) {
         let B = k.dim(0)
         let T = k.dim(1)
@@ -2203,14 +2323,15 @@ enum Qwen35GatedDeltaChunked {
         let C = chunk
         let NC = T / C
         let rowCount = MLXArray(Int32(T))
-        let prepared = prepKernel(
+        let prepared = prepared ?? prepKernel(
             [q, k, g, beta, rowCount],
             template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
             grid: (32, NC, B * Hk),
             threadGroup: (32, 1, 1),
             outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
             outputDTypes: [.float32, .float32, .float32])
-        let outputs = scanFreshKernel(
+        let scan = scanPrefetchActive ? (scanFreshPrefetchKernel ?? scanFreshKernel) : scanFreshKernel
+        let outputs = scan(
             [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
@@ -2241,7 +2362,16 @@ enum Qwen35GatedDeltaChunked {
         else { return }
         let key = [hk, dk, hv, dv, chunk]
         if freshLock.withLock({ freshVerdicts[key] != nil }) { return }
-        let verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        scanPrefetchActive = scanPrefetchEnabled && scanFreshPrefetchKernel != nil
+        var verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        if !verdict && scanPrefetchActive {
+            // the prefetch staging is the suspect: check the stock fresh scan alone
+            scanPrefetchActive = false
+            verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+            FileHandle.standardError.write(
+                "qwen35: chunked GDN scan prefetch disagrees with the stock scan on this device; stock staging kept\n"
+                    .data(using: .utf8)!)
+        }
         let recorded = freshLock.withLock { () -> Bool in
             guard freshVerdicts[key] == nil else { return false }
             freshVerdicts[key] = verdict
@@ -2551,7 +2681,18 @@ final class Qwen35DenseSiblingStack {
 
     /// `(b(x), a(x))` from one matmul, or nil when the stack does not apply
     /// (only plain, unquantized, bias-free `Linear` siblings of one dtype).
-    func apply(_ x: MLXArray, b: Linear, a: Linear, after: MLXArray? = nil) -> (MLXArray, MLXArray)? {
+    /// `after` (the qkv|z product) rides on the reduce launch as an unread
+    /// input, so MLX encodes the reduce after that product and the split-K
+    /// partial runs beside it (`Qwen35SmallNMatmul.overlap`). With `capture`,
+    /// a verify-width split-K product also hands its chunk partials over
+    /// (`Qwen35SplitKFold`): the returned arrays are then the reduce launch as
+    /// a lazy node, dropped unevaluated when the prework sums the partials
+    /// itself (the folded prework's reads of the product and of the partials
+    /// order the partial beside the product on their own).
+    func apply(
+        _ x: MLXArray, b: Linear, a: Linear, after: MLXArray? = nil,
+        capture: Qwen35BAPartialsCapture? = nil
+    ) -> (MLXArray, MLXArray)? {
         guard Self.enabled,
             ObjectIdentifier(type(of: b)) == ObjectIdentifier(Linear.self),
             ObjectIdentifier(type(of: a)) == ObjectIdentifier(Linear.self),
@@ -2563,7 +2704,14 @@ final class Qwen35DenseSiblingStack {
             weight = concatenated([b.weight, a.weight], axis: 0)
             boundary = b.weight.dim(0)
         }
-        let y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
+        let y: MLXArray
+        if let capture, let partials = Qwen35SmallNMatmul.partials(x, weight!) {
+            capture.partials = partials
+            capture.boundary = boundary
+            y = Qwen35SmallNMatmul.reduce(partials, after: after)
+        } else {
+            y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
+        }
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
     }
 }
@@ -2713,6 +2861,9 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35SplitKFold.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
+            hidden: hiddenSize)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
@@ -2940,7 +3091,8 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(
         _ inputs: MLXArray, B: Int, S: Int,
         quantized: SignedBlockHadamard.Int8Activation? = nil,
-        narrowStack: Bool = false, rotated: MLXArray? = nil
+        narrowStack: Bool = false, rotated: MLXArray? = nil,
+        baCapture: Qwen35BAPartialsCapture? = nil
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
@@ -2962,7 +3114,9 @@ final class Qwen35GatedDeltaNet: Module {
                 ?? sharedHadamardProjections(
                     inputs, [inProjQKV, inProjZ], widenOutput: !narrowStack)
             {
-                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA, after: shared[0]) {
+                if let (bOut, aOut) = baStack.apply(
+                    inputs, b: inProjB, a: inProjA, after: shared[0], capture: baCapture)
+                {
                     return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
                 }
                 return (
@@ -3127,7 +3281,8 @@ final class Qwen35GatedDeltaNet: Module {
         // Whole chunks from the zero state without the zeros array
         // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
         if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
-            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape)
+            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape,
+            prepared: pre.prepared)
         {
             return (out, pre.tail, newSsmState)
         }
@@ -3498,8 +3653,14 @@ final class Qwen35GatedDeltaNet: Module {
 
         let qkv: MLXArray
         let z: MLXArray
-        let b: MLXArray
-        let a: MLXArray
+        var b: MLXArray
+        var a: MLXArray
+        // The b|a stack's chunk partials for the prework to sum
+        // (`Qwen35SplitKFold`); nil keeps the reduce launch.
+        let foldEligible: Bool = !exactTargetVerify && S >= 3 && convKernelSize == 4
+        let baCapture: Qwen35BAPartialsCapture? =
+            foldEligible && Qwen35SplitKFold.active(rows: B * S)
+            ? Qwen35BAPartialsCapture() : nil
         if exactTargetVerify {
             let exact = qwen35A3BExactW4G64ProjectionQuad(
                 inProjQKV, inProjZ, inProjB, inProjA, inputs)
@@ -3510,7 +3671,8 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             // Preserve main's fused GDN projection construction and graph.
             (qkv, z, b, a) = projectInputs(
-                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
+                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput,
+                baCapture: baCapture)
         }
 
         // The rows' SSMs are read after the prework: a deferred replay is
@@ -3531,18 +3693,41 @@ final class Qwen35GatedDeltaNet: Module {
         // concatenated conv input for its boundary rows, which the prework
         // kernel also writes (the same FP32 values as the concatenation of the
         // state with the widened qkv, without its cast and copy launches).
-        let pre: Qwen35GDNPrework.Outputs? =
-            (!exactTargetVerify && S >= 3 && convKernelSize == 4)
-            ? Qwen35GDNPrework.run(
-                qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
-                aDecay: derived.decay(aLog), dtBias: dtBias,
-                normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
-                keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim,
-                writeConvInput: Self.preworkWritesConvInput
-                    && qkv.dtype != .bfloat16 && convState.dtype == .float32,
-                stridedReads: Qwen35GDNPrework.verifyStridedReads)
-            : nil
+        var pre: Qwen35GDNPrework.Outputs? = nil
+        if foldEligible {
+            let writeConvInput: Bool =
+                Self.preworkWritesConvInput && qkv.dtype != .bfloat16
+                && convState.dtype == .float32
+            let aDecay = derived.decay(aLog)
+            let normScales = derived.normScales(headKDim: headKDim, dtype: .float32)
+            // The fold (`Qwen35SplitKFold`): the prework launch sums the b|a
+            // chunk partials in the reduce kernel's order and writes the
+            // summed a and b for the tape, the same bits (self-tested at
+            // load); a variant it declines runs the reduce launch below.
+            if let capture = baCapture, let partials = capture.partials {
+                pre = Qwen35GDNPrework.runFolded(
+                    qkv: qkv, convState: convState, convWeight: conv1d.weight,
+                    abPartials: partials.part, aOffset: capture.boundary, bOffset: 0,
+                    aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                    headVDim: headVDim,
+                    writeConvInput: writeConvInput,
+                    stridedReads: Qwen35GDNPrework.verifyStridedReads)
+                if let folded = pre, let foldedA = folded.a, let foldedB = folded.b {
+                    a = foldedA
+                    b = foldedB
+                }
+            }
+            if pre == nil {
+                pre = Qwen35GDNPrework.run(
+                    qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
+                    aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                    headVDim: headVDim,
+                    writeConvInput: writeConvInput,
+                    stridedReads: Qwen35GDNPrework.verifyStridedReads)
+            }
+        }
         let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
@@ -5030,6 +5215,13 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // A prompt-width forward inside an engine step keeps the step's work
+        // interval running: renewed now and at each prompt submission below.
+        // Scheduling hint only (`CBv2EngineWorkInterval`).
+        let promptForward =
+            !captureRecurrentWindow
+            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
+        if promptForward { CBv2EngineWorkInterval.promptForwardBegan() }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -5109,6 +5301,7 @@ public class Qwen35TextModelInner: Module {
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
+                    if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
                 }
                 continue
@@ -5133,6 +5326,7 @@ public class Qwen35TextModelInner: Module {
             if let submission,
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
+                if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
             }
         }
@@ -5145,7 +5339,7 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            dFlash2Tap.tappedHidden = concatenated(tapped.map { $0! }, axis: -1)
+            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
         }
         return hiddenStates
     }
@@ -5179,6 +5373,13 @@ enum Qwen35GDNPrework {
         let tail: MLXArray
         /// `concatenated([convState, qkv], axis: 1)` in FP32, when requested.
         var convInput: MLXArray? = nil
+        /// The chunked scan's prep outputs (T', P, decay factors), when the
+        /// prework launch formed them (`freshStridedRows` form 3).
+        var prepared: [MLXArray]? = nil
+        /// The summed `a` and `b` gate inputs `[B, S, HV]`, when the launch
+        /// formed them from the b|a chunk partials (`Qwen35SplitKFold`).
+        var a: MLXArray? = nil
+        var b: MLXArray? = nil
     }
 
     static let enabled: Bool = {
@@ -5191,7 +5392,7 @@ enum Qwen35GDNPrework {
     // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
     // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
     // decay/dtb [HV] (decay = -exp(A_log)), wq/wk [DK], S (scalar).
-    private static let source = """
+    static let source = """
         constexpr int GRP = HV / HK;
         constexpr int KEY = HK * DK;
         constexpr int VOFF = 2 * KEY;
@@ -5339,8 +5540,11 @@ enum Qwen35GDNPrework {
         """
 
     /// `text` with `convInputBlock` placed before its convolution-tail stores.
-    private static func withConvInput(_ text: String) -> String {
-        let anchor = "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+    static let convInputAnchor =
+        "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+
+    static func withConvInput(_ text: String) -> String {
+        let anchor = convInputAnchor
         precondition(
             text.components(separatedBy: anchor).count == 2,
             "Qwen35 GDN prework: the conv-input source no longer matches the stock kernel")
@@ -5363,7 +5567,7 @@ enum Qwen35GDNPrework {
     /// layer per round). The same elements enter the same arithmetic, so the
     /// outputs are the same values. `BONSAI_PREWORK_STRIDED_VERIFY=0` keeps
     /// the copies.
-    private static let stridedSource: String = {
+    static let stridedSource: String = {
         var text = source
         for (target, replacement) in [
             ("const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);",
