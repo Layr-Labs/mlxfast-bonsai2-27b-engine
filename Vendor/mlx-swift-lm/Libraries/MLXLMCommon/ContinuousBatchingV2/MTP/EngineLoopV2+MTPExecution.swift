@@ -638,6 +638,7 @@ extension EngineLoopV2 {
                     if let lookup, let absorbed = block.absorbLookupRound(requestState: requestState) {
                         proposal = lookup
                         assistantEvalTargets.append(contentsOf: absorbed)
+                        CBv2VerifyQueueHint.markNothingAhead()
                     } else {
                         let drafted = try block.proposeBlock(
                             anchor: carry.token, depth: k, requestState: requestState)
