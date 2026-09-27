@@ -681,6 +681,37 @@ enum Qwen35WideNMatmul {
 
     static let chunk = 512
 
+    /// Reuse the three-int shape buffer across prompt chunks.
+    /// `DARKBLOOM_PROMPT_SPLITK_DIMS=0` allocates a fresh one every launch.
+    static let cacheDims: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_PROMPT_SPLITK_DIMS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let dimsLock = NSLock()
+    nonisolated(unsafe) private static var dimsCache: [String: MLXArray] = [:]
+
+    static func dimsArray(k: Int, rows: Int, n: Int) -> MLXArray {
+        guard cacheDims else { return MLXArray([Int32(k), Int32(rows), Int32(n)]) }
+        let key = "\(k)x\(rows)x\(n)"
+        return dimsLock.withLock {
+            if let hit = dimsCache[key] { return hit }
+            let made = MLXArray([Int32(k), Int32(rows), Int32(n)])
+            eval(made)
+            dimsCache[key] = made
+            return made
+        }
+    }
+
+    /// Prompt chunk widths the seed and the timed prefill actually launch.
+    static func warmDims(k: Int, n: Int) {
+        guard enabled, cacheDims, k % chunk == 0, n % 32 == 0, k > 0, n > 0 else { return }
+        for rows in stride(from: 64, through: 512, by: 64) {
+            _ = dimsArray(k: k, rows: rows, n: n)
+        }
+    }
+
     // grid (N / 32 * 128, M / 64, K / KC), threadgroup (128, 1, 1). Simdgroup
     // sg: rows m0 = 64 * tg.y + 32 * (sg >> 1) .. + 31, columns
     // n0 = 32 * tg.x + 16 * (sg & 1) .. + 15.
@@ -743,7 +774,7 @@ enum Qwen35WideNMatmul {
             FileHandle.standardError.write(
                 Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
         }
-        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let dims = dimsArray(k: k, rows: rows, n: n)
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
             grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),

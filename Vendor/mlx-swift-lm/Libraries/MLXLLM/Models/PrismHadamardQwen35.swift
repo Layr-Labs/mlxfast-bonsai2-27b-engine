@@ -51,6 +51,38 @@ enum Qwen35SmallNMatmul {
 
     static let chunk = 128
 
+    /// Reuse the three-int shape buffer. `DARKBLOOM_QWEN35_SPLITK_DIMS=0`
+    /// allocates a fresh one on every launch.
+    static let cacheDims: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SPLITK_DIMS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let dimsLock = NSLock()
+    nonisolated(unsafe) private static var dimsCache: [String: MLXArray] = [:]
+
+    static func dimsArray(k: Int, rows: Int, n: Int) -> MLXArray {
+        guard cacheDims else { return MLXArray([Int32(k), Int32(rows), Int32(n)]) }
+        let key = "\(k)x\(rows)x\(n)"
+        return dimsLock.withLock {
+            if let hit = dimsCache[key] { return hit }
+            let made = MLXArray([Int32(k), Int32(rows), Int32(n)])
+            eval(made)
+            dimsCache[key] = made
+            return made
+        }
+    }
+
+    /// The verify widths (1...16 rows) and the prompt widths the wide kernel
+    /// accepts, so the timed window does not allocate these buffers.
+    static func warmDims(k: Int, n: Int) {
+        guard enabled, cacheDims, k % chunk == 0, n % 32 == 0, k > 0, n > 0 else { return }
+        for rows in 1 ... 16 {
+            _ = dimsArray(k: k, rows: rows, n: n)
+        }
+    }
+
     /// The reduce takes the qkv|z product as an unread input (`after`), so MLX
     /// encodes it after that product and the partial runs beside the product
     /// instead of alone. `DARKBLOOM_QWEN35_SPLITK_BA_OVERLAP=0` drops it.
@@ -136,7 +168,7 @@ enum Qwen35SmallNMatmul {
         guard rows >= 1, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
         // Prompt width: the 64-row simdgroup-matrix split-K (`Qwen35WideNMatmul`).
         if rows > 16 { return Qwen35WideNMatmul.apply(x, w, rows: rows, k: k, n: n) }
-        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let dims = dimsArray(k: k, rows: rows, n: n)
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
@@ -146,5 +178,38 @@ enum Qwen35SmallNMatmul {
             grid: ((rows * n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+
+    /// `apply` without the reduce launch. Nil for the wide prompt kernel
+    /// (`rows > 16`) and for every shape `apply` would refuse.
+    static func partials(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
+        guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
+        let k = x.dim(-1)
+        let n = w.dim(0)
+        let rows = x.size / k
+        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
+        let dims = dimsArray(k: k, rows: rows, n: n)
+        return partialKernel(
+            [x.reshaped(rows, k), w, dims],
+            grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// The crown reduce, with no unread `after`. The sum is chunk 0 first.
+    static func reduce(
+        _ part: MLXArray, boundary: Int, like x: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, part.ndim == 3, part.dtype == .float32 else { return nil }
+        let ks = part.dim(0)
+        let rows = part.dim(1)
+        let n = part.dim(2)
+        guard ks >= 1, rows >= 1, rows <= 16, boundary > 0, boundary < n else { return nil }
+        let dims = dimsArray(k: ks * chunk, rows: rows, n: n)
+        let y = reduceKernel(
+            [part, dims, dims], template: [("KS", ks)],
+            grid: ((rows * n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+        let shaped = y.reshaped(Array(x.shape.dropLast()) + [n])
+        return (shaped[.ellipsis, ..<boundary], shaped[.ellipsis, boundary...])
     }
 }

@@ -1701,3 +1701,225 @@ extension Qwen35GDNPrework {
         case message(String)
     }
 }
+
+extension Qwen35GDNPrework {
+    /// Sum the verify-width `b|a` split-K partials inside the loads-first
+    /// prework, in the reduce's chunk order. `DARKBLOOM_QWEN35_BA_INTO_PREWORK=0`
+    /// keeps the reduce launch. A failed self-test does the same.
+    static let baIntoPrework: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_BA_INTO_PREWORK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let baFoldSource: String = {
+        var text = verifyLoadsFirstSource
+        let decl = "        float dcy = 0.0f;\n"
+        let reads = """
+        if (gate) {
+          const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];
+          const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];
+          av = a[ab + int64_t(hv) * a_strides[2]] + dtb[int64_t(hv) * dtb_strides[0]];
+          bv = b[bbase + int64_t(hv) * b_strides[2]];
+          dcy = decay[int64_t(hv) * decay_strides[0]];
+        }
+"""
+        let summed = """
+        if (gate) {
+          const int64_t row = int64_t(bb) * int64_t(Sn) + int64_t(t);
+          for (int s = 0; s < KSP; s++) {
+            const int64_t base = int64_t(s) * abp_strides[0] + row * abp_strides[1];
+            bSum += abp[base + int64_t(hv) * abp_strides[2]];
+            aSum += abp[base + int64_t(AOFF + hv) * abp_strides[2]];
+          }
+          av = aSum + dtb[int64_t(hv) * dtb_strides[0]];
+          bv = bSum;
+          dcy = decay[int64_t(hv) * decay_strides[0]];
+        }
+"""
+        let store = "          beta[grow] = betav;\n"
+        let stored = "          beta[grow] = betav;\n          ao[grow] = aSum;\n          bo[grow] = bSum;\n"
+        precondition(text.components(separatedBy: decl).count == 2,
+            "qwen35 b|a prework: dcy anchor moved")
+        precondition(text.components(separatedBy: reads).count == 2,
+            "qwen35 b|a prework: a/b read anchor moved")
+        precondition(text.components(separatedBy: store).count == 2,
+            "qwen35 b|a prework: beta store anchor moved")
+        text = text.replacingOccurrences(of: decl, with: decl + "        float aSum = 0.0f;\n        float bSum = 0.0f;\n")
+        text = text.replacingOccurrences(of: reads, with: summed)
+        text = text.replacingOccurrences(of: store, with: stored)
+        return text
+    }()
+
+    private static let baFoldKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_verify_lf_bapre",
+        inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "ci", "ao", "bo"],
+        source: baFoldSource,
+        ensureRowContiguous: false)
+
+    private struct BAFoldGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, kChunks: Int, dtype: String
+    }
+
+    private static let baFoldLock = NSLock()
+    nonisolated(unsafe) private static var baFoldVerdicts: [BAFoldGeometry: Bool] = [:]
+
+    /// Loads-first prework fed by split-K partials. Nil unless `prepareBAFold`
+    /// recorded a pass for this geometry, or the partial is not the stacked
+    /// `b|a` product.
+    static func runFromPartials(
+        qkv: MLXArray, convState: MLXArray, convWeight: MLXArray,
+        part: MLXArray, boundary: Int,
+        aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
+        writeConvInput: Bool
+    ) -> (b: MLXArray, a: MLXArray, pre: Outputs)? {
+        guard baIntoPrework, writeConvInput, verifyStridedReads, verifyLoadsFirstEnabled,
+            qkv.ndim == 3, part.ndim == 3, part.dtype == .float32
+        else { return nil }
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        let chunks = part.dim(0)
+        guard boundary == valueHeads, part.dim(2) == 2 * valueHeads,
+            part.dim(1) == B * S, chunks >= 1, S >= 3,
+            headKDim == 128, headVDim == 128, valueHeads % keyHeads == 0,
+            CD == 2 * keyHeads * headKDim + valueHeads * headVDim,
+            convState.shape == [B, KS - 1, CD], convWeight.shape == [CD, KS, 1],
+            [DType.float32, .float16].contains(qkv.dtype),
+            convState.dtype == .float32, convWeight.dtype == .float32,
+            aDecay.shape == [valueHeads], aDecay.dtype == .float32,
+            dtBias.shape == [valueHeads],
+            normScales.q.dtype == .float32, normScales.k.dtype == .float32,
+            normScales.q.shape == [headKDim], normScales.k.shape == [headKDim]
+        else { return nil }
+        let geometry = BAFoldGeometry(
+            hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, kChunks: chunks,
+            dtype: "\(qkv.dtype)")
+        guard baFoldLock.withLock({ baFoldVerdicts[geometry] ?? false }) else { return nil }
+        let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        let outputs = baFoldKernel(
+            [qkv, convState, convWeight, part, aDecay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("KSP", chunks), ("AOFF", boundary),
+            ],
+            grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1 + S, CD], [B, S, valueHeads], [B, S, valueHeads],
+            ],
+            outputDTypes: Array(repeating: DType.float32, count: 8))
+        let pre = Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5][0..., S..., 0...], convInput: outputs[5])
+        return (outputs[7], outputs[6], pre)
+    }
+
+    static func prepareBAFold(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, k: Int) {
+        guard baIntoPrework, enabled, verifyStridedReads, verifyLoadsFirstEnabled,
+            dk == 128, dv == 128, hk > 0, hv % hk == 0, ks > 1,
+            k > 0, k % Qwen35SmallNMatmul.chunk == 0
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        let chunks = k / Qwen35SmallNMatmul.chunk
+        for dtype in [DType.float32, .float16] {
+            let geometry = BAFoldGeometry(
+                hk: hk, hv: hv, cd: cd, ks: ks, kChunks: chunks, dtype: "\(dtype)")
+            if baFoldLock.withLock({ baFoldVerdicts[geometry] != nil }) { continue }
+            let (verdict, detail) = baFoldSelfCheck(
+                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, k: k, dtype: dtype)
+            let recorded = baFoldLock.withLock { () -> Bool in
+                guard baFoldVerdicts[geometry] == nil else { return false }
+                baFoldVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded {
+                FileHandle.standardError.write(
+                    ("qwen35 b|a into prework (\(dtype)): self-test "
+                        + (verdict ? "passed" : "FAILED") + " (" + detail + ")\n")
+                        .data(using: .utf8)!)
+            }
+        }
+    }
+
+    private enum BAFoldFailure: Error { case message(String) }
+
+    private static func baFoldSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, k: Int, dtype: DType
+    ) -> (Bool, String) {
+        let cd = 2 * hk * dk + hv * dv
+        let nk = ks - 1
+        let chunks = k / Qwen35SmallNMatmul.chunk
+        let keys = MLXRandom.split(key: MLXRandom.key(0x4241_4644), into: 12)
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for T in [16, 3] {
+                    let x = MLXRandom.normal([1, T, k], key: keys[0])
+                    let w = MLXRandom.normal([2 * hv, k], key: keys[1]) * 0.02
+                    guard let part = Qwen35SmallNMatmul.partials(x, w),
+                        let reduced = Qwen35SmallNMatmul.reduce(part, boundary: hv, like: x)
+                    else { throw BAFoldFailure.message("no partial") }
+                    let b = reduced.0
+                    let a = reduced.1
+                    let qkv = MLXRandom.normal([1, T, cd], key: keys[2]).asType(dtype)
+                    let convState = MLXRandom.normal([1, nk, cd], key: keys[3])
+                    let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[4]) * 0.5
+                    let aDecay = Qwen35GDNDerived().decay(MLXRandom.normal([hv], key: keys[5]) * 0.5)
+                    let dtBias = MLXRandom.normal([hv], key: keys[6])
+                    let normScales = (
+                        q: MLXRandom.normal([dk], key: keys[7]),
+                        k: MLXRandom.normal([dk], key: keys[8]))
+                    eval(part, a, b, qkv, convState, convWeight, aDecay, dtBias, normScales.q, normScales.k)
+                    guard let stock = run(
+                        qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                        aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                        keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv,
+                        writeConvInput: true, stridedReads: true),
+                        let stockCI = stock.convInput
+                    else { throw BAFoldFailure.message("no stock launch") }
+                    let folded = baFoldKernel(
+                        [qkv, convState, convWeight, part, aDecay, dtBias, normScales.q, normScales.k,
+                         MLXArray(Int32(T))],
+                        template: [
+                            ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
+                            ("CD", cd), ("KS", ks), ("KSP", chunks), ("AOFF", hv),
+                        ],
+                        grid: (128 * hk, T, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [
+                            [1, T, hk, dk], [1, T, hk, dk], [1, T, hv, dv], [1, T, hv], [1, T, hv],
+                            [1, nk + T, cd], [1, T, hv], [1, T, hv],
+                        ],
+                        outputDTypes: Array(repeating: DType.float32, count: 8))
+                    var differ: [MLXArray] = []
+                    let pairs: [(MLXArray, MLXArray)] = [
+                        (stock.q, folded[0]), (stock.k, folded[1]), (stock.v, folded[2]),
+                        (stock.g, folded[3]), (stock.beta, folded[4]), (stockCI, folded[5]),
+                        (contiguous(a), folded[6]), (contiguous(b), folded[7]),
+                    ]
+                    for (lhs, rhs) in pairs {
+                        guard lhs.shape == rhs.shape else {
+                            throw BAFoldFailure.message("shape \(lhs.shape) vs \(rhs.shape)")
+                        }
+                        differ.append(
+                            (lhs.view(dtype: .uint32) .!= rhs.view(dtype: .uint32)).asType(.int32).sum())
+                        values += lhs.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        return (mismatches == 0, "rows 16 and 3, \(values) values, \(mismatches) mismatches")
+    }
+}

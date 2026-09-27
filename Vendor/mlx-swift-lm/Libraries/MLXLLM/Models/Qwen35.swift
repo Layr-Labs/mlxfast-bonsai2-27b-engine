@@ -2706,6 +2706,24 @@ final class Qwen35DenseSiblingStack {
         let y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
     }
+
+    /// The split-K partials of the stacked product, or nil when `apply` would
+    /// not have taken `Qwen35SmallNMatmul` (including the wide prompt kernel).
+    func partials(_ x: MLXArray, b: Linear, a: Linear) -> (part: MLXArray, boundary: Int)? {
+        guard Self.enabled,
+            ObjectIdentifier(type(of: b)) == ObjectIdentifier(Linear.self),
+            ObjectIdentifier(type(of: a)) == ObjectIdentifier(Linear.self),
+            b.bias == nil, a.bias == nil, b.weight.ndim == 2, a.weight.ndim == 2,
+            b.weight.dtype == a.weight.dtype, b.weight.dim(1) == a.weight.dim(1),
+            x.dtype == b.weight.dtype
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([b.weight, a.weight], axis: 0)
+            boundary = b.weight.dim(0)
+        }
+        guard let part = Qwen35SmallNMatmul.partials(x, weight!) else { return nil }
+        return (part, boundary)
+    }
 }
 
 
@@ -2853,6 +2871,11 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35GDNPrework.prepareBAFold(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
+            k: hiddenSize)
+        Qwen35SmallNMatmul.warmDims(k: hiddenSize, n: numVHeads * 2)
+        Qwen35WideNMatmul.warmDims(k: hiddenSize, n: numVHeads * 2)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
@@ -3080,7 +3103,8 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(
         _ inputs: MLXArray, B: Int, S: Int,
         quantized: SignedBlockHadamard.Int8Activation? = nil,
-        narrowStack: Bool = false, rotated: MLXArray? = nil
+        narrowStack: Bool = false, rotated: MLXArray? = nil,
+        includeBA: Bool = true
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
@@ -3102,14 +3126,32 @@ final class Qwen35GatedDeltaNet: Module {
                 ?? sharedHadamardProjections(
                     inputs, [inProjQKV, inProjZ], widenOutput: !narrowStack)
             {
-                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA, after: shared[0]) {
+                if includeBA,
+                    let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA, after: shared[0])
+                {
                     return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
+                }
+                if !includeBA {
+                    return (
+                        shared[0],
+                        shared[1].reshaped(B, S, numVHeads, headVDim),
+                        MLXArray.zeros([0]),
+                        MLXArray.zeros([0])
+                    )
                 }
                 return (
                     shared[0],
                     shared[1].reshaped(B, S, numVHeads, headVDim),
                     inProjB(inputs),
                     inProjA(inputs)
+                )
+            }
+            if !includeBA {
+                return (
+                    inProjQKV(inputs),
+                    inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
+                    MLXArray.zeros([0]),
+                    MLXArray.zeros([0])
                 )
             }
             return (
@@ -3637,10 +3679,11 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
         precondition(S >= 1, "Qwen35 capture-verify window must be non-empty")
 
-        let qkv: MLXArray
-        let z: MLXArray
-        let b: MLXArray
-        let a: MLXArray
+        var qkv: MLXArray
+        var z: MLXArray
+        var b: MLXArray
+        var a: MLXArray
+        var foldedPart: (part: MLXArray, boundary: Int)? = nil
         if exactTargetVerify {
             let exact = qwen35A3BExactW4G64ProjectionQuad(
                 inProjQKV, inProjZ, inProjB, inProjA, inputs)
@@ -3648,10 +3691,25 @@ final class Qwen35GatedDeltaNet: Module {
             z = exact.1.reshaped(B, S, numVHeads, headVDim)
             b = exact.2
             a = exact.3
+        } else if Qwen35GDNPrework.baIntoPrework,
+            let part = baStack.partials(inputs, b: inProjB, a: inProjA)
+        {
+            let projected = projectInputs(
+                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput,
+                includeBA: false)
+            qkv = projected.qkv
+            z = projected.z
+            b = projected.b
+            a = projected.a
+            foldedPart = part
         } else {
             // Preserve main's fused GDN projection construction and graph.
-            (qkv, z, b, a) = projectInputs(
+            let projected = projectInputs(
                 inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
+            qkv = projected.qkv
+            z = projected.z
+            b = projected.b
+            a = projected.a
         }
 
         // The rows' SSMs are read after the prework: a deferred replay is
@@ -3672,18 +3730,43 @@ final class Qwen35GatedDeltaNet: Module {
         // concatenated conv input for its boundary rows, which the prework
         // kernel also writes (the same FP32 values as the concatenation of the
         // state with the widened qkv, without its cast and copy launches).
-        let pre: Qwen35GDNPrework.Outputs? =
-            (!exactTargetVerify && S >= 3 && convKernelSize == 4)
-            ? Qwen35GDNPrework.run(
-                qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
+        let pre: Qwen35GDNPrework.Outputs?
+        if !exactTargetVerify, S >= 3, convKernelSize == 4, let foldedPart,
+            let folded = Qwen35GDNPrework.runFromPartials(
+                qkv: qkv, convState: convState, convWeight: conv1d.weight,
+                part: foldedPart.part, boundary: foldedPart.boundary,
                 aDecay: derived.decay(aLog), dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
                 headVDim: headVDim,
                 writeConvInput: Self.preworkWritesConvInput
-                    && qkv.dtype != .bfloat16 && convState.dtype == .float32,
-                stridedReads: Qwen35GDNPrework.verifyStridedReads)
-            : nil
+                    && qkv.dtype != .bfloat16 && convState.dtype == .float32)
+        {
+            b = folded.b
+            a = folded.a
+            pre = folded.pre
+        } else {
+            if let foldedPart, let reduced = Qwen35SmallNMatmul.reduce(
+                foldedPart.part, boundary: foldedPart.boundary, like: inputs)
+            {
+                b = reduced.0
+                a = reduced.1
+            } else if foldedPart != nil {
+                b = inProjB(inputs)
+                a = inProjA(inputs)
+            }
+            pre = (!exactTargetVerify && S >= 3 && convKernelSize == 4)
+                ? Qwen35GDNPrework.run(
+                    qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
+                    aDecay: derived.decay(aLog), dtBias: dtBias,
+                    normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
+                    keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                    headVDim: headVDim,
+                    writeConvInput: Self.preworkWritesConvInput
+                        && qkv.dtype != .bfloat16 && convState.dtype == .float32,
+                    stridedReads: Qwen35GDNPrework.verifyStridedReads)
+                : nil
+        }
         let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
