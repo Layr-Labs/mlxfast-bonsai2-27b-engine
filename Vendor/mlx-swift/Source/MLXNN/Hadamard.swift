@@ -1,6 +1,7 @@
 // Adapted from PrismML-Eng/mlx-swift 6d3a84de28225d1f5bc0a56f5c781596997242f9 (MIT).
 // Preserve the published Bonsai pack's FP32 transform / original output dtype contract.
 import Foundation
+import Cmlx
 @_spi(QuantizedConstantCache) import MLX
 
 /// Invalid transform metadata or incompatible packed weights.
@@ -1872,9 +1873,17 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         self.transform = transform
         super.init(weight: weight)
         freeze()
+        // Load-time only. A miss disables this instance and leaves the stock
+        // GPU gather in place. The timed seed never runs the comparison.
+        if PromptEmbeddingHostGather.enabled {
+            PromptEmbeddingHostGather.verify(self)
+        }
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let gathered = PromptEmbeddingHostGather.lookup(self, indices: x) {
+            return gathered
+        }
         let indices = x.flattened()
         let rows = dequantized(
             weight[indices], scales: scales[indices],
@@ -1887,6 +1896,142 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             transform(x), weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
     }
+}
+
+/// Prompt-width packed-embedding gather that does not bind the full table.
+///
+/// After the idle gate the seed's first command buffer is the embedding
+/// gather. Binding the packed table (about 358 MB) there makes Metal restore
+/// that allocation before the GPU starts; on an M4 that stall was 28 ms and
+/// the seed sat 44 ms behind the same tree's stepper prefill. The stepper
+/// never pays it. A prompt-width lookup (at least 128 int32 ids, never a
+/// verify window) copies the packed rows it needs — 0.7 MB at 512 tokens —
+/// from the already-computed host pointer and runs the stock dequantization
+/// and inverse on that copy. The full table is bound later, behind the
+/// prompt forward's first submission, so the restore overlaps the forward
+/// and the decode window does not pay it either.
+///
+/// `BONSAI_EMBED_HOST_GATHER=0` keeps the stock GPU gather. A failed
+/// load-time bit match disables the instance.
+public enum PromptEmbeddingHostGather {
+    public static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_EMBED_HOST_GATHER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Prompt width, not a verify window (at most 17 rows) and not a decode step.
+    public static let minimumRows = 128
+    /// Above this, reading the ids could be waiting on a real graph. Fall back.
+    private static let maximumRows = 8192
+
+    nonisolated(unsafe) private static var ready = Set<ObjectIdentifier>()
+    /// Weight, scales, and biases of every instance that passed the bit check.
+    /// Touched on each prompt forward, behind the first submission.
+    nonisolated(unsafe) public private(set) static var touchArrays: [MLXArray] = []
+
+    static func lookup(_ embedding: HadamardQuantizedEmbedding, indices x: MLXArray) -> MLXArray? {
+        guard enabled, ready.contains(ObjectIdentifier(embedding)) else { return nil }
+        let n = x.size
+        guard n >= minimumRows, n <= maximumRows, x.dtype == .int32 else { return nil }
+        // A reshape of a host id vector is a few kilobytes. Evaluating it does
+        // not bind the table. A large unavailable graph is not an id vector.
+        if !isAvailable(x) {
+            guard x.ndim <= 2 else { return nil }
+            eval(x)
+        }
+        guard isAvailable(x) else { return nil }
+        let ids = x.asArray(Int32.self)
+        guard ids.count == n else { return nil }
+        guard let weight = gatherRows(embedding.weight, ids),
+            let scales = gatherRows(embedding.scales, ids)
+        else { return nil }
+        let biasRows = embedding.biases.flatMap { gatherRows($0, ids) }
+        if embedding.biases != nil && biasRows == nil { return nil }
+        let rows = dequantized(
+            weight, scales: scales, biases: biasRows,
+            groupSize: embedding.groupSize, bits: embedding.bits)
+        return embedding.transform.inverse(rows).reshaped(x.shape + [embedding.transform.width])
+    }
+
+    static func verify(_ embedding: HadamardQuantizedEmbedding) {
+        let vocab = embedding.weight.dim(0)
+        guard vocab > 8 else { return }
+        // Force the packed constants computed before any timed region. The
+        // idle gate after load is what unwires them; this check is not on
+        // that clock.
+        eval(embedding.weight, embedding.scales)
+        if let biases = embedding.biases { eval(biases) }
+        let sample: [Int32] = [0, 1, 7, Int32(vocab / 2), Int32(vocab - 1), 0]
+        let x = MLXArray(sample).reshaped([1, sample.count])
+        guard let host = lookupUnchecked(embedding, indices: x) else { return }
+        let indices = x.flattened()
+        let stock = embedding.transform.inverse(dequantized(
+            embedding.weight[indices], scales: embedding.scales[indices],
+            biases: embedding.biases.map { $0[indices] },
+            groupSize: embedding.groupSize, bits: embedding.bits)
+        ).reshaped(x.shape + [embedding.transform.width])
+        let hostBytes = host.asData().data
+        let stockBytes = stock.asData().data
+        guard hostBytes == stockBytes else { return }
+        ready.insert(ObjectIdentifier(embedding))
+        var touch = [embedding.weight, embedding.scales]
+        if let biases = embedding.biases { touch.append(biases) }
+        for array in touch where !touchArrays.contains(where: { $0 === array }) {
+            touchArrays.append(array)
+        }
+    }
+
+    /// Same as `lookup` but without the ready-set gate, for the load-time check.
+    private static func lookupUnchecked(
+        _ embedding: HadamardQuantizedEmbedding, indices x: MLXArray
+    ) -> MLXArray? {
+        let ids = x.asArray(Int32.self)
+        guard let weight = gatherRows(embedding.weight, ids),
+            let scales = gatherRows(embedding.scales, ids)
+        else { return nil }
+        let biasRows = embedding.biases.flatMap { gatherRows($0, ids) }
+        if embedding.biases != nil && biasRows == nil { return nil }
+        let rows = dequantized(
+            weight, scales: scales, biases: biasRows,
+            groupSize: embedding.groupSize, bits: embedding.bits)
+        return embedding.transform.inverse(rows).reshaped(x.shape + [embedding.transform.width])
+    }
+
+    /// Copy packed rows from an already-computed table. Does not evaluate the
+    /// table and does not bind it into a command buffer.
+    private static func gatherRows(_ table: MLXArray, _ ids: [Int32]) -> MLXArray? {
+        guard table.ndim == 2, isAvailable(table) else { return nil }
+        let vocab = table.dim(0)
+        let cols = table.dim(1)
+        guard vocab > 0, cols > 0, ids.allSatisfy({ $0 >= 0 && Int($0) < vocab }) else { return nil }
+        // Element strides. A packed row is contiguous; anything else stays on
+        // the stock gather rather than copying the wrong bytes.
+        guard let rawStrides = mlx_array_strides(table.ctx) else { return nil }
+        let strides = (0 ..< 2).map { Int(rawStrides[$0]) }
+        guard strides[1] == 1, strides[0] == cols else { return nil }
+        guard let base = mlx_array_data_uint8(table.ctx) else { return nil }
+        let item = table.itemSize
+        let rowBytes = cols * item
+        var data = Data(count: ids.count * rowBytes)
+        let copied = data.withUnsafeMutableBytes { raw -> Bool in
+            guard let dst = raw.baseAddress else { return false }
+            for (row, id) in ids.enumerated() {
+                let src = base.advanced(by: Int(id) * cols * item)
+                memcpy(dst.advanced(by: row * rowBytes), src, rowBytes)
+            }
+            return true
+        }
+        guard copied else { return nil }
+        return MLXArray(data, [ids.count, cols], dtype: table.dtype)
+    }
+
+    private static func isAvailable(_ array: MLXArray) -> Bool {
+        var available = false
+        guard _mlx_array_is_available(&available, array.ctx) == 0 else { return false }
+        return available
+    }
+
 }
 
 /// The row count from which a forward counts as prompt width: the timed

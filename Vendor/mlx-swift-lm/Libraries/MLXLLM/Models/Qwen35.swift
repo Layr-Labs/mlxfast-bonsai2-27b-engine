@@ -5250,6 +5250,19 @@ public class Qwen35TextModelInner: Module {
             !captureRecurrentWindow
             && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
         if promptForward { CBv2EngineWorkInterval.promptForwardBegan() }
+        // The packed embedding table is not in this forward's first command
+        // buffer when the host gather is on. Bind it behind the first
+        // submission so the idle-gate restore overlaps the forward instead of
+        // stalling the seed token, and so a later decode gather does not pay
+        // the restore either. Once per forward; verify windows do not touch.
+        var embeddingTableTouched = false
+        func touchEmbeddingTableIfNeeded() {
+            guard promptForward, !embeddingTableTouched else { return }
+            embeddingTableTouched = true
+            let arrays = PromptEmbeddingHostGather.touchArrays
+            guard !arrays.isEmpty else { return }
+            asyncEval(arrays.map { $0[0] })
+        }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -5337,6 +5350,7 @@ public class Qwen35TextModelInner: Module {
                 {
                     if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
+                    touchEmbeddingTableIfNeeded()
                     // Behind the layers just submitted: the drafter's weights
                     // for a request that will draft (`DFlash2ResidencyPrefetch`).
                     if promptPrefetch {
@@ -5367,6 +5381,7 @@ public class Qwen35TextModelInner: Module {
             {
                 if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
+                touchEmbeddingTableIfNeeded()
                 if promptPrefetch {
                     DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
                 }
