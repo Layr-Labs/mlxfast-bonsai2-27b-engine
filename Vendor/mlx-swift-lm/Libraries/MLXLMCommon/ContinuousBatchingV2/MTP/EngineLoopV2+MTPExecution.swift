@@ -641,7 +641,13 @@ extension EngineLoopV2 {
                     } else {
                         let drafted = try block.proposeBlock(
                             anchor: carry.token, depth: k, requestState: requestState)
-                        proposal = lookup ?? drafted
+                        // A lookup miss keeps the drafter's block, spliced
+                        // along the prompt span it quotes (`missed`).
+                        proposal =
+                            lookup
+                            ?? CBv2PromptLookupDraft.missed(
+                                drafted, history: row.rec.tokens,
+                                promptLength: row.rec.request.promptTokens.count, depth: k)
                         // The replacement does not depend on the drafter graph.
                         // Keep that graph live so the cache writes are not dropped.
                         assistantEvalTargets.append(drafted)
