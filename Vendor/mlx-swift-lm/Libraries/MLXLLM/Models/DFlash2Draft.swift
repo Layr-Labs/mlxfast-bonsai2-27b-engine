@@ -1878,6 +1878,23 @@ enum DFlash2GreedyWalk {
         let projectedRows = projected[0].asType(.float32).reshaped([-1])
         let scores = unary[0].asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
+        // Keep each rank-dot's accumulation order, but distribute independent
+        // predecessor/candidate pairs over separate SIMD groups. The tiny second
+        // launch walks only the selected rows; no rank-4 product is materialized.
+        if parallelEdges && length >= 7 && k >= 8 && rank >= 128 {
+            let edgeScores = edgeKernel(
+                [anchorPredecessor, previous, next, projectedRows, scores],
+                template: [("L", length), ("K", k), ("R", rank),
+                           ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0)],
+                grid: (32 * k, length, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[length, k, k]], outputDTypes: [.float32])[0]
+            return tableWalkKernel(
+                [edgeScores, candidateIds],
+                template: [("L", length), ("K", k)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[length]], outputDTypes: [.int32])[0]
+                .reshaped([1, length])
+        }
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
             template: [
@@ -1890,6 +1907,63 @@ enum DFlash2GreedyWalk {
             outputDTypes: [.int32])[0]
         return path.reshaped([1, length])
     }
+
+    static let parallelEdges: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PARALLEL_EDGES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let edgeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_parallel_edges",
+        inputNames: ["anchor_predecessor", "previous", "next", "projected", "unary"],
+        outputNames: ["scores"],
+        source: """
+            
+            uint c=thread_index_in_simdgroup;
+            uint slot=threadgroup_position_in_grid.x;
+            uint i=threadgroup_position_in_grid.y;
+            if(c<K){
+             const uint pred_base=i==0?0:((i-1)*K+slot)*R;
+             const uint succ_base=(i*K+c)*R;
+             const device float *pred_ptr=i==0?anchor_predecessor:previous+pred_base;
+             const device float *proj_ptr=projected+i*R;
+             const device float *succ_ptr=next+succ_base;
+            float edge = 0.0f;
+                    if (WALKVEC && (R % 4u) == 0u) {
+                        for (uint d = 0; d < R; d += 4u) {
+                            const float4 pd = *(const device float4*)(pred_ptr + d);
+                            const float4 qd = *(const device float4*)(proj_ptr + d);
+                            const float4 sd = *(const device float4*)(succ_ptr + d);
+                            edge += (pd[0] * qd[0]) * sd[0];
+                            edge += (pd[1] * qd[1]) * sd[1];
+                            edge += (pd[2] * qd[2]) * sd[2];
+                            edge += (pd[3] * qd[3]) * sd[3];
+                        }
+                    } else {
+                        #pragma clang loop unroll(full)
+                        for (uint d = 0; d < R; d++) {
+                            edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                        }
+                    }
+                    scores[(i*K+slot)*K+c]=unary[i*K+c]+edge;}
+            """)
+
+    private static let tableWalkKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_parallel_edge_walk",
+        inputNames: ["scores", "cand"],
+        outputNames: ["path"],
+        source: """
+            
+            uint c=thread_index_in_simdgroup,previous_slot=0;
+            for(uint i=0;i<L;i++){
+             float score=c<K?scores[(i*K+previous_slot)*K+c]:-INFINITY;
+             float m=simd_max(score);
+             uint sel=simd_min((c<K && score==m)?c:0xffffffffu);
+             previous_slot=sel;
+             if(c==0) path[i]=int(cand[i*K+sel]);
+            }
+            """)
 
     private static let kernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_fused_greedy_walk",
