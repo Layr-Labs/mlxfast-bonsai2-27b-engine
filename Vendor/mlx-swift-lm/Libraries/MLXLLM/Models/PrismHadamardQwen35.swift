@@ -128,6 +128,42 @@ enum Qwen35SmallNMatmul {
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
 
+    /// `BONSAI_SPLITK_BA_FOLD=0` keeps the reduce launch in front of the verify
+    /// window's GDN prework; on, the prework sums the chunk partials itself
+    /// (`Qwen35GDNPrework.verifyLoadsFirstFolded`, bitwise checked at load).
+    static let foldEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_SPLITK_BA_FOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `apply`'s partial launch alone, where `apply` takes the 16-row split-K:
+    /// the `[K / 128, rows, N]` chunk partials `reduce` adds; nil otherwise.
+    static func partials(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
+        guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
+        let k = x.dim(-1)
+        let n = w.dim(0)
+        let rows = x.size / k
+        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
+        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        return partialKernel(
+            [x.reshaped(rows, k), w, dims],
+            grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// `apply`'s reduce launch over `partials` (`[rows, N]`), `after` as there.
+    static func reduce(_ part: MLXArray, after: MLXArray? = nil) -> MLXArray {
+        let chunks = part.dim(0)
+        let rows = part.dim(1)
+        let n = part.dim(2)
+        let dims = MLXArray([Int32(chunks * chunk), Int32(rows), Int32(n)])
+        return reduceKernel(
+            [part, dims, (overlap ? after : nil) ?? dims], template: [("KS", chunks)],
+            grid: ((rows * n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+    }
+
     static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
         let k = x.dim(-1)

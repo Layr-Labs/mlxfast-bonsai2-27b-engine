@@ -1319,6 +1319,256 @@ extension Qwen35GDNPrework {
         source: verifyLoadsFirstSource,
         ensureRowContiguous: false)
 
+    /// `verifyLoadsFirstSource` with the GDN b|a split-K's reduce folded in:
+    /// instead of reading `a` and `b` (the reduce's output, `[b | a]` along
+    /// the last axis), each gate thread loads its row's `BAKS` chunk partials
+    /// of b and a (`Qwen35SmallNMatmul.partials`, `[BAKS, rows, 2 * BAOFF]`)
+    /// and adds them in chunk order from 0.0f, exactly as
+    /// `qwen35_splitk_reduce` does (it loads all partials first, then sums;
+    /// the adds and their order are the same, and MLX compiles both in its
+    /// default safe math mode, so they give the same bits). No partial array
+    /// is held, so the gate threads keep the stock kernel's registers. It stores the two sums to `bao`,
+    /// the `[B, S, 2 * BAOFF]` array the reduce would have produced (the
+    /// verify tape keeps b and a), and uses them where the stock kernel used
+    /// the loaded values. Every other line is the stock kernel's. Checked
+    /// bit for bit against the reduce plus the stock loads-first launch at
+    /// model construction (`prepareVerify`); `BONSAI_SPLITK_BA_FOLD=0` keeps
+    /// the reduce launch.
+    private static let verifyLoadsFirstFoldedSource: String = {
+        var text = verifyLoadsFirstSource
+        for (target, replacement) in [
+            ("const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];",
+             """
+             const size_t pmn = size_t(part_shape[1]) * size_t(part_shape[2]);
+                       const size_t prow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(part_shape[2]);
+                       float bsum = 0.0f;
+                       float asum = 0.0f;
+                       #pragma clang loop unroll(full)
+                       for (int s = 0; s < BAKS; s++) {
+                         bsum += part[size_t(s) * pmn + prow + size_t(hv)];
+                         asum += part[size_t(s) * pmn + prow + size_t(BAOFF) + size_t(hv)];
+                       }
+                       bao[prow + size_t(hv)] = bsum;
+                       bao[prow + size_t(BAOFF) + size_t(hv)] = asum;
+             """),
+            ("const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];", ""),
+            ("av = a[ab + int64_t(hv) * a_strides[2]] + dtb[int64_t(hv) * dtb_strides[0]];",
+             "av = asum + dtb[int64_t(hv) * dtb_strides[0]];"),
+            ("bv = b[bbase + int64_t(hv) * b_strides[2]];", "bv = bsum;"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "Qwen35 GDN verify prework: the loads-first source no longer matches (fold)")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        // (`dtb_strides` stays: the bias is still read.)
+        precondition(!text.contains("* a_strides") && !text.contains("* b_strides"))
+        return text
+    }()
+
+    private static let verifyLoadsFirstFoldedKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_verify_lf_ba",
+        inputNames: ["qkv", "cs", "w", "part", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "ci", "bao"],
+        source: verifyLoadsFirstFoldedSource,
+        ensureRowContiguous: false)
+
+    /// The chunk count the fold is checked at and the only one it runs at:
+    /// the b|a product's K (the target's hidden size, 5120) over the split-K
+    /// chunk (`Qwen35SmallNMatmul.chunk`, 128). Any other count keeps the
+    /// reduce launch.
+    static let foldChunks = 40
+
+    private static let foldLock = NSLock()
+    nonisolated(unsafe) private static var foldVerdicts: [LoadsFirstGeometry: Bool] = [:]
+
+    /// The loads-first launch (`verifyLoadsFirst`) over the b|a split-K's
+    /// chunk partials instead of `a` and `b`: its outputs and the reduced
+    /// `[B, S, 2 * boundary]` b|a, or nil where the stock verify prework would
+    /// not take the loads-first kernel, the geometry was not checked, or the
+    /// check failed (the caller then runs the reduce and the stock launch).
+    static func verifyLoadsFirstFolded(
+        qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, part: MLXArray,
+        boundary: Int, aDecay: MLXArray, dtBias: MLXArray,
+        normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, writeConvInput: Bool
+    ) -> (outputs: Outputs, ba: MLXArray)? {
+        guard enabled, verifyStridedReads, writeConvInput, verifyLoadsFirstEnabled,
+            Qwen35SmallNMatmul.foldEnabled,
+            qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3, part.ndim == 3
+        else { return nil }
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        // `run`'s guards, with the partials in place of a and b.
+        guard headKDim == 128, headVDim == 128, valueHeads % keyHeads == 0,
+            CD == 2 * keyHeads * headKDim + valueHeads * headVDim,
+            convState.shape == [B, KS - 1, CD], convWeight.shape == [CD, KS, 1],
+            [DType.float32, .float16, .bfloat16].contains(qkv.dtype),
+            convState.dtype == .float32, convWeight.dtype == .float32,
+            part.dtype == .float32, boundary == valueHeads,
+            part.dim(1) == B * S, part.dim(2) == 2 * valueHeads,
+            part.dim(0) == foldChunks,
+            aDecay.shape == [valueHeads], aDecay.dtype == .float32,
+            dtBias.shape == [valueHeads],
+            normScales.q.dtype == .float32, normScales.k.dtype == .float32,
+            normScales.q.shape == [headKDim], normScales.k.shape == [headKDim],
+            S > 0, S < 65536
+        else { return nil }
+        let geometry = LoadsFirstGeometry(
+            hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, dtype: "\(qkv.dtype)")
+        guard loadsFirstLock.withLock({ loadsFirstVerdicts[geometry] ?? false }),
+            foldLock.withLock({ foldVerdicts[geometry] ?? false })
+        else { return nil }
+        let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        let outputs = verifyLoadsFirstFoldedKernel(
+            [qkv, convState, convWeight, part, aDecay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("BAKS", part.dim(0)),
+                ("BAOFF", boundary),
+            ],
+            grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1 + S, CD], [B, S, 2 * valueHeads],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        return (
+            Outputs(
+                q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+                tail: outputs[5][0..., S..., 0...], convInput: outputs[5]),
+            outputs[6]
+        )
+    }
+
+    /// The folded launch against `Qwen35SmallNMatmul.reduce` followed by the
+    /// stock loads-first launch, every output bit (and the reduced b|a
+    /// against the reduce's output), for partials with rounding-sensitive
+    /// magnitudes, signed zeros and the gate edge values, at the verify's
+    /// 16 rows and at 5; once per geometry and qkv dtype, after the
+    /// loads-first verdict (`prepareVerify`).
+    private static func prepareFold(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard Qwen35SmallNMatmul.foldEnabled, Qwen35SmallNMatmul.enabled else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float32, .float16] {
+            let geometry = LoadsFirstGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            guard loadsFirstLock.withLock({ loadsFirstVerdicts[geometry] ?? false }) else { continue }
+            if foldLock.withLock({ foldVerdicts[geometry] != nil }) { continue }
+            let (verdict, detail) = foldSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
+            let recorded = foldLock.withLock { () -> Bool in
+                guard foldVerdicts[geometry] == nil else { return false }
+                foldVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded {
+                FileHandle.standardError.write(
+                    ("qwen35 GDN verify prework with the b|a reduce folded in (\(dtype)): self-test "
+                        + (verdict ? "passed" : "FAILED") + " (" + detail + ")"
+                        + (verdict ? "\n" : "; reduce launch kept\n")).data(using: .utf8)!)
+            }
+        }
+    }
+
+    private static func foldSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> (Bool, String) {
+        let cd = 2 * hk * dk + hv * dv
+        let nk = ks - 1
+        let width = cd + hv * dv
+        let chunks = foldChunks
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6261_666C), into: 10)
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for T in [16, 5] {
+                    let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                        * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+                    let qkv = spread.asType(dtype)[.ellipsis, ..<cd]
+                    let states = MLXRandom.normal([1, nk + 2, cd], key: keys[2])
+                    let convState = states[0..., 1 ..< (nk + 1), 0...]
+                    // Partials of mixed magnitude (so the chunk order shows in
+                    // the sums), with signed zeros, cancelling pairs and, in
+                    // the last chunk of row 2, the gate edge values.
+                    var part = MLXRandom.normal([chunks, T, 2 * hv], key: keys[3])
+                        * exp(MLXRandom.normal([chunks, T, 2 * hv], key: keys[4]) * 3)
+                    let zeroMask = MLXRandom.uniform(0.0 ..< 1.0, [chunks, T, 2 * hv], key: keys[5]) .< 0.05
+                    part = MLX.where(zeroMask, MLXArray(Float(-0.0)), part)
+                    let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+                    let marks = MLXArray((0 ..< (2 * hv)).map { specials[$0 % specials.count] })
+                    let edge = (MLXArray.arange(chunks) .== (chunks - 1)).reshaped([chunks, 1, 1])
+                        .&& (MLXArray.arange(T) .== 2).reshaped([1, T, 1])
+                    part = MLX.where(edge, marks.reshaped([1, 1, 2 * hv]), part)
+                    let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[6]) * 0.5
+                    let aDecay = Qwen35GDNDerived().decay(
+                        MLXRandom.normal([hv], key: keys[7]) * 0.5)
+                    let dtBias = MLXRandom.normal([hv], key: keys[8])
+                    let normScales = (
+                        q: MLXRandom.normal([dk], key: keys[9]),
+                        k: MLXRandom.normal([dk], key: keys[0]) * 0.5
+                    )
+                    eval(qkv, convState, part, convWeight, aDecay, dtBias, normScales.q,
+                        normScales.k)
+                    // Stock: the reduce, then the loads-first launch on its b|a.
+                    let y = Qwen35SmallNMatmul.reduce(part).reshaped(1, T, 2 * hv)
+                    let b = y[.ellipsis, ..<hv]
+                    let a = y[.ellipsis, hv...]
+                    guard
+                        let stock = verifyLoadsFirst(
+                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                            aDecay: aDecay, dtb: dtBias, normScales: normScales,
+                            keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv),
+                        let stockCI = stock.convInput
+                    else { throw FoldSelfTestFailure.message("no stock loads-first launch") }
+                    let dtb = dtBias
+                    let fold = verifyLoadsFirstFoldedKernel(
+                        [qkv, convState, convWeight, part, aDecay, dtb, normScales.q,
+                         normScales.k, MLXArray(Int32(T))],
+                        template: [
+                            ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
+                            ("CD", cd), ("KS", ks), ("BAKS", chunks), ("BAOFF", hv),
+                        ],
+                        grid: (128 * hk, T, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [
+                            [1, T, hk, dk], [1, T, hk, dk], [1, T, hv, dv], [1, T, hv], [1, T, hv],
+                            [1, nk + T, cd], [1, T, 2 * hv],
+                        ],
+                        outputDTypes: [
+                            .float32, .float32, .float32, .float32, .float32, .float32, .float32,
+                        ])
+                    var differ: [MLXArray] = []
+                    for (x, z) in [
+                        (stock.q, fold[0]), (stock.k, fold[1]), (stock.v, fold[2]),
+                        (stock.g, fold[3]), (stock.beta, fold[4]), (stockCI, fold[5]),
+                        (y, fold[6]),
+                    ] {
+                        guard x.shape == z.shape else {
+                            throw FoldSelfTestFailure.message("shape mismatch")
+                        }
+                        differ.append(
+                            (x.view(dtype: .uint32) .!= z.view(dtype: .uint32)).asType(.int32).sum())
+                        values += x.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        return (mismatches == 0, "rows 16 and 5, \(values) values, \(mismatches) mismatches")
+    }
+
+    private enum FoldSelfTestFailure: Error {
+        case message(String)
+    }
+
     private struct LoadsFirstGeometry: Hashable {
         let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
     }
@@ -1389,6 +1639,7 @@ extension Qwen35GDNPrework {
                         + (verdict ? "\n" : "; stock kernel kept\n")).data(using: .utf8)!)
             }
         }
+        prepareFold(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks)
     }
 
     private static func loadsFirstSelfCheck(
