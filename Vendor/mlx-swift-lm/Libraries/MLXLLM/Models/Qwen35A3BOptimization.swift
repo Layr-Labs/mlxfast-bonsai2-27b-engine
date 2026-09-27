@@ -660,3 +660,98 @@ func qwen35A3BExpertCombiner(
         return output.reshaped(shape)
     }
 }
+
+// MARK: - Prompt-width small-N FP32 matmul
+
+/// The GDN layers' stacked `in_proj_b | in_proj_a` product (`N = 96`, FP32)
+/// at prompt width. MLX runs `[512, 5120] x [5120, 96]` as a GEMM of a few
+/// output tiles that each walk all of K (a few threadgroups for the whole
+/// GPU). Here K is split into 512-wide chunks: one threadgroup per (64 rows,
+/// 32 columns, chunk), each simdgroup accumulating 32 x 16 outputs over its
+/// chunk with FP32 `simdgroup_matrix` products; a second kernel adds the
+/// chunks in chunk order. The product is FP32 up to rounding (the verify-
+/// width split-K is the same arithmetic class). `BONSAI_PROMPT_SPLITK_BA=0`
+/// keeps MLX's GEMM.
+enum Qwen35WideNMatmul {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_SPLITK_BA"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let chunk = 512
+
+    // grid (N / 32 * 128, M / 64, K / KC), threadgroup (128, 1, 1). Simdgroup
+    // sg: rows m0 = 64 * tg.y + 32 * (sg >> 1) .. + 31, columns
+    // n0 = 32 * tg.x + 16 * (sg & 1) .. + 15.
+    private static let partialSource = """
+        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int kc = int(threadgroup_position_in_grid.z);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64 + 32 * int(sg >> 1);
+        const int n0 = int(threadgroup_position_in_grid.x) * 32 + 16 * int(sg & 1);
+        simdgroup_matrix<float, 8, 8> c[4][2];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) {
+          c[i][0] = simdgroup_matrix<float, 8, 8>(0.0f);
+          c[i][1] = simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        simdgroup_matrix<float, 8, 8> a[4], b0, b1;
+        const device float* xa = x + (size_t)m0 * K + kc * KC;
+        const device float* wb = w + (size_t)n0 * K + kc * KC;
+        for (int k = 0; k < KC; k += 8) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 4; i++) { simdgroup_load(a[i], xa + 8 * i * K + k, K); }
+          simdgroup_load(b0, wb + k, K, ulong2(0, 0), true);
+          simdgroup_load(b1, wb + 8 * K + k, K, ulong2(0, 0), true);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 4; i++) {
+            simdgroup_multiply_accumulate(c[i][0], a[i], b0, c[i][0]);
+            simdgroup_multiply_accumulate(c[i][1], a[i], b1, c[i][1]);
+          }
+        }
+        device float* p = part + ((size_t)kc * M + m0) * N + n0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) {
+          simdgroup_store(c[i][0], p + 8 * i * N, N);
+          simdgroup_store(c[i][1], p + 8 * i * N + 8, N);
+        }
+        """
+
+    private static let reduceSource = """
+        const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
+        const uint i = thread_position_in_grid.x;
+        if (i >= uint(M * N)) { return; }
+        float v = 0.0f;
+        for (int s = 0; s < KS; s++) { v += part[(size_t)s * M * N + i]; }
+        out[i] = v;
+        """
+
+    private static let partialKernel = MLXFast.metalKernel(
+        name: "qwen35_widen_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
+        source: partialSource, ensureRowContiguous: true)
+    private static let reduceKernel = MLXFast.metalKernel(
+        name: "qwen35_widen_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
+        source: reduceSource, ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static var announced = false
+
+    static func apply(_ x: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int) -> MLXArray? {
+        guard enabled, rows % 64 == 0, n % 32 == 0, k % chunk == 0 else { return nil }
+        if !announced {
+            announced = true
+            FileHandle.standardError.write(
+                Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
+        }
+        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let part = partialKernel(
+            [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
+            grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        let y = reduceKernel(
+            [part, dims], template: [("KC", chunk)],
+            grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+        return y.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+}
