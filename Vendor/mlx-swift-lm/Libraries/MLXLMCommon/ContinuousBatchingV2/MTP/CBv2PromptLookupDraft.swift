@@ -12,16 +12,45 @@
 // Short matches are not used. A rank-merge at n = 2...4 replaced correct
 // drafter tokens and added rounds (9ac82eeb, 12 rounds -> 15). A unique
 // 16-token prompt span does not.
+//
+// A lookup round does not run the drafter's forward. The lookup reads only
+// the committed history, so the hit is known before the proposal; the
+// drafter then only takes the round's committed context rows into its cache
+// (`CBv2MTPBlockContextAbsorption`: the context half of the block forward,
+// the same kernels over the same rows), so its cache is bit for bit the one
+// the discarded block would have left and every later proposal is unchanged.
+//
+// THE OPENING QUOTE. A response shorter than `minimumMatch` cannot supply a
+// 16-token suffix, so a response that opens by quoting the prompt (the code
+// block of a "return the full function" request) used to wait one or two
+// drafter-only rounds before the lookup could fire. While the response is
+// shorter than `minimumMatch`, the shortest usable match is the WHOLE
+// response instead (and never under two tokens, so a one-token response
+// also needs the prompt token before it to match): the lookup fires only
+// when everything the response has said so far is a unique prompt span.
+// Once the response reaches `minimumMatch` tokens the rule is exactly the
+// long-span rule above. `MLXFAST_DFLASH_LOOKUP_OPENING=0` turns it off.
 
 import Foundation
 import MLX
 
-enum CBv2PromptLookupDraft {
+public enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_LOOKUP=0` keeps the drafter's block.
-    static let enabled: Bool = {
+    public static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// A lookup round skips the drafter's forward (default on).
+    /// `MLXFAST_DFLASH_LOOKUP_SKIP=0` runs the drafter every round and
+    /// discards its ids on a hit, as before. The drafter's absorb is
+    /// self-tested at load; if it is not bitwise there, the skip stays on with
+    /// an inexact absorb unless `MLXFAST_DFLASH_LOOKUP_SKIP_STRICT=1`.
+    public static let skipsDrafter: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_SKIP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     /// `MLXFAST_DFLASH_LOOKUP_MIN` sets the shortest suffix that may replace a
@@ -33,6 +62,59 @@ enum CBv2PromptLookupDraft {
         return max(8, raw.flatMap(Int.init) ?? 16)
     }()
 
+    /// Whether a lookup round may skip `drafter`'s forward: the switch is on
+    /// and the drafter can take a round's context without proposing.
+    static func skipApplies(to drafter: (any CBv2MTPBlockDrafter)?) -> Bool {
+        skipsDrafter && drafter is any CBv2MTPBlockContextAbsorption
+    }
+
+    /// The lookup hit for the next round when that round may skip the
+    /// drafter's forward, else nil.
+    static func skipHit(
+        drafter: (any CBv2MTPBlockDrafter)?, history: [Int], promptLength: Int, depth: Int
+    ) -> Hit? {
+        guard depth > 0, skipApplies(to: drafter) else { return nil }
+        return continuation(history: history, promptLength: promptLength, depth: depth)
+    }
+
+    /// `hit`'s ids as the round's `[1, depth]` proposal, with the drafter's
+    /// cache advanced over the round's committed context as the block would
+    /// have advanced it (`evaluate`: the lazy arrays), or nil when the drafter
+    /// declines: the caller then proposes and `override`s as before.
+    static func skip(
+        _ hit: Hit, drafter: any CBv2MTPBlockDrafter, requestState: any CBv2MTPRequestState,
+        depth: Int
+    ) -> (ids: MLXArray, evaluate: [MLXArray])? {
+        guard hit.ids.count == depth,
+            let absorbing = drafter as? any CBv2MTPBlockContextAbsorption,
+            let evaluate = absorbing.absorbInsteadOfProposing(
+                depth: depth, requestState: requestState)
+        else { return nil }
+        FileHandle.standardError.write(
+            Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth) (drafter skipped)\n".utf8))
+        return (MLXArray(hit.ids, [1, depth]), evaluate)
+    }
+
+    /// `MLXFAST_DFLASH_LOOKUP_OPENING=0` keeps `minimumMatch` for a response
+    /// shorter than it (see THE OPENING QUOTE above).
+    static let opening: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_OPENING"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `MLXFAST_DFLASH_LOOKUP_LOG=1` reports each replaced block on stderr.
+    static let logs = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_LOG"] == "1"
+
+    /// The shortest match that may replace a block when the response (every
+    /// token after the prompt, the seed token included) is `responseLength`
+    /// tokens long: `minimumMatch`, or the whole response while it is shorter,
+    /// with a floor of two tokens.
+    static func shortestMatch(responseLength: Int) -> Int {
+        guard opening else { return minimumMatch }
+        return max(2, min(minimumMatch, responseLength))
+    }
+
     /// The proposal, or the same object when lookup does not apply.
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
@@ -41,8 +123,10 @@ enum CBv2PromptLookupDraft {
             proposal.dim(1) == depth,
             let hit = continuation(history: history, promptLength: promptLength, depth: depth)
         else { return proposal }
-        FileHandle.standardError.write(
-            Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+        if logs {
+            FileHandle.standardError.write(
+                Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+        }
         return MLXArray(hit.ids, [1, depth])
     }
 
@@ -51,15 +135,16 @@ enum CBv2PromptLookupDraft {
         let ids: [Int]
     }
 
-    /// Longest unique prompt continuation of `history`'s suffix, or nil.
+    /// Longest unique prompt continuation of `history`'s suffix, or nil. The
+    /// suffix is at least `shortestMatch(responseLength:)` tokens long.
     ///
     /// The continuation has to lie entirely inside the prompt. Two prompt
     /// spans of the same length with different continuations are ambiguous,
     /// and this length is skipped rather than guessed.
     static func continuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
-        let minimum = minimumMatch
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
+        let minimum = shortestMatch(responseLength: count - prompt)
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }

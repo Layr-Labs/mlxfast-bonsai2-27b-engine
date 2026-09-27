@@ -628,6 +628,17 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else if let hit = CBv2PromptLookupDraft.skipHit(
+                    drafter: block, history: row.rec.tokens,
+                    promptLength: row.rec.request.promptTokens.count, depth: k),
+                    let skipped = CBv2PromptLookupDraft.skip(
+                        hit, drafter: block, requestState: requestState, depth: k)
+                {
+                    // A lookup round: no drafter forward; the drafter took the
+                    // committed context rows as this round's block would have.
+                    proposal = skipped.ids
+                    block.trimBlockState(requestState, toCommittedLength: carry.kvOffset)
+                    assistantEvalTargets.append(contentsOf: skipped.evaluate)
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)

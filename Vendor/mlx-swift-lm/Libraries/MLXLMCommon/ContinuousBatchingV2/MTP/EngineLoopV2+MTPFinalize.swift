@@ -304,10 +304,24 @@ extension EngineLoopV2 {
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            // The next round's ids when they come from the prompt
+            // (`CBv2PromptLookupDraft`), known from the committed history
+            // alone: that round runs no drafter forward. The early block path
+            // below only has the drafter take this round's context, and the
+            // block built before the readback is dropped unadopted.
+            let lookupScanned =
+                finishReason == nil && confirmed > 0 && mtp.config.fixedDraftTokens == k
+                && rec.request.maxTokens - rec.generatedTokenCount > k
+                && CBv2PromptLookupDraft.skipApplies(to: mtp.blockDrafter)
+            let lookupHit =
+                lookupScanned
+                ? CBv2PromptLookupDraft.continuation(
+                    history: rec.tokens, promptLength: rec.request.promptTokens.count, depth: k)
+                : nil
             // The early block path below, with the columns the speculative
             // block assumed: adopt it in place of `finalizeRound` + `proposeBlock`.
             var adoptedProposal: MLXArray?
-            if let speculation, speculation.id == id, finishReason == nil,
+            if let speculation, speculation.id == id, finishReason == nil, lookupHit == nil,
                 confirmed == accepted + 1, mtp.config.fixedDraftTokens == k,
                 rec.request.maxTokens - rec.generatedTokenCount > k,
                 let state = metadata.assistantState
@@ -445,8 +459,17 @@ extension EngineLoopV2 {
                 let leading =
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil
+                // A lookup round: the drafter takes this round's context
+                // rows (as the block would have) and proposes nothing.
+                let skipped = lookupHit.flatMap {
+                    adoptedProposal == nil
+                        ? CBv2PromptLookupDraft.skip(
+                            $0, drafter: block, requestState: state, depth: k) : nil
+                }
                 let proposal: MLXArray?
-                if let adoptedProposal {
+                if skipped != nil {
+                    proposal = nil
+                } else if let adoptedProposal {
                     proposal = adoptedProposal
                 } else if let leading {
                     proposal = try? leading.proposeBlock(
@@ -456,12 +479,26 @@ extension EngineLoopV2 {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
                 }
-                if let drafted = proposal {
-                    // Same object when no unique prompt span matches. The
+                if let skipped {
+                    block.trimBlockState(state, toCommittedLength: kvOffset)
+                    let targets = [skipped.ids] + skipped.evaluate
+                    if leading != nil {
+                        deferredDraftTargets = targets
+                    } else {
+                        asyncEval(targets)
+                    }
+                    earlyBlock = CBv2MTPEarlyBlockProposal(
+                        tokens: skipped.ids, depth: k, anchor: anchor, kvOffset: kvOffset)
+                } else if let drafted = proposal {
+                    // Same object when no unique prompt span matches (as
+                    // the scan above already found, when it ran). The
                     // drafter graph stays in `drafted` either way.
-                    let tokens = CBv2PromptLookupDraft.override(
-                        drafted, history: rec.tokens,
-                        promptLength: rec.request.promptTokens.count, depth: k)
+                    let tokens =
+                        lookupScanned && lookupHit == nil
+                        ? drafted
+                        : CBv2PromptLookupDraft.override(
+                            drafted, history: rec.tokens,
+                            promptLength: rec.request.promptTokens.count, depth: k)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets = [tokens, drafted] + block.evaluationTargets(for: state)
                     if leading != nil {

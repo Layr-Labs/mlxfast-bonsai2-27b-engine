@@ -500,6 +500,18 @@ public protocol CBv2MTPBlockLeadingSubmission: CBv2MTPBlockDrafter {
     ) throws -> MLXArray
 }
 
+/// A block drafter that can take a round's committed context without
+/// proposing, for a round whose ids are already known (a prompt-lookup round,
+/// `CBv2PromptLookupDraft`): its cache ends exactly where `proposeBlock` at
+/// `depth` would have left it, so every later proposal is unchanged.
+public protocol CBv2MTPBlockContextAbsorption: CBv2MTPBlockDrafter {
+    /// The lazy arrays to evaluate (empty: nothing was pending), or nil when
+    /// the drafter declines; the caller then proposes as before.
+    func absorbInsteadOfProposing(
+        depth: Int, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray]?
+}
+
 /// The next block before the readback (`CBv2MTPBlockSpeculation`).
 public enum CBv2MTPDraftBeforeReadback {
     /// `BONSAI_DRAFT_BEFORE_READBACK=0` keeps the next block after the readback.

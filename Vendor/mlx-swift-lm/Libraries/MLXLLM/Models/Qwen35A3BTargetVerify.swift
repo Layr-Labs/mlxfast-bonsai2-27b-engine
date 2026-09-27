@@ -585,7 +585,8 @@ enum Qwen35GDNReplayFused {
     /// the prework's row-contiguous FP32 outputs). Nil when it does not fit.
     static func launch(
         tape: ArraysCache.PrefixReplayTape, keep: Int, aLog: MLXArray, dtBias: MLXArray,
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+        staged: Bool? = nil
     ) -> (y: MLXArray, state: MLXArray)? {
         guard let kernel, Qwen35GatedDeltaV3.enabled, let ps = tape.ssmPre, tape.mask == nil,
             k.ndim == 4, v.ndim == 4
@@ -619,7 +620,12 @@ enum Qwen35GDNReplayFused {
             let aRows = Qwen35GDNReplayBatch.gateRowStride(tape.a),
             let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
         else { return nil }
-        let out = kernel(
+        // Both windows fit the staging buffers (and the verify window is a
+        // full one, where staging pays): the staged form (same values).
+        let useStaged =
+            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
+            && P <= stagedRows
+        let out = (useStaged ? stagedKernel : kernel)(
             [q, k, v, g, beta, MLXArray(Int32(T))] + previous
                 + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))],
             template: [
@@ -684,13 +690,21 @@ enum Qwen35GDNReplayFused {
         verdictLock.lock()
         defer { verdictLock.unlock() }
         guard verdicts[key] == nil else { return }
-        let (passed, detail) = selfTest(layer: layer)
+        var (passed, detail) = selfTest(layer: layer)
+        if !passed, stagedActive {
+            // The staged form failed: retest (and keep) the stock fused kernel.
+            stagedLive = false
+            let first = detail
+            (passed, detail) = selfTest(layer: layer)
+            detail += "; staged form FAILED (\(first)), stock fused kernel"
+        }
         verdicts[key] = passed
         Memory.clearCache()
         FileHandle.standardError.write(
             ("qwen35 GDN replay fused: self-test " + (passed ? "passed" : "FAILED") + " ("
                 + detail + ")"
-                + (passed ? "; the next verify replays the committed prefix\n" : "; replay kept\n"))
+                + (passed ? "; the next verify replays the committed prefix" : "; replay kept")
+                + (passed && stagedActive ? ", rows staged in threadgroup memory\n" : "\n"))
                 .data(using: .utf8)!)
     }
 
@@ -793,6 +807,16 @@ enum Qwen35GDNReplayFused {
                         try compare(fused.y, y)
                         try compare(fused.state, committed)
                         if let states { try compare(fused.state, states[j].ssm) }
+                        if stagedActive {
+                            guard
+                                let stock = launch(
+                                    tape: operand.tape, keep: keep, aLog: operand.aLog,
+                                    dtBias: operand.dtBias, q: w[0], k: w[1], v: w[2], g: w[3],
+                                    beta: w[4], staged: false)
+                            else { throw SelfTestFailure.message("no stock launch at \(keep) rows") }
+                            try compare(fused.y, stock.y)
+                            try compare(fused.state, stock.state)
+                        }
                     }
                     let count = stacked(differ).sum()
                     eval(count)
@@ -804,14 +828,274 @@ enum Qwen35GDNReplayFused {
         } catch {
             return (false, "\(error)")
         }
-        let expected = 4 * G * 2 + (batched ? 3 * G : 0)
+        let expected = 4 * G * 2 + (batched ? 3 * G : 0) + (stagedActive ? 4 * G * 2 : 0)
         let passed = mismatches == 0 && comparisons == expected
         return (
             passed,
             "\(G) tapes at 0, 1, 7 and \(S) kept rows, \(comparisons) comparisons, "
                 + "\(values) values, \(mismatches) mismatches"
-                + (batched ? ", batched replay included" : ""))
+                + (batched ? ", batched replay included" : "")
+                + (stagedActive ? ", staged form vs stock fused kernel included" : ""))
     }
+}
+
+/// `qwen35_gdn_replay_fused` with each window's rows staged in threadgroup
+/// memory (`BONSAI_GDN_REPLAY_STAGED=0` keeps the stock fused kernel).
+///
+/// The stock kernel reads every step's inputs from device memory inside its
+/// sequential step loop: per replayed row the previous tape's k and v rows and
+/// a/b, from which each of the 128 threads computes the same gates, and per
+/// output row q, k, v, g and beta. The previous tape is long out of the
+/// caches by the next verify, so each replayed step waits for a DRAM round
+/// trip, and the output steps wait for their own loads. Here each window is
+/// read once, coalesced, into threadgroup memory before its loop (the replay
+/// window at the start, next to the state load; the output window after the
+/// committed-state store, reusing the replay's k/v space): the k rows as
+/// float4 (swizzled so the eight lanes of a row read different banks), the
+/// threadgroup's 32 v columns, and the per-step gates (thread t computes step
+/// t's gates with the stock expressions). The loops then read those values
+/// from threadgroup memory: every step does the stock arithmetic in the stock
+/// order (the output pass reads the updated state exactly as the stock loop's
+/// interleaved `o` accumulation does), so y and the committed state are the
+/// stock kernel's, bit for bit. Both windows must hold at most 16 rows (the
+/// verify window is 16); otherwise the stock kernel runs.
+///
+/// The fused replay's self-test runs through this form, compared both with
+/// the unfused replay and output-only scan (as for the stock kernel) and with
+/// the stock fused kernel on the same inputs; on a mismatch the stock fused
+/// kernel is retested and kept.
+extension Qwen35GDNReplayFused {
+    static let stagedEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_REPLAY_STAGED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Cleared when the staged form fails its self-test.
+    nonisolated(unsafe) static var stagedLive = true
+    static var stagedActive: Bool { stagedEnabled && stagedLive }
+
+    /// Rows per staged window (the threadgroup buffers' size).
+    static let stagedRows = 16
+
+    private static let stagedHeader = Qwen35GDNReplayBatch.header + """
+        // float4 j of the 16-float k (or q) slice c of a staged row; the
+        // swizzle spreads the eight slices of one read over the banks.
+        inline uint qwen35_staged_slot(uint c, uint j) {
+          return c * 4 + (j ^ ((c >> 1) & 3));
+        }
+
+        """
+
+    // The stock kernel's inputs, outputs, template and grid.
+    private static let stagedSource = """
+        constexpr int R = 16;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        constexpr uint NT = 128;
+        static_assert(Dk == 128 && LPD == 8, "16-float k slices, 8 lanes per row");
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = sg * 32 + lane;
+        const uint c = lane % LPD;
+        const uint dk0 = c * R;
+        const uint row0 = threadgroup_position_in_grid.y * DVPT;
+        const uint rbase = sg * DVPS + (lane / LPD) * DVPL;
+        const uint dvbase = row0 + rbase;
+        threadgroup float4 tk[16 * 32];
+        threadgroup float4 tq[16 * 32];
+        threadgroup float tv[16 * DVPT];
+        threadgroup float tgate[32];
+
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          }
+        }
+
+        // Phase 1: the previous tape's KP rows, the batched replay's step.
+        {
+          const int a_rs = ab_rows[0];
+          const int b_rs = ab_rows[1];
+          const float g_nexp = -metal::precise::exp(alog[hv_idx]);
+          const float g_dtb = dtb[hv_idx];
+          const device float4* k4src = (const device float4*)(pk + hk_idx * Dk);
+          for (uint e = tid; e < uint(KP) * 32u; e += NT) {
+            const uint t = e >> 5, f = e & 31u;
+            tk[t * 32u + qwen35_staged_slot(f >> 2, f & 3u)] = k4src[t * uint(Hk * Dk / 4) + f];
+          }
+          for (uint e = tid; e < uint(KP) * uint(DVPT); e += NT) {
+            const uint t = e / uint(DVPT), r = e % uint(DVPT);
+            tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
+          }
+          if (tid < uint(KP)) {
+            const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
+            tgate[tid] = metal::precise::exp(g_nexp * g_sp);
+            tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int t = 0; t < KP; ++t) {
+            const float gt = tgate[t];
+            const float bt = tgate[16 + t];
+            const threadgroup float4* kt = tk + t * 32;
+            float kv[DVPL];
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float4 k4 = kt[qwen35_staged_slot(c, j)];
+                state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+                state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+                a0 = fma(state[d][4 * j], k4.x, a0);
+                a1 = fma(state[d][4 * j + 1], k4.y, a1);
+                a2 = fma(state[d][4 * j + 2], k4.z, a2);
+                a3 = fma(state[d][4 * j + 3], k4.w, a3);
+              }
+              kv[d] = (a0 + a1) + (a2 + a3);
+            }
+            #pragma clang loop unroll(full)
+            for (int o = LPD / 2; o > 0; o >>= 1) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                kv[d] += simd_shuffle_xor(kv[d], o);
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              const float delta = (tv[t * DVPT + rbase + d] - kv[d]) * bt;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float4 k4 = kt[qwen35_staged_slot(c, j)];
+                state[d][4 * j] = fma(k4.x, delta, state[d][4 * j]);
+                state[d][4 * j + 1] = fma(k4.y, delta, state[d][4 * j + 1]);
+                state[d][4 * j + 2] = fma(k4.z, delta, state[d][4 * j + 2]);
+                state[d][4 * j + 3] = fma(k4.w, delta, state[d][4 * j + 3]);
+              }
+            }
+          }
+        }
+
+        // The committed state.
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          }
+        }
+
+        // Phase 2: this verify's T rows, the output-only scan's step.
+        {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const device float4* k4src = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
+          const device float4* q4src = (const device float4*)(q + (b_idx * T * Hk + hk_idx) * Dk);
+          for (uint e = tid; e < uint(T) * 32u; e += NT) {
+            const uint t = e >> 5, f = e & 31u;
+            const uint slot = t * 32u + qwen35_staged_slot(f >> 2, f & 3u);
+            tk[slot] = k4src[t * uint(Hk * Dk / 4) + f];
+            tq[slot] = q4src[t * uint(Hk * Dk / 4) + f];
+          }
+          for (uint e = tid; e < uint(T) * uint(DVPT); e += NT) {
+            const uint t = e / uint(DVPT), r = e % uint(DVPT);
+            tv[e] = v[((b_idx * T + t) * Hv + hv_idx) * Dv + row0 + r];
+          }
+          if (tid < uint(T)) {
+            tgate[tid] = g[(b_idx * T + tid) * Hv + hv_idx];
+            tgate[16 + tid] = beta[(b_idx * T + tid) * Hv + hv_idx];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+          for (int t = 0; t < T; ++t) {
+            const float gt = tgate[t];
+            const float bt = tgate[16 + t];
+            const threadgroup float4* kt = tk + t * 32;
+            const threadgroup float4* qt = tq + t * 32;
+            float kv[DVPL];
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float4 k4 = kt[qwen35_staged_slot(c, j)];
+                state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+                state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+                a0 = fma(state[d][4 * j], k4.x, a0);
+                a1 = fma(state[d][4 * j + 1], k4.y, a1);
+                a2 = fma(state[d][4 * j + 2], k4.z, a2);
+                a3 = fma(state[d][4 * j + 3], k4.w, a3);
+              }
+              kv[d] = (a0 + a1) + (a2 + a3);
+            }
+            #pragma clang loop unroll(full)
+            for (int o = LPD / 2; o > 0; o >>= 1) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                kv[d] += simd_shuffle_xor(kv[d], o);
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              const float delta = (tv[t * DVPT + rbase + d] - kv[d]) * bt;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float4 k4 = kt[qwen35_staged_slot(c, j)];
+                state[d][4 * j] = fma(k4.x, delta, state[d][4 * j]);
+                state[d][4 * j + 1] = fma(k4.y, delta, state[d][4 * j + 1]);
+                state[d][4 * j + 2] = fma(k4.z, delta, state[d][4 * j + 2]);
+                state[d][4 * j + 3] = fma(k4.w, delta, state[d][4 * j + 3]);
+              }
+            }
+            float out[DVPL];
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float4 q4 = qt[qwen35_staged_slot(c, j)];
+                o0 = fma(state[d][4 * j], q4.x, o0);
+                o1 = fma(state[d][4 * j + 1], q4.y, o1);
+                o2 = fma(state[d][4 * j + 2], q4.z, o2);
+                o3 = fma(state[d][4 * j + 3], q4.w, o3);
+              }
+              out[d] = (o0 + o1) + (o2 + o3);
+            }
+            #pragma clang loop unroll(full)
+            for (int o = LPD / 2; o > 0; o >>= 1) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                out[d] += simd_shuffle_xor(out[d], o);
+              }
+            }
+            if (lane % LPD == 0) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                y_[d] = out[d];
+              }
+            }
+            y_ += Hv * Dv;
+          }
+        }
+        """
+
+    static let stagedKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_replay_fused_staged",
+        inputNames: [
+            "q", "k", "v", "g", "beta", "T", "ps", "pk", "pv", "pa", "pb", "alog", "dtb",
+            "ab_rows", "KP",
+        ],
+        outputNames: ["y", "state_out"],
+        source: stagedSource,
+        header: stagedHeader,
+        ensureRowContiguous: false)
 }
 
 // MARK: - Row-tiled fresh strided GDN prompt prework (znan2)
@@ -1292,6 +1576,7 @@ extension Qwen35GDNPrework {
     /// construction, for every qkv dtype `runFreshState` accepts. A mismatch
     /// prints one line and keeps the stock kernel. Called from the layer's init.
     static func prepare(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        prepareSplit(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks)
         guard enabled, freshStridedReads, rowTiledEnabled, dk == 128, dv == 128, hk > 0,
             hv % hk == 0, (hv / hk) * rowTile <= dk, ks > 1
         else { return }
@@ -1384,6 +1669,520 @@ extension Qwen35GDNPrework {
             if passed == 0 { return 0 }
         }
         return passed
+    }
+}
+
+// MARK: - Column-block split fresh strided GDN prompt prework
+
+/// The prompt-width fresh prework (`freshStridedKernel` / its row-tiled form)
+/// with the q, k and v column blocks in separate threadgroups: threadgroup
+/// x < 2 * HK owns q head x (x < HK) or k head x - HK, one channel per thread
+/// and `splitRows` rows, so each simdgroup holds the stock kernel's channels
+/// in the stock lanes and each row's norm is the same `simd_sum` and the same
+/// `(r0 + r1) + (r2 + r3)` tree; the other threadgroups own 512 v channels
+/// each, four consecutive channels per thread, and the gates of those
+/// channels' four value heads. The stock layout serialises every thread's q,
+/// k and three v columns (each column's loads wait on the previous column's
+/// stores); here a thread has one load window. Every output element takes the
+/// stock arithmetic: the same taps in the same `fma` order from 0.0f, the stock
+/// SiLU (cut from the stock text), the same norm expressions, the stock gate
+/// text (cut), and the same tail copies. One uniform test picks the body: unit
+/// column strides, 4-element aligned rows and weights and row offsets below
+/// 2^31 take 32-bit offsets and vector loads (the model's layout); anything
+/// else reads every element through its strides with 64-bit offsets. Outputs
+/// are row-contiguous. Checked bit for bit against `freshStridedKernel` at
+/// model construction, per qkv dtype, on aligned (fast body) and misaligned
+/// (general body) operand views (`prepareSplit`); a mismatch, an MLX error or a
+/// stock-text change keeps the previous kernel. `BONSAI_GDN_PREWORK_SPLIT=0`
+/// keeps the previous kernel.
+extension Qwen35GDNPrework {
+    static let splitEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Rows per threadgroup of `freshSplitKernel`; a chunk whose row count it
+    /// does not divide keeps the previous kernel.
+    static let splitRows = 4
+
+    private static let freshSplitHeader = """
+        // Four consecutive elements in one load (FP32 and FP16; any other
+        // element type reads one element at a time), widened to FP32.
+        inline float4 gdn_split_ld4(const device float* p) {
+          return *(const device float4*)p;
+        }
+        inline float4 gdn_split_ld4(const device half* p) {
+          return float4(*(const device half4*)p);
+        }
+        template <typename T>
+        inline float4 gdn_split_ld4(const device T* p) {
+          return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
+        }
+
+        """
+
+    private static let freshSplitPrologue = """
+        constexpr int KEY = HK * DK;
+        constexpr int VOFF = 2 * KEY;
+        constexpr int NK = KS - 1;
+        static_assert(DK == 128 && DV % 4 == 0 && (HV * DV) % 512 == 0 && KS == 4, "split prework geometry");
+        const uint c = thread_position_in_threadgroup.x;
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t0 = threadgroup_position_in_grid.y * uint(RW);
+        const uint bb = threadgroup_position_in_grid.z;
+        const int Sn = S;
+        threadgroup float red[4 * RW];
+        auto silu = [&](float acc) -> float {
+          @SILU@
+        };
+        const device InT* qkv_b = qkv + int64_t(bb) * qkv_strides[0];
+        // Unit-stride, aligned operands with 32-bit row offsets take the fast body.
+        // (S < 65536, so a row stride below 32768 keeps every row offset in 32 bits.)
+        const bool fast = qkv_strides[2] == 1 && uint64_t(qkv_strides[1]) < 32768ul
+            && (qkv_strides[1] % 4) == 0
+            && ((reinterpret_cast<ulong>(qkv_b) | reinterpret_cast<ulong>(w)) % ulong(4 * sizeof(float))) == 0
+            && w_strides[0] == KS && w_strides[1] == 1;
+        if (fast) {
+          @FAST@
+        } else {
+          @GENERAL@
+        }
+        """
+
+    /// One body; `freshSplitFast` and `freshSplitGeneral` fill its operand reads.
+    private static let freshSplitBody = """
+        if (blk < uint(2 * HK)) {
+          const int col = int(blk) * 128 + int(c);
+          float wt[KS];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < KS; j++) {
+            wt[j] = @WQK@;
+          }
+          float xw[RW + NK];
+          #pragma clang loop unroll(full)
+          for (int m = 0; m < RW + NK; m++) {
+            const int r = int(t0) + m - NK;
+            xw[m] = (r < 0) ? 0.0f : float(@XQK@);
+          }
+          float xs[RW];
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < RW; i++) {
+            float acc = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < KS; j++) {
+              const float xv = xw[i + j];
+              acc = fma(xv, wt[j], acc);
+            }
+            xs[i] = silu(acc);
+          }
+          const bool isq = blk < uint(HK);
+          const int h = isq ? int(blk) : int(blk) - HK;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint lane = thread_index_in_simdgroup;
+          #pragma clang loop unroll(full)
+          for (int ri = 0; ri < RW; ri++) {
+            const float x = xs[ri];
+            const float s = simd_sum(x * x);
+            if (lane == 0) {
+              red[4 * ri + sg] = s;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const float sc = isq ? wq[c] : wk[c];
+          device float* dst = (isq ? q : k) + ((int(bb) * Sn + int(t0)) * HK + h) * DK + int(c);
+          #pragma clang loop unroll(full)
+          for (int ri = 0; ri < RW; ri++) {
+            threadgroup float* rd = red + 4 * ri;
+            const float s = (rd[0] + rd[1]) + (rd[2] + rd[3]);
+            const float inv = metal::precise::rsqrt(s / float(DK) + 1e-6f);
+            dst[ri * KEY] = (xs[ri] * inv) * sc;
+          }
+          #pragma clang loop unroll(full)
+          for (int ri = 0; ri < RW; ri++) {
+            const int t = int(t0) + ri;
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NK; r++) {
+              const int src = Sn + r - NK;
+              if (src >= 0 && t == src) {
+                tail[(int(bb) * NK + r) * CD + col] = float(@XQKT@);
+              } else if (src < 0 && t == 0) {
+                tail[(int(bb) * NK + r) * CD + col] = 0.0f;
+              }
+            }
+          }
+        } else {
+          const int vb = int(blk) - 2 * HK;
+          const int ch = vb * 512 + 4 * int(c);
+          const int col = VOFF + ch;
+          const int hv4 = ch / DV;
+          const int dv = ch % DV;
+          float wt[KS][4];
+          @WV@
+          float4 xw[RW + NK];
+          #pragma clang loop unroll(full)
+          for (int m = 0; m < RW + NK; m++) {
+            const int r = int(t0) + m - NK;
+            xw[m] = (r < 0) ? float4(0.0f) : @XV@;
+          }
+          device float* vdst = v + ((int(bb) * Sn + int(t0)) * HV + hv4) * DV + dv;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < RW; i++) {
+            float4 o;
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 4; e++) {
+              float acc = 0.0f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) {
+                const float xv = xw[i + j][e];
+                acc = fma(xv, wt[j][e], acc);
+              }
+              o[e] = silu(acc);
+            }
+            *(device float4*)(vdst + i * HV * DV) = o;
+          }
+          if (c < uint(4 * RW)) {
+            const uint t = t0 + c / 4u;
+            const uint hv = uint(vb) * 4u + c % 4u;
+            @ABBASE@
+            @BBASE@
+            @GROW@
+            @GATES@
+          }
+          #pragma clang loop unroll(full)
+          for (int ri = 0; ri < RW; ri++) {
+            const int t = int(t0) + ri;
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NK; r++) {
+              const int src = Sn + r - NK;
+              if (src >= 0 && t == src) {
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 4; e++) {
+                  tail[(int(bb) * NK + r) * CD + col + e] = float(@XVT@);
+                }
+              } else if (src < 0 && t == 0) {
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 4; e++) {
+                  tail[(int(bb) * NK + r) * CD + col + e] = 0.0f;
+                }
+              }
+            }
+          }
+        }
+        """
+
+    /// Unit-stride, aligned operands, 32-bit offsets, vector loads.
+    private static let freshSplitFast: [(String, String)] = [
+        ("@WQK@", "w[col * KS + j]"),
+        ("@XQK@", "qkv_b[r * int(qkv_strides[1]) + col]"),
+        ("@XQKT@", "qkv_b[t * int(qkv_strides[1]) + col]"),
+        ("@WV@", """
+            #pragma clang loop unroll(full)
+              for (int e = 0; e < 4; e++) {
+                const float4 we = *(const device float4*)(w + (col + e) * KS);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) {
+                  wt[j][e] = we[j];
+                }
+              }
+            """),
+        ("@XV@", "gdn_split_ld4(qkv_b + r * int(qkv_strides[1]) + col)"),
+        ("@XVT@", "qkv_b[t * int(qkv_strides[1]) + col + e]"),
+    ]
+
+    /// Any strides and alignment: every element through its strides (64-bit).
+    private static let freshSplitGeneral: [(String, String)] = [
+        ("@WQK@", "w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]]"),
+        ("@XQK@", "qkv_b[int64_t(r) * qkv_strides[1] + int64_t(col) * qkv_strides[2]]"),
+        ("@XQKT@", "qkv_b[int64_t(t) * qkv_strides[1] + int64_t(col) * qkv_strides[2]]"),
+        ("@WV@", """
+            #pragma clang loop unroll(full)
+              for (int e = 0; e < 4; e++) {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) {
+                  wt[j][e] = w[int64_t(col + e) * w_strides[0] + int64_t(j) * w_strides[1]];
+                }
+              }
+            """),
+        ("@XV@", """
+            float4(float(qkv_b[int64_t(r) * qkv_strides[1] + int64_t(col) * qkv_strides[2]]),
+                    float(qkv_b[int64_t(r) * qkv_strides[1] + int64_t(col + 1) * qkv_strides[2]]),
+                    float(qkv_b[int64_t(r) * qkv_strides[1] + int64_t(col + 2) * qkv_strides[2]]),
+                    float(qkv_b[int64_t(r) * qkv_strides[1] + int64_t(col + 3) * qkv_strides[2]]))
+            """),
+        ("@XVT@", "qkv_b[int64_t(t) * qkv_strides[1] + int64_t(col + e) * qkv_strides[2]]"),
+    ]
+
+    /// `freshSplitPrologue` with the fast and the general body, and the SiLU
+    /// and the gates cut from `freshStridedSource`; nil (one stderr line) when
+    /// that text no longer carries a formula the kernel cuts or restates, and
+    /// the previous kernel is kept.
+    private static let freshSplitSource: String? = {
+        let src = freshStridedSource
+        func count(_ s: String, in text: String) -> Int {
+            text.components(separatedBy: s).count - 1
+        }
+        func span(_ start: String, through end: String) -> String? {
+            guard count(start, in: src) == 1, let head = src.range(of: start),
+                let stop = src.range(of: end, range: head.upperBound ..< src.endIndex)
+            else { return nil }
+            return String(src[head.lowerBound ..< stop.upperBound])
+        }
+        func body(_ reads: [(String, String)], unroll: Bool) -> String? {
+            var text = freshSplitBody
+            for (placeholder, read) in reads {
+                guard count(placeholder, in: text) >= 1 else { return nil }
+                text = text.replacingOccurrences(of: placeholder, with: read)
+            }
+            // The general body is the rarely taken one: keep it compact.
+            return unroll
+                ? text
+                : text.replacingOccurrences(
+                    of: "#pragma clang loop unroll(full)", with: "#pragma clang loop unroll(disable)")
+        }
+        // The formulas the bodies restate, as the stock kernel writes them.
+        let restated = [
+            "acc = fma(xv, w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]], acc);",
+            "float sq = simd_sum(xq * xq);",
+            "float sk = simd_sum(xk * xk);",
+            "sq = (red[0] + red[1]) + (red[2] + red[3]);",
+            "sk = (red[4] + red[5]) + (red[6] + red[7]);",
+            "const float invq = metal::precise::rsqrt(sq / float(DK) + 1e-6f);",
+            "const float invk = metal::precise::rsqrt(sk / float(DK) + 1e-6f);",
+            "q[qkrow * size_t(DK) + c] = (xq * invq) * wq[c];",
+            "k[qkrow * size_t(DK) + c] = (xk * invk) * wk[c];",
+            "v[vrow * size_t(DV) + c] = conv_silu(colv);",
+            "tail[trow + colv] = float(qkv[qb + int64_t(t) * qs1 + int64_t(colv) * qs2]);",
+            "tail[trow + colv] = 0.0f;",
+        ]
+        var ok = restated.allSatisfy { count($0, in: src) == 1 }
+        var text = freshSplitPrologue
+        for (placeholder, piece) in [
+            ("@FAST@", body(freshSplitFast, unroll: true)),
+            ("@GENERAL@", body(freshSplitGeneral, unroll: false)),
+            ("@SILU@", span("// MLX's silu", through: "return acc * sig;")),
+            ("@ABBASE@", span("const int64_t ab = ", through: ";")),
+            ("@BBASE@", span("const int64_t bbase = ", through: ";")),
+            ("@GROW@", span("const size_t grow = ", through: ";")),
+            ("@GATES@", span(
+                "// g = exp(-exp(A_log)",
+                through: "beta[grow] = (bv < 0.0f) ? by : 1.0f - by;")),
+        ] {
+            guard ok, let piece, count(placeholder, in: text) >= 1 else {
+                ok = false
+                break
+            }
+            text = text.replacingOccurrences(of: placeholder, with: piece)
+        }
+        guard ok, !text.contains("@") else {
+            FileHandle.standardError.write(
+                "qwen35: GDN split prework: the stock prework text changed; split kernel off\n"
+                    .data(using: .utf8)!)
+            return nil
+        }
+        return text
+    }()
+
+    private static let freshSplitKernel: MLXFast.MLXFastKernel? = freshSplitSource.map {
+        MLXFast.metalKernel(
+            name: "qwen35_gdn_prework_fresh_split",
+            inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+            outputNames: ["q", "k", "v", "g", "beta", "tail"],
+            source: $0,
+            header: freshSplitHeader,
+            ensureRowContiguous: false)
+    }
+
+    private static func splitGeometryFits(
+        B: Int, S: Int, keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, taps: Int
+    ) -> Bool {
+        B == 1 && S > 0 && S < 65536 && S % splitRows == 0 && headKDim == 128
+            && headVDim % 4 == 0 && (valueHeads * headVDim) % 512 == 0 && taps == 4
+            && keyHeads > 0 && valueHeads % keyHeads == 0
+    }
+
+    /// The split launch on `runFreshState`'s arguments (after its guards and
+    /// dtype conversions). Outputs as `freshStridedKernel`'s.
+    private static func freshSplitLaunch(
+        _ kernel: MLXFast.MLXFastKernel,
+        qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+    ) -> Outputs {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        let blocks = 2 * keyHeads + valueHeads * headVDim / 512
+        let outputs = kernel(
+            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", splitRows),
+            ],
+            grid: (128 * blocks, S / splitRows, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5])
+    }
+
+    /// `runFreshState`'s split launch, or nil when the switch is off, the
+    /// geometry does not fit, or this geometry and qkv dtype were not verified.
+    static func freshSplit(
+        qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+    ) -> Outputs? {
+        guard splitEnabled, let kernel = freshSplitKernel,
+            splitGeometryFits(
+                B: qkv.dim(0), S: qkv.dim(1), keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim, taps: convWeight.dim(1))
+        else { return nil }
+        let geometry = SplitGeometry(
+            hk: keyHeads, hv: valueHeads, cd: qkv.dim(2), ks: convWeight.dim(1),
+            dtype: "\(qkv.dtype)")
+        guard splitLock.withLock({ splitVerdicts[geometry] ?? false }) else { return nil }
+        return freshSplitLaunch(
+            kernel, qkv: qkv, convWeight: convWeight, a: a, b: b, decay: decay, dtb: dtb,
+            normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+            headKDim: headKDim, headVDim: headVDim)
+    }
+
+    private struct SplitGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
+    }
+
+    private static let splitLock = NSLock()
+    nonisolated(unsafe) private static var splitVerdicts: [SplitGeometry: Bool] = [:]
+
+    /// Check the split kernel bit for bit against `freshStridedKernel` for
+    /// every qkv dtype `runFreshState` accepts, once per process, at model
+    /// construction (called from `prepare`). A mismatch or MLX error keeps the
+    /// previous kernel.
+    static func prepareSplit(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard enabled, freshStridedReads, splitEnabled, let kernel = freshSplitKernel,
+            splitGeometryFits(
+                B: 1, S: 512, keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv, taps: ks)
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let geometry = SplitGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            if splitLock.withLock({ splitVerdicts[geometry] != nil }) { continue }
+            let (verdict, detail) = splitSelfCheck(
+                kernel, hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
+            let recorded = splitLock.withLock { () -> Bool in
+                guard splitVerdicts[geometry] == nil else { return false }
+                splitVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded {
+                FileHandle.standardError.write(
+                    ("qwen35 GDN prompt prework (column-block split, \(dtype)): self-test "
+                        + (verdict ? "passed" : "FAILED") + " (" + detail + ")"
+                        + (verdict ? "\n" : "; previous kernel kept\n")).data(using: .utf8)!)
+            }
+        }
+    }
+
+    private static func splitSelfCheck(
+        _ kernel: MLXFast.MLXFastKernel,
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> (Bool, String) {
+        let cd = 2 * hk * dk + hv * dv
+        let nk = ks - 1
+        // qkv a column slice of a wider stack (the model's qkv|z product), a
+        // and b column slices of one product; `skew` starts the stack one
+        // element past a vector boundary (a view the model does not build).
+        let width = cd + hv * dv
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7370_6C74), into: 8)
+        let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+        var cases = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for T in [64, 512] {
+                    for skew in [0, 1] {
+                        // A wide magnitude spread; rows 0..<ks of key head 0's q
+                        // channels are zero (an eps-only norm).
+                        let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                            * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+                        let zero = (MLXArray.arange(T).reshaped(1, T, 1) .< ks)
+                            .&& (MLXArray.arange(width).reshaped(1, 1, width) .< dk)
+                        let flat = which(zero, Float(0), spread).asType(dtype).reshaped(-1)
+                        let stack = concatenated([MLXArray.zeros([skew], dtype: dtype), flat])[
+                            skew...
+                        ].reshaped(1, T, width)
+                        let qkv = stack[.ellipsis, ..<cd]
+                        var ba = MLXRandom.normal([1, T, 2 * hv], key: keys[2]) * 4
+                        let marks = MLXArray((0 ..< (2 * hv)).map { specials[$0 % specials.count] })
+                        ba = MLX.where(
+                            (MLXArray.arange(T) .== 2).reshaped([1, T, 1]),
+                            marks.reshaped([1, 1, 2 * hv]), ba)
+                        let b = ba[.ellipsis, ..<hv]
+                        let a = ba[.ellipsis, hv...]
+                        let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[3]) * 0.5
+                        let aDecay = Qwen35GDNDerived().decay(
+                            MLXRandom.normal([hv], key: keys[4]) * 0.5)
+                        let dtBias = MLXRandom.normal([hv], key: keys[5])
+                        let normScales = (
+                            q: MLXRandom.normal([dk], key: keys[6]),
+                            k: MLXRandom.normal([dk], key: keys[7])
+                        )
+                        eval(qkv, a, b, convWeight, aDecay, dtBias, normScales.q, normScales.k)
+                        let stock = freshStridedKernel(
+                            [qkv, convWeight, a, b, aDecay, dtBias, normScales.q, normScales.k,
+                             MLXArray(Int32(T))],
+                            template: [
+                                ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
+                                ("CD", cd), ("KS", ks),
+                            ],
+                            grid: (128 * hk, T, 1), threadGroup: (128, 1, 1),
+                            outputShapes: [
+                                [1, T, hk, dk], [1, T, hk, dk], [1, T, hv, dv], [1, T, hv],
+                                [1, T, hv], [1, nk, cd],
+                            ],
+                            outputDTypes: [
+                                .float32, .float32, .float32, .float32, .float32, .float32,
+                            ])
+                        let split = freshSplitLaunch(
+                            kernel, qkv: qkv, convWeight: convWeight, a: a, b: b,
+                            decay: aDecay, dtb: dtBias, normScales: normScales, keyHeads: hk,
+                            valueHeads: hv, headKDim: dk, headVDim: dv)
+                        var differ: [MLXArray] = []
+                        for (x, y) in [
+                            (stock[0], split.q), (stock[1], split.k), (stock[2], split.v),
+                            (stock[3], split.g), (stock[4], split.beta), (stock[5], split.tail),
+                        ] {
+                            guard x.shape == y.shape, x.dtype == .float32, y.dtype == .float32
+                            else { throw SelfTestFailure.message("shape or dtype mismatch") }
+                            differ.append(
+                                (x.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                                    .asType(.int32).sum())
+                            values += x.size
+                        }
+                        let count = stacked(differ).sum()
+                        eval(count)
+                        try error.check()
+                        mismatches += Int(count.item(Int32.self))
+                        cases += 1
+                    }
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        return (
+            mismatches == 0 && cases == 4,
+            "rows 64 and 512, aligned and skewed views, \(cases) cases, \(values) values, "
+                + "\(mismatches) mismatches")
     }
 }
 
