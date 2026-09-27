@@ -438,6 +438,22 @@ public enum DFlash2SlidingMask {
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
+    private var keptKey: [Int]?
+    private var kept: MLXArray?
+
+    /// ``DFlash2TrainedBlockMask`` for one plain block forward's geometry,
+    /// shared by its layers. Left lazy: the context length moves every round,
+    /// so evaluating it here would add a wait per round.
+    func trainedBlockMask(contextLength: Int, blockLength: Int, trained: Int) -> MLXArray {
+        let requested = [contextLength, blockLength, trained]
+        if let kept, keptKey == requested { return kept }
+        let made = DFlash2TrainedBlockMask.make(
+            keyCount: contextLength + blockLength, blockStart: MLXArray(Int32(contextLength)),
+            blockLength: blockLength, trained: trained)
+        keptKey = requested
+        kept = made
+        return made
+    }
 
     func mask(
         contextLength: Int,
@@ -464,6 +480,51 @@ final class DFlash2SlidingMaskMemo {
     }
 }
 
+// MARK: - The trained block, kept inside a deeper block
+
+/// THE TRAINED BLOCK, KEPT. The drafter was trained at `dflash_config.block_size`
+/// (8: the anchor and 7 mask rows, bidirectional). A deeper declared block
+/// (depth 15 = 16 rows) is legal, but under the plain mask every row of the
+/// trained span also attends to the mask rows past it, a geometry the drafter
+/// never saw in training, and every extension row reads those perturbed rows.
+/// This mask keeps the trained span exactly as trained: block rows
+/// `i < trained` attend to the context and to block rows `j < trained` only,
+/// so their outputs are the trained-size block's outputs (the dynamic
+/// convolution is causal, so later rows never reach them). Each extension row
+/// `i >= trained` attends to the context and to block rows `j <= i`, so no row
+/// sees a mask row past what the trained geometry or its own position needs,
+/// and the draft at a position is the same for every declared depth that
+/// reaches it past the trained block. The boundary is read from the drafter's
+/// own config, never tuned. Only the DRAFT changes; the target verifies every
+/// token, so the output is the target's greedy sequence either way.
+/// `MLXFAST_DFLASH_TRAINED_BLOCK_MASK=0` restores the plain block mask; `=all`
+/// lets the extension rows attend to every block row.
+enum DFlash2TrainedBlockMask {
+    private static let setting: String = ProcessInfo.processInfo
+        .environment["MLXFAST_DFLASH_TRAINED_BLOCK_MASK"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    static let enabled = !["0", "false", "no", "off"].contains(setting)
+    static let causalExtension = setting != "all"
+
+    static func applies(blockLength: Int, trained: Int) -> Bool {
+        enabled && trained > 0 && blockLength > trained
+    }
+
+    /// `true` where allowed, `[blockLength, keyCount]`: key `k` is block row
+    /// `k - blockStart` (negative for a context key, always allowed here; the
+    /// caller ANDs in its own context and tail terms).
+    static func make(
+        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int
+    ) -> MLXArray {
+        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped(blockLength, 1)
+        let row = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount) - blockStart
+        if causalExtension {
+            return (row .< Int32(trained)) .|| ((query .>= Int32(trained)) .&& (row .<= query))
+        }
+        return (row .< Int32(trained)) .|| (query .>= Int32(trained))
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -473,6 +534,8 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
+    /// `dflash_config.block_size`, the block the drafter was trained at.
+    let trainedBlock: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -502,6 +565,7 @@ private final class DFlash2Attention: Module {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
         self.isCausal = config.isCausal
+        self.trainedBlock = config.dflash.blockSize
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
@@ -651,6 +715,11 @@ private final class DFlash2Attention: Module {
             }
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
+        }
+        if DFlash2TrainedBlockMask.applies(blockLength: L, trained: trainedBlock) {
+            let kept = masks.trainedBlockMask(
+                contextLength: cachedLength, blockLength: L, trained: trainedBlock)
+            mask = mask.map { $0 .&& kept } ?? kept
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -2630,8 +2699,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
+        if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
+            // The block sits at row `held + c` of the keys, as in the plain
+            // path it sits right after the cached context.
+            keyMask = keyMask .&& DFlash2TrainedBlockMask.make(
+                keyCount: keys, blockStart: MLXArray(Int32(geometry.rows)) + c,
+                blockLength: blockSize, trained: config.dflash.blockSize)
+        }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         var writes: [(keys: MLXArray, values: MLXArray)] = []
         var lead: MLXArray?
