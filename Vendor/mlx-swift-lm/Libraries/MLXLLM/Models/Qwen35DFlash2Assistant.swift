@@ -46,7 +46,7 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
 public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MTPBlockSpeculation,
-    CBv2PromptLookupAbsorbing, @unchecked Sendable
+    @unchecked Sendable
 {
 
     public let drafter: DFlash2DraftModel
@@ -113,7 +113,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         try drafter.bind(target: text)
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
         assistant.establishSpeculation()
-        assistant.establishLookupSkip()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
     }
@@ -162,6 +161,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
+                self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
             }
@@ -195,6 +195,20 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
     /// `=0` no self-test either). Nothing runs where the head is not on the
     /// int8 verify route or its fused form fails the self-test.
+    /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
+    /// after the verify kernels' trial, the same way: one engine request,
+    /// cancelled once both arms have their rounds, the choice, one stderr
+    /// line, the buffer cache drained.
+    private func runNarrowProducerTrial(serving: any LanguageModel) {
+        typealias Trial = Qwen35NarrowProducerTrial
+        guard Trial.armed else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded, producerTrial: true)
+        Stream().synchronize()
+        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
+        Memory.clearCache()
+    }
+
     private func runHeadTopTwoTrial(serving: any LanguageModel) {
         typealias Head = Qwen35HeadTopTwo
         guard Head.forced != false, Qwen35TensorPackedMatmul.prepareHeadTop2() else { return }
@@ -273,7 +287,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false
+        kernelTrial: Bool = false, producerTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -342,7 +356,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     guard let engine else { return }
                     DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
                 }
-                if headTrial {
+                if producerTrial {
+                    Qwen35NarrowProducerTrial.begin(onEnough: cancel)
+                } else if headTrial {
                     Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
                 } else if kernelTrial {
                     DFlash2KernelTrial.begin(onEnough: cancel)
@@ -361,6 +377,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             done.wait()
             if trialRounds > 0 {
                 Qwen35TensorPackedMatmul.NarrowInSituTrial.active = false
+                Qwen35NarrowProducerTrial.active = false
                 Qwen35HeadTopTwo.Trial.active = false
                 DFlash2KernelTrial.active = false
             }
@@ -638,9 +655,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         var isReleased = false
         /// Columns the last round confirmed (the speculative block's row class guess).
         var lastConfirmed: Int?
-        /// The proposal now being verified came from prompt lookup. The next
-        /// speculative block would be discarded on another hit, so it is not started.
-        var lastProposalWasLookup = false
 
         init(caches: [any KVCache]) { self.caches = caches }
 
@@ -752,6 +766,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
+        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         let state = self.state(requestState)
@@ -880,8 +895,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     }
 
     private(set) var speculationPlan: SpeculationPlan?
-    /// Load-time proof that absorb-without-block matches propose-then-trim.
-    public private(set) var lookupSkipReady = false
 
     final class Speculation: CBv2MTPSpeculativeBlock {
         let state: RequestState
@@ -903,12 +916,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         leadingLayersBeforeReadback: Int
     ) -> (any CBv2MTPSpeculativeBlock)? {
         let state = self.state(requestState)
-        // A lookup hit's next block is another prompt copy, or a miss we can
-        // draft after the readback. Starting it here puts the block forward
-        // on the verify's critical path for tokens the drafter will not emit.
-        if state.lastProposalWasLookup, lookupSkipReady, CBv2PromptLookupDraft.skipDrafterOnHit {
-            return nil
-        }
         guard let plan = speculationPlan, k + 2 == plan.classes.count, !state.isReleased,
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
@@ -939,6 +946,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             plan.classes[confirmed] == s.block.contextRows
         else { return nil }
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
+        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         drafter.adoptSpeculative(s.block, confirmed: confirmed, cache: state.caches)
@@ -1030,97 +1038,5 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             + (speculationPlan!.single
                 ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
                 : "the previous round's class built before the readback") + "; \(ms) ms\n")).utf8))
-    }
-
-    public func noteLookupProposal(_ hit: Bool, requestState: any CBv2MTPRequestState) {
-        state(requestState).lastProposalWasLookup = hit
-    }
-
-    /// Write pending committed rows into the drafter cache and clear them,
-    /// without the block forward. Nil means the caller must `proposeBlock`.
-    public func absorbCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]? {
-        let state = self.state(requestState)
-        guard !state.isReleased else { return nil }
-        if state.pending.isEmpty {
-            // Prefetch, or a previous absorb, already wrote every committed row.
-            return state.contextPrefetched ? [] : nil
-        }
-        let rows = state.pending.count == 1
-            ? state.pending[0] : concatenated(state.pending, axis: 1)
-        seedCacheOffsets(state)
-        guard (try? drafter.absorbContext(targetHidden: rows, cache: state.caches)) == true else {
-            return nil
-        }
-        state.absorbPending()
-        state.contextPrefetched = true
-        return state.caches.flatMap { $0.innerState() }
-    }
-
-    /// One prompt absorb plus the decode row counts, against propose-then-trim.
-    /// A mismatch leaves the skip off; lookup still replaces ids.
-    func establishLookupSkip() {
-        lookupSkipReady = false
-        guard CBv2PromptLookupDraft.skipDrafterOnHit else {
-            FileHandle.standardError.write(Data("dflash2 lookup skip: off\n".utf8))
-            return
-        }
-        let start = DispatchTime.now().uptimeNanoseconds
-        var failure: String?
-        var compared = 0
-        do {
-            let width = drafter.config.targetHiddenSize
-            let prompt = MLXRandom.normal([1, 64, width], key: MLXRandom.key(21))
-            for extra in [1, 4, 8, 9, 11, 16] {
-                let a = RequestState(caches: try drafter.makeCache())
-                let b = RequestState(caches: try drafter.makeCache())
-                defer { a.clearAll(); b.clearAll() }
-                append(prompt, to: a)
-                append(prompt, to: b)
-                eval(prefetchCommittedContext(requestState: a))
-                eval(prefetchCommittedContext(requestState: b))
-                let window = MLXRandom.normal(
-                    [1, extra, width], key: MLXRandom.key(UInt64(300 + extra)))
-                append(window, to: a)
-                append(window, to: b)
-                let committed = a.committedInputCount
-                let drafted = try proposeBlock(
-                    anchor: 7, depth: Self.warmBlockSize - 1, requestState: a)
-                trimBlockState(a, toCommittedLength: committed)
-                guard let absorbed = absorbCommittedContext(requestState: b) else {
-                    failure = "extra \(extra): absorb refused"
-                    break
-                }
-                eval([drafted] + absorbed + evaluationTargets(for: a) + evaluationTargets(for: b))
-                var same = a.pending.isEmpty && b.pending.isEmpty
-                for (x, y) in zip(a.caches, b.caches) {
-                    guard let x = x as? DFlash2BlockKVCache, let y = y as? DFlash2BlockKVCache,
-                        x.offset == y.offset, x.offset == committed,
-                        let rows = x.inPlaceRows, y.inPlaceRows == rows
-                    else { same = false; break }
-                    let keep = min(committed, rows)
-                    for (u, v) in zip(x.innerState(), y.innerState()) {
-                        let p = u[.ellipsis, ..<keep, 0...]
-                        let q = v[.ellipsis, ..<keep, 0...]
-                        same = same && p.shape == q.shape && p.dtype.size == 2
-                            && all(p.view(dtype: .uint16) .== q.view(dtype: .uint16)).item(Bool.self)
-                        compared += p.size
-                    }
-                }
-                if !same {
-                    failure = "extra \(extra): cached rows or cursors differ"
-                    break
-                }
-            }
-        } catch {
-            failure = "\(error)"
-        }
-        Stream().synchronize()
-        Memory.clearCache()
-        lookupSkipReady = failure == nil
-        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        FileHandle.standardError.write(Data((failure.map {
-            "dflash2 lookup skip: self-test FAILED (\($0)); drafter still runs on a hit; \(ms) ms\n"
-        } ?? ("dflash2 lookup skip: self-test passed (pending 1/8/16 after a 64-row prompt, "
-            + "\(compared) values compared bitwise, 0 mismatches); \(ms) ms\n")).utf8))
     }
 }

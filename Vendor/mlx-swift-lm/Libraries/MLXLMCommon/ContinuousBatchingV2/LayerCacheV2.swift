@@ -160,6 +160,26 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// `updateAndAttend(queries:keys:values:scale:sinks:)` (no keep mask) for
+    /// a one-row chunk on the query-block path, returning the blocks'
+    /// outputs in query order (see the protocol). Declines, before any state
+    /// changes, when an observation is armed, a span overlay is bound, the
+    /// layer borrows its K/V, or the chunk would not attend in query blocks.
+    public func updateAndAttendQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]? {
+        guard kind.sharesKVWithLayer == nil, attentionMetadata == nil, attentionPacket == nil,
+            rows.count == 1, boundSpanContexts?.contains(where: { $0 != nil }) != true,
+            let blocks = CBv2AttentionV1.updateAndAttendQueryBlocks(
+                row: rows[0], kind: kind, queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks, softcap: attentionSoftcap)
+        else { return nil }
+        // The offset advance `updateAndAttend` makes.
+        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        return blocks
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk
