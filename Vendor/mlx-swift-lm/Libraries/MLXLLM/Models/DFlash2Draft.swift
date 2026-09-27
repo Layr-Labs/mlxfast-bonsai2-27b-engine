@@ -3081,6 +3081,100 @@ public enum DFlash2ResidencyPrefetch {
     }
 }
 
+/// Copies this call's context and writes positive zero padding into one fresh output.
+/// No context, token, output or activation is retained between calls.
+private enum DFlash2SpeculativeContextPad {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_COPY_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_speculative_context_copy_pad", inputNames: ["context", "dims"],
+        outputNames: ["out"], source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint width = uint(context_shape[2]);
+            if (idx >= uint(dims[0]) * width) { return; }
+            const uint row = idx / width;
+            const uint col = idx - row * width;
+            if (row < uint(context_shape[1])) {
+                const long offset = long(row) * long(context_strides[1])
+                    + long(col) * long(context_strides[2]);
+                out[idx] = context[offset];
+            } else {
+                out[idx] = 0;
+            }
+            """, ensureRowContiguous: false)
+
+    private static func launch(_ context: MLXArray, rows: Int) -> MLXArray {
+        let count = rows * context.dim(2)
+        let word: DType = context.dtype == .float32 ? .uint32 : .uint16
+        return kernel(
+            [context.view(dtype: word), MLXArray([Int32(rows), Int32(context.dim(2))])],
+            grid: ((count + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, rows, context.dim(2)]], outputDTypes: [word])[0].view(dtype: context.dtype)
+    }
+
+    static func apply(_ context: MLXArray, rows: Int) -> MLXArray? {
+        guard enabled, context.ndim == 3, context.dim(0) == 1,
+            context.dim(1) > 0, context.dim(1) < rows, rows <= 34,
+            context.dim(2) > 1, context.dim(2) < Int(Int32.max) / rows,
+            [.float16, .bfloat16, .float32].contains(context.dtype), verified
+        else { return nil }
+        return launch(context, rows: rows)
+    }
+
+    static func prepare() {
+        guard enabled else { return }
+        _ = verified
+    }
+
+    private static let verified: Bool = {
+        guard enabled else { return false }
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for dtype in [DType.float16, .bfloat16, .float32] {
+                    for (have, rows, width) in [(1, 2, 7), (3, 16, 128), (17, 34, 5120)] {
+                        for step in [1, 2] {
+                            let shape = [1, have, width * step]
+                            let count = have * width * step
+                            let input: MLXArray
+                            if dtype == .float32 {
+                                let samples: [UInt32] = [0, 0x80000000, 1, 0x3f800000,
+                                    0xbf800000, 0x7f800000, 0xff800000, 0x7fc12345]
+                                input = MLXArray((0..<count).map { samples[$0 % samples.count] }, shape)
+                                    .view(dtype: dtype)
+                            } else {
+                                let samples: [UInt16] = [0, 0x8000, 1, 0x3c00,
+                                    0xbc00, 0x7c00, 0xfc00, 0x7e35]
+                                input = MLXArray((0..<count).map { samples[$0 % samples.count] }, shape)
+                                    .view(dtype: dtype)
+                            }
+                            let context = input[0..., 0..., .stride(by: step)]
+                            let actual = launch(context, rows: rows)
+                            let expected = concatenated([context, MLXArray.zeros(
+                                [1, rows - have, width], dtype: dtype)], axis: 1)
+                            let word: DType = dtype == .float32 ? .uint32 : .uint16
+                            if !all(actual.view(dtype: word) .== expected.view(dtype: word))
+                                .item(Bool.self) { same = false }
+                            compared += expected.size
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        FileHandle.standardError.write(
+            ("dflash2 speculative context copy-pad: " + (same
+                ? "self-test passed: \(compared) raw words compared; no mismatches\n"
+                : "self-test failed; stock zeros/concatenated kept\n")).data(using: .utf8)!)
+        return same
+    }()
+}
+
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
@@ -3145,6 +3239,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             MLXArray([Int32(config.maskTokenId)], [1, 1])).asType(dtype)
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
+        DFlash2SpeculativeContextPad.prepare()
         // The one-launch concatenations' self-tests, before any timed forward:
         // each layer's [context; block] rows and the target's tapped states.
         DFlash2Concat.prepare(inputs: 2, dtype: dtype)
@@ -3483,7 +3578,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
-        let base = concatenated(
+        let base = DFlash2SpeculativeContextPad.apply(context, rows: n) ?? concatenated(
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
