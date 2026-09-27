@@ -660,3 +660,252 @@ func qwen35A3BExpertCombiner(
         return output.reshaped(shape)
     }
 }
+
+
+// Moved verbatim from Qwen35.swift (per-file byte cap); same module.
+/// The full-attention layer's pre-SDPA work as ONE launch (polymorf's "fused
+/// attention prework", `d4ed6585` notes; this is an independent
+/// implementation, that one was not shipped): for each (row, head) the q or k
+/// head is read through its strides from the q|gate and k projections, then
+/// MLX's `rms_single_row` over the head (D/4 lanes x 4 reads, the
+/// `acc += x * x` chain, `simd_sum`, the zeroed 32-slot threadgroup pass,
+/// `precise::rsqrt(acc / axis + eps)`, `w * (x * inv)`), then MLX's `rope`
+/// kernel on the first RD channels (`exp2(-(i / (RD/2)) * log2(base))`,
+/// `fast::cos`/`fast::sin` of `scale * float(t + offset) * inv_freq`,
+/// `x1 * cos - x2 * sin`, `x1 * sin + x2 * cos`), written head-major
+/// ([B, H, L, D], row-contiguous) as the rope's partial-dims copy lays it out.
+/// The op chain runs eight launches per attention layer for this (a strided
+/// copy and an `rms` launch per norm, a copy and a `rope` launch per partial
+/// rotation) plus the offsets copy; the kernel reads the cache's offsets array
+/// before the cache advances, which is what the copy captured. Same
+/// expressions in the same order, all compiled without fast math; verified
+/// bit for bit against the op chain once per geometry at model construction
+/// (a disagreeing device keeps the op chain). `BONSAI_FUSED_ATTN_PREWORK=0`
+/// keeps the op chain.
+enum Qwen35AttentionPrework {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_ATTN_PREWORK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // grid (TPG * (HQ + HK), L, B), threadgroup (TPG, 1, 1), TPG = D / 4.
+    // Inputs: q [B, L, HQ, D] and k [B, L, HK, D] (any strides, same dtype),
+    // wq/wk [D] FP32, offs [1] or [B] int32 (any stride), epsq/epsk/scale/
+    // lbase (log2 of the rope base) FP32 scalars, axis (= D) uint32 scalar.
+    // Outputs qo [B, HQ, L, D], ko [B, HK, L, D] FP32.
+    private static let source = """
+        constexpr int NR = 4;
+        constexpr int HALF = RD / 2;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hh = threadgroup_position_in_grid.x;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint bb = threadgroup_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int Ln = int(q_shape[1]);
+        const bool isq = hh < uint(HQ);
+        const uint h = isq ? hh : hh - uint(HQ);
+
+        threadgroup float local_sums[32];
+        threadgroup float local_inv[1];
+        threadgroup float rot[RD];
+
+        // rms_single_row: lane lid holds channels NR*lid .. NR*lid+NR-1.
+        const int64_t base = isq
+            ? int64_t(bb) * q_strides[0] + int64_t(t) * q_strides[1] + int64_t(h) * q_strides[2]
+            : int64_t(bb) * k_strides[0] + int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
+        const int64_t cs = isq ? q_strides[3] : k_strides[3];
+        auto src = isq ? q : k;
+        float acc = 0;
+        float thread_x[NR];
+        for (int i = 0; i < NR; i++) {
+          thread_x[i] = static_cast<float>(src[base + int64_t(lid * NR + i) * cs]);
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) {
+          local_sums[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+          local_sums[sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          acc = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            const float eps = isq ? epsq : epsk;
+            local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto w = isq ? wq : wk;
+        auto dst = isq ? qo : ko;
+        const size_t obase =
+            ((size_t(bb) * size_t(isq ? HQ : HK) + size_t(h)) * size_t(Ln) + size_t(t)) * size_t(D);
+        const float inv = local_inv[0];
+        for (int i = 0; i < NR; i++) {
+          const uint c = lid * NR + uint(i);
+          const float n = w[c] * static_cast<float>(thread_x[i] * inv);
+          if (c < uint(RD)) {
+            rot[c] = n;
+          } else {
+            dst[obase + c] = n;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // rope on channels [0, RD): pair (j, j + HALF), as MLX's rope kernel.
+        if (lid < uint(HALF)) {
+          const int off = offs[OB ? 0 : int64_t(bb) * offs_strides[0]];
+          float d = static_cast<float>(lid) / static_cast<float>(HALF);
+          float inv_freq = metal::exp2(-d * lbase);
+          float L = scale * static_cast<float>(t + off);
+          float theta = L * inv_freq;
+          float costheta = metal::fast::cos(theta);
+          float sintheta = metal::fast::sin(theta);
+          float x1 = rot[lid];
+          float x2 = rot[lid + HALF];
+          float rx1 = x1 * costheta - x2 * sintheta;
+          float rx2 = x1 * sintheta + x2 * costheta;
+          dst[obase + lid] = rx1;
+          dst[obase + lid + HALF] = rx2;
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_attn_prework",
+        inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
+        outputNames: ["qo", "ko"],
+        source: source,
+        ensureRowContiguous: false)
+
+    /// `(rope(qNorm(q).transposed(0, 2, 1, 3)), rope(kNorm(k).transposed(0, 2, 1,
+    /// 3)))` at `offsets` for `q` [B, L, HQ, D] and `k` [B, L, HK, D]; nil when
+    /// it does not apply.
+    static func run(
+        q: MLXArray, k: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
+        offsets: MLXArray, ropeDims: Int, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, q.ndim == 4, k.ndim == 4,
+            verified(
+                Geometry(
+                    hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims, dtype: "\(q.dtype)"))
+        else { return nil }
+        return runUnchecked(
+            q: q, k: k, wq: qNorm.weight, wk: kNorm.weight, epsQ: qNorm.eps, epsK: kNorm.eps,
+            offsets: offsets, ropeDims: ropeDims, ropeBase: ropeBase)
+    }
+
+    private static func runUnchecked(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        offsets: MLXArray, ropeDims: Int, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        let B = q.dim(0)
+        let L = q.dim(1)
+        let HQ = q.dim(2)
+        let HK = k.dim(2)
+        let D = q.dim(3)
+        guard k.dim(0) == B, k.dim(1) == L, k.dim(3) == D,
+            q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
+            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
+            offsets.dtype == .int32, offsets.ndim <= 1,
+            offsets.size == 1 || offsets.size == B,
+            L > 0, L < 65536
+        else { return nil }
+        let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let outputs = kernel(
+            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
+             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            template: [
+                ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
+                ("OB", offs.size == 1 ? 1 : 0),
+            ],
+            grid: ((D / 4) * (HQ + HK), L, B), threadGroup: (D / 4, 1, 1),
+            outputShapes: [[B, HQ, L, D], [B, HK, L, D]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private struct Geometry: Hashable {
+        let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    private static func verified(_ geometry: Geometry) -> Bool {
+        lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Compile the kernel and check it bit for bit against the op chain for one
+    /// attention geometry, once per process, at model construction (before
+    /// any timed forward). A geometry or dtype that was not prepared, or that
+    /// disagrees, keeps the op chain.
+    static func prepare(
+        hq: Int, hk: Int, d: Int, ropeDims rd: Int, ropeBase: Float, epsQ: Float, epsK: Float
+    ) {
+        guard enabled, d % 128 == 0, d <= 4096, rd > 0, rd % 4 == 0, rd <= d,
+            rd / 2 <= d / 4
+        else { return }
+        lock.withLock {
+            for dtype in [DType.float32] {
+                let geometry = Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)")
+                if verdicts[geometry] != nil { continue }
+                let verdict = selfCheck(
+                    geometry, dtype: dtype, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
+                verdicts[geometry] = verdict
+                if !verdict {
+                    FileHandle.standardError.write(
+                        "qwen35: fused attention prework disagrees with the op chain on this device (\(dtype)); using the op chain\n"
+                            .data(using: .utf8)!)
+                }
+            }
+        }
+    }
+
+    private static func selfCheck(
+        _ geo: Geometry, dtype: DType, ropeBase: Float, epsQ: Float, epsK: Float
+    ) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6174_746e), into: 6)
+        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
+        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
+        // The op chain as `Qwen35Attention.cbv2Forward` composes it (RMSNorm and
+        // RoPE modules call exactly these).
+        func chain(_ x: MLXArray, _ w: MLXArray, _ eps: Float, _ offsets: MLXArray) -> MLXArray {
+            MLXFast.RoPE(
+                MLXFast.rmsNorm(x, weight: w, eps: eps).transposed(0, 2, 1, 3),
+                dimensions: geo.rd, traditional: false, base: ropeBase, scale: 1,
+                offset: offsets + 0)
+        }
+        var same = MLXArray(true)
+        for (index, (rows, offset)) in [(16, 611), (1, 4093), (37, 0), (5, 200_003)].enumerated() {
+            // The q|gate, k and v projections stacked as the verify produces
+            // them; wide magnitude spread so the reductions see real rounding.
+            let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+            let wide = (MLXRandom.normal([1, rows, width], key: keys[2 + index % 4])
+                * exp(MLXRandom.normal([1, rows, width], key: keys[(3 + index) % 6])))
+                .asType(dtype)
+            let parts = MLX.split(
+                wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d],
+                axis: -1)
+            let q = parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0]
+            let k = parts[1].reshaped(1, rows, geo.hk, -1)
+            let offsets = MLXArray([Int32(offset)])
+            let refQ = chain(q, wq, epsQ, offsets)
+            let refK = chain(k, wk, epsK, offsets)
+            guard
+                let (newQ, newK) = runUnchecked(
+                    q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
+                    ropeDims: geo.rd, ropeBase: ropeBase),
+                refQ.shape == newQ.shape, refK.shape == newK.shape,
+                refQ.dtype == newQ.dtype, refK.dtype == newK.dtype
+            else { return false }
+            same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
+                .&& all(refK.view(dtype: .uint32) .== newK.view(dtype: .uint32))
+        }
+        return same.item(Bool.self)
+    }
+}
