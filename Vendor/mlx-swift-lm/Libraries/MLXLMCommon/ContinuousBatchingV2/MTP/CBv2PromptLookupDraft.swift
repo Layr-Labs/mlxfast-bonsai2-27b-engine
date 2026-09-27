@@ -15,6 +15,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_LOOKUP=0` keeps the drafter's block.
@@ -167,6 +168,13 @@ enum CBv2PromptLookupDraft {
             runs[c] = Int32(length)
         }
 
+        if let fused = CBv2PromptSpliceKernel.select(
+            drafted, history: history, promptLength: prompt, runs: runs,
+            depth: depth, minimum: minimum, trace: spliceTrace)
+        {
+            return fused
+        }
+
         // The prompt continuation of every alignment, [candidates, depth].
         var table = [Int32]()
         table.reserveCapacity(candidates * depth)
@@ -276,4 +284,135 @@ enum CBv2PromptLookupDraft {
         }
         return nil
     }
+}
+
+/// The reference splice expressed as two integer kernels. Every (draft
+/// start, prompt alignment) keeps the same leading agreement, suffix bonus,
+/// eligibility and row-major tie order. No proposed token is read on the
+/// host. Prompt length is a runtime scalar, so a new length needs no new
+/// kernel specialization or expanded [candidates, depth] prompt table.
+enum CBv2PromptSpliceKernel {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func select(
+        _ drafted: MLXArray, history: [Int], promptLength: Int, runs: [Int32],
+        depth: Int, minimum: Int, trace: Bool
+    ) -> MLXArray? {
+        let candidates = promptLength - depth
+        let (alignments, overflow) = candidates.multipliedReportingOverflow(by: depth)
+        guard enabled, drafted.dtype == .int32, drafted.shape == [1, depth],
+            (1 ... 32).contains(depth), candidates > 0, !overflow,
+            alignments <= Int(Int32.max), minimum <= Int(Int32.max),
+            runs.count == candidates
+        else { return nil }
+        let threads = 128
+        let groups = (alignments + threads - 1) / threads
+        let block = drafted.reshaped([depth])
+        let prompt = MLXArray(history[..<promptLength].map { Int32($0) })
+        let runArray = MLXArray(runs)
+        let dims = MLXArray([Int32(candidates), Int32(groups), Int32(minimum)])
+        let partial = alignmentKernel(
+            [block, prompt, runArray, dims], template: [("DEPTH", depth)],
+            grid: (threads * groups, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[groups], [groups]], outputDTypes: [.int32, .int32])
+        let selected = emissionKernel(
+            [block, prompt, partial[0], partial[1], dims], template: [("DEPTH", depth)],
+            grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[depth], [2]], outputDTypes: [.int32, .int32])
+        if trace {
+            let choice = selected[1].asArray(Int32.self)
+            FileHandle.standardError.write(Data(
+                ("dflash2 prompt splice: fire=\(choice[1] != 0) "
+                    + "j=\(Int(choice[0]) / candidates) c=\(Int(choice[0]) % candidates) "
+                    + "depth=\(depth) fused\n").utf8))
+        }
+        return selected[0].reshaped([1, depth])
+    }
+
+    private static let alignmentKernel = MLXFast.metalKernel(
+        name: "mlxfast_prompt_splice_align",
+        inputNames: ["draft", "prompt", "runs", "dims"],
+        outputNames: ["partial_score", "partial_index"],
+        source: """
+            const uint flat = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint count = uint(dims[0]);
+            int score = -1;
+            uint index = 0x7fffffffu;
+            if (flat < count * uint(DEPTH)) {
+                const uint j = flat / count;
+                const uint c = flat - j * count;
+                int agree = 0;
+                for (uint t = 0; j + t < uint(DEPTH); ++t) {
+                    if (draft[j + t] != prompt[c + 1u + t]) break;
+                    ++agree;
+                }
+                const int evidence = agree + (j == 0u ? runs[c] : 0);
+                score = agree >= 1 && evidence >= dims[2] ? evidence : 0;
+                index = flat;
+            }
+            int bestScore = simd_max(score);
+            uint bestIndex = simd_min(score == bestScore ? index : 0x7fffffffu);
+            threadgroup int scores[4];
+            threadgroup uint indices[4];
+            if (lane == 0u) { scores[sg] = bestScore; indices[sg] = bestIndex; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                score = lane < 4u ? scores[lane] : -1;
+                index = lane < 4u ? indices[lane] : 0x7fffffffu;
+                bestScore = simd_max(score);
+                bestIndex = simd_min(score == bestScore ? index : 0x7fffffffu);
+                if (lane == 0u) {
+                    partial_score[threadgroup_position_in_grid.x] = bestScore;
+                    partial_index[threadgroup_position_in_grid.x] = int(bestIndex);
+                }
+            }
+            """)
+
+    private static let emissionKernel = MLXFast.metalKernel(
+        name: "mlxfast_prompt_splice_emit",
+        inputNames: ["draft", "prompt", "partial_score", "partial_index", "dims"],
+        outputNames: ["proposal", "choice"],
+        source: """
+            const uint t = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            int score = -1;
+            uint index = 0x7fffffffu;
+            for (uint g = t; g < uint(dims[1]); g += 128u) {
+                const int s = partial_score[g];
+                const uint i = uint(partial_index[g]);
+                if (s > score || (s == score && i < index)) { score = s; index = i; }
+            }
+            int bestScore = simd_max(score);
+            uint bestIndex = simd_min(score == bestScore ? index : 0x7fffffffu);
+            threadgroup int scores[4];
+            threadgroup uint indices[4];
+            threadgroup int winnerScore;
+            threadgroup uint winnerIndex;
+            if (lane == 0u) { scores[sg] = bestScore; indices[sg] = bestIndex; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                score = lane < 4u ? scores[lane] : -1;
+                index = lane < 4u ? indices[lane] : 0x7fffffffu;
+                bestScore = simd_max(score);
+                bestIndex = simd_min(score == bestScore ? index : 0x7fffffffu);
+                if (lane == 0u) { winnerScore = bestScore; winnerIndex = bestIndex; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint count = uint(dims[0]);
+            const uint j = winnerIndex / count;
+            const uint c = winnerIndex - j * count;
+            const bool fire = winnerScore >= dims[2];
+            if (t < uint(DEPTH)) {
+                const uint source = c + 1u + (t >= j ? t - j : 0u);
+                proposal[t] = fire && t >= j ? prompt[source] : draft[t];
+            }
+            if (t == 0u) { choice[0] = int(winnerIndex); choice[1] = fire ? 1 : 0; }
+            """)
 }
