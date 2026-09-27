@@ -620,8 +620,8 @@ enum Qwen35GDNReplayFused {
             let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
         else { return nil }
         let out = kernel(
-            [q, k, v, g, beta, MLXArray(Int32(T))] + previous
-                + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))],
+            [q, k, v, g, beta, Qwen35DispatchScalars.int32(T)] + previous
+                + [Qwen35DispatchScalars.int32Pair(aRows, bRows), Qwen35DispatchScalars.int32(keep)],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl),
@@ -1214,7 +1214,7 @@ extension Qwen35GDNPrework {
             let qkRows = fused ? C : rows
             let qk = (fused ? fusedPrepKernel : splitQKKernel)(
                 [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
-                 MLXArray(Int32(S))],
+                 Qwen35DispatchScalars.int32(S)],
                 template: [
                     ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                     ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", qkRows),
@@ -1228,7 +1228,7 @@ extension Qwen35GDNPrework {
                        [B, valueHeads, S / C, 2, C]] : []),
                 outputDTypes: [DType](repeating: .float32, count: fused ? 8 : 5))
             let v = splitValueKernel(
-                [qkv, convWeight, MLXArray(Int32(S))],
+                [qkv, convWeight, Qwen35DispatchScalars.int32(S)],
                 template: [
                     ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                     ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
@@ -1241,7 +1241,7 @@ extension Qwen35GDNPrework {
         }
         let outputs = (form == 1 ? narrowRowsKernel : freshStridedRowsKernel)(
             [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+             Qwen35DispatchScalars.int32(S)],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
@@ -1581,7 +1581,7 @@ extension Qwen35GDNPrework {
         }
         let outputs = verifyLoadsFirstKernel(
             [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+             Qwen35DispatchScalars.int32(S)],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
@@ -1677,7 +1677,7 @@ extension Qwen35GDNPrework {
                     else { throw SelfTestFailure.message("no stock launch") }
                     let lf = verifyLoadsFirstKernel(
                         [qkv, convState, convWeight, a, b, aDecay, dtBias, normScales.q,
-                         normScales.k, MLXArray(Int32(T))],
+                         normScales.k, Qwen35DispatchScalars.int32(T)],
                         template: [
                             ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
                             ("CD", cd), ("KS", ks),

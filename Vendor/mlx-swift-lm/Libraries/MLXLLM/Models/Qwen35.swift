@@ -311,7 +311,14 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let third = env["DARKBLOOM_QWEN35_VERIFY_THIRD_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Third boundary after layer 40 (pochita0 `b17b04d4`: paired composite
+        // 4.77259 on parent 4.77070). Off keeps [8, 24]; the second-slice
+        // switch off keeps [8], whether or not the third switch is on.
+        let secondOff = ["0", "false", "no", "off"].contains(second ?? "")
+        let thirdOff = ["0", "false", "no", "off"].contains(third ?? "")
+        let leading = secondOff ? [8] : (thirdOff ? [8, 24] : [8, 24, 40])
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -359,6 +366,136 @@ enum Qwen35TrunkSubmission {
         }
         if plan.isOff || caches.contains(where: { $0 is PagedLayerCache }) { return nil }
         return plan
+    }
+}
+
+/// One evaluated scalar (or a two-int stride pair) reused by every launch
+/// that would otherwise build the same constant. The kernel reads the same
+/// bits from the same dtype and rank. Each cache has its own switch, default
+/// on; off allocates a fresh array at the call, as the crown does.
+/// Filled at layer init for the verify widths, the 512-row prefill, the
+/// model's RMS epsilon and the attention head size, so a timed leg (a fresh
+/// process) does not pay the first allocation inside the window.
+enum Qwen35DispatchScalars {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var int32s: [Int: MLXArray] = [:]
+    nonisolated(unsafe) private static var floats: [UInt32: MLXArray] = [:]
+    nonisolated(unsafe) private static var float1s: [UInt32: MLXArray] = [:]
+    nonisolated(unsafe) private static var uint32s: [UInt32: MLXArray] = [:]
+    nonisolated(unsafe) private static var int32Pairs: [UInt64: MLXArray] = [:]
+
+    /// `MLXArray(Int32(n))` for a row count or a kept-prefix length.
+    static let rowCounts: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_ROWCOUNT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `MLXArray(x)`, `MLXArray([x])` and `MLXArray(UInt32(n))` for an epsilon,
+    /// a rope base or an axis length that does not change between layers.
+    static let scalars: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SCALAR_BUFFER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `MLXArray([a, b])` for the replay's two gate-row strides.
+    static let intPairs: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_INT_PAIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func int32(_ n: Int) -> MLXArray {
+        guard rowCounts, n >= 0, n <= Int(Int32.max) else { return MLXArray(Int32(n)) }
+        if let hit = lock.withLock({ int32s[n] }) { return hit }
+        let made = MLXArray(Int32(n))
+        eval(made)
+        return lock.withLock {
+            if let hit = int32s[n] { return hit }
+            int32s[n] = made
+            return made
+        }
+    }
+
+    static func floatScalar(_ x: Float) -> MLXArray {
+        guard scalars else { return MLXArray(x) }
+        let key = x.bitPattern
+        if let hit = lock.withLock({ floats[key] }) { return hit }
+        let made = MLXArray(x)
+        eval(made)
+        return lock.withLock {
+            if let hit = floats[key] { return hit }
+            floats[key] = made
+            return made
+        }
+    }
+
+    static func float1(_ x: Float) -> MLXArray {
+        guard scalars else { return MLXArray([x]) }
+        let key = x.bitPattern
+        if let hit = lock.withLock({ float1s[key] }) { return hit }
+        let made = MLXArray([x])
+        eval(made)
+        return lock.withLock {
+            if let hit = float1s[key] { return hit }
+            float1s[key] = made
+            return made
+        }
+    }
+
+    static func uint32(_ n: UInt32) -> MLXArray {
+        guard scalars else { return MLXArray(n) }
+        if let hit = lock.withLock({ uint32s[n] }) { return hit }
+        let made = MLXArray(n)
+        eval(made)
+        return lock.withLock {
+            if let hit = uint32s[n] { return hit }
+            uint32s[n] = made
+            return made
+        }
+    }
+
+    static func int32Pair(_ a: Int32, _ b: Int32) -> MLXArray {
+        guard intPairs else { return MLXArray([a, b]) }
+        let key = (UInt64(UInt32(bitPattern: a)) << 32) | UInt64(UInt32(bitPattern: b))
+        if let hit = lock.withLock({ int32Pairs[key] }) { return hit }
+        let made = MLXArray([a, b])
+        eval(made)
+        return lock.withLock {
+            if let hit = int32Pairs[key] { return hit }
+            int32Pairs[key] = made
+            return made
+        }
+    }
+
+    /// Verify windows 0...16 and prompt widths 64, 128, ..., 512.
+    static func warmRowCounts() {
+        guard rowCounts else { return }
+        for n in 0 ... 16 { _ = int32(n) }
+        var n = 64
+        while n <= 512 {
+            _ = int32(n)
+            n += 64
+        }
+    }
+
+    /// The RMS epsilon (scalar and length-1) and the attention axis length.
+    static func warmConstants(eps: Float, headDim: Int, ropeBase: Float) {
+        guard scalars else { return }
+        _ = floatScalar(eps)
+        _ = float1(eps)
+        _ = floatScalar(1)
+        _ = floatScalar(log2(ropeBase))
+        if headDim > 0, headDim <= Int(UInt32.max) {
+            _ = uint32(UInt32(headDim))
+        }
+    }
+
+    /// The contiguous gate-row stride pair `[Hv, Hv]`.
+    static func warmGatePair(valueHeads: Int) {
+        guard intPairs, valueHeads > 0, valueHeads <= Int(Int32.max) else { return }
+        _ = int32Pair(Int32(valueHeads), Int32(valueHeads))
     }
 }
 
@@ -737,7 +874,7 @@ enum Qwen35GatedDeltaV3 {
         // input or allocating a full y tensor when no output row is needed.
         // The unused q slot aliases the already-contiguous gate buffer.
         let outputs = kernel(
-            [outputNeeded ? q : g, k, v, g, beta, state, MLXArray(Int32(T))],
+            [outputNeeded ? q : g, k, v, g, beta, state, Qwen35DispatchScalars.int32(T)],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("OUTPUT_NEEDED", outputNeeded), ("DVPL", rowsPerLane),
@@ -822,7 +959,7 @@ enum Qwen35GatedDeltaV3 {
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
         return outputOnlyKernel(
-            [q, k, v, g, beta, state, MLXArray(Int32(T))],
+            [q, k, v, g, beta, state, Qwen35DispatchScalars.int32(T)],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", rowsPerLane),
@@ -874,7 +1011,7 @@ enum Qwen35GatedDeltaV3 {
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
         let outputs = freshKernel(
-            [q, k, v, g, beta, MLXArray(Int32(T))],
+            [q, k, v, g, beta, Qwen35DispatchScalars.int32(T)],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", rowsPerLane),
@@ -1807,7 +1944,7 @@ enum Qwen35GatedDeltaChunked {
         let Dv = v.dim(3)
         let C = chunk
         let NC = T / C
-        let rowCount = MLXArray(Int32(T))
+        let rowCount = Qwen35DispatchScalars.int32(T)
         let prepared = prepKernel(
             [q, k, g, beta, rowCount],
             template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
@@ -2308,7 +2445,7 @@ enum Qwen35GatedDeltaChunked {
     static func prep(q: MLXArray, k: MLXArray, g: MLXArray, beta: MLXArray) -> [MLXArray] {
         let (B, T, Hk, Dk, Hv) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3), g.dim(2))
         return prepKernel(
-            [q, k, g, beta, MLXArray(Int32(T))],
+            [q, k, g, beta, Qwen35DispatchScalars.int32(T)],
             template: [("C", chunk), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
             grid: (32, T / chunk, B * Hk), threadGroup: (32, 1, 1),
             outputShapes: [
@@ -2332,7 +2469,7 @@ enum Qwen35GatedDeltaChunked {
         let Dv = v.dim(3)
         let C = chunk
         let NC = T / C
-        let rowCount = MLXArray(Int32(T))
+        let rowCount = Qwen35DispatchScalars.int32(T)
         let prepared = prepared ?? prepKernel(
             [q, k, g, beta, rowCount],
             template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
@@ -2876,6 +3013,10 @@ final class Qwen35GatedDeltaNet: Module {
             hidden: hiddenSize)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35DispatchScalars.warmRowCounts()
+        Qwen35DispatchScalars.warmConstants(
+            eps: args.rmsNormEps, headDim: headKDim, ropeBase: 1)
+        Qwen35DispatchScalars.warmGatePair(valueHeads: numVHeads)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -4066,6 +4207,8 @@ final class Qwen35Attention: Module {
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: mrope.rotaryDim,
                 epsQ: args.rmsNormEps, epsK: args.rmsNormEps, mrope: mrope)
         }
+        Qwen35DispatchScalars.warmConstants(
+            eps: args.rmsNormEps, headDim: headDim, ropeBase: args.ropeTheta)
     }
 
     /// q/k RMSNorm, the head transpose and the table-driven partial rotary
@@ -5708,7 +5851,7 @@ enum Qwen35GDNPrework {
             : (writeConvInput ? convInputKernel : kernel)
         let outputs = launch(
             [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+             Qwen35DispatchScalars.int32(S)],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
@@ -5841,7 +5984,7 @@ enum Qwen35GDNPrework {
         }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
             [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+             Qwen35DispatchScalars.int32(S)],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
@@ -6016,8 +6159,8 @@ enum Qwen35AttentionPrework {
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, Qwen35DispatchScalars.floatScalar(epsQ), Qwen35DispatchScalars.floatScalar(epsK), Qwen35DispatchScalars.uint32(UInt32(D)),
+             Qwen35DispatchScalars.floatScalar(log2(ropeBase)), Qwen35DispatchScalars.floatScalar(1)],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -6258,7 +6401,7 @@ enum Qwen35AttentionPreworkExplicit {
         else { return nil }
         let outputs = kernel(
             [q, k, wq, wk, cosine, sine,
-             MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D))],
+             Qwen35DispatchScalars.floatScalar(epsQ), Qwen35DispatchScalars.floatScalar(epsK), Qwen35DispatchScalars.uint32(UInt32(D))],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
             ],
@@ -6861,7 +7004,7 @@ enum Qwen35FusedHadamard {
                 guard x.shape == gate.shape, weight.dtype == .float32, weight.ndim == 1,
                     weight.dim(0) == 128
                 else { return nil }
-                a = x; b = gate; w = weight; eps = MLXArray([epsilon]); prod = 3
+                a = x; b = gate; w = weight; eps = Qwen35DispatchScalars.float1(epsilon); prod = 3
             }
             // Each operand is widened at its own read: the z of an FP16 qkv|z
             // stack gates an FP32 GDN output.
@@ -7473,7 +7616,7 @@ enum Qwen35FusedBoundaryQ8 {
             ("VEC", useVector ? 1 : 0),
             ("GAINVEC", useGainVector ? 1 : 0),
         ]
-        let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
+        let inputs = [x, r, gain, signs, Qwen35DispatchScalars.floatScalar(eps), axisSize]
         if writeNormed {
             let outs = kernelNormed(
                 inputs, template: template,
@@ -7912,7 +8055,7 @@ enum Qwen35GatedNormTail {
         let rows = x.dim(0) * x.dim(1)
         let heads = x.dim(2)
         return kernel(
-            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            [x, z, weight, Qwen35DispatchScalars.float1(eps), signs.reshaped(-1)],
             template: [("H", heads), ("InZ", z.dtype)],
             grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
@@ -8086,7 +8229,7 @@ extension Qwen35FusedBoundaryQ8 {
             ("VEC", useVector ? 1 : 0),
             ("GAINVEC", useGainVector ? 1 : 0),
         ]
-        let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
+        let inputs = [x, r, gain, signs, Qwen35DispatchScalars.floatScalar(eps), axisSize]
         if writeNormed {
             let outs = verifyKernelNormed(
                 inputs, template: template,
