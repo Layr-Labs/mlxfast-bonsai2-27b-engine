@@ -12,6 +12,17 @@
 // Short matches are not used. A rank-merge at n = 2...4 replaced correct
 // drafter tokens and added rounds (9ac82eeb, 12 rounds -> 15). A unique
 // 16-token prompt span does not.
+//
+// THE OPENING QUOTE. A response shorter than `minimumMatch` cannot supply a
+// 16-token suffix, so a response that opens by quoting the prompt (the code
+// block of a "return the full function" request) used to wait one or two
+// drafter-only rounds before the lookup could fire. While the response is
+// shorter than `minimumMatch`, the shortest usable match is the WHOLE
+// response instead (and never under two tokens, so a one-token response
+// also needs the prompt token before it to match): the lookup fires only
+// when everything the response has said so far is a unique prompt span.
+// Once the response reaches `minimumMatch` tokens the rule is exactly the
+// long-span rule above. `MLXFAST_DFLASH_LOOKUP_OPENING=0` turns it off.
 
 import Foundation
 import MLX
@@ -33,6 +44,26 @@ enum CBv2PromptLookupDraft {
         return max(8, raw.flatMap(Int.init) ?? 16)
     }()
 
+    /// `MLXFAST_DFLASH_LOOKUP_OPENING=0` keeps `minimumMatch` for a response
+    /// shorter than it (see THE OPENING QUOTE above).
+    static let opening: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_OPENING"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `MLXFAST_DFLASH_LOOKUP_LOG=1` reports each replaced block on stderr.
+    static let logs = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_LOG"] == "1"
+
+    /// The shortest match that may replace a block when the response (every
+    /// token after the prompt, the seed token included) is `responseLength`
+    /// tokens long: `minimumMatch`, or the whole response while it is shorter,
+    /// with a floor of two tokens.
+    static func shortestMatch(responseLength: Int) -> Int {
+        guard opening else { return minimumMatch }
+        return max(2, min(minimumMatch, responseLength))
+    }
+
     /// The proposal, or the same object when lookup does not apply.
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
@@ -41,8 +72,10 @@ enum CBv2PromptLookupDraft {
             proposal.dim(1) == depth,
             let hit = continuation(history: history, promptLength: promptLength, depth: depth)
         else { return proposal }
-        FileHandle.standardError.write(
-            Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+        if logs {
+            FileHandle.standardError.write(
+                Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+        }
         return MLXArray(hit.ids, [1, depth])
     }
 
@@ -51,15 +84,16 @@ enum CBv2PromptLookupDraft {
         let ids: [Int]
     }
 
-    /// Longest unique prompt continuation of `history`'s suffix, or nil.
+    /// Longest unique prompt continuation of `history`'s suffix, or nil. The
+    /// suffix is at least `shortestMatch(responseLength:)` tokens long.
     ///
     /// The continuation has to lie entirely inside the prompt. Two prompt
     /// spans of the same length with different continuations are ambiguous,
     /// and this length is skipped rather than guessed.
     static func continuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
-        let minimum = minimumMatch
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
+        let minimum = shortestMatch(responseLength: count - prompt)
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
