@@ -2428,6 +2428,252 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // The int8-staged prompt kernel's other schedules, for the load-time
+    // per-shape trial (`PromptFormTrial`). Same op (64 x 64 x 128 `matmul2d`
+    // over the four simdgroups, one `multiply` per 128-group into int32, so
+    // each group's integer product is exact whatever the schedule), same
+    // staging, same destination layout, and the per-group FP32 epilogue of
+    // `sourceStaged8` verbatim, applied to every output in group order: the
+    // outputs are the stock kernel's bit for bit. Templates beyond the stock
+    // ones: MT row tiles of 64 per threadgroup share each staged slice (1,
+    // 2); GS 128-groups staged per barrier (1, 2: a K step of 256); NB
+    // staging buffers (2; 3 with GS = MT = 1: the next group's op is issued
+    // before this group's epilogue); PP two destination tensors, the second
+    // op issued before the first epilogue (0, 1); ST with GS = 1 and NB = 2
+    // the staging's register prefetch (0: stock, load then stores before the
+    // ops; 1: the next group's words loaded before this group's ops, stored
+    // after its epilogue; 2: loaded one group earlier still); SW the
+    // threadgroup raster, bands of 2^SW row tiles walked before the next
+    // column tile (MLX's NAX GEMM swizzle). grid: ((N / 64) << SW) * 128,
+    // M / (64 * MT) >> SW;
+    // threadgroup (128, 1, 1). Same inputs as `sourceStaged8`.
+    private static let sourceStaged8Forms = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int tgx = int(threadgroup_position_in_grid.x);
+        const int tgy = int(threadgroup_position_in_grid.y);
+        const int n0 = (tgx >> SW) * 64;
+        const int mt0 = ((tgy << SW) + (tgx & ((1 << SW) - 1))) * MT;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        threadgroup uint32_t bs[NB * GS][64 * 128 / 4];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, mt0 * 64);
+        auto cTa = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cTb = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mlane = 16 * int(sg >> 1) + fm;
+        float acc[MT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t tlane = (size_t)((8 * int(sg >> 1) + fm) * 4);
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = TILED
+            ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+            : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        // `sourceStaged8`'s staging, split into the words' load and the
+        // codes' stores (the register-prefetch schedules put time between).
+        auto load = [&](int g) -> uint4 {
+          return *(const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
+        };
+        auto put = [&](const uint4 v, int slot) {
+          threadgroup uint32_t* dst = bs[slot] + sc * 32 + sh * 16;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint32_t wv = v[j];
+            const uint4 codes = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+            *(threadgroup uint4*)(dst + 4 * j) = codes;
+          }
+        };
+        auto stage = [&](int g, int slot) { put(load(g), slot); };
+        // Group g's product for row tile t from staging slot `slot`.
+        auto run = [&](int g, int slot, int t, thread decltype(cTa)& cT) {
+          auto tA = A.template slice<128, 64>(g * 128, (mt0 + t) * 64);
+          tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> Bt((threadgroup CodeT*)bs[slot], dextents<int, 2>(128, 64));
+          op.run(tA, Bt, cT);
+        };
+        // Group g's epilogue for row tile t: `sourceStaged8`'s, verbatim.
+        auto epilogue = [&](thread decltype(cTa)& cT, int t, int g) {
+          const int m0 = (mt0 + t) * 64;
+          const int mb = m0 + mlane;
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          float4 b0, b1;
+          if constexpr (NEGATIVE_SCALE_BIAS) {
+            b0 = -s0; b1 = -s1;
+          } else {
+            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+          }
+          float4 u0 = 0.0f, u1 = 0.0f;
+          if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
+          float as[4], rb[4];
+          if (MPERM) {
+            const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + tlane;
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          } else {
+            const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float u = nh ? u1[c] : u0[c];
+            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+              acc[t][i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[t][i]);
+            } else {
+              const float tt = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+              acc[t][i] = fma(b, rb[mh], fma(as[mh], tt, acc[t][i]));
+            }
+          }
+        };
+        if constexpr (NB == 3) {
+          // Pipelined: group g + 1's op goes into the other destination
+          // tensor before group g's epilogue. Staging g + 2 reuses the slot
+          // of g - 1, whose op every simdgroup finished before the barrier
+          // that closed g - 1's epilogue.
+          stage(0, 0);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          run(0, 0, 0, cTa);
+          if (Kg > 1) { stage(1, 1); }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int g = 0; g < Kg; g += 2) {
+            if (g + 1 < Kg) { run(g + 1, (g + 1) % 3, 0, cTb); }
+            if (g + 2 < Kg) { stage(g + 2, (g + 2) % 3); }
+            epilogue(cTa, 0, g);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (g + 1 < Kg) {
+              if (g + 2 < Kg) { run(g + 2, (g + 2) % 3, 0, cTa); }
+              if (g + 3 < Kg) { stage(g + 3, (g + 3) % 3); }
+              epilogue(cTb, 0, g + 1);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        } else if constexpr (GS == 2) {
+          // Two groups per stage and barrier, double-buffered (slots 2b, 2b + 1).
+          stage(0, 0);
+          stage(1, 1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int g = 0; g < Kg; g += 2) {
+            const int cur = (g >> 1) & 1;
+            if (g + 2 < Kg) { stage(g + 2, 2 * (cur ^ 1)); stage(g + 3, 2 * (cur ^ 1) + 1); }
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < MT; t++) {
+              if constexpr (PP != 0) {
+                run(g, 2 * cur, t, cTa);
+                run(g + 1, 2 * cur + 1, t, cTb);
+                epilogue(cTa, t, g);
+                epilogue(cTb, t, g + 1);
+              } else {
+                run(g, 2 * cur, t, cTa);
+                epilogue(cTa, t, g);
+                run(g + 1, 2 * cur + 1, t, cTa);
+                epilogue(cTa, t, g + 1);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        } else {
+          // One group per stage and barrier (the stock schedule): group g's
+          // ops and epilogues from slot g & 1.
+          auto compute = [&](int g, int cur) {
+            if constexpr (PP != 0 && MT == 2) {
+              run(g, cur, 0, cTa);
+              run(g, cur, 1, cTb);
+              epilogue(cTa, 0, g);
+              epilogue(cTb, 1, g);
+            } else {
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < MT; t++) {
+                run(g, cur, t, cTa);
+                epilogue(cTa, t, g);
+              }
+            }
+          };
+          stage(0, 0);
+          if constexpr (ST == 0) {
+            // Stock: group g + 1 staged (load, then its stores) before g's ops.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int g = 0; g < Kg; g++) {
+              const int cur = g & 1;
+              if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+              compute(g, cur);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          } else {
+            // Register prefetch: group g + ST's words are loaded at the top of
+            // group g (ST - 1 groups earlier than they are stored) and group
+            // g + 1's codes are stored after g's epilogue, into the slot of
+            // g - 1, whose ops every simdgroup finished before the last barrier.
+            uint4 vnext = uint4(0);
+            if (ST == 2 && Kg > 1) { vnext = load(1); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int g = 0; g < Kg; g++) {
+              const int cur = g & 1;
+              uint4 vload = uint4(0);
+              if (g + ST < Kg) { vload = load(g + ST); }
+              compute(g, cur);
+              if (g + 1 < Kg) { put(ST == 2 ? vnext : vload, cur ^ 1); }
+              vnext = vload;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT; t++) {
+          const int mb = (mt0 + t) * 64 + mlane;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            const float v0 = acc[t][i];
+            const float v1 = acc[t][i + 1];
+            const float v2 = acc[t][i + 2];
+            const float v3 = acc[t][i + 3];
+            const size_t base = (size_t)mm * N + nb + 32 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
+          }
+        }
+        """
+
+    private static let kernelStaged8Forms = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_forms",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Forms,
+        header: header,
+        ensureRowContiguous: true)
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -4209,6 +4455,22 @@ enum Qwen35TensorPackedMatmul {
             // read could lose its GPU residency between windows).
             let words = support == .staged8 && narrowTiled
                 ? narrowTiledWeight(cache, weight, materialize: true) : weight
+            // The load-time per-shape schedule (`PromptFormTrial`): noted at
+            // the load's prompt forwards, the adopted form launched after.
+            if support == .staged8, PromptFormTrial.recording || !PromptFormTrial.adopted.isEmpty {
+                let key = PromptFormTrial.Key(
+                    k: k, n: n, f32: outputDType == .float32,
+                    negative: cache.biasesAreNegativeScales(scales, biases))
+                if PromptFormTrial.recording {
+                    PromptFormTrial.note(
+                        key, .init(words: words, scalesT: scalesT, biasesT: biasesT, folded: foldedSums))
+                } else if let form = PromptFormTrial.adopted[key], form.fits(m: m) {
+                    return launchStaged8(
+                        form, codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                        activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType,
+                        negative: key.negative)
+                }
+            }
             return packedKernel(
                 [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
@@ -4298,6 +4560,407 @@ extension Qwen35TensorPackedMatmul {
             arrays += reads.compactMap { $0 }
         }
         return arrays
+    }
+}
+
+// MARK: - Prompt-width int8 GEMM schedules, chosen per shape at load
+
+extension Qwen35TensorPackedMatmul {
+    /// One schedule of the int8-staged prompt kernel (`sourceStaged8Forms`);
+    /// every schedule's outputs are the stock kernel's bit for bit.
+    struct PromptForm: Hashable, CustomStringConvertible {
+        let mt: Int, gs: Int, nb: Int, pp: Int, st: Int, sw: Int
+        let name: String
+
+        /// `[m2][g2 | g2n | p3 | pp][r1 | r2][s0-s3]`: `m2` two 64-row tiles
+        /// per threadgroup share each staged weight slice; `g2` two
+        /// 128-groups per stage and barrier, both ops issued before their
+        /// epilogues (`g2n`: each op then its epilogue); `p3` the pipelined
+        /// schedule (three staging buffers, the next group's op before this
+        /// group's epilogue); `pp` both row tiles' ops before their
+        /// epilogues (with `m2`); `r1` / `r2` the staging's register
+        /// prefetch (not with `g2` / `p3`); `s<d>` the raster in bands of
+        /// 2^d row tiles. Nil for the stock schedule and for combinations the
+        /// kernel does not take.
+        init?(name raw: String) {
+            let name = raw.trimmingCharacters(in: .whitespaces).lowercased()
+            var rest = Substring(name)
+            var mt = 1, gs = 1, nb = 2, pp = 0, st = 0, sw = 0
+            if rest.hasPrefix("m2") { mt = 2; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("g2n") { gs = 2; rest = rest.dropFirst(3) }
+            else if rest.hasPrefix("g2") { gs = 2; pp = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("p3") { nb = 3; pp = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("pp") { pp = 1; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("r1") { st = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("r2") { st = 2; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("s"), let d = Int(rest.dropFirst()), (0 ... 3).contains(d) {
+                sw = d
+                rest = ""
+            }
+            guard rest.isEmpty, nb == 2 || (mt == 1 && gs == 1), pp == 0 || mt == 2 || gs == 2 || nb == 3,
+                st == 0 || (gs == 1 && nb == 2),
+                !(mt == 1 && gs == 1 && nb == 2 && pp == 0 && st == 0 && sw == 0)
+            else { return nil }
+            (self.mt, self.gs, self.nb, self.pp, self.st, self.sw) = (mt, gs, nb, pp, st, sw)
+            self.name = name
+        }
+
+        var description: String { name }
+        /// A launch needs `m` to be a multiple of this (one raster band).
+        var rowQuantum: Int { (64 * mt) << sw }
+        func fits(m: Int) -> Bool { m % rowQuantum == 0 }
+    }
+
+    /// One launch of the int8-staged prompt kernel: the stock schedule for a
+    /// nil form (the call and templates the prompt route makes), else the
+    /// form's (`form.fits(m:)` must hold).
+    static func launchStaged8(
+        _ form: PromptForm?, _ codes: MLXArray, _ words: MLXArray, _ scalesT: MLXArray,
+        _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
+        k: Int, m: Int, n: Int, outputDType: DType, negative: Bool
+    ) -> MLXArray {
+        var template: [(String, any KernelTemplateArg)] = [
+            ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+            ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", negative ? 1 : 0),
+            ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", narrowTiled ? 1 : 0),
+        ]
+        let inputs = [codes, words, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)]
+        guard let form else {
+            return kernelStaged8(
+                inputs, template: template, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+        template += [
+            ("MT", form.mt), ("GS", form.gs), ("NB", form.nb), ("PP", form.pp), ("ST", form.st),
+            ("SW", form.sw),
+        ]
+        return kernelStaged8Forms(
+            inputs, template: template,
+            grid: (((n / 64) << form.sw) * 128, (m / (64 * form.mt)) >> form.sw, 1),
+            threadGroup: (128, 1, 1), outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// The load-time per-shape choice of the prompt route's int8 schedule.
+    ///
+    /// The prompt route notes every distinct projection shape it launches
+    /// (`k`, `n`, output type, negated-offset form) with the operands of up
+    /// to `setsPerShape` of its projections (`note`); the load-time prompt
+    /// forwards (`warmTargetPrefill`, the engine warm's seed) fill it. `run`,
+    /// called once from the deferred load warm (`Qwen35DFlash2Assistant`,
+    /// before the socket serves anything), takes each noted shape at the
+    /// scored prompt width (`rows`): every candidate schedule runs on the
+    /// shape's first projection with synthetic activations, once at `rows`
+    /// and once at three raster bands, and must match the stock launch bit
+    /// for bit or is dropped; then stock and the survivors run in turn, one
+    /// command buffer per sample (a burst of launches on distinct
+    /// projections where one launch is short, each launch on the next
+    /// projection so the weights stream from memory as in a forward), a
+    /// discarded first round and `reps` timed rounds; a candidate's score is
+    /// the median of its per-round time ratio to stock, and the best is
+    /// adopted only if, after `confirmReps` more rounds of it against stock
+    /// alone, its score over all its rounds beats stock by more than
+    /// `adoptMargin`. One stderr line per shape and a summary. The route
+    /// then launches the adopted schedule for that shape at every row count
+    /// it fits, and stock elsewhere.
+    ///
+    /// Only where the int8-staged kernel is the prompt route (`staged8`).
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM=0` keeps stock with no trial;
+    /// `..._PFORM_FORCE=<form>` installs that schedule on every shape where it
+    /// passes the bitwise check, without timing (`stock`: no trial);
+    /// `..._PFORM_LIST=s2,r1,...` replaces the candidate list (`PromptForm`).
+    enum PromptFormTrial {
+        struct Key: Hashable, CustomStringConvertible {
+            let k: Int, n: Int, f32: Bool, negative: Bool
+            var description: String {
+                "k \(k) n \(n) \(f32 ? "fp32" : "fp16")\(negative ? "" : " offsets")"
+            }
+        }
+
+        struct Operands {
+            let words: MLXArray, scalesT: MLXArray, biasesT: MLXArray, folded: MLXArray
+        }
+
+        static let enabled: Bool = {
+            let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }()
+
+        static let forcedName: String? = {
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_FORCE"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return raw?.isEmpty == false ? raw : nil
+        }()
+        static let stockNames: Set<String> = ["stock", "0", "off", "none"]
+
+        /// nil: not forced; `.some(nil)`: stock (or an unrecognized name);
+        /// `.some(form)`: that form.
+        static let forced: PromptForm?? = {
+            guard let raw = forcedName else { return nil }
+            if stockNames.contains(raw) { return .some(nil) }
+            return PromptForm(name: raw).map { .some($0) } ?? .some(nil)
+        }()
+
+        /// The candidates, and the list's names that are not a form.
+        static let list: (forms: [PromptForm], rejected: [String]) = {
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_LIST"]
+                ?? "s2,r1,r1s2,p3,m2"
+            var forms: [PromptForm] = []
+            var rejected: [String] = []
+            for name in raw.split(separator: ",") {
+                if let form = PromptForm(name: String(name)) {
+                    if !forms.contains(form) { forms.append(form) }
+                } else {
+                    rejected.append(String(name))
+                }
+            }
+            return (forms, rejected)
+        }()
+        static var candidates: [PromptForm] { list.forms }
+
+        /// The scored prompt width (the timed prompts and the load warm's).
+        static let rows = 512
+        static let setsPerShape = 4
+        static let reps = 4
+        static let confirmReps = 4
+        static let adoptMargin = 0.02
+
+        /// True until `run` (or until the route has noted `noteLimit` launches
+        /// without a trial coming).
+        nonisolated(unsafe) static var recording = true
+        nonisolated(unsafe) private static var noted = 0
+        static let noteLimit = 8192
+        nonisolated(unsafe) private static var shapes: [Key: [Operands]] = [:]
+        nonisolated(unsafe) private static var order: [Key] = []
+        /// The adopted schedule per shape (read at every prompt launch).
+        nonisolated(unsafe) static var adopted: [Key: PromptForm] = [:]
+        nonisolated(unsafe) private static var launchFailed = false
+
+        /// The prompt route's record of one launch (graph build, load time).
+        static func note(_ key: Key, _ operands: Operands) {
+            noted += 1
+            if noted > noteLimit {
+                recording = false
+                shapes = [:]
+                order = []
+                return
+            }
+            if var list = shapes[key] {
+                guard list.count < setsPerShape, !list.contains(where: { $0.words === operands.words })
+                else { return }
+                list.append(operands)
+                shapes[key] = list
+            } else {
+                shapes[key] = [operands]
+                order.append(key)
+            }
+        }
+
+        private static func log(_ line: String) {
+            FileHandle.standardError.write(Data(("bonsai prompt int8 forms: " + line + "\n").utf8))
+        }
+
+        /// Synthetic activations for `m` rows of `k`: signed (or shifted)
+        /// codes over the full range, positive scales, scaled sums of both
+        /// signs. Nothing depends on a request.
+        private static func activations(k: Int, m: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let kg = k / 128
+            let seed = UInt64(7700 + k / 128 + m)
+            let codes = signedCodes
+                ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)).asType(.int8)
+                : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: MLXRandom.key(seed)).asType(.uint8)
+            let ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(seed + 1))
+            let rsb = MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 2)) * Float(50)
+            eval(codes, ascale, rsb)
+            return (codes, ascale, rsb)
+        }
+
+        /// Output elements whose bits differ, or nil when a launch failed.
+        private static func mismatches(_ a: MLXArray, _ b: MLXArray, f32: Bool) -> Int? {
+            launchFailed = false
+            var count: Int?
+            withErrorHandler({ _ in PromptFormTrial.launchFailed = true }) {
+                let bits: DType = f32 ? .uint32 : .uint16
+                let differ = (a.view(dtype: bits) .!= b.view(dtype: bits)).asType(.int32).sum()
+                eval(differ)
+                count = differ.item(Int.self)
+            }
+            return launchFailed ? nil : count
+        }
+
+        private static func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            let mid = sorted.count / 2
+            return sorted.count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+        }
+
+        private static func median(_ values: [UInt64]) -> Double { median(values.map { Double($0) }) }
+
+        /// The trial (see the type's notes). Runs once; safe with nothing noted.
+        static func run() {
+            guard recording else { return }
+            recording = false
+            let registry = shapes
+            let keys = order.filter { $0.n < 65536 }
+            shapes = [:]
+            order = []
+            // Nothing to choose without the int8-staged prompt route.
+            guard Qwen35TensorPackedMatmul.enabled, installed, support == .staged8 else { return }
+            guard enabled else {
+                log("off; stock kept")
+                return
+            }
+            guard !keys.isEmpty else {
+                log("no prompt shape noted before the trial; stock kept")
+                return
+            }
+            if case .some(.none) = forced {
+                let raw = forcedName ?? ""
+                log(stockNames.contains(raw)
+                    ? "forced stock; no trial"
+                    : "DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_FORCE=\(raw) is not a form; stock kept, no trial")
+                return
+            }
+            if !list.rejected.isEmpty {
+                log("DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_LIST: not forms, ignored: "
+                    + list.rejected.joined(separator: ", "))
+            }
+            let start = DispatchTime.now().uptimeNanoseconds
+            var checkNanoseconds: UInt64 = 0
+            var adoptedNames: [String] = []
+            var acts: [[Int]: (MLXArray, MLXArray, MLXArray)] = [:]
+            for key in keys {
+                guard let sets = registry[key], !sets.isEmpty else { continue }
+                let checkStart = DispatchTime.now().uptimeNanoseconds
+                let outputDType: DType = key.f32 ? .float32 : .float16
+                func operands(_ m: Int) -> (MLXArray, MLXArray, MLXArray) {
+                    if let cached = acts[[key.k, m]] { return cached }
+                    let made = activations(k: key.k, m: m)
+                    acts[[key.k, m]] = made
+                    return made
+                }
+                func launch(_ form: PromptForm?, _ set: Operands, m: Int) -> MLXArray {
+                    let (codes, ascale, rsb) = operands(m)
+                    return launchStaged8(
+                        form, codes, set.words, set.scalesT, set.biasesT, set.folded, ascale, rsb,
+                        k: key.k, m: m, n: key.n, outputDType: outputDType, negative: key.negative)
+                }
+                // Bitwise: every candidate against stock, at `rows` and at
+                // three raster bands, on the shape's first projection.
+                let pool: [PromptForm] = {
+                    if case .some(.some(let form)) = forced { return [form] }
+                    return candidates
+                }()
+                var passing: [PromptForm] = []
+                var notes: [String] = []
+                var references: [Int: MLXArray] = [:]
+                for form in pool where form.fits(m: rows) {
+                    var ok = true
+                    for m in [rows, 3 * form.rowQuantum] where ok {
+                        let reference: MLXArray
+                        if let cached = references[m] {
+                            reference = cached
+                        } else {
+                            reference = launch(nil, sets[0], m: m)
+                            eval(reference)
+                            references[m] = reference
+                        }
+                        let bad = mismatches(launch(form, sets[0], m: m), reference, f32: key.f32)
+                        if bad != 0 {
+                            ok = false
+                            notes.append(
+                                "\(form) " + (bad.map { "FAILED at m \(m) (\($0) of \(m * key.n) differ)" }
+                                    ?? "did not launch"))
+                        }
+                    }
+                    if ok { passing.append(form) }
+                }
+                references = [:]
+                checkNanoseconds += DispatchTime.now().uptimeNanoseconds - checkStart
+                if case .some(.some(let form)) = forced {
+                    if passing.contains(form) {
+                        adopted[key] = form
+                        adoptedNames.append("\(key.k)x\(key.n)=\(form)")
+                    }
+                    log("\(key): forced \(form), " + (passing.contains(form) ? "bitwise passed, installed" : notes.joined(separator: "; ") + ", stock kept"))
+                    continue
+                }
+                // Timing: a discarded round, then `reps` rounds, every form once
+                // per round in rotated order, one command buffer per sample. A
+                // candidate's score is the median over rounds of its time over
+                // stock's in the same round (so clock drift between rounds
+                // cancels); the best is confirmed by `confirmReps` more rounds of
+                // it and stock alone and adopted only if its score over all its
+                // rounds still beats stock by more than `adoptMargin`.
+                let forms: [PromptForm?] = [nil] + passing
+                var next = 0
+                func sample(_ form: PromptForm?, burst: Int) -> UInt64 {
+                    var outputs: [MLXArray] = []
+                    for _ in 0 ..< burst {
+                        outputs.append(launch(form, sets[next % sets.count], m: rows))
+                        next += 1
+                    }
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    eval(outputs)
+                    return (DispatchTime.now().uptimeNanoseconds - begin) / UInt64(burst)
+                }
+                let single = sample(nil, burst: 1)
+                let burst = single < 250_000 ? 4 : (single < 500_000 ? 2 : 1)
+                var line = "\(key) (m \(rows), \(sets.count) projections, x\(burst)): "
+                guard forms.count > 1 else {
+                    log(line + "no candidate passed [" + notes.joined(separator: "; ") + "]; stock kept")
+                    continue
+                }
+                var times = [[UInt64]](repeating: [], count: forms.count)
+                for round in 0 ... reps {
+                    var row = [UInt64](repeating: 0, count: forms.count)
+                    for j in forms.indices {
+                        let f = (j + round) % forms.count
+                        row[f] = sample(forms[f], burst: burst)
+                    }
+                    if round > 0 { for f in forms.indices { times[f].append(row[f]) } }
+                }
+                func score(_ f: Int) -> Double {
+                    median(zip(times[f], times[0]).map { Double($0) / Double($1) }) - 1
+                }
+                let scores = forms.indices.map { $0 == 0 ? 0 : score($0) }
+                line += String(format: "stock %.3f ms", median(times[0]) / 1e6)
+                for f in 1 ..< forms.count {
+                    line += " | \(forms[f]!) "
+                        + String(format: "%.3f %+.1f%%", median(times[f]) / 1e6, scores[f] * 100)
+                }
+                if !notes.isEmpty { line += " | " + notes.joined(separator: " | ") }
+                var best = 1
+                for f in 2 ..< forms.count where scores[f] < scores[best] { best = f }
+                var adopt = false
+                if scores[best] < -adoptMargin, let form = forms[best] {
+                    for round in 0 ..< confirmReps {
+                        let first = round % 2 == 0 ? 0 : best
+                        let a = sample(forms[first], burst: burst)
+                        let b = sample(forms[best - first], burst: burst)
+                        times[0].append(first == 0 ? a : b)
+                        times[best].append(first == 0 ? b : a)
+                    }
+                    let confirmed = score(best)
+                    adopt = confirmed < -adoptMargin
+                    line += " -> \(form) " + (adopt ? "confirmed" : "not confirmed")
+                        + String(format: " (%+.1f%% over %d rounds)", confirmed * 100, times[best].count)
+                    if adopt {
+                        adopted[key] = form
+                        adoptedNames.append("\(key.k)x\(key.n)=\(form)")
+                    } else {
+                        line += "; stock kept"
+                    }
+                } else {
+                    line += " -> stock"
+                }
+                log(line)
+            }
+            let total = DispatchTime.now().uptimeNanoseconds - start
+            log(
+                "\(keys.count) shapes, adopted [" + adoptedNames.joined(separator: " ") + "]; "
+                    + String(format: "%.0f ms (bitwise checks incl. first-use compiles %.0f ms)", Double(total) / 1e6, Double(checkNanoseconds) / 1e6))
+        }
     }
 }
 

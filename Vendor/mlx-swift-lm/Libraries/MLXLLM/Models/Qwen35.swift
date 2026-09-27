@@ -311,7 +311,15 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        // A first boundary after layer 2 as well: in a round whose ids came
+        // from the prompt no drafter block is queued ahead of the verify, so
+        // the GPU waits for the host's first submission; after two layers it
+        // starts ~0.4 ms sooner (M4: readback to first submission 0.85 to
+        // 0.48 ms). `MLXFAST_VERIFY_FIRST_SLICE=0` keeps [8, 24].
+        let first = env["MLXFAST_VERIFY_FIRST_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let early = ["0", "false", "no", "off"].contains(first ?? "") ? [] : [2]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? early + [8] : early + [8, 24]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))

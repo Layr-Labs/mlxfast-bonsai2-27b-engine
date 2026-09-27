@@ -160,6 +160,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.warmEngineRound(serving: serving)
                 Stream().synchronize()
                 Memory.clearCache()
+                // The prompt route's per-shape int8 schedule, first, so the
+                // trials below and every served prompt run the adopted one.
+                Qwen35TensorPackedMatmul.PromptFormTrial.run()
+                Stream().synchronize()
+                Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
