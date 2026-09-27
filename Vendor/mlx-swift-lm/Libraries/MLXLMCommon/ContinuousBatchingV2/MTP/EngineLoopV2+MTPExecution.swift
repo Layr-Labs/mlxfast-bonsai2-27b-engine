@@ -512,6 +512,40 @@ extension EngineLoopV2 {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// An early block was already `asyncEval`'d at the previous finalize.
+    /// Submitting it again here runs into MLX's in-flight command-buffer cap
+    /// and holds this thread until the drafter is nearly done, so the verify
+    /// graph is built only after that GPU work. On, the adopted early block
+    /// is not submitted a second time; the verify forward's own eval waits
+    /// on those same arrays. `DARKBLOOM_QWEN35_SKIP_EARLY_REEVAL=0` restores
+    /// the second submission before verify construction.
+    static let skipEarlyBlockReeval: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SKIP_EARLY_REEVAL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// With the second submission skipped, walk the drafter cache's eval
+    /// targets after the verify forward returns (its first layers are already
+    /// on the GPU) instead of before that forward is built. The targets are
+    /// still appended to the step's eval set. `DARKBLOOM_QWEN35_DEFER_EARLY_TARGETS=0`
+    /// walks them before the verify build. Ignored when the reeval is kept.
+    static let deferEarlyBlockTargets: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_DEFER_EARLY_TARGETS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The block proposal is already `[B, k]`. Join it to the seed column
+    /// with one concat instead of slicing k columns and concatenating them
+    /// back inside rectangular verification. Same `[B, 1+k]` token window.
+    /// `DARKBLOOM_QWEN35_VERIFY_BLOCK_JOIN=0` keeps the column slices.
+    static let verifyBlockJoin: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_BLOCK_JOIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
@@ -609,6 +643,7 @@ extension EngineLoopV2 {
             // depth costs one drafter forward rather than k.
             var proposals: [MLXArray] = []
             proposals.reserveCapacity(batch)
+            var adoptedEarly = true
             for (index, row) in verifyRows.enumerated() {
                 guard let requestState = rowMetadata[index].assistantState else {
                     preconditionFailure(
@@ -639,9 +674,7 @@ extension EngineLoopV2 {
                         requestState, toCommittedLength: carry.kvOffset)
                 }
                 proposals.append(proposal)
-                assistantEvalTargets.append(proposal)
-                assistantEvalTargets.append(
-                    contentsOf: block.evaluationTargets(for: requestState))
+                if carry.earlyBlock == nil { adoptedEarly = false }
             }
             let batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
@@ -650,11 +683,28 @@ extension EngineLoopV2 {
             blockDraftIDs = batched
             // The whole block is known before target construction starts, so
             // publish it now; finalization still joins it through the
-            // acceptance packet.
-            asyncEval(assistantEvalTargets)
-            mtp.recordEarlyDraftSubmission()
-            for position in 0 ..< k {
-                draftSteps.append(batched[0..., position])
+            // acceptance packet. An early block was published at the previous
+            // finalize: a second `asyncEval` waits on the in-flight cap, and
+            // the verify graph is built only after the drafter is nearly done.
+            let skipReeval = adoptedEarly && Self.skipEarlyBlockReeval
+            let deferTargets = skipReeval && Self.deferEarlyBlockTargets
+            if !deferTargets {
+                for (index, proposal) in proposals.enumerated() {
+                    assistantEvalTargets.append(proposal)
+                    if let state = rowMetadata[index].assistantState {
+                        assistantEvalTargets.append(
+                            contentsOf: block.evaluationTargets(for: state))
+                    }
+                }
+            }
+            if !skipReeval {
+                asyncEval(assistantEvalTargets)
+                mtp.recordEarlyDraftSubmission()
+            }
+            if !(Self.verifyBlockJoin && mtp.usesRequestStatefulDrafter) {
+                for position in 0 ..< k {
+                    draftSteps.append(batched[0..., position])
+                }
             }
         } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -730,10 +780,26 @@ extension EngineLoopV2 {
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
-        let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        let joinedTokens: MLXArray? =
+            (Self.verifyBlockJoin && mtp.usesRequestStatefulDrafter)
+            ? blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) } : nil
+        let targetColumns =
+            joinedTokens == nil
+            ? [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) } : []
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            joinedTokens: joinedTokens)
+        // Early-block cache targets, walked after the verify forward has
+        // already submitted its leading layers. Still fenced by the step eval.
+        if assistantEvalTargets.isEmpty, let block = mtp.blockDrafter, let blockDraftIDs {
+            assistantEvalTargets.append(blockDraftIDs)
+            for metadata in rowMetadata {
+                if let state = metadata.assistantState {
+                    assistantEvalTargets.append(contentsOf: block.evaluationTargets(for: state))
+                }
+            }
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {

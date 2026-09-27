@@ -28,7 +28,8 @@ extension EngineLoopV2 {
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        joinedTokens: MLXArray? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -38,7 +39,14 @@ extension EngineLoopV2 {
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
         blockContext: MLXArray?
     ) {
-        precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
+        precondition(
+            !columns.isEmpty || joinedTokens != nil,
+            "CBv2 MTP: target verification requires a seed column")
+
+        // `joinedTokens` is the seed column concatenated with the block
+        // proposal: one `[B, 1+k]` window, same tokens as `columns`.
+        let verificationWidth = joinedTokens?.dim(1) ?? columns.count
+        let verificationBatch = joinedTokens?.dim(0) ?? columns[0].dim(0)
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let scores: MLXArray
         let hidden: MLXArray
@@ -107,7 +115,7 @@ extension EngineLoopV2 {
                     logits: logits[batchIndex, localColumn], requestID: row.rec.id,
                     outputIndex: verifyStepBases[batchIndex] + column, phase: phase,
                     batchIndex: batchIndex, batchSize: rows.count, column: column,
-                    verificationWidth: columns.count, draftDepth: columns.count - 1,
+                    verificationWidth: verificationWidth, draftDepth: verificationWidth - 1,
                     seedToken: row.carry?.token, cacheOffset: diagnosticOffsets[batchIndex],
                     policyTopTwo: retainedTopTwo)
                 { diagnostics.append(packet) }
@@ -118,7 +126,7 @@ extension EngineLoopV2 {
         case .serialTarget: false
         case .rectangular, .rectangularExact: true
         case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            verificationWidth * verificationBatch <= mtp.config.maxAutomaticRectangularTokens
         }
 
         // A recurrent target may only verify rectangularly through the
@@ -167,11 +175,19 @@ extension EngineLoopV2 {
         mtp.recordVerificationStrategy(rectangular: useRectangular)
 
         if !useRectangular {
+            let serialColumns: [MLXArray]
+            if columns.isEmpty, let joinedTokens {
+                serialColumns = (0 ..< joinedTokens.dim(1)).map { index in
+                    joinedTokens[0..., index ..< index + 1]
+                }
+            } else {
+                serialColumns = columns
+            }
             var scoreColumnsAccum: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
-            scoreColumnsAccum.reserveCapacity(columns.count)
-            hiddenColumns.reserveCapacity(columns.count)
-            for (columnIndex, column) in columns.enumerated() {
+            scoreColumnsAccum.reserveCapacity(serialColumns.count)
+            hiddenColumns.reserveCapacity(serialColumns.count)
+            for (columnIndex, column) in serialColumns.enumerated() {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output: (logits: MLXArray, lastHidden: MLXArray)
                 var recurrentArrays: [MLXArray] = []
@@ -240,7 +256,7 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularAttention = false
                 }
             }
-            let tokens = concatenated(columns, axis: 1)
+            let tokens = joinedTokens ?? concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
