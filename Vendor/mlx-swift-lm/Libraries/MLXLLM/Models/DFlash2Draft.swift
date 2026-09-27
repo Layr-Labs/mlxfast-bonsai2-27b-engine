@@ -425,6 +425,77 @@ public enum DFlash2SlidingMask {
     }
 }
 
+
+/// The drafter was trained at `dflash_config.block_size` (8): bidirectional
+/// attention inside that span only. A declared 16-row block lets every trained
+/// row also see the extra mask rows. This mask restores the trained span and
+/// lets extension rows read the span plus their own causal prefix.
+/// `MLXFAST_DFLASH_TRAINED_BLOCK_MASK=0` keeps the plain mask.
+enum DFlash2TrainedBlockMask {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TRAINED_BLOCK_MASK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// True when block-key `j` is visible to query row `q`.
+    static func allows(query: Int, blockKey: Int, trained: Int) -> Bool {
+        blockKey < trained || (query >= trained && blockKey <= query)
+    }
+
+    /// `[blockLength, keyCount]`. Keys outside the block stay allowed; the
+    /// caller ANDs its window and tail. Checked once against the host rule.
+    static let verified: Bool = {
+        let trained = 8
+        let block = 16
+        let start = 4
+        let keys = 24
+        let mask = restriction(
+            blockLength: block, keyCount: keys, blockStart: start, trained: trained)
+        eval(mask)
+        let bits = mask.asType(.int32).asArray(Int32.self)
+        var ok = bits.count == block * keys
+        if ok {
+            for q in 0 ..< block {
+                for k in 0 ..< keys {
+                    let j = k - start
+                    let want: Int32 = (j < 0 || j >= block || allows(query: q, blockKey: j, trained: trained))
+                        ? 1 : 0
+                    if bits[q * keys + k] != want { ok = false }
+                }
+            }
+        }
+        FileHandle.standardError.write(
+            (ok
+                ? "dflash2 trained block mask: self-test passed (16 x 24)\n"
+                : "dflash2 trained block mask: mismatch; plain mask kept\n")
+                .data(using: .utf8)!)
+        return ok
+    }()
+
+    static var active: Bool { enabled && verified }
+
+    static func restriction(
+        blockLength: Int, keyCount: Int, blockStart: Int, trained: Int
+    ) -> MLXArray {
+        restriction(
+            blockLength: blockLength, keyCount: keyCount,
+            blockStart: MLXArray(Int32(blockStart)), trained: trained)
+    }
+
+    static func restriction(
+        blockLength: Int, keyCount: Int, blockStart: MLXArray, trained: Int
+    ) -> MLXArray {
+        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped([blockLength, 1])
+        let key = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped([1, keyCount])
+        let j = key - blockStart.asType(.int32)
+        let outside = (j .< Int32(0)) .|| (j .>= Int32(blockLength))
+        let visible = (j .< Int32(trained))
+            .|| ((query .>= Int32(trained)) .&& (j .<= query))
+        return outside .|| visible
+    }
+}
+
 /// The sliding mask of ONE block forward, built once and handed to every layer
 /// that asks for the same geometry.
 ///
@@ -473,6 +544,8 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
+    /// `dflash_config.block_size`: the span the drafter was trained to attend over.
+    let trainedBlock: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -505,6 +578,7 @@ private final class DFlash2Attention: Module {
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
+        self.trainedBlock = config.blockSize
 
         _qProj.wrappedValue = Linear(
             config.hiddenSize, config.attentionHeads * config.headDim, bias: false)
@@ -662,6 +736,12 @@ private final class DFlash2Attention: Module {
             }
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
+        }
+        if DFlash2TrainedBlockMask.active, L > trainedBlock {
+            let restriction = DFlash2TrainedBlockMask.restriction(
+                blockLength: L, keyCount: cachedLength + L, blockStart: cachedLength,
+                trained: trainedBlock)
+            mask = mask.map { $0 .&& restriction } ?? restriction
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -3489,8 +3569,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
+        if DFlash2TrainedBlockMask.active, blockSize > config.blockSize {
+            keyMask = keyMask .&& DFlash2TrainedBlockMask.restriction(
+                blockLength: blockSize, keyCount: keys,
+                blockStart: MLXArray(Int32(geometry.rows)) + c, trained: config.blockSize)
+        }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         var writes: [(keys: MLXArray, values: MLXArray)] = []
         var lead: MLXArray?
