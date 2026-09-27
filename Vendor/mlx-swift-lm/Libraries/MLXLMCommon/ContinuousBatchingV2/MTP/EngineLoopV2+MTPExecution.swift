@@ -314,7 +314,9 @@ extension EngineLoopV2 {
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
-            let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            // Built at its shape: an evaluated host array (not a lazy reshape)
+            // lets the model read a prompt's ids without a GPU round trip.
+            let inputs = MLXArray(slice.map(Int32.init), [1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
