@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -317,6 +318,21 @@ enum Qwen35TrunkSubmission {
             default: Plan(stride: 0, offset: 0, explicit: leading))
     }()
 
+    /// The verify plan when nothing is queued ahead of the verify on the GPU
+    /// (`CBv2VerifyQueueHint`: a prompt-lookup round, whose drafter only
+    /// absorbed its context rows). The default plan's first boundary after 8
+    /// layers is sized to hide behind a drafter block; with none, the GPU
+    /// would wait for the host's ~0.8 ms on those 8 layers, so it starts after
+    /// the first 2. `DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES` sets another plan
+    /// (same syntax); `0` keeps the default one.
+    static let verifyUnqueued: Plan = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
+        let fallback =
+            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+        let plan = Plan.parse(raw, default: fallback)
+        return plan.isOff ? verify : plan
+    }()
+
     static let prompt: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
         default: Plan(stride: 4, offset: 0, explicit: nil))
@@ -351,7 +367,7 @@ enum Qwen35TrunkSubmission {
     ) -> Plan? {
         let plan: Plan
         if captureRecurrentWindow {
-            plan = verify
+            plan = CBv2VerifyQueueHint.takeNothingAhead() ? verifyUnqueued : verify
         } else if rows >= promptMinimumRows {
             plan = prompt
         } else {
@@ -5067,6 +5083,217 @@ final class Qwen35DecoderLayer: Module {
     }
 }
 
+// MARK: - Prompt embedding rows gathered on the host
+
+/// A prompt-width embedding lookup reads its packed rows on the host.
+///
+/// WHY. A decode request's prompt forward (the seed) is the first GPU work
+/// after the benchmark's idle gate, and an idle GPU drops the residency of the
+/// buffers it held: each one is made resident again when a command buffer next
+/// binds it. The forward's first command buffer is the embedding gather, which
+/// binds the whole packed table (248,320 rows: 358 MB of words, scales and
+/// biases) with nothing queued ahead of it, so that restore is paid in full
+/// inside the timed seed (M4 Max, measured per cold start: 4.8-8.5 ms of idle
+/// GPU before the gather). The prompt's token ids are on the host and the
+/// packed table lives in shared memory, so the prompt's rows (0.7 MB for 512
+/// tokens) can be copied without any GPU residency.
+///
+/// WHAT. The same packed bytes through the same kernels: the rows the GPU
+/// gather would produce are copied into fresh arrays, then `dequantized` and
+/// the transform's `inverse` run on them exactly as
+/// `HadamardQuantizedEmbedding` runs them on its gathered rows. The module and
+/// its weights are untouched. Only a token array already on the host
+/// (available, int32) at prompt width (`BonsaiPromptWidth`) takes this path;
+/// verify windows and the drafter's block embedding (device tokens, 16 rows)
+/// keep the module's GPU gather. So that the decode window's first drafter and
+/// verify still find the table resident, the prompt forward binds it with one
+/// tiny launch queued right behind an early prompt submission (`touch`): its
+/// restore then runs while the GPU executes the prompt layers queued ahead.
+///
+/// Checked once before first use: the host rows against the GPU gather's rows
+/// and the resulting embeddings against the module's, bit for bit, over ids
+/// that span the table (both ends, repeats); a mismatch keeps the GPU gather.
+/// `BONSAI_PROMPT_EMBED_HOST_GATHER=0` keeps the GPU gather;
+/// `BONSAI_PROMPT_EMBED_TOUCH_AFTER=<layers>` moves the touch (default 4).
+enum Qwen35PromptEmbeddingHostGather {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_EMBED_HOST_GATHER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The first early prompt submission at or past this many layers carries
+    /// the table's touch behind it.
+    static let touchAfterLayers: Int = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_EMBED_TOUCH_AFTER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(1, value.flatMap { Int($0) } ?? 4)
+    }()
+
+    /// The host-gathered embedding goes out as the forward's first command
+    /// buffer. `BONSAI_PROMPT_EMBED_SUBMIT_FIRST=0` builds it into layer 0's.
+    static let submitsEmbeddingFirst: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_EMBED_SUBMIT_FIRST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// The embeddings of `inputs` from host-gathered rows, or nil for the
+    /// module's own GPU gather.
+    static func embed(_ module: Embedding, _ inputs: MLXArray) -> MLXArray? {
+        guard enabled, let table = module as? HadamardQuantizedEmbedding,
+            inputs.dtype == .int32, inputs.size >= BonsaiPromptWidth.minimumRows,
+            passesSelfTest(table)
+        else { return nil }
+        return embed(table, inputs)
+    }
+
+    /// Binds the table's three arrays in one small command buffer; its
+    /// output is never read.
+    static func touch(_ module: Embedding) {
+        guard let table = module as? HadamardQuantizedEmbedding else { return }
+        let arrays = [table.weight, table.scales] + (table.biases.map { [$0] } ?? [])
+        asyncEval(arrays.map { $0.reshaped(-1)[0 ..< 1].asType(.float32) })
+    }
+
+    private static func embed(_ table: HadamardQuantizedEmbedding, _ inputs: MLXArray) -> MLXArray? {
+        guard let rows = hostRows(table, inputs) else { return nil }
+        let dequantizedRows = dequantized(
+            rows.weight, scales: rows.scales, biases: rows.biases,
+            groupSize: table.groupSize, bits: table.bits)
+        return table.transform.inverse(dequantizedRows)
+            .reshaped(inputs.shape + [table.transform.width])
+    }
+
+    /// The bytes of an evaluated, row-contiguous array that is not a view.
+    private static func hostBytes(_ array: MLXArray) -> UnsafeRawPointer? {
+        var available = false
+        var allocated = 0
+        var offset = 0
+        var elements = 0
+        var rowContiguous = false
+        var unique = false
+        guard
+            mlx_array_get_buffer_info(
+                &available, &allocated, &offset, &elements, &rowContiguous, &unique,
+                array.ctx) == 0,
+            available, rowContiguous, elements == array.size,
+            let bytes = mlx_array_data_uint8(array.ctx)
+        else { return nil }
+        return UnsafeRawPointer(bytes)
+    }
+
+    /// The table rows `weight[ids]`, `scales[ids]` and `biases[ids]` copied on
+    /// the host into fresh `[ids, width]` arrays of the table's dtypes.
+    private static func hostRows(_ table: HadamardQuantizedEmbedding, _ inputs: MLXArray)
+        -> (weight: MLXArray, scales: MLXArray, biases: MLXArray?)?
+    {
+        let weight = table.weight
+        let scales = table.scales
+        guard weight.ndim == 2, scales.ndim == 2, scales.dim(0) == weight.dim(0),
+            table.biases.map({ $0.shape == scales.shape && $0.dtype == scales.dtype }) ?? true,
+            let idBytes = hostBytes(inputs), let weightBytes = hostBytes(weight),
+            let scaleBytes = hostBytes(scales)
+        else { return nil }
+        var biasBytes: UnsafeRawPointer?
+        if let biases = table.biases {
+            guard let bytes = hostBytes(biases) else { return nil }
+            biasBytes = bytes
+        }
+        let count = inputs.size
+        let vocabulary = weight.dim(0)
+        let ids = UnsafeBufferPointer(
+            start: idBytes.assumingMemoryBound(to: Int32.self), count: count)
+        guard ids.allSatisfy({ $0 >= 0 && Int($0) < vocabulary }) else { return nil }
+        func gather(_ source: UnsafeRawPointer, rowBytes: Int) -> Data {
+            var data = Data(count: count * rowBytes)
+            data.withUnsafeMutableBytes { destination in
+                let base = destination.baseAddress!
+                for (row, id) in ids.enumerated() {
+                    memcpy(base + row * rowBytes, source + Int(id) * rowBytes, rowBytes)
+                }
+            }
+            return data
+        }
+        let weightRow = weight.dim(1) * weight.dtype.size
+        let scaleRow = scales.dim(1) * scales.dtype.size
+        return (
+            MLXArray(gather(weightBytes, rowBytes: weightRow), [count, weight.dim(1)], dtype: weight.dtype),
+            MLXArray(gather(scaleBytes, rowBytes: scaleRow), [count, scales.dim(1)], dtype: scales.dtype),
+            biasBytes.map {
+                MLXArray(gather($0, rowBytes: scaleRow), [count, scales.dim(1)], dtype: scales.dtype)
+            }
+        )
+    }
+
+    private static func passesSelfTest(_ table: HadamardQuantizedEmbedding) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict { return verdict }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let (passed, detail) = selfTest(table)
+        verdict = passed
+        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        FileHandle.standardError.write(
+            Data(
+                (passed
+                    ? "bonsai prompt embedding host gather: self-test passed (\(detail)); host rows; \(ms) ms\n"
+                    : "bonsai prompt embedding host gather: self-test FAILED (\(detail)); GPU gather; \(ms) ms\n"
+                ).utf8))
+        return passed
+    }
+
+    /// Host rows against the GPU gather's rows, and the embeddings against the
+    /// module's, bit for bit, at two widths.
+    private static func selfTest(_ table: HadamardQuantizedEmbedding) -> (Bool, String) {
+        let vocabulary = table.weight.dim(0)
+        guard vocabulary > 1 else { return (false, "empty table") }
+        var compared = 0
+        for width in [BonsaiPromptWidth.minimumRows, 512] {
+            var ids: [Int32] = [0, Int32(vocabulary - 1)]
+            var state: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(width)
+            while ids.count < width {
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                ids.append(Int32(Int(state >> 33) % vocabulary))
+            }
+            ids[3] = ids[2]
+            let tokens = MLXArray(ids, [1, width])
+            guard let rows = hostRows(table, tokens), let host = embed(table, tokens) else {
+                return (false, "width \(width): host rows unavailable")
+            }
+            let flat = tokens.flattened()
+            let device = table(tokens)
+            func bits(_ x: MLXArray) -> MLXArray {
+                switch x.dtype.size {
+                case 2: return x.view(dtype: .uint16)
+                case 4: return x.view(dtype: .uint32)
+                default: return x
+                }
+            }
+            var checks = [
+                all(rows.weight .== table.weight[flat]),
+                all(bits(rows.scales) .== bits(table.scales[flat])),
+                MLXArray(host.shape == device.shape && host.dtype == device.dtype),
+            ]
+            if let biases = table.biases, let hostBiases = rows.biases {
+                checks.append(all(bits(hostBiases) .== bits(biases[flat])))
+            }
+            if host.shape == device.shape && host.dtype == device.dtype {
+                checks.append(all(bits(host) .== bits(device)))
+            }
+            eval(checks)
+            guard checks.allSatisfy({ $0.item(Bool.self) }) else {
+                return (false, "width \(width): rows or embeddings differ")
+            }
+            compared += host.size
+        }
+        return (true, "\(compared) embedding values bitwise, rows at \(BonsaiPromptWidth.minimumRows) and 512")
+    }
+}
+
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
@@ -5238,7 +5465,18 @@ public class Qwen35TextModelInner: Module {
         let shapeCall = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
-        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        // A prompt's rows from the host; the table is bound behind the prompt
+        // layers instead (`Qwen35PromptEmbeddingHostGather`).
+        let hostEmbedded =
+            inputEmbeddings == nil ? Qwen35PromptEmbeddingHostGather.embed(embedTokens, inputs) : nil
+        var embeddingTouchDue = hostEmbedded != nil
+        var hiddenStates = inputEmbeddings ?? hostEmbedded ?? embedTokens(inputs)
+        if let hostEmbedded, Qwen35PromptEmbeddingHostGather.submitsEmbeddingFirst {
+            // Its own first command buffer (a 512-row dequantize and unfold that
+            // binds no table), so an idle GPU starts waking while the host
+            // builds layer 0.
+            asyncEval([hostEmbedded])
+        }
         // Early-submission boundaries for this forward (`Qwen35TrunkSubmission`).
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
@@ -5342,6 +5580,12 @@ public class Qwen35TextModelInner: Module {
                     if promptPrefetch {
                         DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
                     }
+                    if embeddingTouchDue,
+                        modelLayerIndex + 1 >= Qwen35PromptEmbeddingHostGather.touchAfterLayers
+                    {
+                        Qwen35PromptEmbeddingHostGather.touch(embedTokens)
+                        embeddingTouchDue = false
+                    }
                 }
                 continue
             }
@@ -5370,10 +5614,19 @@ public class Qwen35TextModelInner: Module {
                 if promptPrefetch {
                     DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
                 }
+                if embeddingTouchDue,
+                    modelLayerIndex + 1 >= Qwen35PromptEmbeddingHostGather.touchAfterLayers
+                {
+                    Qwen35PromptEmbeddingHostGather.touch(embedTokens)
+                    embeddingTouchDue = false
+                }
             }
         }
         if promptPrefetch {
             DFlash2ResidencyPrefetch.submitRemaining()
+        }
+        if embeddingTouchDue {
+            Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
             hiddenStates = hiddenStates + p
