@@ -2245,6 +2245,57 @@ public enum DFlash2ResidencyPrefetch {
 
 // MARK: - The drafter
 
+
+/// `propose` passes the anchor row alone and the mask-column count. The mask
+/// ids were never read: `hiddenStates` embeds the anchor and broadcasts the
+/// bound mask row. `DARKBLOOM_DFLASH_ANCHOR_ROW=0` builds the full id block.
+enum DFlash2AnchorRow {
+    static let direct: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_ANCHOR_ROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
+/// The speculative block pads its context up to `2 * blockSize` with zeros.
+/// Those zeros are read-only and the row count repeats inside a window, so
+/// one evaluated buffer per shape is reused. `DARKBLOOM_DFLASH_PAD_REUSE=0`
+/// allocates a fresh zeros tensor every block.
+enum DFlash2SpeculativePad {
+    static let reuse: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PAD_REUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: MLXArray] = [:]
+
+    static func zeros(rows: Int, hidden: Int, dtype: DType) -> MLXArray {
+        guard reuse, rows > 0 else {
+            return MLXArray.zeros([1, rows, hidden], dtype: dtype)
+        }
+        let key = "\(rows)x\(hidden)x\(dtype)"
+        return lock.withLock {
+            if let hit = cache[key] { return hit }
+            let made = MLXArray.zeros([1, rows, hidden], dtype: dtype)
+            eval(made)
+            cache[key] = made
+            return made
+        }
+    }
+
+    /// Fill every pad width a depth-`block-1` speculative block can ask for,
+    /// so the timed window does not compile or fill them.
+    static func warm(block: Int, hidden: Int, dtype: DType) {
+        guard reuse, block > 1 else { return }
+        let span = 2 * block
+        for contextRows in 1 ... block {
+            _ = zeros(rows: span - contextRows, hidden: hidden, dtype: dtype)
+        }
+    }
+}
+
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
     public let config: DFlash2Configuration
 
@@ -2411,7 +2462,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0,
+        maskColumns: Int = 0
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -2432,7 +2484,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // time; broadcast that exact value across the block. Keep the general
         // one-row case unchanged.
         let embeddedInputs: MLXArray
-        if inputs.dim(1) > 1 {
+        if DFlash2AnchorRow.direct, maskColumns > 0, inputs.dim(1) == 1 {
+            embeddedInputs = try blockEmbedding(anchorIDs: inputs, maskColumns: maskColumns)
+        } else if inputs.dim(1) > 1 {
             embeddedInputs = try blockEmbedding(
                 anchorIDs: inputs[0..., ..<1], maskColumns: inputs.dim(1) - 1)
         } else {
@@ -2536,6 +2590,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
+        if DFlash2AnchorRow.direct {
+            let anchorIDs = MLXArray(anchor.map { Int32($0) }, [anchor.count, 1])
+            let hidden = try hiddenStates(
+                anchorIDs, targetHidden: targetHidden, cache: cache, logitsStart: 1,
+                submittingLeadingLayers: leadingLayers, maskColumns: blockSize - 1)
+            return candidateSelector.selectGreedy(
+                hidden: hidden,
+                logits: try logits(hidden),
+                anchor: anchorIDs.reshaped([anchor.count]))
+        }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let rows = anchor.flatMap { [Int32($0)] + masks }
         let block = MLXArray(rows, [anchor.count, blockSize])
@@ -2625,7 +2689,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
         let base = concatenated(
-            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
+            [
+                context,
+                DFlash2SpeculativePad.zeros(
+                    rows: n - contextRows, hidden: config.hiddenSize, dtype: context.dtype),
+            ],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
