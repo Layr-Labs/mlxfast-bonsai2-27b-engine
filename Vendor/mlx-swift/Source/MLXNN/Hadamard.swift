@@ -128,6 +128,11 @@ public struct SignedBlockHadamard {
         case swiglu(gate: MLXArray, up: MLXArray)
         case sigmoidGate(x: MLXArray, gate: MLXArray)
         case gatedRMSNorm(x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float)
+        /// `sigmoidGate` with `x` given as consecutive row blocks: block i is
+        /// a `[B, Lb, heads, headDim]` view of rows `i * Lb ..< (i + 1) * Lb`
+        /// of `gate`'s `[B, L, heads, headDim]` (the prompt attention's query
+        /// blocks), read where they are instead of concatenated first.
+        case sigmoidGateRowBlocks(blocks: [MLXArray], gate: MLXArray)
 
         /// The array whose shape and dtype the product follows.
         public var primary: MLXArray {
@@ -135,6 +140,7 @@ public struct SignedBlockHadamard {
             case .swiglu(let gate, _): return gate
             case .sigmoidGate(let x, _): return x
             case .gatedRMSNorm(let x, _, _, _): return x
+            case .sigmoidGateRowBlocks(_, let gate): return gate
             }
         }
     }
@@ -271,9 +277,20 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if let fused = Self.fusedInverse, let y = fused(x, signs, blockSize) {
+            return y
+        }
         return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
+
+    /// `inverse` as one kernel: the same values as
+    /// `(hadamardTransform(x.asType(.float32)) * signs).asType(x.dtype)`.
+    /// Installed by the model file; nil declines.
+    public typealias FusedInverse = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedInverse: FusedInverse?
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -1327,6 +1344,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard gdnLayout == nil, x.ndim == 4, x.shape == gate.shape else { return nil }
         return tensorRouteForwardProducer(
             .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+    }
+
+    /// `applyAfterSigmoidGateHeadsOnRoute` with the attention output given as
+    /// its query blocks (`[B, Lb, heads, headDim]` views, in row order) rather
+    /// than their concatenation; the producer reads each block where it is.
+    /// Same elements, same arithmetic. Nil when the route or the fused
+    /// implementation does not take them (the caller then concatenates).
+    public func applyAfterSigmoidGateRowBlocksOnRoute(
+        _ blocks: [MLXArray], gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        guard gdnLayout == nil, !blocks.isEmpty, gate.ndim == 4 else { return nil }
+        return tensorRouteForwardProducer(
+            .sigmoidGateRowBlocks(blocks: blocks, gate: gate), widenOutput: widenOutput)
     }
 
     /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
