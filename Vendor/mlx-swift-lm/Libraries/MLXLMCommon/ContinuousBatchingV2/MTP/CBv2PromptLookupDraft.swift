@@ -37,17 +37,10 @@ enum CBv2PromptLookupDraft {
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
-        guard proposal.ndim == 2, proposal.dim(0) == 1, proposal.dim(1) == depth,
-            let ids = self.proposal(history: history, promptLength: promptLength, depth: depth)
-        else { return proposal }
-        return ids
-    }
-
-    /// The looked-up `[1, depth]` ids, or nil when lookup does not apply.
-    static func proposal(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
-        guard enabled, depth > 0,
+        guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
+            proposal.dim(1) == depth,
             let hit = continuation(history: history, promptLength: promptLength, depth: depth)
-        else { return nil }
+        else { return proposal }
         FileHandle.standardError.write(
             Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
         return MLXArray(hit.ids, [1, depth])
