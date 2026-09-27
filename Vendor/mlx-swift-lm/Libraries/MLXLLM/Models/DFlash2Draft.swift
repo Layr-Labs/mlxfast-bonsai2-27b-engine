@@ -466,6 +466,150 @@ final class DFlash2SlidingMaskMemo {
 
 // MARK: - Attention
 
+
+/// Read the stacked projection's strided Q/K views directly, reproduce the
+/// 128-channel RMS reduction and both BF16 roundings, and rotate into the
+/// head-major outputs. One simdgroup owns a head, so the partner half is a
+/// shuffle and no threadgroup barriers or normalized intermediates remain.
+/// A bitwise check runs once during warm-up; failure keeps the composed path.
+private enum DFlash2AttentionPrework {
+    static let enabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_QKROPE"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+    // Materialized once by Swift's static initialization; only read thereafter.
+    nonisolated(unsafe) private static let eps: MLXArray = {
+        let value = MLXArray([Float(1e-6), Float(1e-6)])
+        eval(value)
+        return value
+    }()
+    nonisolated(unsafe) private static let lbase: MLXArray = {
+        let value = MLXArray([log2(Float(10_000_000))])
+        eval(value)
+        return value
+    }()
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_bf16_qkrope",
+        inputNames: ["q", "k", "wq", "wk", "queryOffset", "keyOffset", "eps", "lbase"],
+        outputNames: ["qo", "ko"],
+        source: """
+        // Full-width DFlash Q/K RMSNorm + RoPE, preserving BF16 intermediates.
+        constexpr int D = 128;
+        constexpr int NR = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint head = threadgroup_position_in_grid.x;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint batch = threadgroup_position_in_grid.z;
+        const bool isq = head < HQ;
+        const uint h = isq ? head : head - HQ;
+        const uint length = isq ? q_shape[1] : k_shape[1];
+        if (row >= length) return;
+        auto src = isq ? q : k;
+        auto w = isq ? wq : wk;
+        auto dst = isq ? qo : ko;
+        const int64_t base = isq
+          ? int64_t(batch)*q_strides[0] + int64_t(row)*q_strides[1] + int64_t(h)*q_strides[2]
+          : int64_t(batch)*k_strides[0] + int64_t(row)*k_strides[1] + int64_t(h)*k_strides[2];
+        const int64_t channel_stride = isq ? q_strides[3] : k_strides[3];
+        float values[NR];
+        float acc = 0;
+        for (int i = 0; i < NR; i++) {
+          values[i] = float(src[base + int64_t(lid*NR+i)*channel_stride]);
+          acc += values[i]*values[i];
+        }
+        acc = simd_sum(acc);
+        // A head fits one simdgroup. Its second reduction is only acc + zeros;
+        // preserve the same value while removing five threadgroup barriers.
+        const float inv = metal::precise::rsqrt(acc / D + (isq ? eps[0] : eps[1]));
+        const size_t outbase = ((size_t(batch)*(isq ? HQ : HK)+h)*length+row)*D;
+        for (int i = 0; i < NR; i++) {
+          uint c = lid*NR+i;
+          T scaled = T(values[i]*inv);
+          T normed = T(w[c]*scaled);
+          float value = float(normed);
+          float peer = simd_shuffle_xor(value, 16);
+          float d = float(c%64)/64.0f;
+          float frequency = metal::exp2(-d*lbase[0]);
+          float position = float(int(row)+(isq ? queryOffset[0] : keyOffset[0]));
+          float angle = position*frequency;
+          float cosine = metal::fast::cos(angle);
+          float sine = metal::fast::sin(angle);
+          float x1 = c < 64 ? value : peer;
+          float x2 = c < 64 ? peer : value;
+          dst[outbase+c] = T(c < 64 ? x1*cosine-x2*sine : x1*sine+x2*cosine);
+        }
+        """,
+        ensureRowContiguous: false)
+
+    private static func launch(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray,
+        queryOffset: MLXArray, keyOffset: Int
+    ) -> (MLXArray, MLXArray) {
+        let b = q.dim(0), ql = q.dim(1), kl = k.dim(1)
+        let hq = q.dim(2), hk = k.dim(2)
+        let outputs = kernel(
+            [q, k, wq, wk, queryOffset.reshaped([1]).asType(.int32), MLXArray([Int32(keyOffset)]), eps, lbase],
+            template: [("T", q.dtype), ("HQ", hq), ("HK", hk)],
+            grid: (32 * (hq + hk), max(ql, kl), b), threadGroup: (32, 1, 1),
+            outputShapes: [[b, hq, ql, 128], [b, hk, kl, 128]],
+            outputDTypes: [q.dtype, k.dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    nonisolated(unsafe) private static var checkFailed = false
+    private static let ready: Bool = {
+        guard enabled else { return false }
+        checkFailed = false
+        var same = true
+        withErrorHandler({ _ in DFlash2AttentionPrework.checkFailed = true }) {
+            let wq = MLXArray((0..<128).map { Float(0.75) + Float($0 % 17) / 32 }).asType(.bfloat16)
+            let wk = MLXArray((0..<128).map { Float(1.25) - Float($0 % 13) / 32 }).asType(.bfloat16)
+            for (ql, kl, off, b) in [(16, 32, 611, 1), (16, 17, 4093, 1), (1, 1, 200003, 1), (16, 512, 0, 1), (7, 11, 12345, 2)] {
+                let width = (32 + 2 * 8) * 128
+                let values = (0..<(b * kl * width)).map { i in
+                    Float((i &* 31 &+ 17) % 509 - 254) / Float(1 << (i % 7))
+                }
+                let wide = MLXArray(values, [b, kl, width]).asType(.bfloat16)
+                let q = wide[0..., (kl - ql)..., ..<(32 * 128)].reshaped(b, ql, 32, 128)
+                let k = wide[0..., 0..., (32 * 128)..<(40 * 128)].reshaped(b, kl, 8, 128)
+                let qo = off + kl - ql
+                let refQ = MLXFast.RoPE(
+                    MLXFast.rmsNorm(q, weight: wq, eps: 1e-6).transposed(0, 2, 1, 3),
+                    dimensions: 128, traditional: false, base: 10_000_000, scale: 1, offset: qo)
+                let refK = MLXFast.RoPE(
+                    MLXFast.rmsNorm(k, weight: wk, eps: 1e-6).transposed(0, 2, 1, 3),
+                    dimensions: 128, traditional: false, base: 10_000_000, scale: 1, offset: off)
+                let (newQ, newK) = launch(q: q, k: k, wq: wq, wk: wk, queryOffset: MLXArray(Int32(qo)), keyOffset: off)
+                let equal = (refQ.view(dtype: .uint16) .== newQ.view(dtype: .uint16)).all()
+                    .&& (refK.view(dtype: .uint16) .== newK.view(dtype: .uint16)).all()
+                eval(equal)
+                if checkFailed || !equal.item(Bool.self) { same = false; break }
+            }
+        }
+        let passed = same && !checkFailed
+        FileHandle.standardError.write(Data(("DFlash Q/K norm+RoPE bitwise check: " + (passed ? "passed; fused\n" : "failed; composed path\n")).utf8))
+        return passed
+    }()
+
+    static func run(
+        q: MLXArray, k: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
+        queryOffset: MLXArray, keyOffset: Int, rope: RoPELayer, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, rope is RoPE, ropeBase == 10_000_000,
+            q.ndim == 4, k.ndim == 4, q.dim(3) == 128, k.dim(3) == 128,
+            q.dim(0) == k.dim(0), q.dim(0) > 0, q.dim(1) > 0, k.dim(1) > 0,
+            q.dtype == .bfloat16, k.dtype == .bfloat16,
+            qNorm.weight.dtype == .bfloat16, kNorm.weight.dtype == .bfloat16,
+            qNorm.weight.shape == [128], kNorm.weight.shape == [128],
+            qNorm.eps == 1e-6, kNorm.eps == 1e-6,
+            queryOffset.size == 1,
+            keyOffset >= 0, keyOffset <= Int(Int32.max) - k.dim(1), ready
+        else { return nil }
+        return launch(q: q, k: k, wq: qNorm.weight, wk: kNorm.weight,
+                      queryOffset: queryOffset, keyOffset: keyOffset)
+    }
+}
+
 private final class DFlash2Attention: Module {
     let layerType: DFlash2LayerType
     let slidingWindow: Int?
@@ -473,6 +617,7 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
+    let ropeBase: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -489,6 +634,7 @@ private final class DFlash2Attention: Module {
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
+        self.ropeBase = config.ropeTheta
 
         _qProj.wrappedValue = Linear(
             config.hiddenSize, config.attentionHeads * config.headDim, bias: false)
@@ -567,12 +713,19 @@ private final class DFlash2Attention: Module {
             } else {
                 (projectedQ, projectedK, projectedV) = (qProj(x), kProj(rows), vProj(rows))
             }
-            queries = rope(
-                qNorm(projectedQ.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
-                offset: blockOffset)
-            let allKeys = rope(
-                kNorm(projectedK.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
+            let qRows = projectedQ.reshaped(B, L, heads, -1)
+            let kRows = projectedK.reshaped(B, n, kvHeads, -1)
+            let allKeys: MLXArray
+            if let fused = DFlash2AttentionPrework.run(
+                q: qRows, k: kRows, qNorm: qNorm, kNorm: kNorm,
+                queryOffset: MLXArray(Int32(blockOffset)), keyOffset: cache.offset,
+                rope: rope, ropeBase: ropeBase)
+            {
+                (queries, allKeys) = fused
+            } else {
+                queries = rope(qNorm(qRows).transposed(0, 2, 1, 3), offset: blockOffset)
+                allKeys = rope(kNorm(kRows).transposed(0, 2, 1, 3), offset: cache.offset)
+            }
             let allValues = projectedV.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             if let block = cache as? DFlash2BlockKVCache,
                 let held = block.updateBlock(
@@ -712,12 +865,20 @@ extension DFlash2Attention {
         else { return nil }
         let blockRows = dynamicSlice(
             y, start: start, axes: [1], sliceSize: [Int32(B), Int32(L), Int32(y.dim(2))])
-        let queries = rope(
-            qNorm(blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
-            offset: queryOffset)
-        let allKeys = rope(
-            kNorm(y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-            offset: cache.offset)
+        let qRows = blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)
+        let kRows = y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)
+        let queries: MLXArray
+        let allKeys: MLXArray
+        if let fused = DFlash2AttentionPrework.run(
+            q: qRows, k: kRows, qNorm: qNorm, kNorm: kNorm,
+            queryOffset: queryOffset, keyOffset: cache.offset,
+            rope: rope, ropeBase: ropeBase)
+        {
+            (queries, allKeys) = fused
+        } else {
+            queries = rope(qNorm(qRows).transposed(0, 2, 1, 3), offset: queryOffset)
+            allKeys = rope(kNorm(kRows).transposed(0, 2, 1, 3), offset: cache.offset)
+        }
         let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
         guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
         else { return nil }
