@@ -434,18 +434,6 @@ public final class HadamardConstantLayoutCache {
         }
     }
 
-    /// The array `derived(source, tag:)` built earlier, or nil; never builds.
-    public func existing(_ source: MLXArray, tag: Int) -> MLXArray? {
-        lock.withLock {
-            entries.first { $0.source === source && $0.tag == tag }?.derived
-        }
-    }
-
-    /// Bits the model file's residency bookkeeping sets once per route that
-    /// reads this cache's constants (a plain flag, so the per-call check is a
-    /// load, not a lock). Nothing here reads it.
-    public var residencyMarks = 0
-
     /// Check the frozen FP16 affine constants once, including signed zero.
     /// This cache is cleared by the owning projection on parameter updates.
     public func biasesAreNegativeScales(_ scales: MLXArray, _ biases: MLXArray) -> Bool {

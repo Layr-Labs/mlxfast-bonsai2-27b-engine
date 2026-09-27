@@ -438,22 +438,6 @@ public enum DFlash2SlidingMask {
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
-    private var keptKey: [Int]?
-    private var kept: MLXArray?
-
-    /// ``DFlash2TrainedBlockMask`` for one plain block forward's geometry,
-    /// shared by its layers. Left lazy: the context length moves every round,
-    /// so evaluating it here would add a wait per round.
-    func trainedBlockMask(contextLength: Int, blockLength: Int, trained: Int) -> MLXArray {
-        let requested = [contextLength, blockLength, trained]
-        if let kept, keptKey == requested { return kept }
-        let made = DFlash2TrainedBlockMask.make(
-            keyCount: contextLength + blockLength, blockStart: MLXArray(Int32(contextLength)),
-            blockLength: blockLength, trained: trained)
-        keptKey = requested
-        kept = made
-        return made
-    }
 
     func mask(
         contextLength: Int,
@@ -480,51 +464,6 @@ final class DFlash2SlidingMaskMemo {
     }
 }
 
-// MARK: - The trained block, kept inside a deeper block
-
-/// THE TRAINED BLOCK, KEPT. The drafter was trained at `dflash_config.block_size`
-/// (8: the anchor and 7 mask rows, bidirectional). A deeper declared block
-/// (depth 15 = 16 rows) is legal, but under the plain mask every row of the
-/// trained span also attends to the mask rows past it, a geometry the drafter
-/// never saw in training, and every extension row reads those perturbed rows.
-/// This mask keeps the trained span exactly as trained: block rows
-/// `i < trained` attend to the context and to block rows `j < trained` only,
-/// so their outputs are the trained-size block's outputs (the dynamic
-/// convolution is causal, so later rows never reach them). Each extension row
-/// `i >= trained` attends to the context and to block rows `j <= i`, so no row
-/// sees a mask row past what the trained geometry or its own position needs,
-/// and the draft at a position is the same for every declared depth that
-/// reaches it past the trained block. The boundary is read from the drafter's
-/// own config, never tuned. Only the DRAFT changes; the target verifies every
-/// token, so the output is the target's greedy sequence either way.
-/// `MLXFAST_DFLASH_TRAINED_BLOCK_MASK=0` restores the plain block mask; `=all`
-/// lets the extension rows attend to every block row.
-enum DFlash2TrainedBlockMask {
-    private static let setting: String = ProcessInfo.processInfo
-        .environment["MLXFAST_DFLASH_TRAINED_BLOCK_MASK"]?
-        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-    static let enabled = !["0", "false", "no", "off"].contains(setting)
-    static let causalExtension = setting != "all"
-
-    static func applies(blockLength: Int, trained: Int) -> Bool {
-        enabled && trained > 0 && blockLength > trained
-    }
-
-    /// `true` where allowed, `[blockLength, keyCount]`: key `k` is block row
-    /// `k - blockStart` (negative for a context key, always allowed here; the
-    /// caller ANDs in its own context and tail terms).
-    static func make(
-        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int
-    ) -> MLXArray {
-        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped(blockLength, 1)
-        let row = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount) - blockStart
-        if causalExtension {
-            return (row .< Int32(trained)) .|| ((query .>= Int32(trained)) .&& (row .<= query))
-        }
-        return (row .< Int32(trained)) .|| (query .>= Int32(trained))
-    }
-}
-
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -534,8 +473,6 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
-    /// `dflash_config.block_size`, the block the drafter was trained at.
-    let trainedBlock: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -565,7 +502,6 @@ private final class DFlash2Attention: Module {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
         self.isCausal = config.isCausal
-        self.trainedBlock = config.dflash.blockSize
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
@@ -726,11 +662,6 @@ private final class DFlash2Attention: Module {
             }
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
-        }
-        if DFlash2TrainedBlockMask.applies(blockLength: L, trained: trainedBlock) {
-            let kept = masks.trainedBlockMask(
-                contextLength: cachedLength, blockLength: L, trained: trainedBlock)
-            mask = mask.map { $0 .&& kept } ?? kept
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -1892,8 +1823,8 @@ enum DFlash2TensorMatmul {
     }
 
     /// The array `apply` reads for `weight` at block width: its tiled copy
-    /// while `current` reads the tiled copies (`tiled` and every variant),
-    /// the weight itself otherwise (`stock`, or a weight without a copy).
+    /// while the chosen kernel reads the tiled layout (`current.tiled`), the
+    /// weight itself otherwise.
     static func readWeight(_ weight: MLXArray) -> MLXArray {
         (current.tiled ? tiledCopy(weight) : nil) ?? weight
     }
@@ -3021,60 +2952,37 @@ enum DFlash2GreedyWalk {
 /// One command buffer that binds a group of arrays: a single thread reads the
 /// first element of each input. It exists for the buffers it binds, not for
 /// its output (see `DFlash2ResidencyPrefetch`).
-///
-/// Every launch has `inputs` inputs of one dtype (a group's arrays by dtype,
-/// the last launch of a dtype repeating its last array), so the kernels a
-/// seed can meet are one per dtype, all compiled by `prewarm` at the first
-/// arming (the load-time engine warm): which arrays are due depends on the
-/// kernels the load-time trials adopt, and a new mix must not JIT in a seed.
 private enum DFlash2ResidencyTouch {
     /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
-    static let inputs = 24
-
-    private static let kernel: MLXFast.MLXFastKernel = {
-        let names = (0 ..< inputs).map { "w\($0)" }
-        let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }.joined(separator: "\n")
-        return MLXFast.metalKernel(
-            name: "dflash2_residency_touch", inputNames: names, outputNames: ["out"],
-            source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
-            ensureRowContiguous: false)
-    }()
-
-    private static func launch(_ chunk: [MLXArray]) -> MLXArray {
-        kernel(
-            chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.float32])[0]
-    }
-
-    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
-        var order: [DType] = []
-        var byType: [DType: [MLXArray]] = [:]
-        for array in arrays {
-            if byType[array.dtype] == nil { order.append(array.dtype) }
-            byType[array.dtype, default: []].append(array)
-        }
-        return order.flatMap { dtype -> [MLXArray] in
-            let same = byType[dtype]!
-            return stride(from: 0, to: same.count, by: inputs).map { start in
-                var chunk = Array(same[start ..< min(start + inputs, same.count)])
-                chunk += Array(repeating: chunk[chunk.count - 1], count: inputs - chunk.count)
-                return launch(chunk)
-            }
-        }
-    }
+    static let maximumInputs = 24
 
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var warmed = false
+    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
 
-    /// Compiles the touch for every dtype a weight can have, once.
-    static func prewarm() {
-        guard lock.withLock({ () -> Bool in
-            defer { warmed = true }
-            return !warmed
-        }) else { return }
-        let types: [DType] = [.bfloat16, .float16, .float32, .uint32, .uint16, .uint8, .int8, .int32]
-        eval(types.map { launch(Array(repeating: MLXArray.zeros([1], dtype: $0), count: inputs)) })
+    private static func kernel(inputs count: Int) -> MLXFast.MLXFastKernel {
+        lock.withLock {
+            if let kernel = kernels[count] { return kernel }
+            let names = (0 ..< count).map { "w\($0)" }
+            let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }
+                .joined(separator: "\n")
+            let kernel = MLXFast.metalKernel(
+                name: "dflash2_residency_touch_\(count)", inputNames: names,
+                outputNames: ["out"],
+                source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
+                ensureRowContiguous: false)
+            kernels[count] = kernel
+            return kernel
+        }
+    }
+
+    /// One touch per `maximumInputs` arrays of `arrays`.
+    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+        stride(from: 0, to: arrays.count, by: maximumInputs).map { start in
+            let chunk = Array(arrays[start ..< min(start + maximumInputs, arrays.count)])
+            return kernel(inputs: chunk.count)(
+                chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.float32])[0]
+        }
     }
 }
 
@@ -3103,18 +3011,6 @@ private enum DFlash2ResidencyTouch {
 /// submission at layer 8, 16, 32 and 48 (`Qwen35TrunkSubmission.promptFused`).
 /// Any group still due at the end of the forward is bound there.
 ///
-/// The same holds for any array only the window reads, so the list goes on
-/// with the target's (`arm`'s `window`): the head rows the drafter scores,
-/// stored words and constants the seed's own head read (the verify route's
-/// tiled copy) never binds, and the verify int8 operands that the kernels the
-/// load-time trials adopted read and the prompt route does not (the
-/// FP32-widened scales of a form that reads them, every operand of a
-/// projection the prompt route never runs). The drafter's own list follows the
-/// adopted drafter kernel: its tiled copies while `DFlash2TensorMatmul.current`
-/// reads them (the tiled kernel or any variant), the stored weights otherwise.
-/// Kernel outputs (the cross-threadgroup bodies' partial planes included) are
-/// fresh allocations in every round, not arrays to bind ahead.
-///
 /// Each group costs one single-thread kernel per 24 arrays on the GPU. No
 /// value of either model is read into any result, and nothing about the
 /// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
@@ -3133,16 +3029,10 @@ public enum DFlash2ResidencyPrefetch {
     nonisolated(unsafe) private static var nextGroup = 0
 
     /// Arms the prefetch for the next prompt forward: called when an engine
-    /// that drafts with `drafter` is built. `window`: the target's arrays the
-    /// window reads and the seed does not (the drafter's head rows, the verify
-    /// kernels' window-only operands), after the drafter's own.
-    static func arm(_ drafter: DFlash2DraftModel, window: @autoclosure () -> [MLXArray] = []) {
+    /// that drafts with `drafter` is built.
+    static func arm(_ drafter: DFlash2DraftModel) {
         guard enabled else { return }
-        DFlash2ResidencyTouch.prewarm()
-        var seen = Set<ObjectIdentifier>()
-        let arrays = (drafter.residencyArrays() + window()).filter {
-            seen.insert(ObjectIdentifier($0)).inserted
-        }
+        let arrays = drafter.residencyArrays()
         let total = arrays.reduce(0) { $0 + $1.nbytes }
         let share = max(1, total / dueAfterLayers.count)
         var built: [[MLXArray]] = []
@@ -3599,15 +3489,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
-        if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
-            // The block sits at row `held + c` of the keys, as in the plain
-            // path it sits right after the cached context.
-            keyMask = keyMask .&& DFlash2TrainedBlockMask.make(
-                keyCount: keys, blockStart: MLXArray(Int32(geometry.rows)) + c,
-                blockLength: blockSize, trained: config.dflash.blockSize)
-        }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         var writes: [(keys: MLXArray, values: MLXArray)] = []
         var lead: MLXArray?
