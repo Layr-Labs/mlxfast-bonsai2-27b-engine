@@ -470,7 +470,13 @@ extension EngineLoopV2 {
                 if let drafted = proposal {
                     // The looked-up ids when a unique prompt span matches. The
                     // drafter graph, or the absorbed rows, stay live either way.
-                    let tokens = lookup ?? drafted
+                    // A miss keeps the drafter's block, spliced along the
+                    // prompt span it quotes (`missed`).
+                    let tokens =
+                        lookup
+                        ?? CBv2PromptLookupDraft.missed(
+                            drafted, history: rec.tokens,
+                            promptLength: rec.request.promptTokens.count, depth: k)
                     block.noteLookupRound(lookup != nil, requestState: state)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets =

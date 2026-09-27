@@ -641,6 +641,42 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext? = nil,
         keepMask: MLXArray? = nil
     ) -> MLXArray {
+        let outputs = attendQueryBlockList(
+            queries: queries, keys: keys, values: values, newTokenCount: newTokenCount,
+            window: window, scale: scale, sinks: sinks, softcap: softcap, blockSize: blockSize,
+            spanContext: spanContext, keepMask: keepMask)
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// `updateAndAttendRow` for B == 1 and no keep mask or span overlay,
+    /// when it takes the query-block branch: the same update and the same
+    /// block outputs, returned in query order (not concatenated). Nil, before
+    /// the row is updated, when that branch would not be taken.
+    static func updateAndAttendQueryBlocks(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> [MLXArray]? {
+        let L = queries.dim(2)
+        guard queries.dim(0) == 1, shouldBlockQueries(L), !kind.isBidirectional else {
+            return nil
+        }
+        let effectiveSinks = dispatchSinks(sinks, kind: kind, queries: queries, softcap: softcap)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return attendQueryBlockList(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
+    }
+
+    /// The query blocks' outputs of `attendQueryBlocks`, in query order.
+    private static func attendQueryBlockList(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        newTokenCount: Int, window: Int?, scale: Float,
+        sinks: MLXArray?, softcap: Float?, blockSize: Int,
+        spanContext: CBv2SpanChunkContext? = nil,
+        keepMask: MLXArray? = nil
+    ) -> [MLXArray] {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         precondition(
             keepMask == nil || spanContext == nil,
@@ -717,7 +753,7 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return outputs
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
@@ -1070,13 +1106,11 @@ package enum CBv2PromptCausalAttention {
                     : Limits<float>::min;
               }
             }
-            // Only initialize unused slots. Active SIMD groups write their
-            // own slots below, so these stores are disjoint and need no barrier.
-            const uint groups = uint((axis_size + 127) / 128);
-            if (simd_group_id == 0 && simd_lane_id >= groups) {
+            if (simd_group_id == 0) {
               local_max[simd_lane_id] = Limits<float>::min;
               local_normalizer[simd_lane_id] = 0;
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Get the max
             float maxval = Limits<float>::finite_min;
@@ -1088,9 +1122,14 @@ package enum CBv2PromptCausalAttention {
               local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Every SIMD group reduces the same 32 ordered partials. This
-            // preserves the reduction tree and avoids a group-zero broadcast.
-            maxval = simd_max(local_max[simd_lane_id]);
+            if (simd_group_id == 0) {
+              maxval = simd_max(local_max[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_max[0] = maxval;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
 
             // Compute exp(x_i - maxval) and store the partial sums in local_normalizer
             float normalizer = 0;
@@ -1104,7 +1143,14 @@ package enum CBv2PromptCausalAttention {
               local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
+            if (simd_group_id == 0) {
+              normalizer = simd_sum(local_normalizer[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_normalizer[0] = normalizer;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
 
             // Normalize and write to the output
             device float* o = out + gid * size_t(axis_size) + lid * N_READS;
