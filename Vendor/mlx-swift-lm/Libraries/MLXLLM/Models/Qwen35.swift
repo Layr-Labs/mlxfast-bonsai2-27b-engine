@@ -2585,6 +2585,21 @@ enum Qwen35SmallNMatmul {
 
     static let chunk = 128
 
+    private static func envOn(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }
+
+    /// Two consecutive `float4` dots per inner step (eight K elements), added
+    /// in the same order as two iterations of the four-wide loop.
+    /// `MLXFAST_SPLITK_X8=0` keeps one `float4` per step.
+    static let wideDot = envOn("MLXFAST_SPLITK_X8")
+    /// The chunk reduction owns four contiguous outputs and adds each chunk
+    /// as a `float4`, one lane per output, in chunk order.
+    /// `MLXFAST_SPLITK_REDUCE4=0` keeps one output per thread.
+    static let wideReduce = envOn("MLXFAST_SPLITK_REDUCE4")
+
     // grid (N / 32 * 128, K / KC, 1), threadgroup (128, 1, 1). Thread t:
     // column nb + (t & 31), rows 4 * (t >> 5) .. + 3 (rows >= M skipped).
     private static let partialSource = """
@@ -2597,14 +2612,32 @@ enum Qwen35SmallNMatmul {
         const int k0 = kc * KC;
         const device float* wr = w + (size_t)(nb + c) * K + k0;
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int k = 0; k < KC; k += 4) {
-          const float4 wv = *(const device float4*)(wr + k);
-          #pragma clang loop unroll(full)
-          for (int r = 0; r < 4; r++) {
-            const int m = r0 + r;
-            if (m < M) {
-              const float4 xv = *(const device float4*)(x + (size_t)m * K + k0 + k);
-              acc[r] += dot(xv, wv);
+        if (X8) {
+          for (int k = 0; k < KC; k += 8) {
+            const float4 wv0 = *(const device float4*)(wr + k);
+            const float4 wv1 = *(const device float4*)(wr + k + 4);
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < 4; r++) {
+              const int m = r0 + r;
+              if (m < M) {
+                const device float* xr = x + (size_t)m * K + k0 + k;
+                const float4 xv0 = *(const device float4*)(xr);
+                const float4 xv1 = *(const device float4*)(xr + 4);
+                acc[r] += dot(xv0, wv0);
+                acc[r] += dot(xv1, wv1);
+              }
+            }
+          }
+        } else {
+          for (int k = 0; k < KC; k += 4) {
+            const float4 wv = *(const device float4*)(wr + k);
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < 4; r++) {
+              const int m = r0 + r;
+              if (m < M) {
+                const float4 xv = *(const device float4*)(x + (size_t)m * K + k0 + k);
+                acc[r] += dot(xv, wv);
+              }
             }
           }
         }
@@ -2618,10 +2651,21 @@ enum Qwen35SmallNMatmul {
     private static let reduceSource = """
         const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
-        if (i >= uint(M * N)) { return; }
-        float v = 0.0f;
-        for (int s = 0; s < KS; s++) { v += part[(size_t)s * M * N + i]; }
-        out[i] = v;
+        const int MN = M * N;
+        if (R4) {
+          const int b = int(i) * 4;
+          if (b >= MN) { return; }
+          float4 v = float4(0.0f);
+          for (int s = 0; s < KS; s++) {
+            v += *(const device float4*)(part + (size_t)s * MN + b);
+          }
+          *(device float4*)(out + b) = v;
+        } else {
+          if (i >= uint(MN)) { return; }
+          float v = 0.0f;
+          for (int s = 0; s < KS; s++) { v += part[(size_t)s * MN + i]; }
+          out[i] = v;
+        }
         """
 
     private static let partialKernel = MLXFast.metalKernel(
@@ -2640,13 +2684,18 @@ enum Qwen35SmallNMatmul {
             return nil
         }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let x8 = wideDot && chunk % 8 == 0
+        let r4 = wideReduce && (rows * n) % 4 == 0
         let part = partialKernel(
-            [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
+            [x.reshaped(rows, k), w, dims],
+            template: [("KC", chunk), ("X8", x8 ? 1 : 0)],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        let reduceThreads = r4 ? (rows * n) / 4 : rows * n
         let y = reduceKernel(
-            [part, dims], template: [("KC", chunk)],
-            grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            [part, dims],
+            template: [("KC", chunk), ("R4", r4 ? 1 : 0)],
+            grid: ((reduceThreads + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
