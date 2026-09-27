@@ -5028,6 +5028,13 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // A prompt-width forward inside an engine step keeps the step's work
+        // interval running: renewed now and at each prompt submission below.
+        // Scheduling hint only (`CBv2EngineWorkInterval`).
+        let promptForward =
+            !captureRecurrentWindow
+            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
+        if promptForward { CBv2EngineWorkInterval.promptForwardBegan() }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -5107,6 +5114,7 @@ public class Qwen35TextModelInner: Module {
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
+                    if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
                 }
                 continue
@@ -5131,6 +5139,7 @@ public class Qwen35TextModelInner: Module {
             if let submission,
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
+                if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
             }
         }
@@ -5143,7 +5152,7 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            dFlash2Tap.tappedHidden = concatenated(tapped.map { $0! }, axis: -1)
+            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
         }
         return hiddenStates
     }
