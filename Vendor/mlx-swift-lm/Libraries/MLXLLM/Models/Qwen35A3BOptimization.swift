@@ -672,11 +672,49 @@ func qwen35A3BExpertCombiner(
 /// chunks in chunk order. The product is FP32 up to rounding (the verify-
 /// width split-K is the same arithmetic class). `BONSAI_PROMPT_SPLITK_BA=0`
 /// keeps MLX's GEMM.
+///
+/// The product's input is the layer boundary's FP32 norm output `n = w *
+/// (h * inv)` (`Qwen35FusedBoundaryQ8`): `h` the FP16 residual sum the
+/// boundary stores in any case, `inv` the row's `rsqrt(mean(h^2) + eps)`
+/// and `w` the norm gain. Writing that FP32 copy costs the boundary kernel
+/// 20 KB per row (10.5 MB per GDN layer at 512 rows) and this kernel reads
+/// it back. `applyRowScale` reads `h`, `w` and the per-row `inv` instead and
+/// forms `w * (h * inv)` in threadgroup memory, the same FP32 expression on
+/// the same operands (the FP16 to FP32 widening is exact), so every
+/// `simdgroup_multiply_accumulate` sees the same values in the same order
+/// and the product is bit for bit the FP32-input kernel's. The boundary then
+/// stores one float per row instead of 5120. A load-time self-test
+/// (`Qwen35FusedBoundaryQ8.rowScaleVerified`) compares the boundary's row
+/// scales, the reconstructed norm output and this product bitwise against
+/// the FP32-copy path on 64, 128 and 512 rows; a mismatch or an MLX error
+/// keeps the FP32 copy. `BONSAI_PROMPT_BA_HALF_INPUT=0` keeps it too.
 enum Qwen35WideNMatmul {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_SPLITK_BA"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The product read from the boundary kernel's FP16 rows and row scales
+    /// (`applyRowScale`) instead of its FP32 norm output.
+    /// `BONSAI_PROMPT_BA_HALF_INPUT=0` keeps the FP32 copy.
+    static let rowScaleEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_BA_HALF_INPUT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return enabled && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// K columns of the 64 staged rows per threadgroup pass in
+    /// `applyRowScale`: 32, 64 or 128 (8, 16 or 32 KB of threadgroup
+    /// memory). 32 by default (the fastest of the three on an M5 Pro in a
+    /// serialized chain at the prompt shape, four threadgroups per core's 32
+    /// KB); `BONSAI_PROMPT_BA_STAGE` for a local A/B. The stage width changes
+    /// the staging schedule only, never a value or the accumulation order.
+    static let stage: Int = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_BA_STAGE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed: Int = value.flatMap { Int($0) } ?? 32
+        return [32, 64, 128].contains(parsed) ? parsed : 32
     }()
 
     static let chunk = 512
@@ -718,6 +756,70 @@ enum Qwen35WideNMatmul {
         }
         """
 
+    // The same grid, threadgroup, tiles and accumulation order as
+    // `partialSource`, with the activation formed from the boundary kernel's
+    // outputs: h half [M, K] (the residual sum), gain float [K] (the norm
+    // gain), inv float [M] (the row's rsqrt). Each pass stages 64 rows x SK
+    // columns of `gain * (float(h) * inv)` in threadgroup memory (thread t:
+    // row t >> 1, columns (t & 1) * SK / 2 .. + SK / 2 - 1, four-wide loads
+    // and stores) and the simdgroups load their A tiles from there.
+    private static let partialRowScaleSource = """
+        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int kc = int(threadgroup_position_in_grid.z);
+        const uint t = thread_position_in_threadgroup.x;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int mt = int(threadgroup_position_in_grid.y) * 64;
+        const int mr = 32 * int(sg >> 1);
+        const int m0 = mt + mr;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32 + 16 * int(sg & 1);
+        // Declared four-wide so the staging stores below (`threadgroup
+        // float4`) and the simdgroup loads start 16-byte aligned.
+        threadgroup float4 xs4[16 * SK];
+        threadgroup float* xs = (threadgroup float*)xs4;
+        simdgroup_matrix<float, 8, 8> c[4][2];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) {
+          c[i][0] = simdgroup_matrix<float, 8, 8>(0.0f);
+          c[i][1] = simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        simdgroup_matrix<float, 8, 8> a[4], b0, b1;
+        const device float* wb = w + (size_t)n0 * K + kc * KC;
+        const int lr = int(t >> 1);
+        const int kh = int(t & 1) * (SK / 2);
+        const float rinv = inv[mt + lr];
+        const device half* hp = h + (size_t)(mt + lr) * K + kc * KC + kh;
+        const device float* gp = gain + kc * KC + kh;
+        threadgroup float* xr = xs + lr * SK + kh;
+        for (int ks = 0; ks < KC; ks += SK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < SK / 8; j++) {
+            const float4 hv = float4(*(const device half4*)(hp + ks + 4 * j));
+            const float4 gv = *(const device float4*)(gp + ks + 4 * j);
+            *(threadgroup float4*)(xr + 4 * j) = gv * (hv * rinv);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          #pragma clang loop unroll(full)
+          for (int k = 0; k < SK; k += 8) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; i++) { simdgroup_load(a[i], xs + (mr + 8 * i) * SK + k, SK); }
+            simdgroup_load(b0, wb + ks + k, K, ulong2(0, 0), true);
+            simdgroup_load(b1, wb + 8 * K + ks + k, K, ulong2(0, 0), true);
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; i++) {
+              simdgroup_multiply_accumulate(c[i][0], a[i], b0, c[i][0]);
+              simdgroup_multiply_accumulate(c[i][1], a[i], b1, c[i][1]);
+            }
+          }
+        }
+        device float* p = part + ((size_t)kc * M + m0) * N + n0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) {
+          simdgroup_store(c[i][0], p + 8 * i * N, N);
+          simdgroup_store(c[i][1], p + 8 * i * N + 8, N);
+        }
+        """
+
     private static let reduceSource = """
         const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
@@ -730,28 +832,96 @@ enum Qwen35WideNMatmul {
     private static let partialKernel = MLXFast.metalKernel(
         name: "qwen35_widen_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
         source: partialSource, ensureRowContiguous: true)
+    private static let partialRowScaleKernel = MLXFast.metalKernel(
+        name: "qwen35_widen_partial_h16", inputNames: ["h", "gain", "inv", "w", "dims"],
+        outputNames: ["part"], source: partialRowScaleSource, ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_widen_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: true)
 
     nonisolated(unsafe) private static var announced = false
+    nonisolated(unsafe) private static var announcedRowScale = false
+
+    /// True when a product of these dimensions takes the kernel pair.
+    static func mayApply(rows: Int, k: Int, n: Int) -> Bool {
+        enabled && rows % 64 == 0 && n % 32 == 0 && k % chunk == 0
+    }
+
+    /// True when a product of these dimensions can read the boundary's FP16
+    /// rows and row scales (`applyRowScale`), the self-test aside.
+    static func mayApplyRowScale(rows: Int, k: Int, n: Int) -> Bool {
+        rowScaleEnabled && mayApply(rows: rows, k: k, n: n)
+    }
 
     static func apply(_ x: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int) -> MLXArray? {
-        guard enabled, rows % 64 == 0, n % 32 == 0, k % chunk == 0 else { return nil }
+        guard mayApply(rows: rows, k: k, n: n) else { return nil }
         if !announced {
             announced = true
             FileHandle.standardError.write(
                 Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
         }
+        return product(x, w, rows: rows, k: k, n: n)
+    }
+
+    /// `x @ w.T` for FP32 `x` [rows, k] (any leading shape of that size) and
+    /// `w` [n, k]: the kernel pair, without the announcement (the self-test's
+    /// reference). Nil when the dimensions do not fit.
+    static func product(_ x: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int) -> MLXArray? {
+        guard mayApply(rows: rows, k: k, n: n), x.dtype == .float32, w.dtype == .float32,
+            x.size == rows * k, w.shape == [n, k]
+        else { return nil }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
             grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
-        let y = reduceKernel(
+        let y = reduce(part, dims: dims, rows: rows, n: n)
+        return y.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+
+    /// `(gain * (float(h) * inv)) @ w.T` read from the boundary kernel's
+    /// outputs: `h` FP16 [rows, k] (any leading shape of that size), `gain`
+    /// FP32 [k], `inv` FP32 [rows], `w` FP32 [n, k]. Bit for bit
+    /// `product(gain * (h.float * inv), w)`. Nil when it does not apply.
+    static func applyRowScale(
+        h: MLXArray, gain: MLXArray, inv: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int
+    ) -> MLXArray? {
+        guard mayApplyRowScale(rows: rows, k: k, n: n) else { return nil }
+        guard let y = productRowScale(h: h, gain: gain, inv: inv, w, rows: rows, k: k, n: n)
+        else { return nil }
+        if !announcedRowScale {
+            announcedRowScale = true
+            FileHandle.standardError.write(
+                Data(
+                    ("qwen35 prompt split-K b|a: reading the boundary's FP16 rows and row scales "
+                        + "(rows \(rows), k \(k), n \(n), stage \(stage))\n").utf8))
+        }
+        return y
+    }
+
+    /// `applyRowScale`'s kernel pair without the switch and the announcement
+    /// (the self-test's candidate). Nil when the operands do not fit.
+    static func productRowScale(
+        h: MLXArray, gain: MLXArray, inv: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int
+    ) -> MLXArray? {
+        guard mayApply(rows: rows, k: k, n: n), h.dtype == .float16, h.size == rows * k,
+            gain.dtype == .float32, gain.size == k, inv.dtype == .float32, inv.size == rows,
+            w.dtype == .float32, w.shape == [n, k]
+        else { return nil }
+        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let part = partialRowScaleKernel(
+            [h.reshaped(rows, k), gain.reshaped(k), inv.reshaped(rows), w, dims],
+            template: [("KC", chunk), ("SK", stage)],
+            grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        let y = reduce(part, dims: dims, rows: rows, n: n)
+        return y.reshaped(Array(h.shape.dropLast()) + [n])
+    }
+
+    private static func reduce(_ part: MLXArray, dims: MLXArray, rows: Int, n: Int) -> MLXArray {
+        reduceKernel(
             [part, dims], template: [("KC", chunk)],
             grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
-        return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
 }
