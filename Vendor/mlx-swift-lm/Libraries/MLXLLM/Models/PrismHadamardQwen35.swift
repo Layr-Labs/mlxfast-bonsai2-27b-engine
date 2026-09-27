@@ -124,9 +124,9 @@ enum Qwen35SmallNMatmul {
         let k = x.dim(-1)
         let n = w.dim(0)
         let rows = x.size / k
-        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else {
-            return nil
-        }
+        guard rows >= 1, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
+        // Prompt width: the 64-row simdgroup-matrix split-K (`Qwen35WideNMatmul`).
+        if rows > 16 { return Qwen35WideNMatmul.apply(x, w, rows: rows, k: k, n: n) }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims],
