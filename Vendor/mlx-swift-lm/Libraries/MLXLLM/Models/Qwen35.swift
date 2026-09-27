@@ -236,9 +236,9 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   that commit (finalize, the leading draft submission, the committed
 ///   recurrent state, the rest of the draft, then the ~3 ms verify build),
 ///   the GPU idles in between. The default plan is ONE boundary after the
-///   first 8 layers (a LEADING verify submission, the verify's first ~5
-///   command buffers): the GPU gets the front of the verify as soon as it is
-///   built, and the host builds the other 48 layers while it runs. One
+///   first 4 layers (a LEADING verify submission): the GPU gets the front
+///   of the verify as soon as it is built, and the host builds the other
+///   60 layers while it runs. One
 ///   boundary rather than periodic slices, because every extra command
 ///   buffer at verify width has measured as a cost on the ranked box (slices
 ///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
@@ -300,11 +300,11 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // One leading submission after layer 8 (pochita0's `11cb04a`; see the type's comment);
+        // Submit after layer 4, earlier than the accepted layer-8 plan (`11cb04a`).
         // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 0, offset: 0, explicit: [8]))
+            default: Plan(stride: 0, offset: 0, explicit: [4]))
     }()
 
     static let prompt: Plan = Plan.parse(
