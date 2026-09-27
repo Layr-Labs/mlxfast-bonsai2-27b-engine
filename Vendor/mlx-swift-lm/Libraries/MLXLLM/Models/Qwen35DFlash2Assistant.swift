@@ -44,6 +44,81 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
     }
 }
 
+/// The current verify packet's leading equal prefix and carry token for the
+/// pre-readback drafter. Only the device verdict is retained between calls.
+private enum Qwen35DFlash2PacketPrefix {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PACKET_PREFIX"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_dflash2_packet_prefix", inputNames: ["packet"],
+        outputNames: ["confirmed", "anchor"],
+        source: """
+            if (thread_position_in_grid.x != 0) return;
+            uint accepted = 0;
+            const size_t stride = packet_strides[0];
+            while (accepted < K && packet[accepted * stride] == packet[(K + accepted) * stride]) {
+                ++accepted;
+            }
+            confirmed[0] = int(accepted + 1);
+            anchor[0] = packet[(K + accepted) * stride];
+            """, ensureRowContiguous: true)
+
+    private static func run(_ packet: MLXArray, depth: Int) -> (confirmed: MLXArray, anchor: MLXArray) {
+        let outputs = kernel(
+            [packet], template: [("K", depth)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[], [1]], outputDTypes: [.int32, .int32])
+        return (outputs[0], outputs[1])
+    }
+
+    private enum CheckFailure: Error { case mismatch }
+
+    /// Immutable, once-per-process proof, forced before the parent's full
+    /// speculative-block proof. Every count and depth, including strided ids.
+    private static let verified: Bool = {
+        guard enabled else { return false }
+        do {
+            try withError { _ in
+                for depth in 1 ... 16 {
+                    for count in 0 ... depth {
+                        let targets = (0 ... depth).map { Int32($0 * 7919 - 104729) }
+                        var drafts = Array(targets.prefix(depth))
+                        if count < depth { drafts[count] &+= 1 }
+                        let ids = drafts + targets
+                        for stride in [1, 2] {
+                            let packet = stride == 1 ? MLXArray(ids)
+                                : MLXArray(ids.flatMap { [$0, Int32.max] })[.stride(by: 2)]
+                            let outputs = run(packet, depth: depth)
+                            let expected = Int32(count + 1)
+                            eval(outputs.confirmed, outputs.anchor)
+                            guard outputs.confirmed.item(Int32.self) == expected,
+                                outputs.anchor.item(Int32.self) == targets[count]
+                            else { throw CheckFailure.mismatch }
+                        }
+                    }
+                }
+            }
+            FileHandle.standardError.write(Data("dflash2 packet prefix: self-test passed; fused\n".utf8))
+            return true
+        } catch {
+            FileHandle.standardError.write(Data("dflash2 packet prefix: self-test FAILED (\(error)); chain kept\n".utf8))
+            return false
+        }
+    }()
+
+    static func prepare() { _ = verified }
+
+    static func apply(_ packet: MLXArray, depth: Int) -> (confirmed: MLXArray, anchor: MLXArray)? {
+        guard enabled, (1 ... 16).contains(depth), packet.ndim == 1,
+            packet.dim(0) >= 2 * depth + 1, packet.dtype == .int32, verified
+        else { return nil }
+        return run(packet, depth: depth)
+    }
+}
+
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
 public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MTPBlockSpeculation,
     @unchecked Sendable
@@ -822,13 +897,19 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
+        let prefix: (confirmed: MLXArray, anchor: MLXArray)
+        if let fused = Qwen35DFlash2PacketPrefix.apply(packet, depth: k) {
+            prefix = fused
+        } else {
+            let targets = packet[k ..< (2 * k + 1)]
+            let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+                .sum().asType(.int32)
+            prefix = (accepted + MLXArray(Int32(1)), targets.take(accepted.reshaped([1]), axis: 0))
+        }
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                anchor: prefix.anchor,
+                confirmed: prefix.confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single)
@@ -862,6 +943,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     func establishSpeculation() {
         speculationPlan = nil
         guard CBv2MTPDraftBeforeReadback.enabled else { return }
+        Qwen35DFlash2PacketPrefix.prepare()
         let start = DispatchTime.now().uptimeNanoseconds
         let block = Self.warmBlockSize
         let classes = drafter.contextRowClasses(rows: block)
