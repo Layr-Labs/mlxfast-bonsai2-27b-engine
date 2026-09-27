@@ -317,6 +317,21 @@ enum Qwen35TrunkSubmission {
             default: Plan(stride: 0, offset: 0, explicit: leading))
     }()
 
+    /// The verify plan when nothing is queued ahead of the verify on the GPU
+    /// (`CBv2VerifyQueueHint`: a prompt-lookup round, whose drafter only
+    /// absorbed its context rows). The default plan's first boundary after 8
+    /// layers is sized to hide behind a drafter block; with none, the GPU
+    /// would wait for the host's ~0.8 ms on those 8 layers, so it starts after
+    /// the first 2. `DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES` sets another plan
+    /// (same syntax); `0` keeps the default one.
+    static let verifyUnqueued: Plan = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
+        let fallback =
+            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+        let plan = Plan.parse(raw, default: fallback)
+        return plan.isOff ? verify : plan
+    }()
+
     static let prompt: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
         default: Plan(stride: 4, offset: 0, explicit: nil))
@@ -351,7 +366,7 @@ enum Qwen35TrunkSubmission {
     ) -> Plan? {
         let plan: Plan
         if captureRecurrentWindow {
-            plan = verify
+            plan = CBv2VerifyQueueHint.takeNothingAhead() ? verifyUnqueued : verify
         } else if rows >= promptMinimumRows {
             plan = prompt
         } else {
