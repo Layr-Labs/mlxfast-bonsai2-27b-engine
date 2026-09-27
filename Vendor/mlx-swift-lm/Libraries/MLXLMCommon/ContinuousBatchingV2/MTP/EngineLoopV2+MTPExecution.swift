@@ -628,13 +628,36 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else if let absorbing = block as? any CBv2PromptLookupAbsorbing,
+                    absorbing.lookupSkipReady,
+                    let hit = CBv2PromptLookupDraft.continuation(
+                        history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k),
+                    let absorbed = absorbing.absorbCommittedContext(
+                        requestState: requestState)
+                {
+                    // The continuation is already the proposal. Absorb the
+                    // committed rows the block forward would have written,
+                    // and do not build the block.
+                    absorbing.noteLookupProposal(true, requestState: requestState)
+                    proposal = MLXArray(hit.ids, [1, k])
+                    block.trimBlockState(
+                        requestState, toCommittedLength: carry.kvOffset)
+                    assistantEvalTargets.append(contentsOf: absorbed)
+                    FileHandle.standardError.write(
+                        Data("dflash2 lookup skip: match=\(hit.match) depth=\(k)\n".utf8))
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
                     proposal = CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
-                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
+                    (block as? any CBv2PromptLookupAbsorbing)?.noteLookupProposal(
+                        CBv2PromptLookupDraft.continuation(
+                            history: row.rec.tokens,
+                            promptLength: row.rec.request.promptTokens.count,
+                            depth: k) != nil,
+                        requestState: requestState)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.

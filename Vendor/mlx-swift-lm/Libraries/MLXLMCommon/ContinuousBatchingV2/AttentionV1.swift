@@ -641,42 +641,6 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext? = nil,
         keepMask: MLXArray? = nil
     ) -> MLXArray {
-        let outputs = attendQueryBlockList(
-            queries: queries, keys: keys, values: values, newTokenCount: newTokenCount,
-            window: window, scale: scale, sinks: sinks, softcap: softcap, blockSize: blockSize,
-            spanContext: spanContext, keepMask: keepMask)
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
-    }
-
-    /// `updateAndAttendRow` for B == 1 and no keep mask or span overlay,
-    /// when it takes the query-block branch: the same update and the same
-    /// block outputs, returned in query order (not concatenated). Nil, before
-    /// the row is updated, when that branch would not be taken.
-    static func updateAndAttendQueryBlocks(
-        row: CBv2SequenceKV, kind: CBv2LayerKind,
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> [MLXArray]? {
-        let L = queries.dim(2)
-        guard queries.dim(0) == 1, shouldBlockQueries(L), !kind.isBidirectional else {
-            return nil
-        }
-        let effectiveSinks = dispatchSinks(sinks, kind: kind, queries: queries, softcap: softcap)
-        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        return attendQueryBlockList(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
-    }
-
-    /// The query blocks' outputs of `attendQueryBlocks`, in query order.
-    private static func attendQueryBlockList(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        newTokenCount: Int, window: Int?, scale: Float,
-        sinks: MLXArray?, softcap: Float?, blockSize: Int,
-        spanContext: CBv2SpanChunkContext? = nil,
-        keepMask: MLXArray? = nil
-    ) -> [MLXArray] {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         precondition(
             keepMask == nil || spanContext == nil,
@@ -753,7 +717,7 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        return outputs
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
