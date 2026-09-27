@@ -482,22 +482,6 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
     private let qkv = DFlash2QKVStack()
 
-    /// The weights a block forward reads here in place of stored ones (the
-    /// q|k|v stack once built, o_proj as `DFlash2TensorMatmul` reads it), and
-    /// the stored weights they stand in for (`DFlash2ResidencyPrefetch`).
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        var read: [MLXArray] = []
-        var replaced: [MLXArray] = []
-        if let stacked = qkv.residentWeight {
-            read.append(stacked)
-            replaced += [qProj.weight, kProj.weight, vProj.weight]
-        }
-        let o = DFlash2TensorMatmul.readWeight(oProj.weight)
-        read.append(o)
-        if o !== oProj.weight { replaced.append(oProj.weight) }
-        return (read, replaced)
-    }
-
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
@@ -791,9 +775,6 @@ private final class DFlash2QKVStack {
         qEnd = 0
         kEnd = 0
     }
-
-    /// The stacked weight once built (nil before its first use).
-    var residentWeight: MLXArray? { weight }
 
     /// The stacked weight, concatenated on first use, or nil when the stack
     /// does not apply to these projections.
@@ -1132,7 +1113,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
 /// Kill switch for the tap-0 convolution joined to its context rows (default on).
 private let dflash2ConvJoinEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_JOIN"]
-    else { return false }
+    else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
@@ -1822,13 +1803,6 @@ enum DFlash2TensorMatmul {
         tiledLock.withLock { tiledCopies[ObjectIdentifier(weight)]?.tiled }
     }
 
-    /// The array `apply` reads for `weight` at block width: its tiled copy
-    /// while the chosen kernel reads the tiled layout (`current.tiled`), the
-    /// weight itself otherwise.
-    static func readWeight(_ weight: MLXArray) -> MLXArray {
-        (current.tiled ? tiledCopy(weight) : nil) ?? weight
-    }
-
     /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
     /// for each 32-column block and 256-wide K step, the 32 columns' 256
     /// values in column order. Only positions change.
@@ -2271,9 +2245,6 @@ private final class DFlash2GateUpStack {
         boundary = 0
     }
 
-    /// The stacked weight once built (nil before its first use).
-    var residentWeight: MLXArray? { weight }
-
     /// The stacked weight, concatenated on first use, or nil when the stack
     /// does not apply.
     func stacked(gate: Linear, up: Linear) -> MLXArray? {
@@ -2301,21 +2272,6 @@ private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
     private let gateUp = DFlash2GateUpStack()
-
-    /// As `DFlash2Attention.residencyWeights`: the gate|up stack and
-    /// down_proj as `DFlash2TensorMatmul` reads them.
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        var read: [MLXArray] = []
-        var replaced: [MLXArray] = []
-        if let stacked = gateUp.residentWeight {
-            read.append(DFlash2TensorMatmul.readWeight(stacked))
-            replaced += [gate.weight, up.weight]
-        }
-        let d = DFlash2TensorMatmul.readWeight(down.weight)
-        read.append(d)
-        if d !== down.weight { replaced.append(down.weight) }
-        return (read, replaced)
-    }
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -2380,20 +2336,6 @@ private final class DFlash2DecoderLayer: Module {
 
     func tensorWeights() -> [MLXArray] {
         (selfAttn.oProj.bias == nil ? [selfAttn.oProj.weight] : []) + mlp.tensorWeights()
-    }
-
-    /// Every array of this layer a block forward reads, in forward order
-    /// (the attention's, then the MLP's, then every other parameter), and
-    /// the stored weights a stack or a tiled copy stands in for.
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        let attention = selfAttn.residencyWeights()
-        let feedForward = mlp.residencyWeights()
-        let replaced = attention.replaced + feedForward.replaced
-        let skipped = Set(replaced.map { ObjectIdentifier($0) })
-        let rest = parameters().flattened().map(\.1).filter {
-            !skipped.contains(ObjectIdentifier($0))
-        }
-        return (attention.read + feedForward.read + rest, replaced)
     }
 
     func callAsFunction(
@@ -2795,7 +2737,7 @@ enum DFlash2GreedyWalk {
     static let narrowOperands: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_NARROW"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static func selectNarrow(
@@ -2947,140 +2889,6 @@ enum DFlash2GreedyWalk {
             """)
 }
 
-// MARK: - Residency prefetch
-
-/// One command buffer that binds a group of arrays: a single thread reads the
-/// first element of each input. It exists for the buffers it binds, not for
-/// its output (see `DFlash2ResidencyPrefetch`).
-private enum DFlash2ResidencyTouch {
-    /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
-    static let maximumInputs = 24
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-
-    private static func kernel(inputs count: Int) -> MLXFast.MLXFastKernel {
-        lock.withLock {
-            if let kernel = kernels[count] { return kernel }
-            let names = (0 ..< count).map { "w\($0)" }
-            let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }
-                .joined(separator: "\n")
-            let kernel = MLXFast.metalKernel(
-                name: "dflash2_residency_touch_\(count)", inputNames: names,
-                outputNames: ["out"],
-                source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
-                ensureRowContiguous: false)
-            kernels[count] = kernel
-            return kernel
-        }
-    }
-
-    /// One touch per `maximumInputs` arrays of `arrays`.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
-        stride(from: 0, to: arrays.count, by: maximumInputs).map { start in
-            let chunk = Array(arrays[start ..< min(start + maximumInputs, arrays.count)])
-            return kernel(inputs: chunk.count)(
-                chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
-                outputShapes: [[1]], outputDTypes: [.float32])[0]
-        }
-    }
-}
-
-/// Makes the drafter's weights GPU-resident again inside the prompt forward
-/// of a request that will draft with it, behind that forward's own work.
-///
-/// Nothing reads the drafter between one request's last round and the next
-/// request's first: the target's prompt forwards and the benchmark's idle
-/// gates leave its weights unwired, and the first block forward of the next
-/// decode pays to make them resident again. Command-buffer timestamps show
-/// it: the round's buffers are committed within half a millisecond, but the
-/// GPU idles before each one in proportion to the drafter bytes it binds,
-/// about 0.1 ms per 10 MB, ~37 ms over the ~3.8 GB the forward reads. Later
-/// rounds show no such gaps.
-///
-/// Making a buffer resident is done as its command buffer is submitted, while
-/// the GPU keeps running the buffers queued ahead of it: a standalone probe
-/// (eight 512 MB arrays unwired by a 30 s idle, each bound by a one-thread
-/// kernel queued behind a 9.4 ms matmul chain) ran in 89.2 ms against 89.4 ms
-/// for the chains alone, while the same binds with nothing queued ahead cost
-/// ~5.5 ms each. A decode's prompt forward keeps up to MLX's ten buffers
-/// (~20-45 ms of prompt layers) queued ahead of the host. So an engine build
-/// that drafts arms this prefetch, and its prompt forward binds the drafter's
-/// arrays (`DFlash2DraftModel.residencyArrays`, in forward order) in four
-/// groups of about equal bytes, each right after the forward's early
-/// submission at layer 8, 16, 32 and 48 (`Qwen35TrunkSubmission.promptFused`).
-/// Any group still due at the end of the forward is bound there.
-///
-/// Each group costs one single-thread kernel per 24 arrays on the GPU. No
-/// value of either model is read into any result, and nothing about the
-/// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
-public enum DFlash2ResidencyPrefetch {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// The prompt layers after which one group each is due.
-    static let dueAfterLayers = [8, 16, 32, 48]
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var groups: [[MLXArray]] = []
-    nonisolated(unsafe) private static var nextGroup = 0
-
-    /// Arms the prefetch for the next prompt forward: called when an engine
-    /// that drafts with `drafter` is built.
-    static func arm(_ drafter: DFlash2DraftModel) {
-        guard enabled else { return }
-        let arrays = drafter.residencyArrays()
-        let total = arrays.reduce(0) { $0 + $1.nbytes }
-        let share = max(1, total / dueAfterLayers.count)
-        var built: [[MLXArray]] = []
-        var group: [MLXArray] = []
-        var bytes = 0
-        for array in arrays {
-            group.append(array)
-            bytes += array.nbytes
-            if bytes >= share * (built.count + 1), built.count < dueAfterLayers.count - 1 {
-                built.append(group)
-                group = []
-            }
-        }
-        if !group.isEmpty { built.append(group) }
-        lock.withLock {
-            groups = built
-            nextGroup = 0
-        }
-    }
-
-    /// Submits every group due once the prompt forward has submitted its
-    /// first `completedLayers` layers. A no-op unless armed.
-    static func submitDue(completedLayers: Int) {
-        let due: [[MLXArray]] = lock.withLock {
-            var due: [[MLXArray]] = []
-            while nextGroup < groups.count,
-                nextGroup >= dueAfterLayers.count
-                    || dueAfterLayers[nextGroup] <= completedLayers
-            {
-                due.append(groups[nextGroup])
-                nextGroup += 1
-            }
-            if nextGroup >= groups.count {
-                groups = []
-                nextGroup = 0
-            }
-            return due
-        }
-        guard !due.isEmpty else { return }
-        asyncEval(due.flatMap { DFlash2ResidencyTouch.touch($0) })
-    }
-
-    /// Submits whatever is still due: the end of a prompt forward.
-    static func submitRemaining() {
-        submitDue(completedLayers: .max)
-    }
-}
-
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
@@ -3170,33 +2978,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
         DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
-    }
-
-    /// Every array a block forward reads that this drafter owns, in forward
-    /// order: each layer's (`DFlash2DecoderLayer.residencyWeights`), then
-    /// every other parameter (`fc`, the norms, the candidate selector's
-    /// projection and codebooks). A stored weight that a stack or a tiled
-    /// copy stands in for is left out; the block forward does not read it.
-    /// The target's embedding and head are the target's, read by its own
-    /// forwards.
-    func residencyArrays() -> [MLXArray] {
-        var arrays: [MLXArray] = []
-        var seen = Set<ObjectIdentifier>()
-        var replaced = Set<ObjectIdentifier>()
-        for layer in layers {
-            let weights = layer.residencyWeights()
-            for array in weights.replaced { replaced.insert(ObjectIdentifier(array)) }
-            for array in weights.read where seen.insert(ObjectIdentifier(array)).inserted {
-                arrays.append(array)
-            }
-        }
-        for (_, array) in parameters().flattened()
-        where !replaced.contains(ObjectIdentifier(array))
-            && seen.insert(ObjectIdentifier(array)).inserted
-        {
-            arrays.append(array)
-        }
-        return arrays
     }
 
     // MARK: The cache
@@ -3642,7 +3423,7 @@ enum DFlash2Concat {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_ONE_LAUNCH_CONCAT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernelLock = NSLock()
@@ -3794,7 +3575,7 @@ enum DFlash2StridedRMSNorm {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_STRIDED_NORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -3974,7 +3755,7 @@ enum DFlash2QKPrework {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_QK_PREWORK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -4162,7 +3943,7 @@ enum DFlash2SwiGLU {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SWIGLU"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
