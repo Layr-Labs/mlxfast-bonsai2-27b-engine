@@ -126,6 +126,45 @@ This command checks your toolchain, builds the two Swift binaries, builds
 This command converts the downloaded checkpoint into the `weights/` tree that
 the engine loads.
 
+### Local OpenAI-compatible API
+
+After `./setup.sh` and the transform, build and run the API from the repository
+root on an Apple Silicon Mac. Setup stages `mlx.metallib` beside the release
+binary; the Metal runtime needs that file there.
+
+```bash
+swift build -c release --force-resolved-versions --product mlxfast-server
+.build/release/mlxfast-server
+```
+
+The server loads `weights/` and listens on `127.0.0.1:8080` by default. It
+uses the vendored `MLXLMServer` model loader and text-generation path, not the
+benchmarker's `bench-worker` or its speculative decoder. It is for local
+inference, not for scoring. The transformed checkpoint includes the tokenizer
+and chat template. A missing or untransformed `weights/` directory is an error;
+run the transform above first. Keep the server on loopback: it has no API-key
+authentication. Use `--host` to bind another interface only behind your own
+access controls.
+
+```bash
+curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"weights","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+```
+
+The server also supports streaming chat completions (`"stream":true`) as
+server-sent events. Query `/v1/models` for the model ID when using a different
+path. `--model /absolute/path/to/weights`, `--port 8081`, and the corresponding
+`MLX_SERVER_MODEL` / `MLX_SERVER_PORT` environment variables override the
+defaults. The model must be a local directory; this entry point never fetches
+a Hub model. Use the ID reported by `/v1/models` in requests: the vendored
+server does not reject a mismatched `model` field and echoes it in responses.
+`--list-routes` prints every supported endpoint without loading a
+checkpoint. Run the binary from the repository root or pass an absolute model
+path. Concurrent requests are serialized by the container engine; this is not
+the ranked runner's continuous-batching path.
+
 ```bash
 ./benchmark.sh --local-iterate
 ```

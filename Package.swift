@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "mlxfast-swift", targets: ["MLXFastCLI"]),
+        .executable(name: "mlxfast-server", targets: ["MLXFastServer"]),
         .library(name: "MLXFastCore", targets: ["MLXFastCore"]),
         .library(name: "MLXFastTransform", targets: ["MLXFastTransform"]),
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
@@ -99,6 +100,12 @@ let package = Package(
                 "MLXFastTransform",
                 "MLXFastHarness",
                 .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
+        .executableTarget(
+            name: "MLXFastServer",
+            dependencies: [
+                .product(name: "MLXLMServer", package: "mlx-swift-lm"),
             ]
         ),
         .testTarget(
