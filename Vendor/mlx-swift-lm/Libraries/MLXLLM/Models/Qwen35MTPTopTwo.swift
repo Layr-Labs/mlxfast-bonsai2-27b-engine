@@ -849,13 +849,39 @@ enum Qwen35TensorPackedMatmul {
           simdgroup_barrier(mem_flags::mem_threadgroup);
           if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
         }
-        // The reduction reuses the staging buffers (free after the K loop):
-        // 16 KB of threadgroup memory in all, two threadgroups per core.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float (*red)[CAP * 32] = (threadgroup float (*)[CAP * 32])&bs[0][0][0];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
+        // RED: simdgroups 1..3 write their partial into their own staging
+        // tile, which the last op has finished reading, and one barrier then
+        // lets simdgroup 0 add them. That write overlaps the other
+        // simdgroups still in the last group's op or epilogue. RED = 0 keeps
+        // the recorded reuse of bs[0] (a barrier before the write, then
+        // another). RED4 packs each lane's four outputs as one float4.
+        // Same partials, added simdgroup 1 then 2 then 3.
+        constexpr bool redOwn = (RED != 0);
+        constexpr bool redWide = redOwn && (RED4 != 0);
+        threadgroup float* red = (threadgroup float*)&bs[0][0][0];
+        auto red_slot = [&](int owner) -> threadgroup float* {
+          return (threadgroup float*)bs[owner][0];
+        };
+        if constexpr (redOwn) {
+          if (sg > 0) {
+            threadgroup float* slot = red_slot(int(sg));
+            if constexpr (redWide) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i += 4) {
+                *(threadgroup float4*)(slot + int(lane) * CAP + i) =
+                    float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+              }
+            } else {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { slot[i * 32 + int(lane)] = acc[i]; }
+            }
+          }
+        } else {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg > 0) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[(int(sg) - 1) * (CAP * 32) + i * 32 + int(lane)] = acc[i]; }
+          }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
@@ -874,10 +900,21 @@ enum Qwen35TensorPackedMatmul {
             float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
             for (int q = 0; q < 4 - 1; q++) {
-              v0 += red[q][i * 32 + lane];
-              v1 += red[q][(i + 1) * 32 + lane];
-              v2 += red[q][(i + 2) * 32 + lane];
-              v3 += red[q][(i + 3) * 32 + lane];
+              if constexpr (redWide) {
+                const float4 rv = *(const threadgroup float4*)(red_slot(q + 1) + int(lane) * CAP + i);
+                v0 += rv.x; v1 += rv.y; v2 += rv.z; v3 += rv.w;
+              } else if constexpr (redOwn) {
+                threadgroup float* rq = red_slot(q + 1);
+                v0 += rq[i * 32 + int(lane)];
+                v1 += rq[(i + 1) * 32 + int(lane)];
+                v2 += rq[(i + 2) * 32 + int(lane)];
+                v3 += rq[(i + 3) * 32 + int(lane)];
+              } else {
+                v0 += red[q * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[q * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[q * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[q * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
             }
             const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
             if constexpr (sizeof(OutT) == sizeof(float)) {
@@ -1076,14 +1113,41 @@ enum Qwen35TensorPackedMatmul {
             if (g + j < g1) { body(g + j, j); }
           }
         }
-        // the reduction reuses the staging buffers, in simdgroup order
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // RED / RED4: see `sourceNarrowInt8`. Own tile is bs[sg], large
+        // enough when KH >= 64 (every body of this kernel).
+        constexpr bool redOwn = (RED != 0) && ((32 * KH / 4) >= (CAP * 32));
+        constexpr bool redWide = redOwn && (RED4 != 0);
         threadgroup float* red = (threadgroup float*)&bs[0][0][0];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
+        auto red_slot = [&](int owner) -> threadgroup float* {
+          return (threadgroup float*)&bs[owner][0][0];
+        };
+        if constexpr (redOwn) {
+          if (sg > 0) {
+            threadgroup float* slot = red_slot(int(sg));
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+            for (int h = 0; h < NH; h++) {
+              if constexpr (redWide) {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i += 4) {
+                  *(threadgroup float4*)(slot + h * (CAP * 32) + int(lane) * CAP + i) =
+                      float4(acc[h][i], acc[h][i + 1], acc[h][i + 2], acc[h][i + 3]);
+                }
+              } else {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) {
+                  slot[h * (CAP * 32) + i * 32 + int(lane)] = acc[h][i];
+                }
+              }
+            }
+          }
+        } else {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg > 0) {
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+            }
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1106,10 +1170,22 @@ enum Qwen35TensorPackedMatmul {
               float v3 = acc[h][i + 3];
               #pragma clang loop unroll(full)
               for (int q = 0; q < 4 - 1; q++) {
-                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
-                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
-                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
-                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                if constexpr (redWide) {
+                  const float4 rv = *(const threadgroup float4*)(
+                      red_slot(q + 1) + h * (CAP * 32) + int(lane) * CAP + i);
+                  v0 += rv.x; v1 += rv.y; v2 += rv.z; v3 += rv.w;
+                } else if constexpr (redOwn) {
+                  threadgroup float* rq = red_slot(q + 1);
+                  v0 += rq[h * (CAP * 32) + i * 32 + int(lane)];
+                  v1 += rq[h * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                  v2 += rq[h * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                  v3 += rq[h * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                } else {
+                  v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
+                  v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                  v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                  v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                }
               }
               const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
               if constexpr (sizeof(OutT) == sizeof(float)) {
@@ -1332,14 +1408,41 @@ enum Qwen35TensorPackedMatmul {
             if (g + j < g1) { body(g + j, j); }
           }
         }
-        // the reduction reuses the staging buffers, in simdgroup order
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // RED / RED4: see `sourceNarrowInt8`. Own tile holds the partial
+        // only when KH >= 64; KH = 32 keeps the recorded reduction.
+        constexpr bool redOwn = (RED != 0) && ((32 * KH / 4) >= (CAP * 32));
+        constexpr bool redWide = redOwn && (RED4 != 0);
         threadgroup float* red = (threadgroup float*)bs;
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int h = 0; h < NH; h++) {
+        auto red_slot = [&](int owner) -> threadgroup float* {
+          return (threadgroup float*)(bs + owner * SWS);
+        };
+        if constexpr (redOwn) {
+          if (sg > 0) {
+            threadgroup float* slot = red_slot(int(sg));
             #pragma clang loop unroll(full)
-            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+            for (int h = 0; h < NH; h++) {
+              if constexpr (redWide) {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i += 4) {
+                  *(threadgroup float4*)(slot + h * (CAP * 32) + int(lane) * CAP + i) =
+                      float4(acc[h][i], acc[h][i + 1], acc[h][i + 2], acc[h][i + 3]);
+                }
+              } else {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) {
+                  slot[h * (CAP * 32) + i * 32 + int(lane)] = acc[h][i];
+                }
+              }
+            }
+          }
+        } else {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg > 0) {
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * NH + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+            }
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1356,10 +1459,22 @@ enum Qwen35TensorPackedMatmul {
               float v3 = acc[h][i + 3];
               #pragma clang loop unroll(full)
               for (int q = 0; q < 4 - 1; q++) {
-                v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
-                v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
-                v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
-                v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                if constexpr (redWide) {
+                  const float4 rv = *(const threadgroup float4*)(
+                      red_slot(q + 1) + h * (CAP * 32) + int(lane) * CAP + i);
+                  v0 += rv.x; v1 += rv.y; v2 += rv.z; v3 += rv.w;
+                } else if constexpr (redOwn) {
+                  threadgroup float* rq = red_slot(q + 1);
+                  v0 += rq[h * (CAP * 32) + i * 32 + int(lane)];
+                  v1 += rq[h * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                  v2 += rq[h * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                  v3 += rq[h * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                } else {
+                  v0 += red[(q * NH + h) * (CAP * 32) + i * 32 + int(lane)];
+                  v1 += red[(q * NH + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                  v2 += red[(q * NH + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                  v3 += red[(q * NH + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                }
               }
               const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
               if constexpr (sizeof(OutT) == sizeof(float)) {
@@ -1527,12 +1642,34 @@ enum Qwen35TensorPackedMatmul {
             if (t + u < npair) { step(t + u, u); }
           }
         }
-        // the owners' partials, reduced as in `sourceNarrowInt8` (the staging is free)
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // RED / RED4: see `sourceNarrowInt8`. Owner qd writes its own tile
+        // (sg == qd) once KH >= 64; KH = 32 keeps the recorded reduction.
+        constexpr bool redOwn = (RED != 0) && ((32 * KH / 4) >= (CAP * 32));
+        constexpr bool redWide = redOwn && (RED4 != 0);
         threadgroup float* red = (threadgroup float*)bs;
-        if (role == 0 && qd > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[(qd - 1) * (CAP * 32) + i * 32 + int(lane)] = acc[i]; }
+        auto red_slot = [&](int owner) -> threadgroup float* {
+          return (threadgroup float*)(bs + owner * SWS);
+        };
+        if constexpr (redOwn) {
+          if (role == 0 && qd > 0) {
+            threadgroup float* slot = red_slot(qd);
+            if constexpr (redWide) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i += 4) {
+                *(threadgroup float4*)(slot + int(lane) * CAP + i) =
+                    float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+              }
+            } else {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { slot[i * 32 + int(lane)] = acc[i]; }
+            }
+          }
+        } else {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (role == 0 && qd > 0) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[(qd - 1) * (CAP * 32) + i * 32 + int(lane)] = acc[i]; }
+          }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
@@ -1546,10 +1683,21 @@ enum Qwen35TensorPackedMatmul {
             float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
             for (int q = 0; q < 4 - 1; q++) {
-              v0 += red[q * (CAP * 32) + i * 32 + int(lane)];
-              v1 += red[q * (CAP * 32) + (i + 1) * 32 + int(lane)];
-              v2 += red[q * (CAP * 32) + (i + 2) * 32 + int(lane)];
-              v3 += red[q * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              if constexpr (redWide) {
+                const float4 rv = *(const threadgroup float4*)(red_slot(q + 1) + int(lane) * CAP + i);
+                v0 += rv.x; v1 += rv.y; v2 += rv.z; v3 += rv.w;
+              } else if constexpr (redOwn) {
+                threadgroup float* rq = red_slot(q + 1);
+                v0 += rq[i * 32 + int(lane)];
+                v1 += rq[(i + 1) * 32 + int(lane)];
+                v2 += rq[(i + 2) * 32 + int(lane)];
+                v3 += rq[(i + 3) * 32 + int(lane)];
+              } else {
+                v0 += red[q * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[q * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[q * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[q * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
             }
             const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
             if constexpr (sizeof(OutT) == sizeof(float)) {
@@ -2072,6 +2220,47 @@ enum Qwen35TensorPackedMatmul {
     /// these (and `original`), so the pick over them is the record's pick.
     static let narrowRecordVariants: Set<NarrowVariant> = [.v0, .pd1, .pd2, .tn64]
 
+    /// The verify int8 reduction writes each simdgroup's partial into its own
+    /// staging tile before the single cross-simdgroup barrier, so the write
+    /// overlaps the other simdgroups' last K group. `DARKBLOOM_QWEN35_VERIFY_RED=0`
+    /// keeps the recorded two-barrier reuse of the first tile. `original` stays
+    /// on that recorded reduction, and the load-time self-test compares every
+    /// other body against it.
+    static let verifyReductionOverlap: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_RED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The same early partial for the zoo and pair bodies.
+    /// `DARKBLOOM_QWEN35_VERIFY_RED_ZOO=0` keeps their recorded reduction.
+    static let verifyZooReductionOverlap: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_RED_ZOO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Each lane's four partials move as one float4. The add order is still
+    /// element 0, then 1, then 2, then 3, and simdgroup 1, then 2, then 3.
+    /// `DARKBLOOM_QWEN35_VERIFY_RED4=0` keeps scalar partial stores.
+    static let verifyReductionWide: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_RED4"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// RED / RED4 for this launch. `original` stays on the recorded reduction
+    /// so the self-test has an unchanged reference. Zoo and pair take the
+    /// zoo switch; the record bodies and their fused head take the other.
+    static func reductionTemplate(_ kernel: NarrowKernel) -> [(String, any KernelTemplateArg)] {
+        let zoo = kernel.variant.family != nil
+        let enabled = kernel != .original && (zoo ? verifyZooReductionOverlap : verifyReductionOverlap)
+        return [
+            ("RED", enabled ? 1 : 0),
+            ("RED4", enabled && verifyReductionWide ? 1 : 0),
+        ]
+    }
+
     /// Sets `narrowNeedsProof` / `narrowNeedsF32` for these choices.
     static func setNarrowOperandNeeds(_ choices: [NarrowChoice]) {
         let all = choices.flatMap { [$0.0] + Array($0.1.values) }
@@ -2361,11 +2550,11 @@ enum Qwen35TensorPackedMatmul {
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", outputDType), ("NEG", kernel.form == .base ? 0 : 1),
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
-        ]
+        ] + reductionTemplate(kernel)
         let v = kernel.variant
         // The zoo bodies read the tiled copy only (`original` otherwise).
         if let family = v.family, tiled {
-            let zooTemplate = Array(template.prefix(3))
+            let zooTemplate = Array(template.prefix(3)) + reductionTemplate(kernel)
             if family == "pair" {
                 return kernelNarrowInt8Pair(
                     inputs, template: zooTemplate + [("PD", v.pd), ("KH", v.kh)],
@@ -3468,7 +3657,7 @@ extension Qwen35TensorPackedMatmul {
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", DType.float32), ("NEG", kernel.form == .base ? 0 : 1),
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
-        ]
+        ] + reductionTemplate(kernel)
         let v = kernel.variant
         // The zoo bodies have no fused form: their head launch stays stock.
         guard v.family == nil else { return nil }
