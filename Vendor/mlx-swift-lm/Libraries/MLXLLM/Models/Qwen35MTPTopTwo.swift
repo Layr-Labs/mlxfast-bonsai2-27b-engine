@@ -3552,7 +3552,9 @@ enum Qwen35TensorPackedMatmul {
     /// `..._TZOO_FORCE=<body>` (e.g. `k32pd2`, `p4k16pd1`) installs that body
     /// on every shape (a zoo 3a body: but the head), without a trial, once it
     /// passes; `..._TZOO_FORCE=down=x4k32pd2,o=pk32pd2,...` installs one body
-    /// per named shape over the record's pick (validation).
+    /// per named shape over the record's pick. The default map selects
+    /// k32pd2 for attn/qkvz/gateup/o/down after those exact tests, leaving
+    /// the head unchanged. `..._TZOO_FORCE=auto` restores ordinary tuning.
     static let narrowZoo: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -3614,6 +3616,11 @@ enum Qwen35TensorPackedMatmul {
         func knob(_ name: String) -> String? {
             environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
+        // Use the existing parser and exact per-device proofs for this
+        // checkpoint-shape map. The head keeps the record's selected route.
+        // An explicit body/map overrides it; "auto" restores normal tuning.
+        let zooForce = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE")
+            ?? "attn=k32pd2,qkvz=k32pd2,gateup=k32pd2,o=k32pd2,down=k32pd2"
         let forms: [NarrowEpilogue]
         switch knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_EPILOGUE") {
         case "off", "0", "false", "no", "base": return ((.original, [:]), [])
@@ -3764,8 +3771,8 @@ enum Qwen35TensorPackedMatmul {
                     }
                     return same ?? false
                 }
-                if narrowZoo, let name = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE"),
-                    let variant = NarrowVariant(name: name), variant.family != nil,
+                if narrowZoo,
+                    let variant = NarrowVariant(name: zooForce), variant.family != nil,
                     variant.xtg == nil || narrowXTGVariants.contains(variant)
                 {
                     let forced = NarrowKernel(variant: variant, form: zooForm)
@@ -3782,7 +3789,8 @@ enum Qwen35TensorPackedMatmul {
                 // A per-shape map (`attn=`, `qkvz=`, `gateup=`, `o=`, `down=`,
                 // `head=` a zoo body each, comma-separated) over the record's
                 // pick; each body passes FP16, and FP32 on a wide shape.
-                if narrowZoo, let value = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE"), value.contains("=") {
+                if narrowZoo, zooForce.contains("=") {
+                    let value = zooForce
                     let names = NarrowInSituTrial.perShapeNames.map { $0.replacingOccurrences(of: "|", with: "") } + ["head"]
                     let keys = NarrowInSituTrial.perShapeKeys + [NarrowInSituTrial.headKey]
                     var map = byShape, exact16 = Set<NarrowKernel>(), exact32 = Set<NarrowKernel>()
