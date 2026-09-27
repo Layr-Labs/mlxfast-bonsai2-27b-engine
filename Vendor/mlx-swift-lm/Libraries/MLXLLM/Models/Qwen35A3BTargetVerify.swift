@@ -1701,3 +1701,304 @@ extension Qwen35GDNPrework {
         case message(String)
     }
 }
+
+/// `bonsai_signed_hadamard_1024_q8` (the quantizing rotation, one 64-thread
+/// threadgroup per 1024-block) at verify width with 128 or 256 threads per
+/// block. Thread t reads the stock operand of block elements EPT t ... EPT t +
+/// EPT - 1 (EPT = 1024 / threads, the same `inp` element, signs and head remap
+/// per element); the transform applies `hadamard_n<float, 1024, 16, 4>`'s
+/// butterfly levels in its order (strides below EPT in registers, the next five
+/// across the simdgroup by `simd_shuffle_xor`, each pair still `a + b` /
+/// `a - b` with `a` the lower element, the rest as one radix pass through
+/// threadgroup memory); each 128-group is quantized by one simdgroup with the
+/// stock expressions and lane layout (lane l holds elements 4l .. 4l + 3). So
+/// every code, scale and scaled sum is the stock kernel's, bit for bit.
+///
+/// Each template form (width, presigned, head remap, code order) is compared
+/// bit for bit with the stock kernel on synthetic rows (an all-zero group,
+/// outliers, sign flips) before its first use; a mismatch or MLX error keeps
+/// the stock kernel for that form. `BONSAI_ROTATION_Q8_BLOCKS=0` keeps it
+/// everywhere.
+enum Qwen35RotationQ8Blocks {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_ROTATION_Q8_BLOCKS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let header = """
+        // Thread-local Hadamard butterfly for 2^R values, as in
+        // mlx/backend/metal/kernels/hadamard.h (radix_func).
+        template <short R>
+        inline void bonsai_hadamard_radix(thread float* x) {
+          constexpr short logR = __builtin_ctz(R);
+          short h = 1;
+          #pragma clang loop unroll(full)
+          for (short s = 0; s < logR; s++) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < R / 2; i++) {
+              short k = i & (h - 1);
+              short j = ((i - k) << 1) + k;
+              float a = x[j];
+              float b = x[j + h];
+              x[j] = a + b;
+              x[j + h] = a - b;
+            }
+            h <<= 1;
+          }
+        }
+
+        """
+
+    // grid (TPB * rows * BPR, 1, 1), threadgroup (TPB, 1, 1); the stock
+    // kernel's template plus TPB (128 or 256).
+    private static let source = """
+        constexpr short N = 1024;
+        constexpr uint EPT = uint(N) / uint(TPB);
+        static_assert(TPB == 128 || TPB == 256, "threads per block");
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint row = blk / uint(BPR);
+        const uint bcol = (blk % uint(BPR)) * uint(N);
+        const size_t rowbase = size_t(row) * size_t(W);
+        threadgroup float buf[N];
+        float x[EPT];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < EPT; r++) {
+          const uint col = bcol + EPT * tid + r;
+          uint src = col;
+          if (GR > 1) {
+            const uint d = col % uint(GD);
+            const uint hr = col / uint(GD);
+            const uint h = hr / uint(GR);
+            const uint rr = hr % uint(GR);
+            src = (rr * uint(GKH) + h) * uint(GD) + d;
+          }
+          float v = float(inp[rowbase + src]);
+          if (!PRESIGNED) {
+            v = v * signs[col];
+          }
+          x[r] = v;
+        }
+        bonsai_hadamard_radix<short(EPT)>(x);
+        #pragma clang loop unroll(full)
+        for (ushort s = 1; s < 32; s <<= 1) {
+          const bool upper = (lane & s) != 0;
+          #pragma clang loop unroll(full)
+          for (uint r = 0; r < EPT; r++) {
+            const float o = simd_shuffle_xor(x[r], s);
+            x[r] = upper ? (o - x[r]) : (x[r] + o);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < EPT; r++) {
+          buf[EPT * tid + r] = x[r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (TPB == 256) {
+          // strides 128, 256, 512: radix 8 over elements e + 128 k
+          if (tid < 128) {
+            float y[8];
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 8; k++) {
+              y[k] = buf[tid + 128 * k];
+            }
+            bonsai_hadamard_radix<8>(y);
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 8; k++) {
+              buf[tid + 128 * k] = y[k];
+            }
+          }
+        } else {
+          // strides 256, 512: radix 4 over elements e + 256 k
+          #pragma clang loop unroll(full)
+          for (uint u = 0; u < 2; u++) {
+            const uint e = tid + 128 * u;
+            float y[4];
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 4; k++) {
+              y[k] = buf[e + 256 * k];
+            }
+            bonsai_hadamard_radix<4>(y);
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 4; k++) {
+              buf[e + 256 * k] = y[k];
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint gi = sg; gi < 8; gi += uint(TPB) / 32) {
+          const short index = short(gi * 128 + 4 * lane);
+          float v[4];
+          float amax = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            v[r] = buf[index + r] * 0.03125f;
+            amax = max(amax, fabs(v[r]));
+          }
+          amax = simd_max(amax);
+          const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+          const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
+          float part = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const float q = rint(v[r] * iqs);
+            part += q;
+            const uint kk = uint(index + r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+          }
+          part = simd_sum(part);
+          if (lane == 0) {
+            const size_t g = size_t(bcol / 128) + size_t(gi);
+            const uint ml = row & 63u;
+            const size_t qidx = MPERM
+              ? (size_t(row >> 6) * size_t(W / 128) * 64 + g * 64
+                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (size_t(row) * size_t(W / 128) + g);
+            qscale[qidx] = qs;
+            qsum[qidx] = qs * part;
+          }
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_signed_hadamard_1024_q8_blocks",
+        inputNames: ["inp", "signs"],
+        outputNames: ["out", "qscale", "qsum"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// Threads per block: 256 while the launch has at most 128 blocks (a
+    /// 16-row window of the 5120/6144-wide operands), else 128.
+    static func threads(blocks: Int) -> Int { blocks <= 128 ? 256 : 128 }
+
+    private struct Form: Hashable {
+        let width: Int, presigned: Bool, gr: Int, gkh: Int, gd: Int
+        let perm: Bool, mperm: Bool, signed: Bool, dtype: String, tpb: Int
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Form: Bool] = [:]
+
+    /// The stock kernel's outputs for `x` from this kernel, or nil (off, not
+    /// a verify-width launch, or a form that failed its self-test). `stock`
+    /// runs the stock kernel with the same template (for the self-test).
+    static func launch(
+        _ x: MLXArray, _ signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        rows: Int, width: Int, groupShape: [Int], codesDType: DType,
+        stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+    ) -> SignedBlockHadamard.Int8Activation? {
+        guard enabled, rows > 0, rows < BonsaiPromptWidth.minimumRows, width % 1024 == 0
+        else { return nil }
+        func value(_ name: String) -> Int? {
+            guard let arg = template.first(where: { $0.0 == name })?.1 else { return nil }
+            if let v = arg as? Int { return v }
+            if let v = arg as? Bool { return v ? 1 : 0 }
+            return nil
+        }
+        guard let presigned = value("PRESIGNED"), let gr = value("GR"), let gkh = value("GKH"),
+            let gd = value("GD"), let perm = value("PERM"), let mperm = value("MPERM"),
+            let signed = value("SIGNED"), value("QSIM") == 0
+        else { return nil }
+        let blocks = rows * (width / 1024)
+        let tpb = threads(blocks: blocks)
+        let form = Form(
+            width: width, presigned: presigned != 0, gr: gr, gkh: gkh, gd: gd, perm: perm != 0,
+            mperm: mperm != 0, signed: signed != 0, dtype: "\(x.dtype)", tpb: tpb)
+        let tmpl = template + [("TPB", tpb)]
+        guard verified(form, x: x, signs: signs, template: template, tmpl: tmpl, rows: rows,
+            width: width, groupShape: groupShape, codesDType: codesDType, stock: stock)
+        else { return nil }
+        let outs = run(x, signs, tmpl: tmpl, rows: rows, width: width, tpb: tpb,
+            groupShape: groupShape, codesDType: codesDType)
+        return SignedBlockHadamard.Int8Activation(codes: outs[0], scales: outs[1], scaledSums: outs[2])
+    }
+
+    private static func run(
+        _ x: MLXArray, _ signs: MLXArray, tmpl: [(String, any KernelTemplateArg)], rows: Int,
+        width: Int, tpb: Int, groupShape: [Int], codesDType: DType
+    ) -> [MLXArray] {
+        kernel(
+            [x, signs], template: tmpl,
+            grid: (tpb * rows * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
+            outputShapes: [x.shape, groupShape, groupShape],
+            outputDTypes: [codesDType, .float32, .float32])
+    }
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    /// Once per form: synthetic operands of `x`'s shape and dtype (per-row
+    /// scales, outlier channels, an all-zero 128-group, a row of opposite
+    /// signs), both kernels, every output compared as unsigned integers.
+    private static func verified(
+        _ form: Form, x: MLXArray, signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        tmpl: [(String, any KernelTemplateArg)], rows: Int, width: Int, groupShape: [Int],
+        codesDType: DType, stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict = verdicts[form] { return verdict }
+        var values = 0
+        var mismatches = 0
+        var detail = ""
+        do {
+            try withError { error in
+                for seed in [51, 52] {
+                    let key = MLXRandom.key(UInt64(seed))
+                    let scale = MLXRandom.uniform(
+                        Float(0.01) ..< Float(40), [rows, 1], key: MLXRandom.split(key: key, into: 3)[0])
+                    let outlier = MLXArray(
+                        (0 ..< width).map { $0 % 331 == 17 ? Float(90) : Float(1) })
+                    var v = MLXRandom.normal(
+                        [rows, width], key: MLXRandom.split(key: key, into: 3)[1]) * scale * outlier
+                    // an all-zero group in row 0 (amax 0) and a negated copy of row 0 in the last row
+                    let cols = MLXArray(0 ..< width).reshaped(1, width)
+                    let zeroGroup = (cols .>= MLXArray(Int32(256))) .&& (cols .< MLXArray(Int32(384)))
+                    let rowIds = MLXArray(0 ..< rows).reshaped(rows, 1)
+                    v = which(zeroGroup .&& (rowIds .== MLXArray(Int32(0))), MLXArray(Float(0)), v)
+                    if rows > 1 {
+                        v = which(rowIds .== MLXArray(Int32(rows - 1)), -v[0 ..< 1], v)
+                    }
+                    let operand = v.asType(x.dtype).reshaped(x.shape)
+                    let a = stock([operand, signs], template)
+                    let b = run(operand, signs, tmpl: tmpl, rows: rows, width: width,
+                        tpb: form.tpb, groupShape: groupShape, codesDType: codesDType)
+                    guard a.count == 3, b.count == 3 else {
+                        throw SelfTestFailure.message("output count")
+                    }
+                    var differ: [MLXArray] = []
+                    for (p, q) in zip(a, b) {
+                        guard p.shape == q.shape, p.dtype == q.dtype else {
+                            throw SelfTestFailure.message("shape or dtype mismatch")
+                        }
+                        let bits: DType = p.dtype == .float32 ? .uint32 : p.dtype
+                        differ.append((p.view(dtype: bits) .!= q.view(dtype: bits)).asType(.int32).sum())
+                        values += p.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            detail = " (\(error))"
+            mismatches = max(mismatches, 1)
+        }
+        let passed = mismatches == 0
+        verdicts[form] = passed
+        FileHandle.standardError.write(
+            ("bonsai rotation q8 per block (\(rows)x\(width), \(form.tpb) threads, presigned "
+                + "\(form.presigned ? 1 : 0), heads \(form.gr)): self-test "
+                + (passed ? "passed" : "FAILED") + ": \(values) values, \(mismatches) mismatches"
+                + detail + (passed ? "\n" : "; stock kernel kept\n")).data(using: .utf8)!)
+        return passed
+    }
+}
