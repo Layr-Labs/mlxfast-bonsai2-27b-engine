@@ -443,6 +443,7 @@ calibration_error="$(
   MLXFAST_CAL_REF_COMMIT="${REFERENCE_COMMIT}" \
   MLXFAST_CAL_REF_DATE="${reference_commit_date}" \
   MLXFAST_CAL_BOX="${RUNNER_NAME:-}" \
+  MLXFAST_CAL_LIVE="$(jq -r '(.live_goldens // [])[]' "${CONTRACT}")" \
   python3 - <<'PYEOF'
 import datetime
 import json
@@ -467,11 +468,29 @@ except (OSError, json.JSONDecodeError) as exc:
 if not isinstance(cal, dict):
     refuse(f"the baseline calibration file is not a JSON object: {path}")
 
-if cal.get("version") != 1:
+# Version 1 holds one prompt at the top level. Version 2 holds one entry for
+# each prompt in `prompts`.
+if cal.get("version") == 1:
+    entries = [cal]
+elif cal.get("version") == 2:
+    entries = cal.get("prompts")
+    if not isinstance(entries, list) or not entries or not all(
+        isinstance(entry, dict) for entry in entries
+    ):
+        refuse("baseline calibration prompts is not a list of one entry for each prompt")
+else:
     refuse(
-        f"baseline calibration version is {cal.get('version')!r}, expected 1; "
+        f"baseline calibration version is {cal.get('version')!r}, expected 1 or 2; "
         "this box's file was written by a different calibrator"
     )
+
+held = [entry.get("prompt") for entry in entries]
+for live in os.environ["MLXFAST_CAL_LIVE"].split():
+    if live not in held:
+        refuse(
+            f"baseline calibration has no entry for live prompt {live!r}; it holds "
+            f"{held!r}, so the control leg on {live!r} would have no health band"
+        )
 
 want_track = os.environ["MLXFAST_CAL_TRACK_ID"]
 if cal.get("track_id") != want_track:
@@ -507,27 +526,28 @@ numeric_fields = (
     "decode_band_low",
     "decode_band_high",
 )
-for field in numeric_fields:
-    value = cal.get(field)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        refuse(f"baseline calibration {field} is {value!r}, which is not a number")
-    if not math.isfinite(value):
-        refuse(f"baseline calibration {field} is {value!r}, which is not finite")
-    if value <= 0:
-        refuse(
-            f"baseline calibration {field} is {value!r}; every measured value and every "
-            "band edge must be positive (a zero CV across repeated passes is a frozen "
-            "clock, not a stable box)"
-        )
+for entry in entries:
+    for field in numeric_fields:
+        value = entry.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            refuse(f"baseline calibration {field} is {value!r}, which is not a number")
+        if not math.isfinite(value):
+            refuse(f"baseline calibration {field} is {value!r}, which is not finite")
+        if value <= 0:
+            refuse(
+                f"baseline calibration {field} is {value!r}; every measured value and every "
+                "band edge must be positive (a zero CV across repeated passes is a frozen "
+                "clock, not a stable box)"
+            )
 
-for axis in ("prefill", "decode"):
-    low = cal[f"{axis}_band_low"]
-    high = cal[f"{axis}_band_high"]
-    if not low < 1 < high:
-        refuse(
-            f"baseline calibration {axis} band is [{low}, {high}]; a band must straddle "
-            "1 (low < 1 < high), or the leg it judges can never be healthy"
-        )
+    for axis in ("prefill", "decode"):
+        low = entry[f"{axis}_band_low"]
+        high = entry[f"{axis}_band_high"]
+        if not low < 1 < high:
+            refuse(
+                f"baseline calibration {axis} band is [{low}, {high}]; a band must straddle "
+                "1 (low < 1 < high), or the leg it judges can never be healthy"
+            )
 
 captured_at = cal.get("captured_at")
 if not isinstance(captured_at, str) or not captured_at:

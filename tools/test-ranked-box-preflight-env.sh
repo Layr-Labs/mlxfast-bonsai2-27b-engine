@@ -182,23 +182,26 @@ write_calibration() {
     --arg box "${BOX_NAME}" \
     --arg commit "${REF_COMMIT}" \
     --arg captured "${CAPTURED_AT}" \
+    --argjson live "$(jq -c '.live_goldens' "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")" \
     '{
-      version: 1,
+      version: 2,
       track_id: $track,
       box: $box,
       reference_commit: $commit,
-      prompt: "pool-1",
-      passes: 4,
-      prefill_seconds_per_token_mean: 0.0006282488193359375,
-      decode_seconds_per_token_mean: 0.0329116748046875,
-      prefill_cv: 0.004,
-      decode_cv: 0.002,
-      prefill_band_low: 0.95,
-      prefill_band_high: 1.05,
-      decode_band_low: 0.98,
-      decode_band_high: 1.02,
       captured_at: $captured,
-      benchd_source_commit: "0123456789abcdef0123456789abcdef01234567"
+      benchd_source_commit: "0123456789abcdef0123456789abcdef01234567",
+      prompts: [$live[] | {
+        prompt: .,
+        passes: 4,
+        prefill_seconds_per_token_mean: 0.0006282488193359375,
+        decode_seconds_per_token_mean: 0.0329116748046875,
+        prefill_cv: 0.004,
+        decode_cv: 0.002,
+        prefill_band_low: 0.95,
+        prefill_band_high: 1.05,
+        decode_band_low: 0.98,
+        decode_band_high: 1.02
+      }]
     }' | jq "${filter}" > "${path}"
 }
 
@@ -326,8 +329,8 @@ printf 'not json at all\n' > "${BAD}"
 expect_refusal "case 9 (unparseable)" "does not parse as JSON" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.version = 2'
-expect_refusal "case 10 (wrong version)" "version is 2" \
+write_calibration "${BAD}" '.version = 3'
+expect_refusal "case 10 (wrong version)" "version is 3" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.track_id = "some-other-track-mlx-v9"'
@@ -342,12 +345,20 @@ write_calibration "${BAD}" '.reference_commit = "0000000000000000000000000000000
 expect_refusal "case 13 (wrong reference commit)" "measured a different reference tree" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.decode_seconds_per_token_mean = -1'
+write_calibration "${BAD}" '.prompts[-1].decode_seconds_per_token_mean = -1'
 expect_refusal "case 14 (negative measurement)" "must be positive" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.prefill_band_low = 1.02'
+write_calibration "${BAD}" '.prompts[-1].prefill_band_low = 1.02'
 expect_refusal "case 15 (band does not straddle 1)" "must straddle" \
+  "MLXFAST_BASELINE_CALIBRATION=${BAD}"
+
+write_calibration "${BAD}" 'del(.prompts[-1])'
+expect_refusal "case 15b (a live prompt has no entry)" "has no entry for live prompt" \
+  "MLXFAST_BASELINE_CALIBRATION=${BAD}"
+
+write_calibration "${BAD}" '.version = 1 | . + .prompts[0] | del(.prompts)'
+expect_refusal "case 15c (a version 1 file holds one prompt only)" "has no entry for live prompt" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.captured_at = "2001-01-01T00:00:00+00:00"'

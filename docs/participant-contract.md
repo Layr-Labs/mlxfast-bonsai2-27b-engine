@@ -566,27 +566,31 @@ tools/calibrate-box.sh "<runner name>" /path/to/baseline-calibration.json
 The command takes the box GPU lock. It then runs the serial-control leg four
 times under the full official methodology: the cool gate before each pass, one
 resident worker for each pass, and the same live goldens the ranked run scores
-over. The file it writes holds one entry per live golden and carries values
-only. The values for one prompt are:
+over. The file it writes holds one entry for each live golden and carries
+values only:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "track_id": "bonsai2-27b-mlx-v1",
   "box": "<the runner name>",
   "reference_commit": "<the fixture's baseline_reference_commit>",
-  "prompt": "<one name from the fixture's live_goldens>",
-  "passes": 4,
-  "prefill_seconds_per_token_mean": 0.0,
-  "decode_seconds_per_token_mean": 0.0,
-  "prefill_cv": 0.0,
-  "decode_cv": 0.0,
-  "prefill_band_low": 0.95,
-  "prefill_band_high": 1.05,
-  "decode_band_low": 0.98,
-  "decode_band_high": 1.02,
   "captured_at": "<ISO 8601 UTC>",
-  "benchd_source_commit": "<40 hex>"
+  "benchd_source_commit": "<40 hex>",
+  "prompts": [
+    {
+      "prompt": "<one name from the fixture's live_goldens>",
+      "passes": 4,
+      "prefill_seconds_per_token_mean": 0.0,
+      "decode_seconds_per_token_mean": 0.0,
+      "prefill_cv": 0.0,
+      "decode_cv": 0.0,
+      "prefill_band_low": 0.95,
+      "prefill_band_high": 1.05,
+      "decode_band_low": 0.98,
+      "decode_band_high": 1.02
+    }
+  ]
 }
 ```
 
