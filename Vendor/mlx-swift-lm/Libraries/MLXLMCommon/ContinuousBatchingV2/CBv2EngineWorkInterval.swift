@@ -69,11 +69,10 @@ public final class CBv2EngineWorkInterval: @unchecked Sendable {
     /// prompt coverage is off (`MLXFAST_PROMPT_WORK_INTERVAL`).
     private static let promptDeadlineTicks: UInt64? = {
         guard enabled else { return nil }
-        // Off by default on this lineage (the box read it slower); `on` or a deadline in ms turns it on.
         let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_WORK_INTERVAL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let value, !value.isEmpty, !["0", "false", "no", "off"].contains(value) else { return nil }
-        let milliseconds = UInt64(value).flatMap { $0 > 0 ? $0 : nil } ?? 4
+        if ["0", "false", "no", "off"].contains(value ?? "") { return nil }
+        let milliseconds = value.flatMap { UInt64($0) }.flatMap { $0 > 0 ? $0 : nil } ?? 4
         return ticks(milliseconds: milliseconds)
     }()
 

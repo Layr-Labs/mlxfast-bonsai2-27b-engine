@@ -2691,7 +2691,26 @@ final class Qwen35DenseSiblingStack {
 
     /// `(b(x), a(x))` from one matmul, or nil when the stack does not apply
     /// (only plain, unquantized, bias-free `Linear` siblings of one dtype).
-    func apply(_ x: MLXArray, b: Linear, a: Linear, after: MLXArray? = nil) -> (MLXArray, MLXArray)? {
+    /// `after` (the qkv|z product) rides on the reduce launch as an unread
+    /// input, so MLX encodes the reduce after that product and the split-K
+    /// partial runs beside it (`Qwen35SmallNMatmul.overlap`). With `capture`,
+    /// a verify-width split-K product also hands its chunk partials over
+    /// (`Qwen35SplitKFold`): the returned arrays are then the reduce launch as
+    /// a lazy node, dropped unevaluated when the prework sums the partials
+    /// itself (the folded prework's reads of the product and of the partials
+    /// order the partial beside the product on their own).
+    /// With `rowScale` (the layer boundary's FP16 rows, gain and row scales,
+    /// whose norm output `x` is) a prompt-width product (more than 16 rows)
+    /// reads those instead of `x` (`Qwen35WideNMatmul.applyRowScale`), the
+    /// same values bit for bit; `x` itself is read only where that does not
+    /// apply. The two extras never meet: `capture` is filled only by the
+    /// verify-width partial kernel (at most 16 rows), `rowScale` is read only
+    /// above 16 rows.
+    func apply(
+        _ x: MLXArray, b: Linear, a: Linear, after: MLXArray? = nil,
+        capture: Qwen35BAPartialsCapture? = nil,
+        rowScale: Qwen35FusedBoundaryQ8.RowScale? = nil
+    ) -> (MLXArray, MLXArray)? {
         guard Self.enabled,
             ObjectIdentifier(type(of: b)) == ObjectIdentifier(Linear.self),
             ObjectIdentifier(type(of: a)) == ObjectIdentifier(Linear.self),
@@ -2703,8 +2722,41 @@ final class Qwen35DenseSiblingStack {
             weight = concatenated([b.weight, a.weight], axis: 0)
             boundary = b.weight.dim(0)
         }
-        let y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
+        let k = weight!.dim(1)
+        let n = weight!.dim(0)
+        let rows = x.size / k
+        let y: MLXArray
+        if let rowScale, rows > 16, Qwen35SmallNMatmul.enabled, x.dtype == .float32,
+            weight!.dtype == .float32, rowScale.h.size == rows * k,
+            let fused = Qwen35WideNMatmul.applyRowScale(
+                h: rowScale.h, gain: rowScale.gain, inv: rowScale.inv, weight!,
+                rows: rows, k: k, n: n)
+        {
+            // Prompt width: the product read from the boundary's FP16 rows.
+            y = fused.reshaped(Array(x.shape.dropLast()) + [n])
+        } else if let capture, let partials = Qwen35SmallNMatmul.partials(x, weight!) {
+            // Verify width: the chunk partials handed to the prework fold.
+            capture.partials = partials
+            capture.boundary = boundary
+            y = Qwen35SmallNMatmul.reduce(partials, after: after)
+        } else {
+            y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
+        }
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+
+    /// True when `apply` on `rows` rows would read a boundary's row scales
+    /// (`Qwen35WideNMatmul.applyRowScale`), the self-test aside.
+    func takesRowScale(rows: Int, b: Linear, a: Linear) -> Bool {
+        guard Self.enabled, Qwen35SmallNMatmul.enabled, rows > 16,
+            ObjectIdentifier(type(of: b)) == ObjectIdentifier(Linear.self),
+            ObjectIdentifier(type(of: a)) == ObjectIdentifier(Linear.self),
+            b.bias == nil, a.bias == nil, b.weight.ndim == 2, a.weight.ndim == 2,
+            b.weight.dtype == .float32, a.weight.dtype == .float32,
+            b.weight.dim(1) == a.weight.dim(1)
+        else { return false }
+        return Qwen35WideNMatmul.mayApplyRowScale(
+            rows: rows, k: b.weight.dim(1), n: b.weight.dim(0) + a.weight.dim(0))
     }
 }
 
@@ -2853,6 +2905,12 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35SplitKFold.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
+            hidden: hiddenSize)
+        // After the fused replay's, the reads-first prework's and the fold's
+        // verdicts: its trial times the chains they form.
+        Qwen35GDNVerifyFused.prepare(layer: self)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
@@ -3080,7 +3138,9 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(
         _ inputs: MLXArray, B: Int, S: Int,
         quantized: SignedBlockHadamard.Int8Activation? = nil,
-        narrowStack: Bool = false, rotated: MLXArray? = nil
+        narrowStack: Bool = false, rotated: MLXArray? = nil,
+        baCapture: Qwen35BAPartialsCapture? = nil,
+        rowScale: Qwen35FusedBoundaryQ8.RowScale? = nil
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
@@ -3102,7 +3162,10 @@ final class Qwen35GatedDeltaNet: Module {
                 ?? sharedHadamardProjections(
                     inputs, [inProjQKV, inProjZ], widenOutput: !narrowStack)
             {
-                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA, after: shared[0]) {
+                if let (bOut, aOut) = baStack.apply(
+                    inputs, b: inProjB, a: inProjA, after: shared[0], capture: baCapture,
+                    rowScale: rowScale)
+                {
                     return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
                 }
                 return (
@@ -3559,11 +3622,25 @@ final class Qwen35GatedDeltaNet: Module {
     /// CBv2 target path. Request-owned conv/SSM rows are gathered into the
     /// active rectangle, evaluated once, then split back into their owning
     /// transactions. No recurrent tensor is represented as attention KV.
+    /// True when this layer's b|a stack at `rows` prompt rows reads the
+    /// layer boundary's FP16 rows and row scales instead of its FP32 norm
+    /// output (`Qwen35DenseSiblingStack.takesRowScale`); the boundary then
+    /// need not store that copy. The self-test's verdict is the boundary's.
+    func promptBAReadsRowScale(rows: Int) -> Bool {
+        guard fusedInProj == nil, !(inProjB is QuantizedLinear), !(inProjA is QuantizedLinear)
+        else { return false }
+        return baStack.takesRowScale(rows: rows, b: inProjB, a: inProjA)
+    }
+
+    /// `rowScaleInput`: the layer boundary's FP16 rows, gain and row scales
+    /// whose norm output `inputs` is (`Qwen35FusedBoundaryQ8.RowScale`); the
+    /// b|a stack reads them instead of `inputs`.
     func cbv2Forward(
         _ inputs: MLXArray,
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        quantizedInput: SignedBlockHadamard.Int8Activation? = nil
+        quantizedInput: SignedBlockHadamard.Int8Activation? = nil,
+        rowScaleInput: Qwen35FusedBoundaryQ8.RowScale? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -3571,7 +3648,8 @@ final class Qwen35GatedDeltaNet: Module {
 
         let (qkv, z, b, a) = projectInputs(
             inputs, B: B, S: S, quantized: quantizedInput,
-            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows)
+            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows,
+            rowScale: rowScaleInput)
 
         let processed: (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)
         if let fresh = freshPromptChunk(
@@ -3639,8 +3717,18 @@ final class Qwen35GatedDeltaNet: Module {
 
         let qkv: MLXArray
         let z: MLXArray
-        let b: MLXArray
-        let a: MLXArray
+        var b: MLXArray
+        var a: MLXArray
+        // The window's GDN chain (`Qwen35GDNVerifyFused.Chain`, trial-decided
+        // at load): the b|a stack's chunk partials are captured for the
+        // prework, or the fused launch, to sum (`Qwen35SplitKFold`) only where
+        // the picked chain reads them; nil keeps the reduce launch.
+        let foldEligible: Bool = !exactTargetVerify && S >= 3 && convKernelSize == 4
+        let verifyChain: Qwen35GDNVerifyFused.Chain =
+            foldEligible ? Qwen35GDNVerifyFused.chain(for: self) : .record
+        let baCapture: Qwen35BAPartialsCapture? =
+            foldEligible && verifyChain.usesPartials && Qwen35SplitKFold.active(rows: B * S)
+            ? Qwen35BAPartialsCapture() : nil
         if exactTargetVerify {
             let exact = qwen35A3BExactW4G64ProjectionQuad(
                 inProjQKV, inProjZ, inProjB, inProjA, inputs)
@@ -3651,7 +3739,8 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             // Preserve main's fused GDN projection construction and graph.
             (qkv, z, b, a) = projectInputs(
-                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput)
+                inputs, B: B, S: S, quantized: quantizedInput, rotated: rotatedInput,
+                baCapture: baCapture)
         }
 
         // The rows' SSMs are read after the prework: a deferred replay is
@@ -3672,24 +3761,84 @@ final class Qwen35GatedDeltaNet: Module {
         // concatenated conv input for its boundary rows, which the prework
         // kernel also writes (the same FP32 values as the concatenation of the
         // state with the widened qkv, without its cast and copy launches).
-        let pre: Qwen35GDNPrework.Outputs? =
-            (!exactTargetVerify && S >= 3 && convKernelSize == 4)
-            ? Qwen35GDNPrework.run(
-                qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
-                aDecay: derived.decay(aLog), dtBias: dtBias,
-                normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
-                keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim,
-                writeConvInput: Self.preworkWritesConvInput
-                    && qkv.dtype != .bfloat16 && convState.dtype == .float32,
-                stridedReads: Qwen35GDNPrework.verifyStridedReads)
-            : nil
-        let convInput = pre?.convInput ?? concatenated([convState, qkv], axis: 1)
+        var pre: Qwen35GDNPrework.Outputs? = nil
+        // One row's window whose prework runs inside the recurrence launch
+        // (`Qwen35GDNVerifyFused`, chains C and D): the same q, k, v and conv
+        // input, the output rows and, for a pending deferred replay, the
+        // committed state; with the partials captured, the summed a and b.
+        var verifyFused: Qwen35GDNVerifyFused.Result? = nil
+        if foldEligible {
+            let writeConvInput: Bool =
+                Self.preworkWritesConvInput && qkv.dtype != .bfloat16
+                && convState.dtype == .float32
+            let aDecay = derived.decay(aLog)
+            let normScales = derived.normScales(headKDim: headKDim, dtype: .float32)
+            if case .fused(let slabs, let folded) = verifyChain, B == 1, writeConvInput {
+                // D reads the captured partials; without them (the stack
+                // declined its split-K) the launches below run. C reads the
+                // reduced product, so the reduce launch runs as on the record.
+                let gates: Qwen35GDNVerifyFused.Gates?
+                if folded {
+                    gates = baCapture.flatMap { capture in
+                        capture.partials.map {
+                            .partials(abp: $0.part, aOffset: capture.boundary, bOffset: 0)
+                        }
+                    }
+                } else {
+                    gates = .reduced(a: a, b: b)
+                }
+                if let gates {
+                    verifyFused = Qwen35GDNVerifyFused.run(
+                        layer: self,
+                        input: recurrentState[0].inputState(modelLayerIndex: modelLayerIndex),
+                        qkv: qkv, convState: convState, convWeight: conv1d.weight, gates: gates,
+                        aDecay: aDecay, dtBias: dtBias, normScales: normScales, slabs: slabs)
+                }
+                if let fused = verifyFused, let fusedA = fused.a, let fusedB = fused.b {
+                    a = fusedA
+                    b = fusedB
+                }
+            }
+            // The fold (`Qwen35SplitKFold`): the prework launch sums the b|a
+            // chunk partials in the reduce kernel's order and writes the
+            // summed a and b for the tape, the same bits (self-tested at
+            // load); a variant it declines runs the reduce launch below.
+            if verifyFused == nil, let capture = baCapture, let partials = capture.partials {
+                pre = Qwen35GDNPrework.runFolded(
+                    qkv: qkv, convState: convState, convWeight: conv1d.weight,
+                    abPartials: partials.part, aOffset: capture.boundary, bOffset: 0,
+                    aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                    headVDim: headVDim,
+                    writeConvInput: writeConvInput,
+                    stridedReads: Qwen35GDNPrework.verifyStridedReads)
+                if let folded = pre, let foldedA = folded.a, let foldedB = folded.b {
+                    a = foldedA
+                    b = foldedB
+                }
+            }
+            if verifyFused == nil, pre == nil {
+                pre = Qwen35GDNPrework.run(
+                    qkv: qkv, convState: convState, convWeight: conv1d.weight, a: a, b: b,
+                    aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
+                    headVDim: headVDim,
+                    writeConvInput: writeConvInput,
+                    stridedReads: Qwen35GDNPrework.verifyStridedReads)
+            }
+        }
+        let convInput =
+            verifyFused?.convInput ?? pre?.convInput ?? concatenated([convState, qkv], axis: 1)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
         let convOutBackingAll: MLXArray
-        if let pre {
+        if let verifyFused {
+            qNormed = verifyFused.q
+            kNormed = verifyFused.k
+            v = verifyFused.v
+            convOutBackingAll = verifyFused.v
+        } else if let pre {
             qNormed = pre.q
             kNormed = pre.k
             v = pre.v
@@ -3719,14 +3868,16 @@ final class Qwen35GatedDeltaNet: Module {
         }
         // One row whose SSM is this layer's pending deferred replay: the
         // fused scan computes it and this window's output rows in one launch.
-        let fused = pre.flatMap { pre in
-            B == 1
-                ? Qwen35GDNReplayFused.run(
-                    layer: self,
-                    input: recurrentState[0].inputState(modelLayerIndex: modelLayerIndex),
-                    pre: pre)
-                : nil
-        }
+        let fused: (y: MLXArray, state: MLXArray)? =
+            verifyFused.map { (y: $0.y, state: $0.state) }
+            ?? pre.flatMap { pre in
+                B == 1
+                    ? Qwen35GDNReplayFused.run(
+                        layer: self,
+                        input: recurrentState[0].inputState(modelLayerIndex: modelLayerIndex),
+                        pre: pre)
+                    : nil
+            }
         let ssmRows =
             fused.map { [$0.state] }
             ?? recurrentState.map {
@@ -3741,10 +3892,11 @@ final class Qwen35GatedDeltaNet: Module {
             // (`Qwen35GDNVerifyStateSkip`) and full acceptance replays the
             // window from the tape instead.
             let recurrence: (MLXArray, MLXArray?)
-            if let pre {
-                if let fused {
-                    recurrence = (fused.y, nil)
-                } else if let chunked = Qwen35GatedDeltaChunked.runVerify(
+            if let fused {
+                // The fused launch ran this window's rows (state skip on).
+                recurrence = (fused.y, nil)
+            } else if let pre {
+                if let chunked = Qwen35GatedDeltaChunked.runVerify(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
                 {
                     recurrence = (chunked.0, chunked.1)
@@ -4859,10 +5011,14 @@ final class Qwen35DecoderLayer: Module {
                 || sharedHadamardTensorRouteTakesNarrowInt8(
                     siblings, rows: x.size / transform.width)
         else { return nil }
+        // A GDN layer whose b|a stack reads the boundary's FP16 rows and row
+        // scales needs no FP32 norm output stored.
+        let rows = x.size / transform.width
         return Qwen35FusedBoundaryQ8.apply(
             x, pending, gain: inputLayerNorm.weight, unsignedGain: inputLayerNorm.weight,
             eps: inputLayerNorm.eps, transform: transform, gainSigned: false,
-            writeNormed: isLinear)
+            writeNormed: isLinear,
+            rowScaleNormed: isLinear && (linearAttn?.promptBAReadsRowScale(rows: rows) ?? false))
     }
 
     /// `fusedInputBoundary` for a verify window on the matrix route: the
@@ -4957,7 +5113,8 @@ final class Qwen35DecoderLayer: Module {
             } else {
                 r = linearAttn!.cbv2Forward(
                     layerInput, modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState, quantizedInput: quantized)
+                    recurrentState: recurrentState, quantizedInput: quantized,
+                    rowScaleInput: boundary?.rowScale)
             }
         } else {
             guard let attentionCache else {
@@ -5208,12 +5365,6 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
-        // A prompt-width forward with the drafter's tap armed binds the
-        // drafter's weights behind its own early submissions when an engine
-        // build that drafts armed the prefetch (`DFlash2ResidencyPrefetch`).
-        let promptPrefetch =
-            tapLayerIds != nil && !captureRecurrentWindow
-            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
         // The pending path's early-submission plan: the verify plan for a
         // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
@@ -5265,11 +5416,6 @@ public class Qwen35TextModelInner: Module {
                 {
                     if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
-                    // Behind the layers just submitted: the drafter's weights
-                    // for a request that will draft (`DFlash2ResidencyPrefetch`).
-                    if promptPrefetch {
-                        DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
-                    }
                 }
                 continue
             }
@@ -5295,13 +5441,7 @@ public class Qwen35TextModelInner: Module {
             {
                 if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
-                if promptPrefetch {
-                    DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
-                }
             }
-        }
-        if promptPrefetch {
-            DFlash2ResidencyPrefetch.submitRemaining()
         }
         if let p = pending {
             hiddenStates = hiddenStates + p
@@ -5349,6 +5489,10 @@ enum Qwen35GDNPrework {
         /// The chunked scan's prep outputs (T', P, decay factors), when the
         /// prework launch formed them (`freshStridedRows` form 3).
         var prepared: [MLXArray]? = nil
+        /// The summed `a` and `b` gate inputs `[B, S, HV]`, when the launch
+        /// formed them from the b|a chunk partials (`Qwen35SplitKFold`).
+        var a: MLXArray? = nil
+        var b: MLXArray? = nil
     }
 
     static let enabled: Bool = {
@@ -5361,7 +5505,7 @@ enum Qwen35GDNPrework {
     // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
     // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
     // decay/dtb [HV] (decay = -exp(A_log)), wq/wk [DK], S (scalar).
-    private static let source = """
+    static let source = """
         constexpr int GRP = HV / HK;
         constexpr int KEY = HK * DK;
         constexpr int VOFF = 2 * KEY;
@@ -5509,8 +5653,11 @@ enum Qwen35GDNPrework {
         """
 
     /// `text` with `convInputBlock` placed before its convolution-tail stores.
-    private static func withConvInput(_ text: String) -> String {
-        let anchor = "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+    static let convInputAnchor =
+        "// Next convolution tail: rows S-NK..S-1 of the concatenated input."
+
+    static func withConvInput(_ text: String) -> String {
+        let anchor = convInputAnchor
         precondition(
             text.components(separatedBy: anchor).count == 2,
             "Qwen35 GDN prework: the conv-input source no longer matches the stock kernel")
@@ -5533,7 +5680,7 @@ enum Qwen35GDNPrework {
     /// layer per round). The same elements enter the same arithmetic, so the
     /// outputs are the same values. `BONSAI_PREWORK_STRIDED_VERIFY=0` keeps
     /// the copies.
-    private static let stridedSource: String = {
+    static let stridedSource: String = {
         var text = source
         for (target, replacement) in [
             ("const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);",
@@ -7249,8 +7396,23 @@ enum Qwen35FusedBoundaryQ8 {
 
     struct Output {
         let h: MLXArray
+        /// The FP32 norm output: the kernel's own store, or, with `rowScale`,
+        /// the lazy `gain * (h.float * inv)` (bit for bit the same values;
+        /// evaluated only if a consumer falls back to it).
         let normed: MLXArray?
         let activation: SignedBlockHadamard.Int8Activation
+        /// The norm output's factors when the kernel stored the row scales
+        /// instead of the FP32 copy (`Qwen35WideNMatmul.applyRowScale`).
+        let rowScale: RowScale?
+    }
+
+    /// The boundary's norm output as `gain * (float(h) * inv)`: `h` the
+    /// FP16 residual sum the kernel stores, `gain` the FP32 norm gain, `inv`
+    /// FP32 [rows], each row's `precise::rsqrt(sum(h^2) / W + eps)`.
+    struct RowScale {
+        let h: MLXArray
+        let gain: MLXArray
+        let inv: MLXArray
     }
 
     nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(width))
@@ -7273,7 +7435,8 @@ enum Qwen35FusedBoundaryQ8 {
     /// checked that the route takes the activation. Nil when it does not apply.
     static func apply(
         _ x: MLXArray, _ r: MLXArray, gain: MLXArray, unsignedGain: MLXArray, eps: Float,
-        transform: SignedBlockHadamard, gainSigned: Bool, writeNormed: Bool
+        transform: SignedBlockHadamard, gainSigned: Bool, writeNormed: Bool,
+        rowScaleNormed: Bool = false
     ) -> Output? {
         // A full verify window on the int8-activation narrow route (16 rows)
         // takes the kernel too, under its own 16-row self-test.
@@ -7291,9 +7454,17 @@ enum Qwen35FusedBoundaryQ8 {
                 ? narrowVerified(unsignedGain: unsignedGain, eps: eps, transform: transform)
                 : verified(unsignedGain: unsignedGain, eps: eps, transform: transform)
         else { return nil }
+        // A prompt-width GDN boundary whose b|a product reads the FP16 rows
+        // and row scales (`Qwen35WideNMatmul.applyRowScale`) stores one
+        // float per row instead of the FP32 norm output, under its own
+        // bitwise self-test. The norm output is the unsigned gain's.
+        let rowScale =
+            writeNormed && rowScaleNormed && !narrow && !gainSigned
+            && Qwen35WideNMatmul.rowScaleEnabled && (x.size / width) % 64 == 0
+            && rowScaleVerified(unsignedGain: unsignedGain, eps: eps, transform: transform)
         return launch(
             x, r, gain: gain, signs: transform.signVector, eps: eps, gainSigned: gainSigned,
-            writeNormed: writeNormed)
+            writeNormed: writeNormed, rowScale: rowScale)
     }
 
     private static let lock = NSLock()
@@ -7400,7 +7571,7 @@ enum Qwen35FusedBoundaryQ8 {
 
     private static func launch(
         _ x: MLXArray, _ r: MLXArray, gain: MLXArray, signs: MLXArray, eps: Float,
-        gainSigned: Bool, writeNormed: Bool
+        gainSigned: Bool, writeNormed: Bool, rowScale: Bool = false
     ) -> Output {
         let rows = x.size / width
         let codesShape = [rows, width]
@@ -7413,6 +7584,24 @@ enum Qwen35FusedBoundaryQ8 {
             ("GAINVEC", useGainVector ? 1 : 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
+        if writeNormed && rowScale {
+            let outs = kernelRowScale(
+                inputs, template: template,
+                grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
+                outputShapes: [x.shape, codesShape, groupShape, groupShape, [rows]],
+                outputDTypes: [.float16, Qwen35TensorPackedMatmul.codesDType, .float32, .float32, .float32])
+            let h = outs[0]
+            let inv = outs[4]
+            // The norm output the kernel would have stored, as a lazy graph
+            // (`gain * (h * inv)` in that order: the kernel's own expression
+            // on the same operands; a product is commutative bit for bit).
+            let normed = gain * (h.asType(.float32) * inv.reshaped(Array(x.shape.dropLast()) + [1]))
+            return Output(
+                h: h, normed: normed,
+                activation: SignedBlockHadamard.Int8Activation(
+                    codes: outs[1], scales: outs[2], scaledSums: outs[3]),
+                rowScale: RowScale(h: h, gain: gain, inv: inv))
+        }
         if writeNormed {
             let outs = kernelNormed(
                 inputs, template: template,
@@ -7422,7 +7611,8 @@ enum Qwen35FusedBoundaryQ8 {
             return Output(
                 h: outs[0], normed: outs[4],
                 activation: SignedBlockHadamard.Int8Activation(
-                    codes: outs[1], scales: outs[2], scaledSums: outs[3]))
+                    codes: outs[1], scales: outs[2], scaledSums: outs[3]),
+                rowScale: nil)
         }
         let outs = kernel(
             inputs, template: template,
@@ -7432,7 +7622,8 @@ enum Qwen35FusedBoundaryQ8 {
         return Output(
             h: outs[0], normed: nil,
             activation: SignedBlockHadamard.Int8Activation(
-                codes: outs[1], scales: outs[2], scaledSums: outs[3]))
+                codes: outs[1], scales: outs[2], scaledSums: outs[3]),
+            rowScale: nil)
     }
 
     struct SelfTestReport {
@@ -7617,6 +7808,7 @@ enum Qwen35FusedBoundaryQ8 {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv = local_inv[0];
+        BONSAI_STORE_INV;
 
         // rms_looped's output `w * (x * inv)`, then the signs. GAINVEC loads
         // the four lanes this thread already owns (e0 is a multiple of 4, W
@@ -7736,7 +7928,7 @@ enum Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_q8",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "codes", "qscale", "qsum"],
-        source: "#define BONSAI_STORE_NORMED(e, n)\n" + source,
+        source: "#define BONSAI_STORE_NORMED(e, n)\n#define BONSAI_STORE_INV\n" + source,
         header: header,
         ensureRowContiguous: true)
 
@@ -7744,9 +7936,144 @@ enum Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_q8_normed",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "codes", "qscale", "qsum", "nout"],
-        source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + source,
+        source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n#define BONSAI_STORE_INV\n"
+            + source,
         header: header,
         ensureRowContiguous: true)
+
+    /// `kernelNormed` storing the row's `inv` (one float, `ninv[row]`)
+    /// instead of the 5120 FP32 norm values; the b|a product forms `w * (h
+    /// * inv)` itself (`Qwen35WideNMatmul.applyRowScale`).
+    private static let kernelRowScale = MLXFast.metalKernel(
+        name: "bonsai_boundary_rmsnorm_hadamard_q8_rowscale",
+        inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
+        outputNames: ["hout", "codes", "qscale", "qsum", "ninv"],
+        source: "#define BONSAI_STORE_NORMED(e, n)\n"
+            + "#define BONSAI_STORE_INV if (lid == 0) { ninv[row] = inv; }\n" + source,
+        header: header,
+        ensureRowContiguous: true)
+}
+
+/// The prompt-width GDN boundary storing the row scales instead of the FP32
+/// norm output, and the b|a product reading them (`Qwen35WideNMatmul
+/// .applyRowScale`): one verdict for the pair, decided at the first
+/// prompt-width GDN boundary (the load-time prompt warm) by a bitwise
+/// self-test against the FP32-copy path, with the FP32 copy kept on any
+/// mismatch or MLX error.
+extension Qwen35FusedBoundaryQ8 {
+    nonisolated(unsafe) private static var rowScaleVerdict: Bool?
+
+    static func rowScaleVerified(
+        unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let rowScaleVerdict { return rowScaleVerdict }
+        let report = rowScaleSelfTest(unsignedGain: unsignedGain, eps: eps, transform: transform)
+        rowScaleVerdict = report.passed
+        FileHandle.standardError.write(
+            ("qwen35 prompt b|a from the boundary's FP16 rows: " + report.summary
+                + (report.passed
+                    ? "; in use (stage \(Qwen35WideNMatmul.stage))\n"
+                    : "; FP32 normed copy kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    /// At 64, 128 and 512 rows (the prompt minimum, the warm and the timed
+    /// shape), on residual rows built as the boundary self-test builds them:
+    /// the row-scale kernel's `h`, codes, scales and sums against the
+    /// normed kernel's; the reconstructed norm output (`gain * (h * inv)`,
+    /// the lazy fallback) against `MLXFast.rmsNorm(x + r)`; and the b|a
+    /// product read from `h`, `gain` and `inv` against the FP32-input kernel
+    /// pair on the norm output, with an N = 96 FP32 weight of the in_proj
+    /// scale. Every value is compared as unsigned integers (bitwise).
+    static func rowScaleSelfTest(
+        unsignedGain: MLXArray, eps: Float, transform: SignedBlockHadamard,
+        cases: [(Int, Int)] = [(64, 61), (128, 62), (512, 63)]
+    ) -> SelfTestReport {
+        var report = SelfTestReport()
+        do {
+            try withError { error in
+                let signs = transform.signVector
+                let k = width
+                let n = 96
+                let w = MLXRandom.normal([n, k], key: MLXRandom.key(UInt64(777))) * Float(0.02)
+                for (rows, seed) in cases {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let outlier = MLXArray(
+                        (0 ..< width).map { $0 % 509 == 7 ? Float(100) : Float(1) })
+                    let x32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 100))) * scale * outlier
+                    var r32 = MLXRandom.normal(
+                        [1, rows, width], key: MLXRandom.key(UInt64(seed + 200))) * scale
+                        * Float(0.25)
+                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows / 3)))
+                        .reshaped(1, rows, 1)
+                    r32 = which(zeroRow, -x32, r32)
+                    let x = x32.asType(.float16)
+                    let r = r32.asType(.float16)
+                    let h0 = x + r
+                    let n0 = MLXFast.rmsNorm(h0, weight: unsignedGain, eps: eps)
+                    let reference = launch(
+                        x, r, gain: unsignedGain, signs: signs, eps: eps, gainSigned: false,
+                        writeNormed: true, rowScale: false)
+                    let out = launch(
+                        x, r, gain: unsignedGain, signs: signs, eps: eps, gainSigned: false,
+                        writeNormed: true, rowScale: true)
+                    guard let rowScale = out.rowScale, let normed = out.normed,
+                        let referenceNormed = reference.normed
+                    else {
+                        report.passed = false
+                        report.error = "the row-scale form was not launched"
+                        return
+                    }
+                    guard
+                        let y0 = Qwen35WideNMatmul.product(
+                            referenceNormed.reshaped(rows, k), w, rows: rows, k: k, n: n),
+                        let y1 = Qwen35WideNMatmul.productRowScale(
+                            h: rowScale.h.reshaped(rows, k), gain: rowScale.gain,
+                            inv: rowScale.inv, w, rows: rows, k: k, n: n)
+                    else {
+                        report.passed = false
+                        report.error = "the b|a kernel pair does not take \(rows) x \(k) -> \(n)"
+                        return
+                    }
+                    let pairs: [(MLXArray, MLXArray)] = [
+                        (h0, out.h),
+                        (reference.activation.codes, out.activation.codes),
+                        (reference.activation.scales, out.activation.scales),
+                        (reference.activation.scaledSums, out.activation.scaledSums),
+                        (n0, normed),
+                        (referenceNormed, normed),
+                        (y0, y1),
+                    ]
+                    report.cases += 1
+                    for (a, b) in pairs {
+                        guard a.dtype == b.dtype, a.shape == b.shape else {
+                            report.passed = false
+                            report.error = "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                            return
+                        }
+                        let bits: DType =
+                            a.dtype == .float16 ? .uint16 : a.dtype == .float32 ? .uint32 : a.dtype
+                        let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        let count = Int(differ.item(Int32.self))
+                        report.values += a.size
+                        report.mismatches += count
+                        if count != 0 { report.passed = false }
+                    }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
 }
 
 /// The GDN output's gated per-head RMSNorm and the output projection's
