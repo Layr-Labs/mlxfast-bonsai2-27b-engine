@@ -2538,6 +2538,46 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // The register-weight kernel over the plane copy of the words
+    // (`planeWeight`, `promptPlaneWeights`). In `sourceStaged8Reg` the four
+    // lanes of a k-quad group (same nl, kq = 0..3) each load the same four
+    // columns' 128 bytes a group and keep one plane of them; here lane l loads
+    // only its own 32 bytes (two uint4; a simdgroup's 1 KB a group is
+    // contiguous), whose word j holds at shift 2c plane kq of column nl + 8c's
+    // word j. So (P[j] >> 2c) & 0x03030303 is the Reg kernel's bw[c + 4j]:
+    // the same right operand, op, epilogue and stores, every output bit the
+    // Reg kernel's (checked at load, `promptPlaneSelfTest`). Derived from
+    // `sourceStaged8Reg` by checked replacements; nil if an anchor is missing
+    // (the Reg kernel is kept). grid, threadgroup and inputs as the Reg kernel.
+    private static let sourceStaged8RegPlane: String? = {
+        var text = sourceStaged8Reg
+        let edits: [(String, String)] = [
+            ("const device uint4* wcol = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256 + (size_t)nl * 8);",
+             "const device uint4* wcol = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256) + lane * 2;"),
+            ("for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * 16]; wv[2 * c + 1] = src[c * 16 + 1]; }",
+             "for (int c = 0; c < 2; c++) { wv[c] = src[c]; }"),
+            ("const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];",
+             "const uint cs = 2 * uint(c); const uint4 lo = wv[0]; const uint4 hi = wv[1];"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        // The eight plane extracts of the extract loop: shift 2c, not 2 kq.
+        guard text.components(separatedBy: " >> sh) & 0x03030303u").count == 9 else { return nil }
+        return text.replacingOccurrences(of: " >> sh) & 0x03030303u", with: " >> cs) & 0x03030303u")
+    }()
+
+    private static let kernelStaged8RegPlane: MLXFast.MLXFastKernel? = sourceStaged8RegPlane.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_q8_rp",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -3566,6 +3606,86 @@ enum Qwen35TensorPackedMatmul {
         return passed
     }
 
+    /// The register-weight kernel over the plane copy of the words
+    /// (`sourceStaged8RegPlane`, `narrowPlaneWeight`) in place of the tiled
+    /// copy, wherever the register-weight kernel runs. On unless
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_PLANE=0`, and only after its
+    /// bitwise self-test against the register-weight kernel
+    /// (`promptPlaneSelfTest`). The plane copy is one more copy of each
+    /// projection's words the prompt route reads (the verify route keeps the
+    /// tiled copy), so `windowResidencyArrays` lists the tiled copy for it.
+    static let promptPlaneWeights: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_PLANE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""), promptRegisterWeights,
+            kernelStaged8RegPlane != nil
+        else { return false }
+        return promptPlaneSelfTest()
+    }()
+
+    nonisolated(unsafe) private static var promptPlaneFailed = false
+    nonisolated(unsafe) static var promptPlaneAnnounced = false
+
+    /// `sourceStaged8RegPlane` over `planeWeight` of the tiled words against
+    /// `sourceStaged8Reg` over the tiled words, on synthetic operands: three
+    /// shapes (6, 4 and 10 column blocks; 1, 2 and 3 row tiles; 8, 20 and 12
+    /// groups), FP32 and FP16 outputs, every output bit compared. A compile or
+    /// run error counts as a failure.
+    private static func promptPlaneSelfTest() -> Bool {
+        guard let planeKernel = kernelStaged8RegPlane else { return false }
+        var same = true
+        var compared = 0
+        promptPlaneFailed = false
+        withErrorHandler({ _ in Qwen35TensorPackedMatmul.promptPlaneFailed = true }) {
+            for (index, (m, k, n)) in [(128, 1024, 192), (64, 2560, 128), (192, 1536, 320)].enumerated() {
+                let kg = k / 128
+                let seed = UInt64(191 + 8 * index)
+                let codes = MLXRandom.randInt(
+                    Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)
+                ).asType(.int8)
+                let weight = MLXRandom.randInt(
+                    Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+                ).asType(.uint16).view(dtype: .uint32)
+                var s = MLXRandom.uniform(
+                    Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(seed + 2))
+                let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [kg, n], key: MLXRandom.key(seed + 3))
+                s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+                s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+                let scalesT = s.asType(.float16)
+                let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                let folded = MLXRandom.normal([kg, n], key: MLXRandom.key(seed + 4))
+                let ascale = MLXRandom.uniform(
+                    Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(seed + 5))
+                let asums = MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 6)) * Float(50)
+                let tiled = tileNarrowWeight(weight, n: n, k: k)
+                let plane = planeWeight(tiled, n: n, k: k)
+                let rest = [scalesT, biasesT, folded, ascale, asums, dimsArray(k: k, m: m, n: n)]
+                for outputDType in [DType.float32, .float16] {
+                    let reg = kernelStaged8Reg(
+                        [codes, tiled] + rest, template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let planar = planeKernel(
+                        [codes, plane] + rest, template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let bits: DType = outputDType == .float32 ? .uint32 : .uint16
+                    let equal = (reg.view(dtype: bits) .== planar.view(dtype: bits)).all()
+                    eval(equal)
+                    if !equal.item(Bool.self) { same = false }
+                    compared += m * n
+                }
+            }
+        }
+        let passed = same && !promptPlaneFailed
+        FileHandle.standardError.write(
+            Data(
+                ("bonsai prompt plane-weight kernel: self-test "
+                    + (passed ? "passed (\(compared) values bitwise, 0 mismatches)\n"
+                        : "FAILED; the register-weight kernel keeps the tiled copy\n")).utf8))
+        return passed
+    }
+
     /// `[N, K/16]` packed words reordered to `[N/32, K/128, 32, 8]`: for each
     /// 32-column block and 128-group, the 32 columns' 8 words in column order.
     static func tileNarrowWeight(_ weight: MLXArray, n: Int, k: Int) -> MLXArray {
@@ -3581,6 +3701,43 @@ enum Qwen35TensorPackedMatmul {
             let tiled = tileNarrowWeight(w, n: w.dim(0), k: w.dim(1) * 16)
             if materialize { eval(tiled) }
             return tiled
+        }
+    }
+
+    /// The tiled words (`tileNarrowWeight`: `[N/32, K/128, 32 columns, 8
+    /// words]`) with each 1 KB block's 2-bit codes permuted into the plane
+    /// layout `[N/32, K/128, 32 lanes, 8 words]` the plane kernel reads
+    /// (`sourceStaged8RegPlane`): lane l = kq0 | nl0 << 1 | nl1 << 2 | kq1 << 3
+    /// | nl2 << 4 (the Reg kernel's nl = ((l >> 1) & 3) + 4 ((l >> 4) & 1),
+    /// kq = (l & 1) + 2 ((l >> 3) & 1)), word j = OR over c of ((W[8c + nl][j]
+    /// >> 2 kq) & 0x03030303) << 2c. Same size, the same codes, moved.
+    static func planeWeight(_ tiled: MLXArray, n: Int, k: Int) -> MLXArray {
+        let blocks = tiled.reshaped([n / 32, k / 128, 4, 8, 8])
+        let mask = MLXArray(UInt32(0x0303_0303))
+        var planes: [MLXArray] = []
+        for kq in 0 ..< 4 {
+            let plane = (blocks >> MLXArray(UInt32(2 * kq))) & mask
+            var word = plane[0..., 0..., 0, 0..., 0...]
+            for c in 1 ..< 4 {
+                word = word | (plane[0..., 0..., c, 0..., 0...] << MLXArray(UInt32(2 * c)))
+            }
+            planes.append(word)
+        }
+        // [N/32, K/128, nl (nl2, nl0..1), j, kq (kq1, kq0)] -> lane order.
+        return stacked(planes, axis: -1).reshaped([n / 32, k / 128, 2, 4, 8, 2, 2])
+            .transposed(0, 1, 2, 5, 3, 6, 4).contiguous().reshaped([n, k / 16])
+    }
+
+    /// The plane copy of a projection's words (tag 6), built once per weight
+    /// array from its tiled copy `tiled` (`narrowTiledWeight`, taken outside
+    /// the cache's lock: `derived` does not nest).
+    static func narrowPlaneWeight(
+        _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, tiled: MLXArray
+    ) -> MLXArray {
+        cache.derived(weight, tag: 6) { w in
+            let plane = planeWeight(tiled, n: w.dim(0), k: w.dim(1) * 16)
+            eval(plane)
+            return plane
         }
     }
 
@@ -4402,6 +4559,25 @@ enum Qwen35TensorPackedMatmul {
                                 .data(using: .utf8)!)
                     }
                     let words = narrowTiledWeight(cache, weight, materialize: true)
+                    // The plane copy of the same words (self-tested bitwise
+                    // at load against this kernel): each lane loads its own
+                    // 32 bytes a group. The verify route keeps the tiled copy,
+                    // listed for residency (`promptPlaneMark`).
+                    if promptPlaneWeights, let planeKernel = kernelStaged8RegPlane {
+                        if !promptPlaneAnnounced {
+                            promptPlaneAnnounced = true
+                            FileHandle.standardError.write(
+                                "bonsai prompt plane-weight kernel: in use (m \(m), k \(k), n \(n), \(outputDType))\n"
+                                    .data(using: .utf8)!)
+                        }
+                        cache.residencyMarks |= promptPlaneMark
+                        return planeKernel(
+                            [codes, narrowPlaneWeight(cache, weight, tiled: words), scalesT, biasesT, foldedSums,
+                             activation.scales, activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                            template: [("OutT", outputDType)],
+                            grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                            outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    }
                     return kernelStaged8Reg(
                         [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                          activation.scaledSums, dimsArray(k: k, m: m, n: n)],
@@ -4444,6 +4620,9 @@ enum Qwen35TensorPackedMatmul {
 extension Qwen35TensorPackedMatmul {
     /// `HadamardConstantLayoutCache.residencyMarks` bits.
     static let promptReadMark = 4
+    /// Set where the prompt route reads the plane copy (`promptPlaneWeights`)
+    /// rather than the tiled copy the verify route reads.
+    static let promptPlaneMark = 8
 
     /// A verify int8 call site, held weakly: its layout cache and constants.
     private final class VerifySite {
@@ -4494,7 +4673,12 @@ extension Qwen35TensorPackedMatmul {
                 cache, scales, biases, k: site.k, n: site.n, outputDType: site.outputDType)
             let promptRead = cache.residencyMarks & promptReadMark != 0
             var reads: [MLXArray?] = []
-            if !promptRead { reads.append(narrowTiled ? cache.existing(weight, tag: 5) : weight) }
+            // The words: window-only unless the prompt route reads the same
+            // copy (it reads the plane copy, not the tiled one, under
+            // `promptPlaneMark`).
+            if !promptRead || cache.residencyMarks & promptPlaneMark != 0 {
+                reads.append(narrowTiled ? cache.existing(weight, tag: 5) : weight)
+            }
             switch choice.form {
             case .negativeBiasF32Scales:
                 reads.append(cache.existing(scales, tag: 4))
