@@ -459,6 +459,7 @@ extension EngineLoopV2 {
                     proposal = adoptedProposal
                 } else if lookupContext != nil, let lookup {
                     proposal = lookup
+                    CBv2VerifyQueueHint.markNothingAhead()
                 } else if let leading {
                     proposal = try? leading.proposeBlock(
                         anchor: anchor, depth: k, requestState: state,
