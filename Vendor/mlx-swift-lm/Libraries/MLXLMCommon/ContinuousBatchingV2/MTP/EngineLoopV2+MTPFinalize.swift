@@ -445,57 +445,30 @@ extension EngineLoopV2 {
                 let leading =
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil
-                let history = rec.tokens
-                let promptLength = rec.request.promptTokens.count
-                let hit = CBv2PromptLookupDraft.continuation(
-                    history: history, promptLength: promptLength, depth: k)
-                let absorbing = block as? any CBv2PromptLookupAbsorbing
                 let proposal: MLXArray?
-                let keepDrafterGraph: Bool
                 if let adoptedProposal {
                     proposal = adoptedProposal
-                    keepDrafterGraph = true
-                } else if let hit, let absorbing, absorbing.lookupSkipReady,
-                    let absorbed = absorbing.absorbCommittedContext(requestState: state)
-                {
-                    // Prompt copy. The block forward is not built; the absorb
-                    // writes the committed rows it would have written.
-                    proposal = MLXArray(hit.ids, [1, k])
-                    keepDrafterGraph = false
-                    block.trimBlockState(state, toCommittedLength: kvOffset)
-                    asyncEval(
-                        [proposal!] + absorbed + block.evaluationTargets(for: state))
-                    FileHandle.standardError.write(
-                        Data("dflash2 lookup skip: match=\(hit.match) depth=\(k)\n".utf8))
                 } else if let leading {
                     proposal = try? leading.proposeBlock(
                         anchor: anchor, depth: k, requestState: state,
                         submittingLeadingLayers: Self.earlyDraftLeadingLayers)
-                    keepDrafterGraph = true
                 } else {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
-                    keepDrafterGraph = true
                 }
                 if let drafted = proposal {
-                    let tokens: MLXArray
-                    if keepDrafterGraph {
-                        // Same object when no unique prompt span matches. The
-                        // drafter graph stays in `drafted` either way.
-                        tokens = CBv2PromptLookupDraft.override(
-                            drafted, history: history,
-                            promptLength: promptLength, depth: k)
-                        block.trimBlockState(state, toCommittedLength: kvOffset)
-                        let targets = [tokens, drafted] + block.evaluationTargets(for: state)
-                        if leading != nil {
-                            deferredDraftTargets = targets
-                        } else {
-                            asyncEval(targets)
-                        }
+                    // Same object when no unique prompt span matches. The
+                    // drafter graph stays in `drafted` either way.
+                    let tokens = CBv2PromptLookupDraft.override(
+                        drafted, history: rec.tokens,
+                        promptLength: rec.request.promptTokens.count, depth: k)
+                    block.trimBlockState(state, toCommittedLength: kvOffset)
+                    let targets = [tokens, drafted] + block.evaluationTargets(for: state)
+                    if leading != nil {
+                        deferredDraftTargets = targets
                     } else {
-                        tokens = drafted
+                        asyncEval(targets)
                     }
-                    absorbing?.noteLookupProposal(hit != nil, requestState: state)
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 }

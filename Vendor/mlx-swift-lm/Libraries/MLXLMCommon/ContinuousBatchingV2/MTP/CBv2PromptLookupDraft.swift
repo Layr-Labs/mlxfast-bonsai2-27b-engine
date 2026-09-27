@@ -3,17 +3,11 @@
 // The drafter never reads token ids. When the committed text repeats a span
 // of the prompt, the tokens that followed that span are already known, and a
 // block drafter still spends a round re-deriving them. This replaces the
-// draft ids when a unique prompt span of at least `minimumMatch` tokens
-// matches the committed suffix and the following `depth` tokens sit in the
-// prompt. The target still verifies every id and still emits its own greedy
-// tokens. A miss returns the same proposal object, so the graph, the kernels
-// and the values are unchanged.
-//
-// On a hit the block forward is also skipped, but only after a load-time
-// proof that writing the pending context through `absorbContext` leaves the
-// same cache bits as propose-then-trim. The next miss therefore drafts from
-// the same cache the stock path would have left. `MLXFAST_DFLASH_LOOKUP_SKIP=0`
-// keeps the stock "replace ids, still run the drafter" path.
+// draft ids — and only the draft ids — when a unique prompt span of at least
+// `minimumMatch` tokens matches the committed suffix and the following
+// `depth` tokens sit in the prompt. The target still verifies every id and
+// still emits its own greedy tokens. A miss returns the same proposal object,
+// so the graph, the kernels and the values are unchanged.
 //
 // Short matches are not used. A rank-merge at n = 2...4 replaced correct
 // drafter tokens and added rounds (9ac82eeb, 12 rounds -> 15). A unique
@@ -22,29 +16,10 @@
 import Foundation
 import MLX
 
-/// A block drafter that can commit context without the block forward.
-///
-/// The engine calls this only when prompt lookup already has the proposal ids.
-/// `absorbCommittedContext` returns nil when it cannot leave the cache in the
-/// state `proposeBlock` + trim would, and the engine then proposes as usual.
-public protocol CBv2PromptLookupAbsorbing: AnyObject {
-    /// True only after the load-time bitwise proof passed.
-    var lookupSkipReady: Bool { get }
-    func absorbCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]?
-    func noteLookupProposal(_ hit: Bool, requestState: any CBv2MTPRequestState)
-}
-
-public enum CBv2PromptLookupDraft {
+enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_LOOKUP=0` keeps the drafter's block.
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `MLXFAST_DFLASH_LOOKUP_SKIP=0` keeps running the drafter on a hit.
-    public static let skipDrafterOnHit: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_SKIP"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -88,6 +63,15 @@ public enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
+        // Every longer eligible match contains this suffix and leaves the
+        // same continuation inside the prompt. Prove a miss in one scan
+        // before scanning all longer lengths; ambiguous hits still use the
+        // original longest-match selection below.
+        let minimumSuffix = history[(count - minimum) ..< count]
+        let lastMinimumStart = prompt - minimum - depth
+        guard (0 ... lastMinimumStart).contains(where: { start in
+            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
+        }) else { return nil }
         for length in stride(from: longest, through: minimum, by: -1) {
             let suffix = count - length
             let lastStart = prompt - length - depth

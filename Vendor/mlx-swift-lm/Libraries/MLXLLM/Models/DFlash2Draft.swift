@@ -1,6 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
 // DFlash 2 block drafter.
+// The wide FP32 selector reuses singleton-batch views from the narrow path;
+// selector arithmetic, output ids, and the pinned parameter format are unchanged.
 //
 // This is a port of the reference MLX Python implementation, `dflash/model_mlx.py`
 // of `z-lab/dflash` at `07ebd93`: `DFlashAttention`, `GroupedDynamicCausalConv`,
@@ -2828,7 +2830,9 @@ enum DFlash2GreedyWalk {
         let length = candidates.dim(1)
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
-        let c = candidates[0]
+        // Reuse the narrow path's singleton-batch views while keeping this
+        // path's FP32 widening and stock kernel. Preserve general indexing.
+        let c = candidates.dim(0) == 1 ? candidates.squeezed(axis: 0) : candidates[0]
         // Gather only the codebook rows the candidate lists can visit. The
         // fused kernel scores each edge and advances the greedy walk in one
         // pass, instead of materializing an [L-1, K, K, rank] broadcast.
@@ -2837,8 +2841,10 @@ enum DFlash2GreedyWalk {
         let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
             .asType(.float32).reshaped([-1])
         let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
-        let projectedRows = projected[0].asType(.float32).reshaped([-1])
-        let scores = unary[0].asType(.float32).reshaped([-1])
+        let projectedBatch = projected.dim(0) == 1 ? projected.squeezed(axis: 0) : projected[0]
+        let projectedRows = projectedBatch.asType(.float32).reshaped([-1])
+        let unaryBatch = unary.dim(0) == 1 ? unary.squeezed(axis: 0) : unary[0]
+        let scores = unaryBatch.asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
