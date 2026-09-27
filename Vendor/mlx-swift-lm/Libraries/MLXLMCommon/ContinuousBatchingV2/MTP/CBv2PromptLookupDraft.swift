@@ -51,6 +51,17 @@ enum CBv2PromptLookupDraft {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Probe the current committed suffix before any as-yet unbuilt block,
+    /// including entry into a copy span. The previous proposal's source is
+    /// useful for scheduling before readback, but is not a condition for a
+    /// current exact match. `MLXFAST_DFLASH_LOOKUP_ON_ENTRY=0` restores that
+    /// previous-source restriction and the ordinary first-block path.
+    static let onEntryEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_ON_ENTRY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let lock = NSLock()
     /// Requests whose newest proposal came from the prompt.
     nonisolated(unsafe) private static var fromPrompt: Set<CBv2RequestID> = []

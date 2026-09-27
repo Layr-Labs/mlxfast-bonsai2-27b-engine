@@ -449,13 +449,17 @@ extension EngineLoopV2 {
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil
                 let proposal: MLXArray?
-                // The previous proposal came from the prompt and no block was
-                // built before the readback: the continuation is looked up
-                // first, and only a miss runs the drafter. On a hit the
+                // When no block was adopted, look up the current committed
+                // suffix before building a new one, including entry into a
+                // copy span. The previous-source hint still controls work
+                // scheduled before readback above. On a hit the
                 // drafter's cache is untouched and the context rows
                 // `finalizeRound` just queued stay pending for the next block.
+                let probePrompt = adoptedProposal == nil && CBv2PromptLookupDraft.skipEnabled
+                    && (CBv2PromptLookupDraft.onEntryEnabled
+                        || CBv2PromptLookupDraft.expectsPromptProposal(id))
                 let promptProposal =
-                    adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
+                    probePrompt
                     ? CBv2PromptLookupDraft.lookup(
                         history: rec.tokens, promptLength: rec.request.promptTokens.count,
                         depth: k)
@@ -479,7 +483,8 @@ extension EngineLoopV2 {
                 } else if let drafted = proposal {
                     // Same object when no unique prompt span matches. The
                     // drafter graph stays in `drafted` either way.
-                    let tokens = CBv2PromptLookupDraft.override(
+                    let tokens = probePrompt && CBv2PromptLookupDraft.onEntryEnabled
+                        ? drafted : CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)

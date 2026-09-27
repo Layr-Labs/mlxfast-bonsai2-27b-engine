@@ -616,6 +616,8 @@ extension EngineLoopV2 {
                 }
                 let carry = row.carry!
                 let proposal: MLXArray
+                let lookupFirst = CBv2PromptLookupDraft.skipEnabled
+                    && CBv2PromptLookupDraft.onEntryEnabled
                 if let early = carry.earlyBlock {
                     // Proposed and submitted at the previous round's finalize
                     // with this carry's anchor and offset (`storeCarry`
@@ -628,10 +630,22 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else if lookupFirst,
+                    let tokens = CBv2PromptLookupDraft.lookup(
+                        history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k)
+                {
+                    // The first hit needs no draft to replace. As on an
+                    // early lookup hit, committed context stays pending for
+                    // the next real block; target verification is unchanged.
+                    proposal = tokens
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: true)
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
-                    proposal = CBv2PromptLookupDraft.override(
+                    // A pre-draft miss cannot become a hit without new
+                    // committed tokens. Avoid searching the same history twice.
+                    proposal = lookupFirst ? drafted : CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
                     CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
