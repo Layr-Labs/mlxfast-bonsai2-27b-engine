@@ -832,7 +832,7 @@ extension Qwen35GDNPrework {
     /// Rows per threadgroup of `freshStridedRowsKernel`: one fixed value, not
     /// chosen per chip or at run time. A chunk whose row count it does not
     /// divide takes `freshStridedKernel`.
-    static let rowTile = 4
+    static let rowTile = 8
 
     /// `freshStridedSource` with one threadgroup per (key head, `RW`
     /// consecutive rows) instead of per (key head, row). The stock launch reads
