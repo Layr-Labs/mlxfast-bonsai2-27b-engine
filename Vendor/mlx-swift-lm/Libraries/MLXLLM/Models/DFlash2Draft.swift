@@ -3341,9 +3341,29 @@ private enum DFlash2ResidencyTouch {
 /// Each group costs one single-thread kernel per 24 arrays on the GPU. No
 /// value of either model is read into any result, and nothing about the
 /// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
+///
+/// WHERE THE LIST IS BUILT. The engine build runs at the head of the seed
+/// window, before any GPU work, so whatever it does there is host time the
+/// seed pays in full: walking the drafter's modules for its arrays and
+/// splitting them into the byte groups took 0.6-2.3 ms of the 0.9-3.5 ms
+/// engine build (local M4 phase markers). Nothing reads the groups before the
+/// prompt forward's first early submission, so `arm` keeps only the drafter
+/// and the window's arrays (read at arm, as before) and the first
+/// `submitDue` builds the same list and the same groups there, behind the
+/// GPU work that submission just queued. The touches, their order, their
+/// groups and the layers they follow are unchanged.
+/// `MLXFAST_RESIDENCY_DEFERRED_ARM=0` builds the groups at `arm` again.
 public enum DFlash2ResidencyPrefetch {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Builds the groups at the prompt forward's first submission rather than
+    /// at `arm` (default on; see the type's comment).
+    static let deferredArm: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_RESIDENCY_DEFERRED_ARM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -3354,6 +3374,9 @@ public enum DFlash2ResidencyPrefetch {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var groups: [[MLXArray]] = []
     nonisolated(unsafe) private static var nextGroup = 0
+    /// An arm whose groups are not built yet: the drafter and the window's
+    /// arrays as `arm` read them.
+    nonisolated(unsafe) private static var unbuilt: (drafter: DFlash2DraftModel, window: [MLXArray])?
 
     /// Arms the prefetch for the next prompt forward: called when an engine
     /// that drafts with `drafter` is built. `window`: the target's arrays the
@@ -3362,8 +3385,28 @@ public enum DFlash2ResidencyPrefetch {
     static func arm(_ drafter: DFlash2DraftModel, window: @autoclosure () -> [MLXArray] = []) {
         guard enabled else { return }
         DFlash2ResidencyTouch.prewarm()
+        let windowArrays = window()
+        if deferredArm {
+            lock.withLock {
+                unbuilt = (drafter, windowArrays)
+                groups = []
+                nextGroup = 0
+            }
+            return
+        }
+        let built = buildGroups(of: drafter, window: windowArrays)
+        lock.withLock {
+            unbuilt = nil
+            groups = built
+            nextGroup = 0
+        }
+    }
+
+    /// The drafter's arrays, then the window's, each once, in four groups of
+    /// about equal bytes.
+    private static func buildGroups(of drafter: DFlash2DraftModel, window: [MLXArray]) -> [[MLXArray]] {
         var seen = Set<ObjectIdentifier>()
-        let arrays = (drafter.residencyArrays() + window()).filter {
+        let arrays = (drafter.residencyArrays() + window).filter {
             seen.insert(ObjectIdentifier($0)).inserted
         }
         let total = arrays.reduce(0) { $0 + $1.nbytes }
@@ -3380,15 +3423,24 @@ public enum DFlash2ResidencyPrefetch {
             }
         }
         if !group.isEmpty { built.append(group) }
-        lock.withLock {
-            groups = built
-            nextGroup = 0
-        }
+        return built
     }
 
     /// Submits every group due once the prompt forward has submitted its
     /// first `completedLayers` layers. A no-op unless armed.
     static func submitDue(completedLayers: Int) {
+        // A deferred arm's groups, built at the forward's first submission.
+        let pending = lock.withLock { () -> (drafter: DFlash2DraftModel, window: [MLXArray])? in
+            defer { unbuilt = nil }
+            return unbuilt
+        }
+        if let pending {
+            let built = buildGroups(of: pending.drafter, window: pending.window)
+            lock.withLock {
+                groups = built
+                nextGroup = 0
+            }
+        }
         let due: [[MLXArray]] = lock.withLock {
             var due: [[MLXArray]] = []
             while nextGroup < groups.count,
