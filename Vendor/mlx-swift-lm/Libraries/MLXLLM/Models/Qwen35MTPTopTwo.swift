@@ -1838,6 +1838,877 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+
+    // Two 64-column tiles per threadgroup, one staged activation group.
+    // `sourceStaged8` reads the 64 x 128 activation tile from device memory
+    // once per 64-column tile. At TN = 64 that activation traffic is four
+    // times the packed-weight traffic (M*K*(N/64) bytes versus (M/64)*(N*K/4)).
+    // Here each threadgroup owns 128 columns. It copies one activation group
+    // into threadgroup memory and runs both column tiles against that copy,
+    // so the device read happens once. The products, the factored epilogue
+    // and the output addresses match `sourceStaged8` tile for tile. `LAYOUT`
+    // is the copy order the load-time self-test found bit-identical; a miss
+    // or a slower trial keeps `sourceStaged8`. `BONSAI_PROMPT_N2=0` forces
+    // that kernel.
+    private static let sourceStaged8N2 = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int nBase = int(threadgroup_position_in_grid.x) * 128;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        threadgroup uint32_t bs[64 * 128 / 4];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs, dextents<int, 2>(128, 64));
+        threadgroup uint8_t astore[128 * 64];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> As((threadgroup CodeT*)astore, dextents<int, 2>(128, 64));
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc0[CAP], acc1[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        const int sc = int(tid >> 1);
+        const int sh = int(tid & 1);
+        const device CodeT* xbytes = (const device CodeT*)xq;
+        auto stageB = [&](int g, int n0) {
+          const device uint32_t* wrow = TILED
+              ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+              : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+          const uint4 v = *(const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
+          threadgroup uint32_t* dst = bs + sc * 32 + sh * 16;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint32_t wv = v[j];
+            *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+          }
+        };
+        auto stageA = [&](int g) {
+          const int k0 = g * 128;
+          if (LAYOUT == 0) {
+            // element (i, j) at j * 128 + i: first extent contiguous, the
+            // [M, K] row-major order the rotation writes.
+            if (tid < 64) {
+              const device CodeT* src = xbytes + (size_t)(m0 + int(tid)) * K + k0;
+              threadgroup uint8_t* dst = astore + int(tid) * 128;
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 8; q++) {
+                *(threadgroup uint4*)(dst + 16 * q) = *(const device uint4*)(src + 16 * q);
+              }
+            }
+          } else {
+            // element (i, j) at i * 64 + j.
+            const device CodeT* src = xbytes + (size_t)(k0 + int(tid)) * M + m0;
+            threadgroup uint8_t* dst = astore + int(tid) * 64;
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) {
+              *(threadgroup uint4*)(dst + 16 * q) = *(const device uint4*)(src + 16 * q);
+            }
+          }
+        };
+        auto tAs = As.template slice<128, 64>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tAs)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        for (int g = 0; g < Kg; g++) {
+          stageA(g);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          #pragma clang loop unroll(full)
+          for (int tile = 0; tile < 2; tile++) {
+            const int n0 = nBase + 64 * tile;
+            const int nb = n0 + 16 * int(sg & 1) + fn;
+            stageB(g, n0);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            op.run(tAs, B0, cT);
+            const device half4* sp0 = (const device half4*)(scalesT + nb);
+            const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+            const device half4* bp0 = (const device half4*)(biasesT + nb);
+            const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+            const device float4* up0p = (const device float4*)(uT + nb);
+            const device float4* up1p = (const device float4*)(uT + nb + 32);
+            const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+            float4 b0, b1;
+            if constexpr (NEGATIVE_SCALE_BIAS) {
+              b0 = -s0; b1 = -s1;
+            } else {
+              b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+            }
+            float4 u0 = 0.0f, u1 = 0.0f;
+            if (!SIGNED) { u0 = up0p[g * NQ]; u1 = up1p[g * NQ]; }
+            float asv[4], rb[4];
+            if (MPERM) {
+              const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+              const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+              asv[0] = as4.x; asv[1] = as4.y; asv[2] = as4.z; asv[3] = as4.w;
+              rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4; q++) {
+                asv[q] = ascale[mrow[q] * Kg + g];
+                rb[q] = rsb[mrow[q] * Kg + g];
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int nh = (i >> 3) & 1;
+              const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+              const float s = nh ? s1[c] : s0[c];
+              const float b = nh ? b1[c] : b0[c];
+              const float u = nh ? u1[c] : u0[c];
+              const float prev = tile == 0 ? acc0[i] : acc1[i];
+              float nv;
+              if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                nv = fma(s, fma(asv[mh], float(cT[i]), -rb[mh]), prev);
+              } else {
+                const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                nv = fma(b, rb[mh], fma(asv[mh], t, prev));
+              }
+              if (tile == 0) { acc0[i] = nv; } else { acc1[i] = nv; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int tile = 0; tile < 2; tile++) {
+          const int n0 = nBase + 64 * tile;
+          const int nb = n0 + 16 * int(sg & 1) + fn;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            const float v = tile == 0 ? acc0[i] : acc1[i];
+            out[(size_t)mm * N + nb + c + 32 * nh] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelStaged8N2 = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_n2",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8N2,
+        header: header,
+        ensureRowContiguous: true)
+
+
+    // Pipe 1 hides the next activation-group load under the second
+    // column tile and issues the other tile's weight unpack before the
+    // tensor op. Pipe 2 double-buffers both operands in 32 KiB. The
+    // load-time trial keeps a pipe only when every FP32 bit matches
+    // sourceStaged8 and the prompt-shaped timing is faster.
+    private static let sourceStaged8N2P = """
+                // Pipe 1: one activation tile, double-buffered weights. The next
+                // group's activation bytes are loaded into registers during the
+                // second column tile's tensor op, then written to threadgroup memory
+                // before the next group. Weight unpack of one tile is issued before
+                // the other tile's tensor op, matching sourceStaged8's overlap.
+                // 8 KiB activations + 16 KiB weights.
+
+                const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+                const int Kg = K / 128;
+                const int nBase = int(threadgroup_position_in_grid.x) * 128;
+                const int m0 = int(threadgroup_position_in_grid.y) * 64;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint tid = thread_position_in_threadgroup.x;
+                constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+                mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+                typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+                const device CodeT* xbytes = (const device CodeT*)xq;
+
+                threadgroup uint8_t astore[128 * 64];
+                threadgroup uint32_t bs[2][64 * 128 / 4];
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> As((threadgroup CodeT*)astore, dextents<int, 2>(128, 64));
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B1((threadgroup CodeT*)bs[1], dextents<int, 2>(128, 64));
+
+                constexpr int CAP = 32;
+                const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+                const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+                const int mb = m0 + 16 * int(sg >> 1) + fm;
+                const int sc = int(tid) >> 1;
+                const int sh = int(tid) & 1;
+                const int NQ = N / 4;
+                int mrow[4];
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < 4; q++) { mrow[q] = m0 + 16 * int(sg >> 1) + fm + 8 * (q & 1) + 32 * (q >> 1); }
+                const int tbase = (m0 + 16 * int(sg >> 1) + fm) * Kg;
+                float acc0[CAP];
+                float acc1[CAP];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
+
+                uint4 apref[4];
+
+                auto stageB = [&](int g, int n0, threadgroup uint32_t* words) {
+                  const device uint32_t* wrow = TILED
+                      ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+                      : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+                  const uint4 v = *(const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
+                  threadgroup uint32_t* dst = words + sc * 32 + sh * 16;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < 4; j++) {
+                    const uint32_t wv = v[j];
+                    *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                        wv & 0x03030303u,
+                        (wv >> 2) & 0x03030303u,
+                        (wv >> 4) & 0x03030303u,
+                        (wv >> 6) & 0x03030303u);
+                  }
+                };
+
+
+                auto loadA = [&](int g) {
+                  const int k0 = g * 128;
+                  if (LAYOUT == 0) {
+                    const int r = int(tid) & 63;
+                    const int h = int(tid) >> 6;
+                    const device uint8_t* src = (const device uint8_t*)xbytes + (size_t)(m0 + r) * K + k0 + 64 * h;
+                    apref[0] = *(const device uint4*)(src);
+                    apref[1] = *(const device uint4*)(src + 16);
+                    apref[2] = *(const device uint4*)(src + 32);
+                    apref[3] = *(const device uint4*)(src + 48);
+                  } else {
+                    const device uint8_t* src = (const device uint8_t*)xbytes + (size_t)(k0 + int(tid)) * M + m0;
+                    apref[0] = *(const device uint4*)(src);
+                    apref[1] = *(const device uint4*)(src + 16);
+                    apref[2] = *(const device uint4*)(src + 32);
+                    apref[3] = *(const device uint4*)(src + 48);
+                  }
+                };
+                auto storeA = [&](threadgroup uint8_t* dstBase) {
+                  if (LAYOUT == 0) {
+                    const int r = int(tid) & 63;
+                    const int h = int(tid) >> 6;
+                    threadgroup uint8_t* dst = dstBase + r * 128 + 64 * h;
+                    *(threadgroup uint4*)(dst) = apref[0];
+                    *(threadgroup uint4*)(dst + 16) = apref[1];
+                    *(threadgroup uint4*)(dst + 32) = apref[2];
+                    *(threadgroup uint4*)(dst + 48) = apref[3];
+                  } else {
+                    threadgroup uint8_t* dst = dstBase + int(tid) * 64;
+                    *(threadgroup uint4*)(dst) = apref[0];
+                    *(threadgroup uint4*)(dst + 16) = apref[1];
+                    *(threadgroup uint4*)(dst + 32) = apref[2];
+                    *(threadgroup uint4*)(dst + 48) = apref[3];
+                  }
+                };
+
+                auto tAs = As.template slice<128, 64>(0, 0);
+                auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tAs)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+                loadA(0);
+                storeA(astore);
+                stageB(0, nBase, bs[0]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int g = 0; g < Kg; g++) {
+                  stageB(g, nBase + 64, bs[1]);
+                  {
+                    const int n0 = nBase;
+                    const int tile = 0;
+
+                  const int nbS = n0 + 16 * int(sg & 1) + fn;
+                  const device half4* sp0 = (const device half4*)(scalesT + nbS);
+                  const device half4* sp1 = (const device half4*)(scalesT + nbS + 32);
+                  const device half4* bp0 = (const device half4*)(biasesT + nbS);
+                  const device half4* bp1 = (const device half4*)(biasesT + nbS + 32);
+                  const device float4* up0p = (const device float4*)(uT + nbS);
+                  const device float4* up1p = (const device float4*)(uT + nbS + 32);
+                  float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+                  float4 b0, b1;
+                  if constexpr (NEGATIVE_SCALE_BIAS) {
+                    b0 = -s0; b1 = -s1;
+                  } else {
+                    b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+                  }
+                  float4 u0 = 0.0f, u1 = 0.0f;
+                  if (!SIGNED) { u0 = up0p[g * NQ]; u1 = up1p[g * NQ]; }
+
+                    op.run(tAs, B0, cT);
+
+                  float asv[4], rb[4];
+                  if (MPERM) {
+                    const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+                    const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+                    asv[0] = as4.x; asv[1] = as4.y; asv[2] = as4.z; asv[3] = as4.w;
+                    rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+                  } else {
+                    #pragma clang loop unroll(full)
+                    for (int q = 0; q < 4; q++) {
+                      asv[q] = ascale[mrow[q] * Kg + g];
+                      rb[q] = rsb[mrow[q] * Kg + g];
+                    }
+                  }
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                    const float s = nh ? s1[c] : s0[c];
+                    const float b = nh ? b1[c] : b0[c];
+                    const float u = nh ? u1[c] : u0[c];
+                    const float prev = tile == 0 ? acc0[i] : acc1[i];
+                    float nv;
+                    if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                      nv = fma(s, fma(asv[mh], float(cT[i]), -rb[mh]), prev);
+                    } else {
+                      const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                      nv = fma(b, rb[mh], fma(asv[mh], t, prev));
+                    }
+                    if (tile == 0) { acc0[i] = nv; } else { acc1[i] = nv; }
+                  }
+
+                  }
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  if (g + 1 < Kg) {
+                    loadA(g + 1);
+                    stageB(g + 1, nBase, bs[0]);
+                  }
+                  {
+                    const int n0 = nBase + 64;
+                    const int tile = 1;
+
+                  const int nbS = n0 + 16 * int(sg & 1) + fn;
+                  const device half4* sp0 = (const device half4*)(scalesT + nbS);
+                  const device half4* sp1 = (const device half4*)(scalesT + nbS + 32);
+                  const device half4* bp0 = (const device half4*)(biasesT + nbS);
+                  const device half4* bp1 = (const device half4*)(biasesT + nbS + 32);
+                  const device float4* up0p = (const device float4*)(uT + nbS);
+                  const device float4* up1p = (const device float4*)(uT + nbS + 32);
+                  float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+                  float4 b0, b1;
+                  if constexpr (NEGATIVE_SCALE_BIAS) {
+                    b0 = -s0; b1 = -s1;
+                  } else {
+                    b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+                  }
+                  float4 u0 = 0.0f, u1 = 0.0f;
+                  if (!SIGNED) { u0 = up0p[g * NQ]; u1 = up1p[g * NQ]; }
+
+                    op.run(tAs, B1, cT);
+
+                  float asv[4], rb[4];
+                  if (MPERM) {
+                    const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+                    const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+                    asv[0] = as4.x; asv[1] = as4.y; asv[2] = as4.z; asv[3] = as4.w;
+                    rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+                  } else {
+                    #pragma clang loop unroll(full)
+                    for (int q = 0; q < 4; q++) {
+                      asv[q] = ascale[mrow[q] * Kg + g];
+                      rb[q] = rsb[mrow[q] * Kg + g];
+                    }
+                  }
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                    const float s = nh ? s1[c] : s0[c];
+                    const float b = nh ? b1[c] : b0[c];
+                    const float u = nh ? u1[c] : u0[c];
+                    const float prev = tile == 0 ? acc0[i] : acc1[i];
+                    float nv;
+                    if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                      nv = fma(s, fma(asv[mh], float(cT[i]), -rb[mh]), prev);
+                    } else {
+                      const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                      nv = fma(b, rb[mh], fma(asv[mh], t, prev));
+                    }
+                    if (tile == 0) { acc0[i] = nv; } else { acc1[i] = nv; }
+                  }
+
+                  }
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  if (g + 1 < Kg) {
+                    storeA(astore);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                  }
+                }
+
+                #pragma clang loop unroll(full)
+                for (int tile = 0; tile < 2; tile++) {
+                  const int n0 = nBase + 64 * tile;
+                  const int nb = n0 + 16 * int(sg & 1) + fn;
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+                    const float v = tile == 0 ? acc0[i] : acc1[i];
+                    out[(size_t)mm * N + nb + c + 32 * nh] = OutT(v);
+                  }
+                }
+    """
+
+    private static let kernelStaged8N2P = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_n2p",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8N2P,
+        header: header,
+        ensureRowContiguous: true)
+
+    private static let sourceStaged8N2Q = """
+                // Pipe 2: double-buffered activation tile and double-buffered weights,
+                // 32 KiB exactly. The next activation group is staged into the idle
+                // buffer during the current group's first column tile, so neither the
+                // activation copy nor the weight unpack sits in front of the tensor op.
+
+                const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+                const int Kg = K / 128;
+                const int nBase = int(threadgroup_position_in_grid.x) * 128;
+                const int m0 = int(threadgroup_position_in_grid.y) * 64;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint tid = thread_position_in_threadgroup.x;
+                constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+                mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+                typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+                const device CodeT* xbytes = (const device CodeT*)xq;
+
+                threadgroup uint8_t smem[32 * 1024];
+                threadgroup uint8_t* aBytes0 = smem;
+                threadgroup uint8_t* aBytes1 = smem + 8192;
+                threadgroup uint32_t* bWords0 = (threadgroup uint32_t*)(smem + 16384);
+                threadgroup uint32_t* bWords1 = (threadgroup uint32_t*)(smem + 24576);
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> A0((threadgroup CodeT*)aBytes0, dextents<int, 2>(128, 64));
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> A1((threadgroup CodeT*)aBytes1, dextents<int, 2>(128, 64));
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bWords0, dextents<int, 2>(128, 64));
+                tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B1((threadgroup CodeT*)bWords1, dextents<int, 2>(128, 64));
+
+                constexpr int CAP = 32;
+                const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+                const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+                const int mb = m0 + 16 * int(sg >> 1) + fm;
+                const int sc = int(tid) >> 1;
+                const int sh = int(tid) & 1;
+                const int NQ = N / 4;
+                int mrow[4];
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < 4; q++) { mrow[q] = m0 + 16 * int(sg >> 1) + fm + 8 * (q & 1) + 32 * (q >> 1); }
+                const int tbase = (m0 + 16 * int(sg >> 1) + fm) * Kg;
+                float acc0[CAP];
+                float acc1[CAP];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
+
+                uint4 apref[4];
+
+                auto stageB = [&](int g, int n0, threadgroup uint32_t* words) {
+                  const device uint32_t* wrow = TILED
+                      ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+                      : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+                  const uint4 v = *(const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
+                  threadgroup uint32_t* dst = words + sc * 32 + sh * 16;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < 4; j++) {
+                    const uint32_t wv = v[j];
+                    *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                        wv & 0x03030303u,
+                        (wv >> 2) & 0x03030303u,
+                        (wv >> 4) & 0x03030303u,
+                        (wv >> 6) & 0x03030303u);
+                  }
+                };
+
+
+                auto loadA = [&](int g) {
+                  const int k0 = g * 128;
+                  if (LAYOUT == 0) {
+                    const int r = int(tid) & 63;
+                    const int h = int(tid) >> 6;
+                    const device uint8_t* src = (const device uint8_t*)xbytes + (size_t)(m0 + r) * K + k0 + 64 * h;
+                    apref[0] = *(const device uint4*)(src);
+                    apref[1] = *(const device uint4*)(src + 16);
+                    apref[2] = *(const device uint4*)(src + 32);
+                    apref[3] = *(const device uint4*)(src + 48);
+                  } else {
+                    const device uint8_t* src = (const device uint8_t*)xbytes + (size_t)(k0 + int(tid)) * M + m0;
+                    apref[0] = *(const device uint4*)(src);
+                    apref[1] = *(const device uint4*)(src + 16);
+                    apref[2] = *(const device uint4*)(src + 32);
+                    apref[3] = *(const device uint4*)(src + 48);
+                  }
+                };
+                auto storeA = [&](threadgroup uint8_t* dstBase) {
+                  if (LAYOUT == 0) {
+                    const int r = int(tid) & 63;
+                    const int h = int(tid) >> 6;
+                    threadgroup uint8_t* dst = dstBase + r * 128 + 64 * h;
+                    *(threadgroup uint4*)(dst) = apref[0];
+                    *(threadgroup uint4*)(dst + 16) = apref[1];
+                    *(threadgroup uint4*)(dst + 32) = apref[2];
+                    *(threadgroup uint4*)(dst + 48) = apref[3];
+                  } else {
+                    threadgroup uint8_t* dst = dstBase + int(tid) * 64;
+                    *(threadgroup uint4*)(dst) = apref[0];
+                    *(threadgroup uint4*)(dst + 16) = apref[1];
+                    *(threadgroup uint4*)(dst + 32) = apref[2];
+                    *(threadgroup uint4*)(dst + 48) = apref[3];
+                  }
+                };
+
+                auto tA0 = A0.template slice<128, 64>(0, 0);
+                auto tA1 = A1.template slice<128, 64>(0, 0);
+                auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+                loadA(0);
+                storeA(aBytes0);
+                stageB(0, nBase, bWords0);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int g = 0; g < Kg; g++) {
+                  const int aCur = g & 1;
+                  stageB(g, nBase + 64, bWords1);
+                  if (g + 1 < Kg) {
+                    loadA(g + 1);
+                    storeA(aCur == 0 ? aBytes1 : aBytes0);
+                  }
+                  {
+                    const int n0 = nBase;
+                    const int tile = 0;
+
+                  const int nbS = n0 + 16 * int(sg & 1) + fn;
+                  const device half4* sp0 = (const device half4*)(scalesT + nbS);
+                  const device half4* sp1 = (const device half4*)(scalesT + nbS + 32);
+                  const device half4* bp0 = (const device half4*)(biasesT + nbS);
+                  const device half4* bp1 = (const device half4*)(biasesT + nbS + 32);
+                  const device float4* up0p = (const device float4*)(uT + nbS);
+                  const device float4* up1p = (const device float4*)(uT + nbS + 32);
+                  float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+                  float4 b0, b1;
+                  if constexpr (NEGATIVE_SCALE_BIAS) {
+                    b0 = -s0; b1 = -s1;
+                  } else {
+                    b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+                  }
+                  float4 u0 = 0.0f, u1 = 0.0f;
+                  if (!SIGNED) { u0 = up0p[g * NQ]; u1 = up1p[g * NQ]; }
+
+                    if (aCur == 0) { op.run(tA0, B0, cT); } else { op.run(tA1, B0, cT); }
+
+                  float asv[4], rb[4];
+                  if (MPERM) {
+                    const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+                    const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+                    asv[0] = as4.x; asv[1] = as4.y; asv[2] = as4.z; asv[3] = as4.w;
+                    rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+                  } else {
+                    #pragma clang loop unroll(full)
+                    for (int q = 0; q < 4; q++) {
+                      asv[q] = ascale[mrow[q] * Kg + g];
+                      rb[q] = rsb[mrow[q] * Kg + g];
+                    }
+                  }
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                    const float s = nh ? s1[c] : s0[c];
+                    const float b = nh ? b1[c] : b0[c];
+                    const float u = nh ? u1[c] : u0[c];
+                    const float prev = tile == 0 ? acc0[i] : acc1[i];
+                    float nv;
+                    if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                      nv = fma(s, fma(asv[mh], float(cT[i]), -rb[mh]), prev);
+                    } else {
+                      const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                      nv = fma(b, rb[mh], fma(asv[mh], t, prev));
+                    }
+                    if (tile == 0) { acc0[i] = nv; } else { acc1[i] = nv; }
+                  }
+
+                  }
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  if (g + 1 < Kg) { stageB(g + 1, nBase, bWords0); }
+                  {
+                    const int n0 = nBase + 64;
+                    const int tile = 1;
+
+                  const int nbS = n0 + 16 * int(sg & 1) + fn;
+                  const device half4* sp0 = (const device half4*)(scalesT + nbS);
+                  const device half4* sp1 = (const device half4*)(scalesT + nbS + 32);
+                  const device half4* bp0 = (const device half4*)(biasesT + nbS);
+                  const device half4* bp1 = (const device half4*)(biasesT + nbS + 32);
+                  const device float4* up0p = (const device float4*)(uT + nbS);
+                  const device float4* up1p = (const device float4*)(uT + nbS + 32);
+                  float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+                  float4 b0, b1;
+                  if constexpr (NEGATIVE_SCALE_BIAS) {
+                    b0 = -s0; b1 = -s1;
+                  } else {
+                    b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+                  }
+                  float4 u0 = 0.0f, u1 = 0.0f;
+                  if (!SIGNED) { u0 = up0p[g * NQ]; u1 = up1p[g * NQ]; }
+
+                    if (aCur == 0) { op.run(tA0, B1, cT); } else { op.run(tA1, B1, cT); }
+
+                  float asv[4], rb[4];
+                  if (MPERM) {
+                    const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+                    const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+                    asv[0] = as4.x; asv[1] = as4.y; asv[2] = as4.z; asv[3] = as4.w;
+                    rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+                  } else {
+                    #pragma clang loop unroll(full)
+                    for (int q = 0; q < 4; q++) {
+                      asv[q] = ascale[mrow[q] * Kg + g];
+                      rb[q] = rsb[mrow[q] * Kg + g];
+                    }
+                  }
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                    const float s = nh ? s1[c] : s0[c];
+                    const float b = nh ? b1[c] : b0[c];
+                    const float u = nh ? u1[c] : u0[c];
+                    const float prev = tile == 0 ? acc0[i] : acc1[i];
+                    float nv;
+                    if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                      nv = fma(s, fma(asv[mh], float(cT[i]), -rb[mh]), prev);
+                    } else {
+                      const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                      nv = fma(b, rb[mh], fma(asv[mh], t, prev));
+                    }
+                    if (tile == 0) { acc0[i] = nv; } else { acc1[i] = nv; }
+                  }
+
+                  }
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                #pragma clang loop unroll(full)
+                for (int tile = 0; tile < 2; tile++) {
+                  const int n0 = nBase + 64 * tile;
+                  const int nb = n0 + 16 * int(sg & 1) + fn;
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1;
+                    const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+                    const float v = tile == 0 ? acc0[i] : acc1[i];
+                    out[(size_t)mm * N + nb + c + 32 * nh] = OutT(v);
+                  }
+                }
+    """
+
+    private static let kernelStaged8N2Q = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_n2q",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8N2Q,
+        header: header,
+        ensureRowContiguous: true)
+
+
+    /// `-1` layout keeps `sourceStaged8`. Otherwise `pipe` is the fastest
+    /// bit-identical 128-column form: 0 copies the activation group and then
+    /// waits on each weight unpack, 1 hides the next activation load and the
+    /// other tile's unpack, 2 double-buffers both. A miss or a trial that is
+    /// not at least 0.5% faster keeps the stock kernel. `BONSAI_PROMPT_N2=0`
+    /// forces stock.
+    struct PromptN2Pick {
+        var layout: Int
+        var pipe: Int
+    }
+
+    static let promptN2Pick: PromptN2Pick = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_PROMPT_N2"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(raw ?? "") {
+            return PromptN2Pick(layout: -1, pipe: -1)
+        }
+        guard support == .staged8 else { return PromptN2Pick(layout: -1, pipe: -1) }
+        return promptN2Trial(force: raw == "1" || raw == "on" || raw == "yes")
+    }()
+
+    private static func promptN2Launch(
+        _ pipe: Int, _ layout: Int, _ neg: Int, _ tiled: Int,
+        _ codes: MLXArray, _ words: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ folded: MLXArray, _ ascale: MLXArray, _ asums: MLXArray,
+        _ k: Int, _ m: Int, _ n: Int
+    ) -> MLXArray {
+        var template: [(String, any KernelTemplateArg)] = [
+            ("OutT", DType.float32), ("MPERM", rowTiledConstants ? 1 : 0),
+            ("SIGNED", signedCodes ? 1 : 0),
+            ("NEGATIVE_SCALE_BIAS", neg), ("FACTORED", factoredPromptEpilogue ? 1 : 0),
+            ("TILED", tiled),
+        ]
+        let kernel: MLXFast.MLXFastKernel
+        switch pipe {
+        case 0:
+            template.append(("LAYOUT", layout))
+            kernel = kernelStaged8N2
+        case 1:
+            template.append(("LAYOUT", layout))
+            kernel = kernelStaged8N2P
+        case 2:
+            template.append(("LAYOUT", layout))
+            kernel = kernelStaged8N2Q
+        default:
+            kernel = kernelStaged8
+        }
+        let nTile = pipe >= 0 ? 128 : 64
+        return kernel(
+            [codes, words, scalesT, biasesT, folded, ascale, asums, dimsArray(k: k, m: m, n: n)],
+            template: template,
+            grid: (n / nTile * 128, m / 64, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// Bit-identical to `sourceStaged8` on both offset forms and on a
+    /// two-threadgroup width, then faster on a prompt-shaped pair.
+    nonisolated(unsafe) private static var n2ProbeFailed = false
+
+    private static func promptN2Trial(force: Bool) -> PromptN2Pick {
+        let keep = PromptN2Pick(layout: -1, pipe: -1)
+        let codeType: DType = signedCodes ? .int8 : .uint8
+        let tiledFlag = narrowTiled ? 1 : 0
+        func pack(
+            _ m: Int, _ k: Int, _ n: Int, _ salt: Int
+        ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
+            let kg = k / 128
+            let codes = MLXRandom.randInt(
+                signedCodes ? Int32(-127) ..< Int32(128) : Int32(0) ..< Int32(256), [m, k],
+                key: MLXRandom.key(UInt64(80 + salt))
+            ).asType(codeType)
+            let weight = MLXRandom.randInt(
+                Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(UInt64(90 + salt))
+            ).asType(.uint16).view(dtype: .uint32)
+            let scalesT = MLXRandom.uniform(
+                Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(UInt64(100 + salt))
+            ).asType(.float16)
+            let biasesT = MLXRandom.uniform(
+                Float(-0.02) ..< Float(0.02), [kg, n], key: MLXRandom.key(UInt64(110 + salt))
+            ).asType(.float16)
+            let folded = MLXRandom.normal([kg, n], key: MLXRandom.key(UInt64(120 + salt)))
+            let ascale = MLXRandom.uniform(
+                Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(UInt64(130 + salt)))
+            let asums = MLXRandom.normal([m, kg], key: MLXRandom.key(UInt64(140 + salt))) * Float(50)
+            let words = tiledFlag == 1 ? tileNarrowWeight(weight, n: n, k: k) : weight
+            return (codes, words, scalesT, biasesT, folded, ascale, asums)
+        }
+        let small = pack(128, 512, 128, 1)
+        let wide = pack(64, 512, 256, 2)
+        func same(_ pipe: Int, _ layout: Int, _ neg: Int, _ shape: (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray), _ k: Int, _ m: Int, _ n: Int) -> Bool {
+            n2ProbeFailed = false
+            var equal = false
+            withErrorHandler({ _ in n2ProbeFailed = true }) {
+                let stock = promptN2Launch(
+                    -1, layout, neg, tiledFlag, shape.0, shape.1, shape.2, shape.3,
+                    shape.4, shape.5, shape.6, k, m, n)
+                let cand = promptN2Launch(
+                    pipe, layout, neg, tiledFlag, shape.0, shape.1, shape.2, shape.3,
+                    shape.4, shape.5, shape.6, k, m, n)
+                equal = (stock.view(dtype: .uint32) .== cand.view(dtype: .uint32)).all()
+                    .item(Bool.self)
+            }
+            return !n2ProbeFailed && equal
+        }
+        func matchingLayout(_ pipe: Int) -> Int? {
+            for layout in [0, 1] {
+                let ok = [0, 1].allSatisfy { neg in
+                    same(pipe, layout, neg, small, 512, 128, 128)
+                        && same(pipe, layout, neg, wide, 512, 64, 256)
+                }
+                if ok { return layout }
+            }
+            return nil
+        }
+        if force {
+            guard let forcedLayout = matchingLayout(0) else {
+                FileHandle.standardError.write(
+                    Data("bonsai prompt n2: self-test failed; 64-column kernel kept\n".utf8))
+                return keep
+            }
+            FileHandle.standardError.write(
+                Data("bonsai prompt n2: layout \(forcedLayout) pipe 0 forced\n".utf8))
+            return PromptN2Pick(layout: forcedLayout, pipe: 0)
+        }
+        var cands: [(pipe: Int, layout: Int)] = []
+        for pipe in [0, 1, 2] {
+            if let layout = matchingLayout(pipe) {
+                cands.append((pipe, layout))
+            } else {
+                FileHandle.standardError.write(
+                    Data("bonsai prompt n2: pipe \(pipe) self-test failed; not timed\n".utf8))
+            }
+        }
+        guard !cands.isEmpty else {
+            FileHandle.standardError.write(
+                Data("bonsai prompt n2: self-test failed; 64-column kernel kept\n".utf8))
+            return keep
+        }
+        let prompt = pack(512, 2048, 512, 3)
+        func promptSame(_ pipe: Int, _ layout: Int) -> Bool {
+            same(pipe, layout, 1, prompt, 2048, 512, 512)
+        }
+        cands = cands.filter { promptSame($0.pipe, $0.layout) }
+        guard !cands.isEmpty else {
+            FileHandle.standardError.write(
+                Data("bonsai prompt n2: prompt-shaped self-test failed; 64-column kernel kept\n".utf8))
+            return keep
+        }
+        func millis(_ pipe: Int, _ layout: Int) -> Double? {
+            n2ProbeFailed = false
+            var ms = 0.0
+            withErrorHandler({ _ in n2ProbeFailed = true }) {
+                let warm = promptN2Launch(
+                    pipe, layout, 1, tiledFlag, prompt.0, prompt.1, prompt.2, prompt.3,
+                    prompt.4, prompt.5, prompt.6, 2048, 512, 512)
+                eval(warm)
+                let t0 = Date()
+                for _ in 0 ..< 16 {
+                    eval(promptN2Launch(
+                        pipe, layout, 1, tiledFlag, prompt.0, prompt.1, prompt.2, prompt.3,
+                        prompt.4, prompt.5, prompt.6, 2048, 512, 512))
+                }
+                ms = Date().timeIntervalSince(t0) * 62.5
+            }
+            return n2ProbeFailed ? nil : ms
+        }
+        guard let stockMs = millis(-1, 0) else {
+            FileHandle.standardError.write(
+                Data("bonsai prompt n2: timing failed; 64-column kernel kept\n".utf8))
+            return keep
+        }
+        var bestPipe = -1
+        var bestLayout = -1
+        var bestMs = stockMs
+        for cand in cands {
+            guard let ms = millis(cand.pipe, cand.layout) else {
+                FileHandle.standardError.write(
+                    Data("bonsai prompt n2: pipe \(cand.pipe) timing failed\n".utf8))
+                continue
+            }
+            let line = String(
+                format: "bonsai prompt n2: pipe %d layout %d stock %.3f ms candidate %.3f ms (%+.2f%%)\n",
+                cand.pipe, cand.layout, stockMs, ms, (ms / stockMs - 1) * 100)
+            FileHandle.standardError.write(Data(line.utf8))
+            if ms < stockMs * 0.985 && ms < bestMs {
+                bestMs = ms
+                bestPipe = cand.pipe
+                bestLayout = cand.layout
+            }
+        }
+        if bestPipe < 0 {
+            FileHandle.standardError.write(
+                Data("bonsai prompt n2: 64-column kernel kept\n".utf8))
+            return keep
+        }
+        let adopted = String(
+            format: "bonsai prompt n2: adopted pipe %d layout %d (%.3f ms vs stock %.3f ms)\n",
+            bestPipe, bestLayout, bestMs, stockMs)
+        FileHandle.standardError.write(Data(adopted.utf8))
+        return PromptN2Pick(layout: bestLayout, pipe: bestPipe)
+    }
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -3034,14 +3905,25 @@ enum Qwen35TensorPackedMatmul {
                 ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
                 ("SIGNED", signedCodes ? 1 : 0),
             ]
+            var nTile = 64
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
-                packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                let neg = cache.biasesAreNegativeScales(scales, biases) ? 1 : 0
+                template.append(("NEGATIVE_SCALE_BIAS", neg))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
+                if promptN2Pick.layout >= 0, n % 128 == 0 {
+                    switch promptN2Pick.pipe {
+                    case 1: packedKernel = kernelStaged8N2P
+                    case 2: packedKernel = kernelStaged8N2Q
+                    default: packedKernel = kernelStaged8N2
+                    }
+                    template.append(("LAYOUT", promptN2Pick.layout))
+                    nTile = 128
+                } else {
+                    packedKernel = kernelStaged8
+                }
             default: packedKernel = kernelStaged
             }
             // The prompt route reads the verify route's tiled copy too, so the
@@ -3053,9 +3935,12 @@ enum Qwen35TensorPackedMatmul {
                 [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
                 template: template,
-                grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                grid: (n / nTile * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
+        // Resolve the N-tile trial now, at install, so its launches stay out
+        // of every scored forward. A miss leaves the 64-column kernel.
+        if support == .staged8 { _ = promptN2Pick }
     }
 }
 
