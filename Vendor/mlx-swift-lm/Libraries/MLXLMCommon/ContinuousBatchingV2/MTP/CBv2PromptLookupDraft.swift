@@ -80,6 +80,11 @@ enum CBv2PromptLookupDraft {
         return MLXArray(hit.ids, [1, depth])
     }
 
+    /// The looked-up `[1, depth]` ids, or nil when lookup does not apply.
+    static func proposal(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+        lookup(history: history, promptLength: promptLength, depth: depth)
+    }
+
     /// `MLXFAST_DFLASH_SPLICE=0` keeps the host lookup alone (the block is
     /// then the drafter's whenever no unique 16-token prompt span matches).
     static let spliceEnabled: Bool = {
@@ -238,6 +243,15 @@ enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
+        // Every longer eligible match contains this suffix and leaves the
+        // same continuation inside the prompt. Prove a miss in one scan
+        // before scanning all longer lengths; ambiguous hits still use the
+        // original longest-match selection below.
+        let minimumSuffix = history[(count - minimum) ..< count]
+        let lastMinimumStart = prompt - minimum - depth
+        guard (0 ... lastMinimumStart).contains(where: { start in
+            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
+        }) else { return nil }
         for length in stride(from: longest, through: minimum, by: -1) {
             let suffix = count - length
             let lastStart = prompt - length - depth
@@ -275,24 +289,5 @@ enum CBv2PromptLookupDraft {
             }
         }
         return nil
-    }
-}
-
-/// Whether the next verify forward has no drafter block queued ahead of it on
-/// the GPU (a round whose ids came from the prompt with the drafter skipped).
-/// The verify's early-submission plan assumes a ~6 ms block ahead to hide the
-/// host's first layers; without it the GPU waits for them, so that verify
-/// submits sooner (`Qwen35TrunkSubmission.verifyUnqueued`). Set and taken on
-/// the engine thread, which builds the verify right after the finalize that
-/// sets it.
-public enum CBv2VerifyQueueHint {
-    nonisolated(unsafe) private static var nothingAhead = false
-
-    public static func markNothingAhead() { nothingAhead = true }
-
-    /// The hint for the verify being built now, cleared as it is read.
-    public static func takeNothingAhead() -> Bool {
-        defer { nothingAhead = false }
-        return nothingAhead
     }
 }

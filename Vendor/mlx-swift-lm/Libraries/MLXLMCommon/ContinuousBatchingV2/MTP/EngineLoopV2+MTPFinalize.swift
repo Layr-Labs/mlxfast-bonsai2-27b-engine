@@ -474,7 +474,6 @@ extension EngineLoopV2 {
                 }
                 if let tokens = promptProposal {
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
-                    CBv2VerifyQueueHint.markNothingAhead()
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 } else if let drafted = proposal {
