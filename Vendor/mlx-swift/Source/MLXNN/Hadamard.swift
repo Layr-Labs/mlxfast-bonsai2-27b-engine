@@ -128,6 +128,11 @@ public struct SignedBlockHadamard {
         case swiglu(gate: MLXArray, up: MLXArray)
         case sigmoidGate(x: MLXArray, gate: MLXArray)
         case gatedRMSNorm(x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float)
+        /// `sigmoidGate` with `x` given as consecutive row blocks: block i is
+        /// a `[B, Lb, heads, headDim]` view of rows `i * Lb ..< (i + 1) * Lb`
+        /// of `gate`'s `[B, L, heads, headDim]` (the prompt attention's query
+        /// blocks), read where they are instead of concatenated first.
+        case sigmoidGateRowBlocks(blocks: [MLXArray], gate: MLXArray)
 
         /// The array whose shape and dtype the product follows.
         public var primary: MLXArray {
@@ -135,6 +140,7 @@ public struct SignedBlockHadamard {
             case .swiglu(let gate, _): return gate
             case .sigmoidGate(let x, _): return x
             case .gatedRMSNorm(let x, _, _, _): return x
+            case .sigmoidGateRowBlocks(_, let gate): return gate
             }
         }
     }
@@ -271,9 +277,20 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if let fused = Self.fusedInverse, let y = fused(x, signs, blockSize) {
+            return y
+        }
         return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
+
+    /// `inverse` as one kernel: the same values as
+    /// `(hadamardTransform(x.asType(.float32)) * signs).asType(x.dtype)`.
+    /// Installed by the model file; nil declines.
+    public typealias FusedInverse = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedInverse: FusedInverse?
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -1134,6 +1151,62 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return y.reshaped(leading + [n])
     }
 
+    /// Whether a full verify window's output projections (SwiGLU -> down,
+    /// the attention gate -> o_proj, the GDN gated norm -> out_proj) take
+    /// `tensorRouteNarrowForwardProducer`: the quantizing rotation forms the
+    /// producer in its read instead of a separate elementwise launch storing
+    /// the signed product first. Off unless `BONSAI_NARROW_PRODUCER=1`; the
+    /// model's load-time round trial may switch it (and only adopts it when
+    /// its rounds are faster).
+    nonisolated(unsafe) public static var narrowProducerActive: Bool = narrowProducerForced ?? false
+
+    /// `BONSAI_NARROW_PRODUCER` when set explicitly (on or off); nil lets the
+    /// model decide (its load-time trial, else off).
+    public static let narrowProducerForced: Bool? = {
+        guard let value = ProcessInfo.processInfo.environment["BONSAI_NARROW_PRODUCER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !value.isEmpty
+        else { return nil }
+        if ["1", "true", "yes", "on"].contains(value) { return true }
+        if ["0", "false", "no", "off"].contains(value) { return false }
+        return nil
+    }()
+
+    /// The int8-activation verify-width route of a producer's output, formed
+    /// inside the quantizing rotation (`forwardInt8(producer:)`): the same
+    /// activation `tensorRouteForwardNarrowInt8` quantizes from the stored
+    /// signed product (the producer's FP32 expressions are the elementwise
+    /// launches'), against the same packed matmul. A full window only (16
+    /// rows: the narrow route pads nothing). Nil when it does not apply or the
+    /// fused implementation declines.
+    fileprivate func tensorRouteNarrowForwardProducer(
+        _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
+    ) -> MLXArray? {
+        guard Self.narrowProducerActive, Self.tensorRouteEnabled,
+            let matmul = Self.tensorPackedMatmulNarrowInt8,
+            let applies = Self.tensorPackedMatmulNarrowApplies
+        else { return nil }
+        let x = producer.primary
+        let k = transform.width
+        guard x.ndim >= 2, x.size % k == 0 else { return nil }
+        let rows = x.size / k
+        let n = weight.dim(0)
+        guard rows == Self.tensorRouteMaximumNarrowRows, k % 128 == 0, tensorRouteTakes(self),
+            applies(rows, n, k),
+            let activation = transform.forwardInt8(
+                producer: producer, gdnLayout: gdnLayout, groupSize: 128)
+        else { return nil }
+        let flat = SignedBlockHadamard.Int8Activation(
+            codes: activation.codes.reshaped(rows, k),
+            scales: activation.scales.reshaped(rows, k / 128),
+            scaledSums: activation.scaledSums.reshaped(rows, k / 128))
+        let outputDType: DType = widenOutput ? .float32 : .float16
+        guard let y = matmul(
+            flat, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+        else { return nil }
+        let leading = x.ndim == 4 ? [x.dim(0), x.dim(1)] : Array(x.shape.dropLast())
+        return y.reshaped(leading + [n])
+    }
+
     /// The verify-width tensor route: one FP16 rotation with group sums, rows
     /// padded to 16, one packed matmul over the (stacked) codes.
     private func tensorRouteForwardNarrow(
@@ -1289,6 +1362,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     {
         if gdnLayout == nil,
             let y = tensorRouteForwardProducer(.swiglu(gate: gate, up: up), widenOutput: widenOutput)
+                ?? tensorRouteNarrowForwardProducer(
+                    .swiglu(gate: gate, up: up), widenOutput: widenOutput)
         {
             return y
         }
@@ -1329,6 +1404,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
     }
 
+    /// `applyAfterSigmoidGateHeadsOnRoute` with the attention output given as
+    /// its query blocks (`[B, Lb, heads, headDim]` views, in row order) rather
+    /// than their concatenation; the producer reads each block where it is.
+    /// Same elements, same arithmetic. Nil when the route or the fused
+    /// implementation does not take them (the caller then concatenates).
+    public func applyAfterSigmoidGateRowBlocksOnRoute(
+        _ blocks: [MLXArray], gate: MLXArray, widenOutput: Bool = true
+    ) -> MLXArray? {
+        guard gdnLayout == nil, !blocks.isEmpty, gate.ndim == 4 else { return nil }
+        return tensorRouteForwardProducer(
+            .sigmoidGateRowBlocks(blocks: blocks, gate: gate), widenOutput: widenOutput)
+    }
+
     /// `applyAfterSigmoidGate` for `[B, S, heads, headDim]` operands read
     /// through their strides by the fused-input rotation (the verify width's
     /// matrix route): the head-transposed attention output and the gate half
@@ -1337,6 +1425,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterSigmoidGateHeads(
         _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
     ) -> MLXArray? {
+        // A full verify window on the int8 route: the gate formed in the
+        // quantizing rotation's read (`tensorRouteNarrowForwardProducer`).
+        if gdnLayout == nil, x.ndim == 4, x.shape == gate.shape,
+            let y = tensorRouteNarrowForwardProducer(
+                .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+        {
+            return y
+        }
         guard HadamardStridedInputs.enabled, gdnLayout == nil, x.ndim == 4,
             x.shape == gate.shape, x.dim(2) * x.dim(3) == transform.width,
             let store = fusedInputStoreDType(rows: x.dim(0) * x.dim(1)),
@@ -1352,6 +1448,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     ) -> MLXArray? {
         if let y = tensorRouteForwardProducer(
             .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
+            ?? tensorRouteNarrowForwardProducer(
+                .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
         {
             return y
         }
