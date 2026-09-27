@@ -984,12 +984,14 @@ extension Qwen35GDNReplayFused {
           }
         }
 
-        // The committed state.
+        // The committed state; Dk and dk0 align each four-float store.
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          for (int i = 0; i < R; i += 4) {
+            const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+            *(device float4*)(state_out + base) = float4(
+                state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
           }
         }
 
