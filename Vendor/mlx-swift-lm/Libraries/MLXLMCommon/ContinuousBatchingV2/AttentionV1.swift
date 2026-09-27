@@ -989,6 +989,71 @@ package enum CBv2PromptCausalAttention {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The GQA products as one matrix per key/value head: the `repeats` query
+    /// heads of a key/value head are `repeats * L` rows of one `[repeats * L,
+    /// D] x [D, kL]` matmul (and the probabilities one `[repeats * L, kL] x
+    /// [kL, D]`), instead of a batch of `repeats` `[L, D]` operands against a
+    /// broadcast key or value. The same rows against the same keys: each
+    /// output element is the same dot product. Taken only when the query rows
+    /// merge into that shape as a view, and only after `foldVerified` found
+    /// the two forms bit for bit equal on this device (verify and prompt row
+    /// counts, strided cache slices). Verify width only (a 16-row block):
+    /// at prompt width the seed's blocked prefill measured faster with the
+    /// broadcast batch. `DARKBLOOM_ATTN_FOLD_HEADS=0` keeps the broadcast batch.
+    static let foldHeads: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_FOLD_HEADS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let foldLock = NSLock()
+    nonisolated(unsafe) private static var foldVerdict: Bool?
+
+    /// Both forms of both products on synthetic FP32 operands shaped as the
+    /// window's (24 query heads over 4 key/value heads, head dimension 256):
+    /// 16 query rows against 528, 600 and 700 keys and 512 rows against 512
+    /// keys, the keys and values slices of a longer cache buffer. Every
+    /// output bit must match; one stderr line either way. Runs once, at the
+    /// first attention forward of the warm (never inside a timed phase: the
+    /// worker's load-time warm takes both row counts first).
+    private static func foldVerified() -> Bool {
+        foldLock.lock()
+        defer { foldLock.unlock() }
+        if let foldVerdict { return foldVerdict }
+        var same = true
+        var compared = 0
+        let heads = 24, kvHeads = 4, D = 256, rep = heads / kvHeads
+        for (L, kL) in [(16, 528), (16, 600), (16, 700), (512, 512)] where same {
+            let q = MLXRandom.normal([1, heads, L, D], key: MLXRandom.key(UInt64(0x6f6c + kL))) * Float(0.06)
+            let cacheK = MLXRandom.normal([1, kvHeads, kL + 96, D], key: MLXRandom.key(UInt64(0x6f6d + kL)))
+            let cacheV = MLXRandom.normal([1, kvHeads, kL + 96, D], key: MLXRandom.key(UInt64(0x6f6e + kL)))
+            let k = cacheK[0..., 0..., ..<kL, 0...]
+            let v = cacheV[0..., 0..., ..<kL, 0...]
+            let s5 = matmul(q.reshaped([1, kvHeads, rep, L, D]), k.expandedDimensions(axis: 2).swappedAxes(-1, -2))
+            let s4 = matmul(q.reshaped([1, kvHeads, rep * L, D]), k.swappedAxes(-1, -2))
+                .reshaped([1, kvHeads, rep, L, kL])
+            let p = softmax(s5, axis: -1, precise: true)
+            let o5 = matmul(p, v.expandedDimensions(axis: 2)).reshaped([1, heads, L, D])
+            let o4 = matmul(p.reshaped([1, kvHeads, rep * L, kL]), v).reshaped([1, heads, L, D])
+            eval(s5, s4, o5, o4)
+            same = same && all(s5.view(dtype: .uint32) .== s4.view(dtype: .uint32)).item(Bool.self)
+                && all(o5.view(dtype: .uint32) .== o4.view(dtype: .uint32)).item(Bool.self)
+            compared += s5.size + o5.size
+        }
+        foldVerdict = same
+        FileHandle.standardError.write(Data((same
+            ? "bonsai attention fold: self-test passed (\(compared) values compared bitwise, 0 mismatches); folded\n"
+            : "bonsai attention fold: self-test FAILED; broadcast batch kept\n").utf8))
+        return same
+    }
+
+    /// Whether `[B, H, L, D]` queries merge into `[B, kvHeads, repeats * L,
+    /// D]` as a view (row-contiguous heads, rows and columns).
+    private static func queriesFold(_ q: MLXArray) -> Bool {
+        let st = q.strides
+        return st.count == 4 && st[3] == 1 && st[2] == q.dim(3) && st[1] == q.dim(2) * q.dim(3)
+    }
+
     /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
     /// per thread (kL % 4 == 0, so they share a row).
     private static let maskKernel = MLXFast.metalKernel(
@@ -1163,15 +1228,21 @@ package enum CBv2PromptCausalAttention {
             B * H * L * kL < Int(Int32.max)
         else { return nil }
         let repeats = H / kvHeads
+        // Verify width only: at prompt width the broadcast batch measured faster
+        // in the seed's blocked prefill (and the fold's gain is at 16 rows).
+        let fold = verify && repeats > 1 && foldHeads && queriesFold(queries) && foldVerified()
         var q = queries
         var k = keys
         var v = values
-        if repeats > 1 {
+        if repeats > 1 && !fold {
             q = q.reshaped([B, kvHeads, repeats, L, D])
             k = k.expandedDimensions(axis: 2)
             v = v.expandedDimensions(axis: 2)
         }
-        let scores = matmul(q, k.swappedAxes(-1, -2))
+        let scores = fold
+            ? matmul(q.reshaped([B, kvHeads, repeats * L, D]), k.swappedAxes(-1, -2))
+                .reshaped([B, kvHeads, repeats, L, kL])
+            : matmul(q, k.swappedAxes(-1, -2))
         let operands: [any ScalarOrArray] = [
             scores, MLXArray(Int32(kL - L)), MLXArray(Int32(L)), MLXArray(Int32(kL)),
             MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude),
@@ -1193,6 +1264,10 @@ package enum CBv2PromptCausalAttention {
                 outputShapes: [scores.shape],
                 outputDTypes: [.float32])[0]
             probabilities = softmax(masked, axis: -1, precise: true)
+        }
+        if fold {
+            return matmul(probabilities.reshaped([B, kvHeads, repeats * L, kL]), v)
+                .reshaped([B, H, L, D])
         }
         var out = matmul(probabilities, v)
         if repeats > 1 {

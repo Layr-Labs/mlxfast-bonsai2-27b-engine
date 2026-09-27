@@ -2166,6 +2166,108 @@ enum Qwen35GatedDeltaChunked {
         outputNames: ["y", "state_out"],
         source: scanFreshSource)
 
+    /// `scanFreshSource` with each chunk's K, Q, T' and P loaded into
+    /// registers while the previous chunk computes, then stored to the same
+    /// threadgroup tiles between the same two barriers: the chunk loop no
+    /// longer waits on device loads before its math. Only the staging moves;
+    /// every threadgroup value and every operation is the stock text's, so the
+    /// outputs are bit-identical (`prepareFresh` checks it; a mismatch drops
+    /// back to `scanFreshKernel`). `DARKBLOOM_GDN_SCAN_PREFETCH=0` keeps the
+    /// stock staging. Derived by checked replacements; nil if the text moved.
+    private static let scanFreshPrefetchSource: String? = {
+        var text = scanFreshSource
+        let stageStart = "// stage this chunk's K, Q, T', P (the previous chunk's readers are done)"
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        let loopHead = "for (int n = 0; n < NC; ++n) {"
+        guard text.components(separatedBy: stageStart).count == 2,
+            text.components(separatedBy: loopHead).count == 2,
+            let a = text.range(of: stageStart),
+            let b1 = text.range(of: barrier, range: a.upperBound ..< text.endIndex),
+            let b2 = text.range(of: barrier, range: b1.upperBound ..< text.endIndex)
+        else { return nil }
+        text.replaceSubrange(a.lowerBound ..< b2.upperBound, with: """
+            // chunk n's K, Q, T', P were loaded into registers during chunk n - 1
+                          threadgroup_barrier(mem_flags::mem_threadgroup);
+                          pf_store();
+                          threadgroup_barrier(mem_flags::mem_threadgroup);
+                          if (n + 1 < NC) { pf_load(n + 1); }
+            """)
+        guard let head = text.range(of: loopHead) else { return nil }
+        text.replaceSubrange(head.lowerBound ..< head.lowerBound, with: """
+            constexpr int RK = (KQ4 + NT - 1) / NT;
+                        constexpr int RT = (2 * TP4 + NT - 1) / NT;
+                        float4 pk_[RK], pq_[RK], pt_[RT];
+                        auto pf_load = [&](int nn) {
+                          const int tt0 = nn * C;
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RK; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < KQ4) {
+                              const int row = e / (Dk / 4);
+                              const int c4 = (e % (Dk / 4)) * 4;
+                              const size_t src = (size_t)(tt0 + row) * ks + c4;
+                              pk_[i] = *(const device float4*)(kbase + src);
+                              pq_[i] = *(const device float4*)(qbase + src);
+                            }
+                          }
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RT; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < 2 * TP4) {
+                              const int which = e / TP4;
+                              const int f = e % TP4;
+                              const device float* src = (which == 0 ? tbase : pbase) + (size_t)nn * C * C;
+                              pt_[i] = *(const device float4*)(src + f * 4);
+                            }
+                          }
+                        };
+                        auto pf_store = [&]() {
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RK; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < KQ4) {
+                              const int row = e / (Dk / 4);
+                              const int c4 = (e % (Dk / 4)) * 4;
+                              *(threadgroup float4*)(Ksh + row * LK + c4) = pk_[i];
+                              *(threadgroup float4*)(Qsh + row * LK + c4) = pq_[i];
+                            }
+                          }
+                          _Pragma("clang loop unroll(full)")
+                          for (int i = 0; i < RT; ++i) {
+                            const int e = tid + i * NT;
+                            if (e < 2 * TP4) {
+                              const int which = e / TP4;
+                              const int f = e % TP4;
+                              const int row = f / (C / 4);
+                              const int c4 = (f % (C / 4)) * 4;
+                              *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = pt_[i];
+                            }
+                          }
+                        };
+                        pf_load(0);
+
+            """)
+        return text
+    }()
+
+    private static let scanFreshPrefetchKernel: MLXFast.MLXFastKernel? = scanFreshPrefetchSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_gated_delta_chunk_scan_fresh_pf",
+            inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+            outputNames: ["y", "state_out"],
+            source: $0)
+    }
+
+    static let scanPrefetchEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_GDN_SCAN_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether `freshChunks` launches `scanFreshPrefetchKernel` (set by
+    /// `prepareFresh` before its check, cleared if the check fails with it).
+    nonisolated(unsafe) private static var scanPrefetchActive = false
+
     /// `run` from an all-zero FP32 state of `stateShape`, which is not passed,
     /// for a window of whole chunks (a remainder's sequential tail reads the
     /// state array, so such a window stays on `run`); nil when this does not
@@ -2210,7 +2312,8 @@ enum Qwen35GatedDeltaChunked {
             threadGroup: (32, 1, 1),
             outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
             outputDTypes: [.float32, .float32, .float32])
-        let outputs = scanFreshKernel(
+        let scan = scanPrefetchActive ? (scanFreshPrefetchKernel ?? scanFreshKernel) : scanFreshKernel
+        let outputs = scan(
             [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
@@ -2241,7 +2344,16 @@ enum Qwen35GatedDeltaChunked {
         else { return }
         let key = [hk, dk, hv, dv, chunk]
         if freshLock.withLock({ freshVerdicts[key] != nil }) { return }
-        let verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        scanPrefetchActive = scanPrefetchEnabled && scanFreshPrefetchKernel != nil
+        var verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        if !verdict && scanPrefetchActive {
+            // the prefetch staging is the suspect: check the stock fresh scan alone
+            scanPrefetchActive = false
+            verdict = freshSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+            FileHandle.standardError.write(
+                "qwen35: chunked GDN scan prefetch disagrees with the stock scan on this device; stock staging kept\n"
+                    .data(using: .utf8)!)
+        }
         let recorded = freshLock.withLock { () -> Bool in
             guard freshVerdicts[key] == nil else { return false }
             freshVerdicts[key] = verdict
