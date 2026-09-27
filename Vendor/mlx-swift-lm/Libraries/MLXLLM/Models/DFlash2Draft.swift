@@ -3255,6 +3255,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             MLXArray([Int32(config.maskTokenId)], [1, 1])).asType(dtype)
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
+        DFlash2SpeculativeKeyMask.prepare()
         // The one-launch concatenations' self-tests, before any timed forward:
         // each layer's [context; block] rows and the target's tapped states.
         DFlash2Concat.prepare(inputs: 2, dtype: dtype)
@@ -3628,10 +3629,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
-        let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
-            .reshaped([1, keys])
+        let queryOffset: MLXArray
+        var keyMask: MLXArray
+        if let generated = DFlash2SpeculativeKeyMask.apply(
+            c, rows: geometry.rows, offset: geometry.offset, blockSize: blockSize)
+        {
+            queryOffset = generated.queryOffset
+            keyMask = generated.keyMask
+        } else {
+            queryOffset = MLXArray(Int32(geometry.offset)) + c
+            keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+                .reshaped([1, keys])
+        }
         if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
             // The block sits at row `held + c` of the keys, as in the plain
             // path it sits right after the cached context.
@@ -3750,6 +3760,94 @@ public final class DFlash2SpeculativeBlock {
         (self.tokens, self.writes, self.installedLayers, self.contextRows) =
             (tokens, writes, installedLayers, contextRows)
     }
+}
+
+/// Generates this call's speculative offset and key mask from its device count.
+/// No count, mask, token, context or output is retained between calls.
+private enum DFlash2SpeculativeKeyMask {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_KEYMASK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_speculative_offset_keymask", inputNames: ["confirmed", "dims"],
+        outputNames: ["offset", "mask"], source: """
+            const uint idx = thread_position_in_grid.x;
+            if (idx == 0) {
+                offset[0] = as_type<int>(uint(dims[0]) + uint(confirmed));
+            }
+            if (idx < uint(dims[2])) {
+                const int limit = as_type<int>(uint(dims[1]) + uint(confirmed));
+                mask[idx] = int(idx) < limit;
+            }
+            """, ensureRowContiguous: true)
+
+    private static func launch(
+        _ confirmed: MLXArray, rows: Int, offset: Int, blockSize: Int
+    ) -> (queryOffset: MLXArray, keyMask: MLXArray) {
+        let keys = rows + 2 * blockSize
+        let outputs = kernel(
+            [confirmed, MLXArray([Int32(offset), Int32(rows + blockSize), Int32(keys)])],
+            grid: ((keys + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[], [1, keys]], outputDTypes: [.int32, .bool])
+        return (outputs[0], outputs[1])
+    }
+
+    static func apply(
+        _ confirmed: MLXArray, rows: Int, offset: Int, blockSize: Int
+    ) -> (queryOffset: MLXArray, keyMask: MLXArray)? {
+        guard enabled, confirmed.ndim == 0, confirmed.dtype == .int32,
+            (2 ... 17).contains(blockSize), rows >= 0,
+            rows <= Int(Int32.max) - 2 * blockSize,
+            offset >= 0, offset <= Int(Int32.max), verified
+        else { return nil }
+        return launch(confirmed, rows: rows, offset: offset, blockSize: blockSize)
+    }
+
+    static func prepare() {
+        guard enabled else { return }
+        _ = verified
+    }
+
+    private static let verified: Bool = {
+        guard enabled else { return false }
+        var same = true
+        var cases = 0
+        var elements = 0
+        do {
+            try withError { error in
+                for block in [2, 16, 17] {
+                    for rows in [0, 33, 2014] {
+                        for offset in [0, Int(Int32.max) - 17] {
+                            for count in Set([1, block / 2, block]).sorted() {
+                                let c = MLXArray(Int32(count - 1)) + MLXArray(Int32(1))
+                                let actual = launch(c, rows: rows, offset: offset, blockSize: block)
+                                let keys = rows + 2 * block
+                                let expectedOffset = MLXArray(Int32(offset)) + c
+                                let expectedMask = (MLXArray(Int32(0) ..< Int32(keys))
+                                    .< (MLXArray(Int32(rows + block)) + c)).reshaped([1, keys])
+                                eval(actual.queryOffset, actual.keyMask, expectedOffset, expectedMask)
+                                try error.check()
+                                if actual.queryOffset.asArray(Int32.self) != expectedOffset.asArray(Int32.self)
+                                    || actual.keyMask.asArray(Bool.self) != expectedMask.asArray(Bool.self)
+                                { same = false }
+                                cases += 1
+                                elements += keys + 1
+                            }
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        FileHandle.standardError.write(
+            ("dflash2 speculative keymask: " + (same
+                ? "self-test passed: \(cases) cases, \(elements) integer/Boolean elements; no mismatches\n"
+                : "self-test failed; stock offset/mask kept\n")).data(using: .utf8)!)
+        return same
+    }()
 }
 
 enum DFlash2ContextPadding {
