@@ -4065,6 +4065,9 @@ final class Qwen35Attention: Module {
             Qwen35AttentionPreworkExplicit.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: mrope.rotaryDim,
                 epsQ: args.rmsNormEps, epsK: args.rmsNormEps, mrope: mrope)
+            Qwen35AttentionPreworkKV.prepare(
+                hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
+                ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
         }
     }
 
@@ -4214,9 +4217,26 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
         var queries: MLXArray
         var keys: MLXArray
-        // The fused prework reads the cache's offsets array as it stands
-        // before the cache advances (the value the copy below captures).
-        if !exactTargetVerify, positionIds == nil,
+        // The prework writing the append into the cache itself, followed by
+        // the attention `updateAndAttend` would run (`Qwen35AttentionPreworkKV`).
+        // The prompt-width row-block route below (the o_proj rotation reads
+        // the attention's query blocks in place) keeps the slice updates; the
+        // in-place append takes the other widths (the verify window).
+        let rowBlockRoute = !exactTargetVerify && B == 1 && L >= BonsaiPromptWidth.minimumRows
+            && Qwen35FusedHadamard.rowBlocksEnabled && oProj is HadamardQuantizedLinear
+        var attendedInPlace: MLXArray? = nil
+        if !exactTargetVerify, positionIds == nil, !narrowsToLastQuery, !rowBlockRoute,
+            let fusedRope,
+            let attended = Qwen35AttentionPreworkKV.attend(
+                q: qSplit[0], k: kProjection.reshaped(B, L, kvHeads, -1),
+                v: vProjection.reshaped(B, L, kvHeads, -1), qNorm: qNorm, kNorm: kNorm,
+                ropeDims: fusedRope.dims, ropeBase: fusedRope.base, cache: cache, scale: scale)
+        {
+            attendedInPlace = attended
+            (queries, keys) = (qSplit[0], kProjection)  // not read
+        } else if !exactTargetVerify, positionIds == nil,
+            // The fused prework reads the cache's offsets array as it stands
+            // before the cache advances (the value the copy below captures).
             let fused = fusedPrework(
                 qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
                 offsets: cache.positionOffsets)
@@ -4263,8 +4283,7 @@ final class Qwen35Attention: Module {
             // are not concatenated; where it declines they are concatenated
             // here exactly as the cache would have.
             var joined: MLXArray? = nil
-            if !exactTargetVerify, B == 1, L >= BonsaiPromptWidth.minimumRows,
-                Qwen35FusedHadamard.rowBlocksEnabled,
+            if attendedInPlace == nil, rowBlockRoute,
                 let packed = oProj as? HadamardQuantizedLinear,
                 let blocks = cache.updateAndAttendQueryBlocks(
                     queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
@@ -4276,9 +4295,10 @@ final class Qwen35Attention: Module {
                 }
                 joined = blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 2)
             }
-            let attended = (joined ?? cache.updateAndAttend(
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: nil))
+            let attended = (attendedInPlace ?? joined
+                ?? cache.updateAndAttend(
+                    queries: queries, keys: keys, values: values,
+                    scale: scale, sinks: nil))
                 .transposed(0, 2, 1, 3)
             // Prompt width on the tensor route: the gate producer reads the
             // head-transposed output and the gate half of each q|gate head
@@ -6016,7 +6036,7 @@ enum Qwen35AttentionPrework {
             offsets: offsets, ropeDims: ropeDims, ropeBase: ropeBase)
     }
 
-    private static func runUnchecked(
+    static func runUnchecked(
         q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
         offsets: MLXArray, ropeDims: Int, ropeBase: Float
     ) -> (MLXArray, MLXArray)? {
@@ -6055,6 +6075,11 @@ enum Qwen35AttentionPrework {
 
     private static func verified(_ geometry: Geometry) -> Bool {
         lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Whether `run` takes this geometry (`Qwen35AttentionPreworkKV` mirrors it).
+    static func verified(hq: Int, hk: Int, d: Int, rd: Int, dtype: DType) -> Bool {
+        verified(Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)"))
     }
 
     /// Compile the kernel and check it bit for bit against the op chain for one
