@@ -1667,7 +1667,133 @@ enum DFlash2TopK {
     private static let chunks = 8
     private static let threads = 128
 
+
+    private static let singleEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SINGLE_TOPK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// One SIMD group owns a row and writes its final sorted candidates.
+    /// This removes the intermediate chunk lists and their second merge.
     static func select(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
+        if enabled, singleEnabled, vectorScan, k == 16,
+            logits.ndim == 3, logits.dim(0) == 1, logits.dtype == .float16,
+            logits.dim(1) >= 1, logits.dim(1) <= 32,
+            logits.dim(2) >= k, logits.dim(2) % 4 == 0, singleVerified
+        {
+            return single(logits, k: k)
+        }
+        return stock(logits, k: k)
+    }
+
+    private static func single(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray) {
+        let rows = logits.dim(1)
+        let vocabularySize = logits.dim(2)
+        let result = singleKernel(
+            [logits.reshaped([rows, vocabularySize])],
+            template: [
+                ("NV", vocabularySize), ("S", 1), ("TPG", 32), ("KTOP", k),
+                ("VEC", 1), ("HALF", 1),
+            ],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, k], [rows, k]], outputDTypes: [.uint32, .float32])
+        return (result[0].reshaped([1, rows, k]), result[1].reshaped([1, rows, k]))
+    }
+
+    /// Deterministic data, independent of requests: random-looking values,
+    /// ties, signed zero, NaN and infinities, including uneven stock chunks.
+    private static let singleVerified: Bool = {
+        for vocabularySize in [1024, 4100, 100352] {
+            for pattern in 0 ..< 5 {
+                let rows = pattern == 0 ? 15 : 2
+                var values = [Float]()
+                values.reserveCapacity(rows * vocabularySize)
+                for index in 0 ..< (rows * vocabularySize) {
+                    let value: Float
+                    switch pattern {
+                    case 0:
+                        let integer = (index * 113 + 17) % 4093 - 2046
+                        value = Float(integer) / 123
+                    case 1: value = 0
+                    case 2: value = Float(index % 9 - 4)
+                    case 3:
+                        if index % 97 == 0 { value = .nan }
+                        else if index % 53 == 0 { value = .infinity }
+                        else if index % 29 == 0 { value = -.infinity }
+                        else { value = Float(index % 257 - 128) }
+                    default: value = index % 2 == 0 ? 0.0 : -0.0
+                    }
+                    values.append(value)
+                }
+                let logits = MLXArray(values).reshaped([1, rows, vocabularySize]).asType(.float16)
+                guard let reference = stock(logits, k: 16) else { return false }
+                let result = single(logits, k: 16)
+                let sameIds = (reference.0 .== result.0).all()
+                let sameBits = (reference.1.view(dtype: .uint32) .== result.1.view(dtype: .uint32)).all()
+                if !(sameIds .&& sameBits).item(Bool.self) {
+                    FileHandle.standardError.write(Data("DFlash single top-k: bitwise check failed; stock path\n".utf8))
+                    return false
+                }
+            }
+        }
+        FileHandle.standardError.write(Data("DFlash single top-k: bitwise checks passed; enabled\n".utf8))
+        return true
+    }()
+
+    private static let singleKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_topk_single",
+        inputNames: ["logits"], outputNames: ["cand", "val"],
+        source: """
+            // grid (TPG * S, rows): threadgroup (chunk, row) reduces one chunk of a row to its top-KK
+            constexpr int KK = KTOP;
+            static_assert(TPG % 32 == 0 && TPG / 32 <= 32 && KK <= 32, "one merge simdgroup");
+            const uint t = thread_position_in_threadgroup.x;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr uint CH = (NV + S - 1) / S;
+            const uint lo = chunk * CH;
+            const uint hi = min(lo + CH, uint(NV));
+            // `logits` is float or half (the drafter's FP16 head read); the
+            // key and the gathered value are the float the half widens to.
+            auto x = logits + size_t(row) * NV;
+            uint k[KK], id[KK];
+            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+            if (VEC && (CH % 4u) == 0u) {
+                // Increasing indices, four-wide. CH % 4 covers the chunk.
+                for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                    if (HALF) {
+                        const half4 q = *(const device half4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u);
+                    } else {
+                        const float4 q = *(const device float4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u);
+                    }
+                }
+            } else {
+                for (uint v = lo + t; v < hi; v += TPG) {
+                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v);
+                }
+            }
+            uint ok = 0u, oi = 0u;
+            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+            if (lane < uint(KK)) {
+                const uint slot = KK - 1 - lane;
+                cand[row * KK + slot] = oi;
+                val[row * KK + slot] = logits[size_t(row) * NV + oi];
+            }
+            """,
+        header: header)
+
+    private static func stock(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
         guard enabled, logits.ndim == 3, logits.dim(0) == 1,
             logits.dtype == .float32 || logits.dtype == .float16
         else { return nil }
