@@ -2913,6 +2913,7 @@ enum Qwen35TensorPackedMatmul {
             }
         }
         if verifyEnabled, verifyForm == .staged8, signedCodes {
+            HadamardQuantizedLinear.narrowProducerApproves = Qwen35VerifyProducerQ8.approves
             HadamardQuantizedLinear.tensorPackedMatmulNarrowInt8 = {
                 activation, weight, scales, biases, groupSize, outputDType, cache in
                 let codes = activation.codes

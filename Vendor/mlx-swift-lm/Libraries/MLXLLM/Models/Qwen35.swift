@@ -2542,10 +2542,12 @@ final class Qwen35DenseSiblingStack {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
     private var weight: MLXArray?
+    private var weightTiled: MLXArray?
     private var boundary = 0
 
     func clear() {
         weight = nil
+        weightTiled = nil
         boundary = 0
     }
 
@@ -2562,8 +2564,10 @@ final class Qwen35DenseSiblingStack {
         if weight == nil {
             weight = concatenated([b.weight, a.weight], axis: 0)
             boundary = b.weight.dim(0)
+            weightTiled = Qwen35SmallNMatmul.prepareTiled(weight!)
         }
-        let y = Qwen35SmallNMatmul.apply(x, weight!) ?? matmul(x, weight!.T)
+        let y = Qwen35SmallNMatmul.apply(x, weight!, tiled: weightTiled)
+            ?? matmul(x, weight!.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
     }
 }
@@ -2582,6 +2586,12 @@ final class Qwen35DenseSiblingStack {
 /// chunks in chunk order. The result is the FP32 product (max error ~4e-4
 /// absolute on outputs of magnitude ~260, i.e. rounding).
 /// `DARKBLOOM_QWEN35_SPLITK_BA=0` keeps MLX's GEMM.
+///
+/// The partial kernel reads a load-time tiled copy of `w` (one contiguous
+/// 512 B run per threadgroup and k step instead of 32 rows 20 KB apart) and
+/// the reduce takes its chunk count as a compile-time constant (its loads
+/// issued together); both bitwise the row-major pair, checked at bind.
+/// `MLXFAST_SPLITK_BA_TILED=0` keeps the row-major pair.
 enum Qwen35SmallNMatmul {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SPLITK_BA"]?
@@ -2637,7 +2647,110 @@ enum Qwen35SmallNMatmul {
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: true)
 
-    static func apply(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
+    // The tiled reads: `w4` holds `w` as [K / 4][N] float4 (a load-time copy),
+    // so a threadgroup's 32 lanes read one contiguous 512 B run per k step
+    // instead of 32 rows 4 K bytes apart. Same operands to the same `dot` in
+    // the same order as `partialSource`: the partials are bitwise the same.
+    private static let partialTiledSource = """
+        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int nb = int(threadgroup_position_in_grid.x) * 32;
+        const int kc = int(threadgroup_position_in_grid.y);
+        const uint t = thread_position_in_threadgroup.x;
+        const int c = int(t & 31);
+        const int r0 = int(t >> 5) * 4;
+        const int k0 = kc * KC;
+        const device float4* wr = (const device float4*)w4 + (size_t)(k0 / 4) * N + nb + c;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < KC; k += 4) {
+          const float4 wv = *wr;
+          wr += N;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            const int m = r0 + r;
+            if (m < M) {
+              const float4 xv = *(const device float4*)(x + (size_t)m * K + k0 + k);
+              acc[r] += dot(xv, wv);
+            }
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < 4; r++) {
+          const int m = r0 + r;
+          if (m < M) { part[((size_t)kc * M + m) * N + nb + c] = acc[r]; }
+        }
+        """
+
+    // The chunk count as a template constant: the KS loads are issued
+    // together instead of one dependent strided load at a time; the adds
+    // stay sequential in chunk order, as in `reduceSource`.
+    private static let reduceUnrolledSource = """
+        const int M = dims[1]; const int N = dims[2];
+        const uint i = thread_position_in_grid.x;
+        if (i >= uint(M * N)) { return; }
+        const size_t MN = (size_t)M * N;
+        float p[KS];
+        #pragma clang loop unroll(full)
+        for (int s = 0; s < KS; s++) { p[s] = part[(size_t)s * MN + i]; }
+        float v = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int s = 0; s < KS; s++) { v += p[s]; }
+        out[i] = v;
+        """
+
+    private static let partialTiledKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_partial_tiled", inputNames: ["x", "w4", "dims"],
+        outputNames: ["part"], source: partialTiledSource, ensureRowContiguous: true)
+    private static let reduceUnrolledKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_reduce_unrolled", inputNames: ["part", "dims"],
+        outputNames: ["out"], source: reduceUnrolledSource, ensureRowContiguous: true)
+
+    /// `MLXFAST_SPLITK_BA_TILED=0` keeps the row-major weight reads and the
+    /// runtime-count reduce.
+    static let tiledEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_SPLITK_BA_TILED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let tiledLock = NSLock()
+    nonisolated(unsafe) private static var tiledVerdict: Bool?
+
+    /// The load-time copy of `w` `[N, K]` as `[K / 4, N * 4]` (float4 per
+    /// (k / 4, n)), or nil when the tiled path is off, does not apply, or its
+    /// bind-time self-test (bitwise against the row-major pair on this
+    /// weight) failed: then `apply` runs the row-major pair as before.
+    static func prepareTiled(_ w: MLXArray) -> MLXArray? {
+        guard enabled, tiledEnabled, w.dtype == .float32, w.ndim == 2 else { return nil }
+        let n = w.dim(0)
+        let k = w.dim(1)
+        guard n % 32 == 0, k % chunk == 0 else { return nil }
+        let w4 = w.reshaped(n, k / 4, 4).transposed(1, 0, 2).reshaped(k / 4, n * 4)
+        eval(w4)
+        return tiledLock.withLock {
+            if let verdict = tiledVerdict { return verdict ? w4 : nil }
+            var same = true
+            var compared = 0
+            for (rows, seed) in [(16, 41), (5, 42), (1, 43)] {
+                let keys = MLXRandom.split(key: MLXRandom.key(UInt64(seed)), into: 2)
+                let x = MLXRandom.normal([1, rows, k], key: keys[0])
+                    * exp(MLXRandom.normal([1, rows, k], key: keys[1]))
+                let yRef = run(x, w, tiled: nil)
+                let yNew = run(x, w, tiled: w4)
+                same = same && all(yRef.view(dtype: .uint32) .== yNew.view(dtype: .uint32))
+                    .item(Bool.self)
+                compared += yRef.size
+            }
+            tiledVerdict = same
+            FileHandle.standardError.write(
+                ("qwen35 split-K a|b tiled reads: "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; tiled\n"
+                        : "self-test failed; row-major reads kept\n")).data(using: .utf8)!)
+            return same ? w4 : nil
+        }
+    }
+
+    static func apply(_ x: MLXArray, _ w: MLXArray, tiled: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
@@ -2645,7 +2758,25 @@ enum Qwen35SmallNMatmul {
         guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else {
             return nil
         }
+        return run(x, w, tiled: tiled)
+    }
+
+    private static func run(_ x: MLXArray, _ w: MLXArray, tiled: MLXArray?) -> MLXArray {
+        let k = x.dim(-1)
+        let n = w.dim(0)
+        let rows = x.size / k
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        if let w4 = tiled {
+            let part = partialTiledKernel(
+                [x.reshaped(rows, k), w4, dims], template: [("KC", chunk)],
+                grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+            let y = reduceUnrolledKernel(
+                [part, dims], template: [("KC", chunk), ("KS", k / chunk)],
+                grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+            return y.reshaped(Array(x.shape.dropLast()) + [n])
+        }
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
@@ -5117,6 +5248,13 @@ public class Qwen35TextModelInner: Module {
         let submission = Qwen35TrunkSubmission.plan(
             rows: hiddenStates.dim(1), captureRecurrentWindow: captureRecurrentWindow,
             caches: caches)
+        // A prompt-width forward inside an engine step keeps the step's work
+        // interval running: renewed now and at each prompt submission below.
+        // Scheduling hint only (`CBv2EngineWorkInterval`).
+        let promptForward =
+            !captureRecurrentWindow
+            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
+        if promptForward { CBv2EngineWorkInterval.promptForwardBegan() }
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
@@ -5196,6 +5334,7 @@ public class Qwen35TextModelInner: Module {
                 if let fusedSubmission,
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
+                    if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
                 }
                 continue
@@ -5220,6 +5359,7 @@ public class Qwen35TextModelInner: Module {
             if let submission,
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
+                if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
             }
         }
@@ -5232,7 +5372,7 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            dFlash2Tap.tappedHidden = concatenated(tapped.map { $0! }, axis: -1)
+            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
         }
         return hiddenStates
     }
@@ -6768,6 +6908,163 @@ enum Qwen35FusedHadamard {
         }
     }
 }
+
+/// The verify window's producer chains on the int8 narrow route (16 rows):
+/// the SwiGLU product, the GDN output's gated norm and the attention output
+/// gate are formed in the quantizing rotation's read (the prompt route's
+/// `..._q8p`) instead of by their own launches ahead of
+/// `bonsai_signed_hadamard_1024_q8`. Per verify window of the 27B: 64
+/// compiled SwiGLU launches, 48 norms and 48 compiled gated tails, and 16
+/// compiled gates with the 32 copies that flattened their operands fewer.
+///
+/// Each kind is self-tested once per width and dtypes on the running GPU at
+/// 16 rows, bit for bit against the composed ops production runs (the
+/// compiled chain with the signs, then the pre-signed `forwardInt8`), on
+/// operands laid out as production lays them out; a mismatch keeps the
+/// composed path. `BONSAI_VERIFY_SWIGLU_Q8=0`, `BONSAI_VERIFY_GATED_NORM_Q8=0`
+/// and `BONSAI_VERIFY_ATTN_GATE_Q8=0` keep it per kind.
+enum Qwen35VerifyProducerQ8 {
+    private static func on(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }
+    static let swiglu = on("BONSAI_VERIFY_SWIGLU_Q8")
+    static let gatedNorm = on("BONSAI_VERIFY_GATED_NORM_Q8")
+    static let attentionGate = on("BONSAI_VERIFY_ATTN_GATE_Q8")
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+
+    /// `HadamardQuantizedLinear.narrowProducerApproves`: the kind's switch,
+    /// the operand dtypes the composed chain computes in FP32, and the kind's
+    /// verdict (its self-test runs on first use).
+    static func approves(
+        _ producer: SignedBlockHadamard.Int8Producer, _ transform: SignedBlockHadamard
+    ) -> Bool {
+        // The composed chains compared against carry the signs (the default fold).
+        guard Qwen35FusedElementwise.foldsHadamardSigns, transform.blockSize == 1024
+        else { return false }
+        let key: String
+        switch producer {
+        case .swiglu(let gate, let up):
+            guard swiglu, gate.dtype == up.dtype, [DType.float16, .float32].contains(gate.dtype)
+            else { return false }
+            key = "swiglu \(transform.width) \(gate.dtype)"
+        case .gatedRMSNorm(let x, let gate, let weight, _):
+            guard gatedNorm, x.dtype == .float32, x.ndim == 4, x.dim(3) == 128,
+                [DType.float16, .float32].contains(gate.dtype), weight.dtype == .float32
+            else { return false }
+            key = "gated norm \(transform.width) \(gate.dtype)"
+        case .sigmoidGate(let x, let gate):
+            guard attentionGate, x.dtype == .float32, gate.dtype == .float32, x.ndim == 4
+            else { return false }
+            key = "attention gate \(transform.width) \(x.dim(2))x\(x.dim(3))"
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict = verdicts[key] { return verdict }
+        let report = selfTest(producer, transform)
+        verdicts[key] = report.passed
+        FileHandle.standardError.write(
+            ("bonsai verify producer q8 (\(key)): " + report.summary
+                + (report.passed ? "; fused\n" : "; composed path kept\n")).data(using: .utf8)!)
+        return report.passed
+    }
+
+    /// Sixteen rows with per-row scales from 0.05 to 30 (the sigmoid saturates
+    /// both ways) and one zero row (all-zero groups, the norm's `rsqrt(eps)`),
+    /// in production's layouts (SwiGLU's halves, the GDN gate and the attention
+    /// gate are column slices of a stacked product, the attention output is
+    /// head-transposed). Outputs compared as unsigned integers.
+    private static func selfTest(
+        _ producer: SignedBlockHadamard.Int8Producer, _ transform: SignedBlockHadamard
+    ) -> Qwen35FusedBoundaryQ8.SelfTestReport {
+        var report = Qwen35FusedBoundaryQ8.SelfTestReport()
+        let rows = 16
+        let width = transform.width
+        let signs = transform.signVector
+        do {
+            try withError { error in
+                for seed in [61, 62] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                        * (MLXArray(0 ..< rows) .!= MLXArray(Int32(rows / 3)))
+                            .asType(.float32).reshaped(1, rows, 1)
+                    func normal(_ n: Int, _ salt: Int) -> MLXArray {
+                        MLXRandom.normal([1, rows, n], key: MLXRandom.key(UInt64(seed * 8 + salt)))
+                            * scale
+                    }
+                    let signed: MLXArray
+                    let fused: SignedBlockHadamard.Int8Producer
+                    switch producer {
+                    case .swiglu(let gate, _):
+                        let halves = split(normal(2 * width, 1).asType(gate.dtype), parts: 2, axis: -1)
+                        signed = Qwen35FusedElementwise.swigluSigned(halves[0], halves[1], signs)
+                        fused = .swiglu(gate: halves[0], up: halves[1])
+                    case .gatedRMSNorm(let x, let gate, let weight, let eps):
+                        let shape = [1, rows, x.dim(2), x.dim(3)]
+                        let out = normal(width, 2).reshaped(shape)
+                        let z = split(normal(2 * width, 3).asType(gate.dtype), parts: 2, axis: -1)[1]
+                            .reshaped(shape)
+                        let normed = MLXFast.rmsNorm(out, weight: weight, eps: eps)
+                        signed = Qwen35FusedElementwise.gatedNormTailSigned(
+                            normed, z.asType(.float32), signs.reshaped(x.dim(2), x.dim(3)))
+                        fused = .gatedRMSNorm(x: out, gate: z, weight: weight, eps: eps)
+                    case .sigmoidGate(let x, _):
+                        // The head-transposed attention output and the gate
+                        // half of each q|gate head.
+                        let (heads, dim) = (x.dim(2), x.dim(3))
+                        let xs = (MLXRandom.normal(
+                            [1, heads, rows, dim], key: MLXRandom.key(UInt64(seed * 8 + 4)))
+                            * scale.reshaped(1, 1, rows, 1)).transposed(0, 2, 1, 3)
+                        let gs = normal(2 * width, 5).reshaped(1, rows, heads, 2 * dim)
+                            .split(parts: 2, axis: -1)[1]
+                        signed = Qwen35FusedElementwise.sigmoidGateSigned(
+                            xs.reshaped(1, rows, -1), gs.reshaped(1, rows, -1), signs)
+                        fused = .sigmoidGate(x: xs, gate: gs)
+                    }
+                    guard
+                        let a0 = transform.forwardInt8(
+                            signed.reshaped(rows, width), gdnLayout: nil, preSigned: true,
+                            groupSize: 128),
+                        let a1 = transform.forwardInt8(
+                            producer: fused, gdnLayout: nil, groupSize: 128)
+                    else {
+                        report.passed = false
+                        report.error = "a quantizing rotation is not installed"
+                        return
+                    }
+                    report.cases += 1
+                    for (a, b) in [
+                        (a0.codes, a1.codes), (a0.scales, a1.scales),
+                        (a0.scaledSums, a1.scaledSums),
+                    ] {
+                        guard a.dtype == b.dtype, a.shape == b.shape else {
+                            report.passed = false
+                            report.error = "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                            return
+                        }
+                        let bits: DType = a.dtype == .float32 ? .uint32 : a.dtype
+                        let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        let count = Int(differ.item(Int32.self))
+                        report.values += a.size
+                        report.mismatches += count
+                        if count != 0 { report.passed = false }
+                    }
+                }
+            }
+        } catch {
+            report.passed = false
+            report.error = "\(error)"
+        }
+        return report
+    }
+}
+
 
 /// A prompt-width decoder-layer boundary for the tensor route as ONE launch:
 /// the FP16 residual add `h = x + r`, the RMSNorm of `h` with its FP32 gain,

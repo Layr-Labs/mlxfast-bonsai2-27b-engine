@@ -835,6 +835,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ layoutCache: HadamardConstantLayoutCache
     ) -> MLXArray?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8: TensorPackedMatmulNarrowInt8?
+    /// Whether a full verify window on the int8 narrow route may form this
+    /// producer inside the quantizing rotation (`tensorRouteForwardNarrowProducer`);
+    /// the model installs it behind its own 16-row bitwise self-test. Nil
+    /// keeps the composed chain.
+    nonisolated(unsafe) public static var narrowProducerApproves:
+        ((SignedBlockHadamard.Int8Producer, SignedBlockHadamard) -> Bool)?
     static var narrowRouteInstalled: Bool {
         (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
             && tensorPackedMatmulNarrowApplies != nil
@@ -1134,6 +1140,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return y.reshaped(leading + [n])
     }
 
+    /// A full verify window (16 rows) on the int8 narrow route with this
+    /// projection's input producer formed in the quantizing rotation's read, as
+    /// `tensorRouteForwardProducer` forms it at prompt width: the producer's
+    /// own launches and the rotation become one launch with the same codes,
+    /// scales and sums. Nil when it does not apply or `narrowProducerApproves`
+    /// does not approve the producer.
+    fileprivate func tensorRouteForwardNarrowProducer(
+        _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
+    ) -> MLXArray? {
+        guard let approves = Self.narrowProducerApproves else { return nil }
+        let x = producer.primary
+        let k = transform.width
+        guard x.ndim >= 2, x.size % k == 0,
+            tensorRouteTakesNarrowInt8(rows: x.size / k, siblings: [self]),
+            approves(producer, transform),
+            let activation = transform.forwardInt8(
+                producer: producer, gdnLayout: gdnLayout, groupSize: 128)
+        else { return nil }
+        let leading = x.ndim == 4 ? [x.dim(0), x.dim(1)] : Array(x.shape.dropLast())
+        return tensorRouteForwardQuantized(
+            activation, rows: x.size / k, leading: leading, siblings: [self],
+            widenOutput: widenOutput)?.first
+    }
+
     /// The verify-width tensor route: one FP16 rotation with group sums, rows
     /// padded to 16, one packed matmul over the (stacked) codes.
     private func tensorRouteForwardNarrow(
@@ -1289,6 +1319,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     {
         if gdnLayout == nil,
             let y = tensorRouteForwardProducer(.swiglu(gate: gate, up: up), widenOutput: widenOutput)
+                ?? tensorRouteForwardNarrowProducer(
+                    .swiglu(gate: gate, up: up), widenOutput: widenOutput)
         {
             return y
         }
@@ -1337,6 +1369,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterSigmoidGateHeads(
         _ x: MLXArray, gate: MLXArray, widenOutput: Bool = true
     ) -> MLXArray? {
+        // A full verify window on the int8 narrow route: the producer reads
+        // both views through their strides.
+        if gdnLayout == nil, x.ndim == 4, x.shape == gate.shape,
+            let y = tensorRouteForwardNarrowProducer(
+                .sigmoidGate(x: x, gate: gate), widenOutput: widenOutput)
+        {
+            return y
+        }
         guard HadamardStridedInputs.enabled, gdnLayout == nil, x.ndim == 4,
             x.shape == gate.shape, x.dim(2) * x.dim(3) == transform.width,
             let store = fusedInputStoreDType(rows: x.dim(0) * x.dim(1)),
@@ -1350,8 +1390,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func applyAfterGatedRMSNorm(
         _ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float, widenOutput: Bool = true
     ) -> MLXArray? {
-        if let y = tensorRouteForwardProducer(
-            .gatedRMSNorm(x: x, gate: z, weight: weight, eps: eps), widenOutput: widenOutput)
+        let producer = SignedBlockHadamard.Int8Producer.gatedRMSNorm(
+            x: x, gate: z, weight: weight, eps: eps)
+        if let y = tensorRouteForwardProducer(producer, widenOutput: widenOutput)
+            ?? tensorRouteForwardNarrowProducer(producer, widenOutput: widenOutput)
         {
             return y
         }
