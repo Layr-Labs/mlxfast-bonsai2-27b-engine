@@ -157,6 +157,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             // and a round run after the full load removed it in every one.
             CBv2DeferredLoadWarm.register { [weak self] in
                 guard let self else { return }
+                // its first verify forward is the verify trial's microbench chain
+                Qwen35TensorPackedMatmul.NarrowInSituTrial.beginCapture()
                 self.warmEngineRound(serving: serving)
                 Stream().synchronize()
                 Memory.clearCache()
@@ -172,27 +174,31 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     /// The verify int8 kernels' in-situ trial
     /// (`Qwen35TensorPackedMatmul.NarrowInSituTrial`), after the full load:
-    /// one engine request long enough for every candidate's timed rounds,
-    /// cancelled once they are in, then the choice, one stderr line, and the
-    /// buffer cache drained. Nothing runs when no trial is armed (no int8
-    /// verify route, one candidate, or
+    /// stage 1's chain microbench over the verify forward the warm round
+    /// before captured, then, with a finalist, one engine request long enough
+    /// for stage 2's paired rounds, cancelled once they are in; then the
+    /// choice, one stderr line, and the buffer cache drained. Nothing runs
+    /// when no trial is armed (no int8 verify route, one candidate, or
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off`).
     private func runNarrowInSituTrial(serving: any LanguageModel) {
         typealias Trial = Qwen35TensorPackedMatmul.NarrowInSituTrial
         guard Trial.armed else { return }
         let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded)
-        Stream().synchronize()
+        if Trial.shortlist() {
+            Memory.clearCache()
+            warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded)
+            Stream().synchronize()
+        }
         Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
         Memory.clearCache()
     }
 
     /// The fused head top-2 (`Qwen35HeadTopTwo`, OFF by default), after the
     /// verify kernels' trial so the head's kernel is final: the bitwise
-    /// self-test of that kernel's fused form, then one engine request whose
-    /// real rounds alternate off and on (`Qwen35HeadTopTwo.Trial`), on
-    /// adopted only if its median round is more than 0.5 % faster, and one
-    /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
+    /// self-test of that kernel's fused form and its chain microbench, then,
+    /// when on's gain admits it, one engine request whose real rounds run
+    /// paired cycles of off and on (`Qwen35HeadTopTwo.Trial`), on adopted only
+    /// under `PairedRoundTrial`'s rule, and one stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
     /// `=0` no self-test either). Nothing runs where the head is not on the
     /// int8 verify route or its fused form fails the self-test.
     /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
@@ -219,27 +225,33 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             return
         }
         let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Head.Trial.roundsNeeded, headTrial: true)
-        Stream().synchronize()
+        if Head.Trial.shortlist() {
+            Memory.clearCache()
+            warmEngineRound(serving: serving, trialRounds: Head.Trial.roundsNeeded, headTrial: true)
+            Stream().synchronize()
+        }
         Head.Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
         Memory.clearCache()
     }
 
     /// The drafter kernel's in-situ trial (`DFlash2KernelTrial`), after the
-    /// verify kernels' own trial, the same way: an engine request for stage 1
-    /// (stored layout, tiled copies, bit-for-bit variants), a second identical
-    /// one for stage 2 (the changed-split variants of the stage-1 pick) when
-    /// the variants are on and one passes its self-test, one stderr line, the
-    /// buffer cache drained. Runs only when the tiled self-test passed and no
-    /// switch forces the kernel (`MLXFAST_DRAFT_TILED`, `MLXFAST_DRAFT_KVAR_FORCE`).
+    /// verify kernels' own trial, the same way: stage 1's chain microbench
+    /// (stored layout, tiled copies, bit-for-bit variants, then the
+    /// changed-split variants of the fastest), then, with a finalist, one
+    /// engine request of paired rounds (a changed split with no tape from the
+    /// earlier trials: a `stock` request records one first), one stderr line,
+    /// the buffer cache drained. Runs only when the tiled self-test passed and
+    /// no switch forces the kernel (`MLXFAST_DRAFT_TILED`, `MLXFAST_DRAFT_KVAR_FORCE`).
     private func runKernelTrial(serving: any LanguageModel) {
         guard DFlash2KernelTrial.armed else { return }
         let start = DispatchTime.now().uptimeNanoseconds
-        DFlash2KernelTrial.beginFirstStage()
-        warmEngineRound(
-            serving: serving, trialRounds: DFlash2KernelTrial.requestRounds, kernelTrial: true)
-        Stream().synchronize()
-        if DFlash2KernelTrial.beginSecondStage() {
+        if DFlash2KernelTrial.shortlist() {
+            if DFlash2KernelTrial.needsTape {
+                Memory.clearCache()
+                warmEngineRound(
+                    serving: serving, trialRounds: DFlash2KernelTrial.requestRounds, tapeOnly: true)
+                Stream().synchronize()
+            }
             Memory.clearCache()
             warmEngineRound(
                 serving: serving, trialRounds: DFlash2KernelTrial.requestRounds, kernelTrial: true)
@@ -284,10 +296,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// enough tokens to reach that many rounds even at full acceptance, the
     /// trial's round hook is armed for it, and the request is cancelled as
     /// soon as the trial has its rounds (`headTrial`: the head top-2 trial's
-    /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
+    /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s;
+    /// `tapeOnly`: only the drafter trial's tape).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false, producerTrial: Bool = false
+        kernelTrial: Bool = false, tapeOnly: Bool = false, producerTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -356,7 +369,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     guard let engine else { return }
                     DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
                 }
-                if producerTrial {
+                if tapeOnly {
+                    DFlash2KernelTrial.beginTape(rounds: trialRounds, onEnough: cancel)
+                } else if producerTrial {
                     Qwen35NarrowProducerTrial.begin(onEnough: cancel)
                 } else if headTrial {
                     Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
@@ -365,6 +380,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 } else {
                     Qwen35TensorPackedMatmul.NarrowInSituTrial.begin(onEnough: cancel)
                 }
+                // The first trial request's proposals are the drafter trial's tape.
+                if !kernelTrial, !tapeOnly { DFlash2KernelTrial.beginTape() }
             }
             let done = DispatchSemaphore(value: 0)
             Task.detached {
@@ -380,6 +397,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Qwen35NarrowProducerTrial.active = false
                 Qwen35HeadTopTwo.Trial.active = false
                 DFlash2KernelTrial.active = false
+                DFlash2KernelTrial.endTape()
             }
         }
         // The engine is out of scope here; its last references go as the
@@ -570,6 +588,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     private func warmDrafter() {
         let block = Self.warmBlockSize
+        DFlash2SpeculativePad.warm(
+            block: block, hidden: drafter.config.hiddenSize, dtype: drafter.dtype)
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0

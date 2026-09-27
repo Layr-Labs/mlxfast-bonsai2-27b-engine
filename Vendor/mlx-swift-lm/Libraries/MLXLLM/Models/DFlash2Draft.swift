@@ -1,6 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
 // DFlash 2 block drafter.
+// The wide FP32 selector reuses singleton-batch views from the narrow path;
+// selector arithmetic, output ids, and the pinned parameter format are unchanged.
 //
 // This is a port of the reference MLX Python implementation, `dflash/model_mlx.py`
 // of `z-lab/dflash` at `07ebd93`: `DFlashAttention`, `GroupedDynamicCausalConv`,
@@ -2097,6 +2099,70 @@ enum DFlash2TensorMatmul {
         return result ?? (false, .nan)
     }
 
+    /// The weights with a tiled copy, in the drafter's forward order (the
+    /// trial's microbench chain, `chainTimes`).
+    nonisolated(unsafe) private static var chainWeights: [MLXArray] = []
+
+    /// Each kernel's best time (ns) over `runs` passes of the drafter's tensor
+    /// launches as one dependent chain (each launch reads the previous one's
+    /// output as its input, so it waits for it as in the drafter; the values
+    /// do not change a launch's time), after one warm-up chain, the kernels in
+    /// rotated order per pass; and `kernels[0]`'s spread (its median run over
+    /// its best, minus one). nil without copies or on an MLX error.
+    static func chainTimes(_ kernels: [Kernel], runs: Int) -> (best: [Double], spread: Double, warm: Double)? {
+        let weights = chainWeights
+        guard !weights.isEmpty, !kernels.isEmpty else { return nil }
+        let saved = current
+        defer { current = saved }
+        let input = MLXRandom.normal([rowsPerTile, weights[0].dim(1)], key: MLXRandom.key(8301))
+            .asType(.bfloat16)
+        func chain(_ kernel: Kernel) -> MLXArray? {
+            current = kernel
+            var x = input
+            for (index, w) in weights.enumerated() {
+                let k = w.dim(1)
+                if index > 0 {
+                    let flat = x.reshaped([-1])
+                    x = (flat.size >= rowsPerTile * k
+                        ? flat[0 ..< rowsPerTile * k]
+                        : concatenated(
+                            [flat, MLXArray.zeros([rowsPerTile * k - flat.size], dtype: flat.dtype)]))
+                        .reshaped([rowsPerTile, k])
+                }
+                guard let y = apply(x, weight: w) else { return nil }
+                x = y
+            }
+            return x
+        }
+        var best = Array(repeating: Double.infinity, count: kernels.count)
+        var reference: [Double] = []
+        var warmNanoseconds = 0.0
+        let completed = try? withError { error -> Bool in
+            guard let warm = chain(kernels[0]) else { return false }
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            eval(warm)
+            warmNanoseconds = Double(DispatchTime.now().uptimeNanoseconds - t0)
+            try error.check()
+            for pass in 0 ..< runs {
+                let order = kernels.indices.map { (pass + $0) % kernels.count }
+                let graphs = order.map { chain(kernels[$0]) }
+                for (index, graph) in zip(order, graphs) {
+                    guard let graph else { continue }
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    eval(graph)
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0)
+                    best[index] = min(best[index], elapsed)
+                    if index == 0 { reference.append(elapsed) }
+                }
+                try error.check()
+            }
+            return true
+        }
+        guard completed == true, best[0].isFinite else { return nil }
+        let sorted = reference.sorted()
+        return (best, sorted.isEmpty ? 0 : sorted[sorted.count / 2] / best[0] - 1, warmNanoseconds)
+    }
+
     private static let tiledLock = NSLock()
     /// Each stored weight (held, so its identity is never reused) with its copy.
     nonisolated(unsafe) private static var tiledCopies:
@@ -2127,6 +2193,7 @@ enum DFlash2TensorMatmul {
     /// self-test operands.
     static func dropTiledCopies() {
         tiledLock.withLock { tiledCopies.removeAll() }
+        chainWeights = []
         dropTestOperands()
     }
 
@@ -2190,6 +2257,7 @@ enum DFlash2TensorMatmul {
             tiledLock.withLock {
                 for (w, t) in copies { tiledCopies[ObjectIdentifier(w)] = (w, t) }
             }
+            chainWeights = copies.map(\.source)
             var shapes = Set<[Int]>()
             testWeights = copies.filter { shapes.insert($0.source.shape).inserted }
             testInputs = inputs
@@ -2249,53 +2317,65 @@ enum DFlash2TensorMatmul {
 }
 
 /// The drafter kernel's in-situ trial, in the load-time warm
-/// (`Qwen35DFlash2Assistant.runKernelTrial`), modelled on the verify int8
-/// kernels' `NarrowInSituTrial`: engine requests whose rounds rotate through
-/// the candidate kernels, `perCandidate` timed rounds each; per candidate the
-/// median round (outliers above 1.5x the median dropped); a candidate is
-/// adopted only when it beats the reference by more than `adoptMargin`.
+/// (`Qwen35DFlash2Assistant.runKernelTrial`), in the verify int8 kernels'
+/// two stages (`Qwen35TensorPackedMatmul.NarrowInSituTrial`).
 ///
-/// Stage 1 rotates `stock`, `tiled` and the bit-for-bit variants that passed
-/// their self-test; the fastest is kept only if it beats `stock`. Every
-/// stage-1 kernel gives the record's bits, so each round's draft ids are the
-/// record body's; they are kept, with the committed position each round
-/// proposed from, as the tape. Stage 2 (variants on, and a changed-split
-/// variant of the stage-1 pick passing its self-test) runs the same request
-/// again (same prompt, same budget: the same rounds while the drafts match),
-/// rotating the pick and its changed-split variants. A variant is adopted only
-/// if every one of its rounds proposed exactly the tape's ids from the tape's
-/// position, the pick's own rounds matched the tape as well, and it beats the
-/// pick; otherwise the pick stays. The target decides every emitted token
-/// either way; the check keeps the drafter's proposals, and so the
-/// acceptance, the record's on the trial's rounds.
+/// Stage 1 (`shortlist`), a GPU-bound microbench: the drafter's 15 tensor
+/// launches on their real weights, in the forward's order, as one dependent
+/// chain per kernel (`DFlash2TensorMatmul.chainTimes`: each launch reads the
+/// previous one's output), one warm-up chain and `chainRuns` passes, each
+/// kernel's best run kept. First `stock`, `tiled` and the bit-for-bit variants
+/// that passed their self-test; then the changed-split variants of the
+/// fastest tiled kernel that pass theirs, timed beside `stock`
+/// and that kernel. The finalist is the fastest kernel of the last pass if
+/// its gain over `stock` passes `PairedRoundTrial.admits`; else `stock` stays
+/// and no round runs.
+///
+/// Stage 2, paired rounds (`PairedRoundTrial`): one engine request whose
+/// rounds run cycles of `stock` and the finalist; the finalist is adopted only
+/// under the paired rule. A changed-split finalist reorders the FP32 sums, so
+/// it is adopted only if, in addition, every one of its rounds and of
+/// `stock`'s proposed exactly the tape's ids from the tape's position: the
+/// tape is every round's proposal of an earlier request of the same warm on
+/// the same prompt with every kernel bitwise the record's and the drafter on
+/// the stored layout (the verify or head trial's stage 2, else one request of
+/// its own, `needsTape`), so the rounds match while the drafts do.
+/// The target decides every emitted token either way; the check keeps the
+/// drafter's proposals, and so the acceptance, the record's on the trial's
+/// rounds.
 ///
 /// A round is the host time from its proposal to the next. A proposal is
 /// built with its round's kernel: set at `roundBoundary()` (the top of every
-/// proposal) and, for a block built before the previous round's readback
+/// proposal and every adopted speculative block) and, for a block built
+/// before the previous round's readback
 /// (`Qwen35DFlash2Assistant.speculateBlock`), at `aheadOfRound()`, so a
-/// round's drafter work runs the kernel the round is timed for. The first
-/// round is discarded.
+/// round's drafter work runs the kernel the round is timed for; a round whose
+/// proposal was built with another kernel is void. The first round is
+/// discarded.
 enum DFlash2KernelTrial {
     typealias Kernel = DFlash2TensorMatmul.Kernel
 
     nonisolated(unsafe) static var armed = false
     nonisolated(unsafe) static var active = false
+    /// `stock` and the finalist.
     nonisolated(unsafe) private static var candidates: [Kernel] = [.stock]
-    nonisolated(unsafe) private static var perCandidate = 12
-    nonisolated(unsafe) private static var stage = 0
+    /// Each timed round's candidate (`PairedRoundTrial.schedule`).
+    nonisolated(unsafe) private static var arms: [Int] = []
     nonisolated(unsafe) private static var roundIndex = 0
     nonisolated(unsafe) private static var lastBoundary: UInt64 = 0
     nonisolated(unsafe) private static var durations: [Int: UInt64] = [:]
     nonisolated(unsafe) private static var proposals: [Int: Proposal] = [:]
     nonisolated(unsafe) private static var tape: [Int: (position: Int, ids: [Int32])] = [:]
+    nonisolated(unsafe) private static var taping = false
+    nonisolated(unsafe) private static var tapeIndex = 0
+    nonisolated(unsafe) private static var tapeRounds = Int.max
+    /// The finalist is a changed split and no earlier request left a tape:
+    /// one request of `stock` records it first (`beginTape(rounds:onEnough:)`).
+    nonisolated(unsafe) private(set) static var needsTape = false
     nonisolated(unsafe) private static var onEnough: (() -> Void)?
-    nonisolated(unsafe) private static var pick = Kernel.stock
-    nonisolated(unsafe) private static var proposalCount = 0
     nonisolated(unsafe) private static var log = ""
-    /// Host times: stage 1 begun, its request done, stage 2's self-tests done.
+    /// Host times: stage 1 begun, stage 1 done.
     nonisolated(unsafe) private static var marks: [UInt64] = []
-    /// The rounds both requests budget for (the same budget, the same rounds).
-    nonisolated(unsafe) private(set) static var requestRounds = 0
 
     private struct Proposal {
         let tag: Int  // the candidate it was built with; -1 unknown
@@ -2303,28 +2383,42 @@ enum DFlash2KernelTrial {
         let tokens: MLXArray
     }
 
-    static let adoptMargin = 0.005
-    static let outlierFactor = 1.5
-    /// Timed rounds per candidate: stage 1 with variants (12 for the two-way
-    /// trial), stage 2.
-    static let roundsPerVariant = 8
-    static let roundsPerSplit = 6
+    /// Timed chain passes (each kernel keeps its best).
+    static let chainRuns = 5
+    /// With no round floor measured (`PairedRoundTrial.admits`), the
+    /// finalist's chain must beat `stock`'s by more than this.
+    static let chainAdmit = 0.002
 
-    /// The discarded round, the seed-side boundary, then every candidate's rounds.
-    static var roundsNeeded: Int { 2 + candidates.count * perCandidate }
+    /// The stage-2 request's budget: the discarded round, the seed-side
+    /// boundary, then every timed round.
+    static var requestRounds: Int { 2 + arms.count }
 
     @inline(__always) static func roundBoundary() {
-        guard active else { return }
-        boundary()
+        guard active || taping else { return }
+        if active {
+            boundary()
+        } else {
+            tapeIndex += 1
+            if tapeIndex == tapeRounds {
+                let enough = onEnough
+                onEnough = nil
+                enough?()
+            }
+        }
+    }
+
+    /// The candidate of the round after boundary `index` (0: `stock`).
+    private static func arm(_ index: Int) -> Int {
+        index >= 1 && index - 1 < arms.count ? arms[index - 1] : 0
     }
 
     private static func boundary() {
         let now = DispatchTime.now().uptimeNanoseconds
         if roundIndex >= 2 { durations[roundIndex - 1] = now - lastBoundary }
         lastBoundary = now
-        DFlash2TensorMatmul.current = candidates[roundIndex % candidates.count]
+        DFlash2TensorMatmul.current = candidates[arm(roundIndex)]
         roundIndex += 1
-        if roundIndex >= roundsNeeded {
+        if roundIndex >= requestRounds {
             active = false
             let enough = onEnough
             onEnough = nil
@@ -2336,7 +2430,7 @@ enum DFlash2KernelTrial {
     /// (the next boundary's) and returns its candidate; nil with no trial.
     static func aheadOfRound() -> Int? {
         guard active else { return nil }
-        let tag = roundIndex % candidates.count
+        let tag = arm(roundIndex)
         DFlash2TensorMatmul.current = candidates[tag]
         return tag
     }
@@ -2344,14 +2438,24 @@ enum DFlash2KernelTrial {
     /// The round's proposal, built at its boundary (`proposeBlock`) from
     /// `position` committed rows.
     @inline(__always) static func recordProposed(_ tokens: MLXArray, position: Int) {
-        guard active, roundIndex >= 1 else { return }
-        record(tokens, tag: (roundIndex - 1) % candidates.count, position: position)
+        guard active || taping else { return }
+        if taping {
+            if tapeIndex >= 1 { proposals[tapeIndex - 1] = Proposal(tag: 0, position: position, tokens: tokens) }
+            return
+        }
+        guard roundIndex >= 1 else { return }
+        record(tokens, tag: arm(roundIndex - 1), position: position)
     }
 
     /// The round's proposal, built ahead with `tag` (`aheadOfRound()`) and
     /// adopted at its boundary from `position` committed rows.
     @inline(__always) static func recordAdopted(_ tokens: MLXArray, tag: Int?, position: Int) {
-        guard active, roundIndex >= 1 else { return }
+        guard active || taping else { return }
+        if taping {
+            if tapeIndex >= 1 { proposals[tapeIndex - 1] = Proposal(tag: 0, position: position, tokens: tokens) }
+            return
+        }
+        guard roundIndex >= 1 else { return }
         record(tokens, tag: tag ?? -1, position: position)
     }
 
@@ -2359,22 +2463,89 @@ enum DFlash2KernelTrial {
         proposals[roundIndex - 1] = Proposal(tag: tag, position: position, tokens: tokens)
     }
 
-    /// Stage 1's candidates, and the budget both requests use.
-    static func beginFirstStage() {
-        candidates = [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
-        perCandidate = candidates.count > 2 ? roundsPerVariant : 12
-        stage = 1
-        pick = .stock
-        tape = [:]
+    /// Records every proposal of the next engine request as the tape (once;
+    /// only for a trial that can take a changed split): an earlier trial's
+    /// request (`Qwen35DFlash2Assistant.warmEngineRound`), or, with `rounds`,
+    /// a request of its own that `onEnough` ends after that many boundaries.
+    static func beginTape(rounds: Int = .max, onEnough: (() -> Void)? = nil) {
+        guard armed, !active, DFlash2TensorMatmul.variantsEnabled, tape.isEmpty else { return }
+        proposals = [:]
+        tapeIndex = 0
+        tapeRounds = rounds
+        self.onEnough = onEnough
+        taping = true
+    }
+
+    static func endTape() {
+        guard taping else { return }
+        taping = false
+        onEnough = nil
+        needsTape = false
+        for (index, p) in proposals {
+            tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
+        }
+        proposals = [:]
+    }
+
+    /// Stage 1 (see the type's notes). True when stage 2 is to run.
+    static func shortlist() -> Bool {
+        candidates = [.stock]
+        arms = []
         log = ""
-        proposalCount = 0
+        needsTape = false
         marks = [DispatchTime.now().uptimeNanoseconds]
-        requestRounds = max(
-            roundsNeeded, DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
+        guard armed else { return false }
+        func pass(_ kernels: [Kernel]) -> (kernel: Kernel, stock: Double, time: Double)? {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            guard let (best, spread, warm) = DFlash2TensorMatmul.chainTimes(kernels, runs: chainRuns) else {
+                log += (log.isEmpty ? "" : "; ") + "stage 1 chain failed"
+                return nil
+            }
+            log += (log.isEmpty ? "" : "; ") + "stage 1 chain ("
+                + String(format: "warm-up %.1f ms, best of %d, stock spread %.2f%%, %.0f ms", warm / 1e6, chainRuns, spread * 100, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+                + ") ms ["
+                + kernels.indices.map {
+                    kernels[$0].name + " " + String(format: "%.3f", best[$0] / 1e6)
+                        + ($0 == 0 ? "" : String(format: " %+.2f%%", (best[$0] / best[0] - 1) * 100))
+                }.joined(separator: " | ") + "]"
+            let fastest = (1 ..< kernels.count).min { best[$0] < best[$1] } ?? 0
+            return fastest > 0 ? (kernels[fastest], best[0], best[fastest]) : nil
+        }
+        var finalist = pass([.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants)
+        if let pick = finalist?.kernel, DFlash2TensorMatmul.variantsEnabled {
+            var passed: [Kernel] = []
+            var tested: [String] = []
+            for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
+                let test = DFlash2TensorMatmul.selfTest(kernel)
+                if test.passed { passed.append(kernel) }
+                tested.append(
+                    kernel.name
+                        + (test.passed ? String(format: " max rel %.1e", test.maxRelative) : " FAILED"))
+            }
+            log += "; split variants self-test [\(tested.joined(separator: ", "))]"
+            if !passed.isEmpty, let second = pass([.stock, pick] + passed) { finalist = second }
+        }
+        if let (kernel, stock, time) = finalist,
+            PairedRoundTrial.admits(gain: stock - time, reference: stock, fallback: chainAdmit)
+        {
+            candidates = [.stock, kernel]
+            needsTape = !kernel.bitwise && tape.isEmpty
+            log += "; finalist \(kernel.name)" + (needsTape ? " (a tape request first)" : "")
+        } else {
+            log += "; no kernel's chain gain passes the admission"
+        }
+        if PairedRoundTrial.nullRun {
+            candidates = [.stock, .stock]
+            needsTape = false
+            log += "; MLXFAST_TRIAL_NULL: the finalist is stock"
+        }
+        marks.append(DispatchTime.now().uptimeNanoseconds)
+        arms = PairedRoundTrial.schedule(challengers: candidates.count - 1)
+        return !arms.isEmpty
     }
 
     static func begin(onEnough: @escaping () -> Void) {
-        guard armed else { return }
+        guard armed, !arms.isEmpty else { return }
         roundIndex = 0
         lastBoundary = 0
         durations = [:]
@@ -2384,143 +2555,65 @@ enum DFlash2KernelTrial {
         active = true
     }
 
-    private static func median(_ values: [UInt64]) -> Double? {
-        guard !values.isEmpty else { return nil }
-        let sorted = values.sorted()
-        let mid = sorted.count / 2
-        return sorted.count % 2 == 1
-            ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
-    }
-
-    private typealias Timing = (median: Double?, kept: Int, timed: Int)
-
-    /// Per candidate. A round counts for the candidate it was scheduled for
-    /// only when its proposal was built with that candidate.
-    private static func timings() -> [Timing] {
-        var times = Array(repeating: [UInt64](), count: candidates.count)
-        for (index, duration) in durations {
-            let tag = index % candidates.count
-            guard proposals[index]?.tag == tag else { continue }
-            times[tag].append(duration)
-        }
-        return times.map { values in
-            guard let first = median(values) else { return (nil, 0, 0) }
-            let kept = values.filter { Double($0) <= outlierFactor * first }
-            return (median(kept), kept.count, values.count)
-        }
-    }
-
-    /// The fastest eligible candidate if it beats candidate 0 by more than
-    /// the margin, else candidate 0.
-    private static func choose(_ t: [Timing], eligible: [Bool]) -> Int {
-        guard let reference = t[0].median else { return 0 }
-        var best = 0
-        for c in 1 ..< t.count where eligible[c] {
-            if let m = t[c].median, m < (t[best].median ?? .infinity) { best = c }
-        }
-        return best > 0 && t[best].median! < reference * (1 - adoptMargin) ? best : 0
-    }
-
-    private static func describe(_ t: [Timing], _ note: (Int) -> String = { _ in "" }) -> String {
-        candidates.indices.map { c in
-            "\(candidates[c].name) "
-                + (t[c].median.map { String(format: "%.2f", $0 / 1e6) } ?? "-")
-                + " ms (\(t[c].kept)/\(t[c].timed)\(note(c)))"
-        }.joined(separator: ", ")
-    }
-
-    private static func change(_ t: [Timing], _ c: Int) -> String {
-        guard c > 0, let m = t[c].median, let r = t[0].median else { return "" }
-        return String(format: " (%+.2f%%)", (m / r - 1) * 100)
-    }
-
-    /// The stage-1 pick and (variants on) the tape, once.
-    private static func concludeFirstStage() {
-        guard stage == 1, log.isEmpty else { return }
-        let t = timings()
-        let best = choose(t, eligible: Array(repeating: true, count: candidates.count))
-        pick = candidates[best]
-        log = describe(t) + " -> \(pick.name)\(change(t, best))"
-        proposalCount += roundIndex
-        if DFlash2TensorMatmul.variantsEnabled {
-            for (index, p) in proposals {
-                tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
+    /// Whether every recorded proposal of `stock` and the finalist matches
+    /// the tape (see the type's notes), and the counts for the log.
+    private static func matchesTape() -> (Bool, String) {
+        var recorded = [0, 0]
+        var equal = [0, 0]
+        var firstOff = Int.max
+        var unknownDiffers = false
+        for index in proposals.keys.sorted() {
+            let p = proposals[index]!
+            if p.tag >= 0, p.tag < 2 { recorded[p.tag] += 1 }
+            guard index < firstOff, let entry = tape[index], entry.position == p.position else {
+                firstOff = min(firstOff, index)
+                continue
             }
+            let same = p.tokens.asType(.int32).asArray(Int32.self) == entry.ids
+            if p.tag < 0 || p.tag >= 2 {
+                if !same { unknownDiffers = true }
+                continue
+            }
+            if same { equal[p.tag] += 1 }
         }
-        proposals = [:]
+        let clean = (0 ..< 2).allSatisfy { recorded[$0] > 0 && equal[$0] == recorded[$0] } && !unknownDiffers
+        return (clean, "ids vs the tape: stock \(equal[0])/\(recorded[0]), \(candidates[1].name) \(equal[1])/\(recorded[1])")
     }
 
-    /// After the first request: `concludeFirstStage`, then the changed-split
-    /// variants of the pick that pass their self-test. True when the second
-    /// request is to run.
-    static func beginSecondStage() -> Bool {
-        active = false
-        onEnough = nil
-        guard armed, stage == 1 else { return false }
-        marks.append(DispatchTime.now().uptimeNanoseconds)
-        concludeFirstStage()
-        guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty else { return false }
-        var passed: [Kernel] = []
-        var tested: [String] = []
-        for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
-            let test = DFlash2TensorMatmul.selfTest(kernel)
-            if test.passed { passed.append(kernel) }
-            tested.append(
-                kernel.name
-                    + (test.passed ? String(format: " max rel %.1e", test.maxRelative) : " FAILED"))
-        }
-        log += "; split variants self-test [\(tested.joined(separator: ", "))]"
-        marks.append(DispatchTime.now().uptimeNanoseconds)
-        guard !passed.isEmpty else { return false }
-        candidates = [pick] + passed
-        perCandidate = roundsPerSplit
-        stage = 2
-        return true
-    }
-
-    /// Installs the verdict (the stage-1 pick unless a stage-2 variant
-    /// qualified; the copies are freed when the stored layout stays), logs
-    /// one line and disarms. Safe when nothing ran.
+    /// Installs the verdict (`stock` unless the finalist qualified; the
+    /// copies are freed when the stored layout stays), logs one line and
+    /// disarms. Safe when nothing ran.
     static func finish(elapsedNanoseconds: UInt64) {
         active = false
         onEnough = nil
+        taping = false
         guard armed else { return }
         armed = false
-        concludeFirstStage()
-        var adopted = pick
-        if stage == 2 {
-            proposalCount += roundIndex
-            let t = timings()
-            let n = candidates.count
-            var recorded = Array(repeating: 0, count: n)
-            var compared = recorded
-            var equal = recorded
-            var firstOff = Int.max
-            var unknownDiffers = false
-            for index in proposals.keys.sorted() {
-                let p = proposals[index]!
-                if p.tag >= 0 { recorded[p.tag] += 1 }
-                guard index < firstOff, let entry = tape[index], entry.position == p.position else {
-                    firstOff = min(firstOff, index)
-                    continue
-                }
-                let same = p.tokens.asType(.int32).asArray(Int32.self) == entry.ids
-                if p.tag < 0 {
-                    if !same { unknownDiffers = true }
-                    continue
-                }
-                compared[p.tag] += 1
-                if same { equal[p.tag] += 1 }
+        var adopted = Kernel.stock
+        var challengerWon = false
+        if candidates.count == 2, !arms.isEmpty {
+            let times: [Double?] = arms.indices.map { i in
+                guard let d = durations[i + 1], proposals[i + 1]?.tag == arms[i] else { return nil }
+                return Double(d)
             }
-            func clean(_ c: Int) -> Bool {
-                recorded[c] > 0 && compared[c] == recorded[c] && equal[c] == recorded[c]
+            let verdict = PairedRoundTrial.verdicts(arms: arms, times: times, challengers: 1).first
+                ?? PairedRoundTrial.Verdict()
+            var eligible = true
+            var ids = ""
+            if !candidates[1].bitwise {
+                (eligible, ids) = matchesTape()
+                ids = ", " + ids
             }
-            let eligible = (0 ..< n).map { c in c > 0 && clean(c) && clean(0) && !unknownDiffers }
-            let best = choose(t, eligible: eligible)
-            adopted = candidates[best]
-            log += "; " + describe(t) { c in ", ids \(equal[c])/\(recorded[c])" }
-                + " -> \(adopted.name)\(change(t, best))"
+            if verdict.adopt, eligible {
+                adopted = candidates[1]
+                challengerWon = true
+            }
+            log += "; stage 2 (\(roundIndex) proposals, "
+                + PairedRoundTrial.header(arms: arms, times: times, reference: "stock") + ") "
+                + (PairedRoundTrial.nullRun ? "null" : candidates[1].name) + " vs stock "
+                + verdict.summary + ids
         }
+        let adoptedName = challengerWon && PairedRoundTrial.nullRun ? "null (= stock)" : adopted.name
         DFlash2TensorMatmul.current = adopted
         if adopted.tiled {
             DFlash2TensorMatmul.dropTestOperands()
@@ -2531,15 +2624,14 @@ enum DFlash2KernelTrial {
         let phases = zip(marks.dropFirst(), marks).map { String(format: "%.0f", Double($0 - $1) / 1e6) }
         FileHandle.standardError.write(
             Data(
-                ("dflash2 kernel trial: \(log); adopted \(adopted.name) "
+                ("dflash2 kernel trial: \(log); adopted \(adoptedName) "
                     + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : "stored layout")); "
-                    + "\(proposalCount) proposals; "
                     + String(format: "%.0f ms", Double(elapsedNanoseconds) / 1e6)
                     + " (\(phases.joined(separator: " + ")))\n").utf8))
         proposals = [:]
         tape = [:]
         durations = [:]
-        stage = 0
+        arms = []
     }
 }
 
@@ -3051,7 +3143,9 @@ enum DFlash2GreedyWalk {
         let length = candidates.dim(1)
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
-        let c = candidates[0]
+        // Reuse the narrow path's singleton-batch views while keeping this
+        // path's FP32 widening and stock kernel. Preserve general indexing.
+        let c = candidates.dim(0) == 1 ? candidates.squeezed(axis: 0) : candidates[0]
         // Gather only the codebook rows the candidate lists can visit. The
         // fused kernel scores each edge and advances the greedy walk in one
         // pass, instead of materializing an [L-1, K, K, rank] broadcast.
@@ -3060,8 +3154,10 @@ enum DFlash2GreedyWalk {
         let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
             .asType(.float32).reshaped([-1])
         let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
-        let projectedRows = projected[0].asType(.float32).reshaped([-1])
-        let scores = unary[0].asType(.float32).reshaped([-1])
+        let projectedBatch = projected.dim(0) == 1 ? projected.squeezed(axis: 0) : projected[0]
+        let projectedRows = projectedBatch.asType(.float32).reshaped([-1])
+        let unaryBatch = unary.dim(0) == 1 ? unary.squeezed(axis: 0) : unary[0]
+        let scores = unaryBatch.asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
@@ -3416,6 +3512,57 @@ public enum DFlash2ResidencyPrefetch {
 
 // MARK: - The drafter
 
+
+/// `propose` passes the anchor row alone and the mask-column count. The mask
+/// ids were never read: `hiddenStates` embeds the anchor and broadcasts the
+/// bound mask row. `DARKBLOOM_DFLASH_ANCHOR_ROW=0` builds the full id block.
+enum DFlash2AnchorRow {
+    static let direct: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_ANCHOR_ROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
+/// The speculative block pads its context up to `2 * blockSize` with zeros.
+/// Those zeros are read-only and the row count repeats inside a window, so
+/// one evaluated buffer per shape is reused. `DARKBLOOM_DFLASH_PAD_REUSE=0`
+/// allocates a fresh zeros tensor every block.
+enum DFlash2SpeculativePad {
+    static let reuse: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PAD_REUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: MLXArray] = [:]
+
+    static func zeros(rows: Int, hidden: Int, dtype: DType) -> MLXArray {
+        guard reuse, rows > 0 else {
+            return MLXArray.zeros([1, rows, hidden], dtype: dtype)
+        }
+        let key = "\(rows)x\(hidden)x\(dtype)"
+        return lock.withLock {
+            if let hit = cache[key] { return hit }
+            let made = MLXArray.zeros([1, rows, hidden], dtype: dtype)
+            eval(made)
+            cache[key] = made
+            return made
+        }
+    }
+
+    /// Fill every pad width a depth-`block-1` speculative block can ask for,
+    /// so the timed window does not compile or fill them.
+    static func warm(block: Int, hidden: Int, dtype: DType) {
+        guard reuse, block > 1 else { return }
+        let span = 2 * block
+        for contextRows in 1 ... block {
+            _ = zeros(rows: span - contextRows, hidden: hidden, dtype: dtype)
+        }
+    }
+}
+
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
     public let config: DFlash2Configuration
 
@@ -3601,7 +3748,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray?,
         cache: [KVCache],
         logitsStart: Int,
-        submittingLeadingLayers leadingLayers: Int = 0
+        submittingLeadingLayers leadingLayers: Int = 0,
+        maskColumns: Int = 0
     ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -3622,7 +3770,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // time; broadcast that exact value across the block. Keep the general
         // one-row case unchanged.
         let embeddedInputs: MLXArray
-        if inputs.dim(1) > 1 {
+        if DFlash2AnchorRow.direct, maskColumns > 0, inputs.dim(1) == 1 {
+            embeddedInputs = try blockEmbedding(anchorIDs: inputs, maskColumns: maskColumns)
+        } else if inputs.dim(1) > 1 {
             embeddedInputs = try blockEmbedding(
                 anchorIDs: inputs[0..., ..<1], maskColumns: inputs.dim(1) - 1)
         } else {
@@ -3732,6 +3882,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         submittingLeadingLayers leadingLayers: Int = 0
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
+        if DFlash2AnchorRow.direct {
+            let anchorIDs = MLXArray(anchor.map { Int32($0) }, [anchor.count, 1])
+            let hidden = try hiddenStates(
+                anchorIDs, targetHidden: targetHidden, cache: cache, logitsStart: 1,
+                submittingLeadingLayers: leadingLayers, maskColumns: blockSize - 1)
+            return candidateSelector.selectGreedy(
+                hidden: hidden,
+                logits: try logits(hidden),
+                anchor: anchorIDs.reshaped([anchor.count]))
+        }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let rows = anchor.flatMap { [Int32($0)] + masks }
         let block = MLXArray(rows, [anchor.count, blockSize])
@@ -3821,7 +3981,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
         let base = concatenated(
-            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
+            [
+                context,
+                DFlash2SpeculativePad.zeros(
+                    rows: n - contextRows, hidden: config.hiddenSize, dtype: context.dtype),
+            ],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c

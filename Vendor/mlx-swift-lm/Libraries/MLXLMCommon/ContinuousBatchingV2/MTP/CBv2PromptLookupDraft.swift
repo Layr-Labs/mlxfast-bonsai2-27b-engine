@@ -63,6 +63,15 @@ enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
+        // Every longer eligible match contains this suffix and leaves the
+        // same continuation inside the prompt. Prove a miss in one scan
+        // before scanning all longer lengths; ambiguous hits still use the
+        // original longest-match selection below.
+        let minimumSuffix = history[(count - minimum) ..< count]
+        let lastMinimumStart = prompt - minimum - depth
+        guard (0 ... lastMinimumStart).contains(where: { start in
+            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
+        }) else { return nil }
         for length in stride(from: longest, through: minimum, by: -1) {
             let suffix = count - length
             let lastStart = prompt - length - depth
