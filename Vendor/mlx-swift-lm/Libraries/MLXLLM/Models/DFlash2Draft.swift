@@ -3549,37 +3549,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return true
     }
 
-    /// At most one block of committed rows (a prompt-lookup round's, see
-    /// `Qwen35DFlash2Assistant.absorbLookupRound`) entered as the next block's
-    /// forward would enter them: projected by `contextProjection`, the block
-    /// path's own `fc`, and keyed by each layer's `absorbContext`, whose
-    /// up-to-16-row projection takes the block forward's row-count-independent
-    /// tensor kernel. Returns false, having written nothing, when a layer's
-    /// cache cannot take the rows in place.
-    public func absorbBlockContext(targetHidden: MLXArray, cache: [KVCache]) throws -> Bool {
-        guard target != nil else { throw DFlash2Error.notBound }
-        guard cache.count == layers.count else {
-            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
-        }
-        guard targetHidden.dim(-1) == config.targetHiddenSize else {
-            throw DFlash2Error.targetHiddenSizeMismatch(
-                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
-        }
-        let rows = targetHidden.dim(1)
-        guard (1 ... 16).contains(rows),
-            cache.allSatisfy({ ($0 as? DFlash2BlockKVCache)?.canAbsorb(contextRows: rows) ?? false }),
-            config.layerTypes.allSatisfy({ $0 == .slidingAttention }),
-            let slidingWindow = config.slidingWindow,
-            DFlash2SlidingMask.contextSkip(contextLength: rows, slidingWindow: slidingWindow) == 0
-        else { return false }
-        let context = contextProjection(targetHidden)
-        for (index, layer) in layers.enumerated() {
-            let absorbed = layer.absorbContext(context, rope: rope, cache: cache[index])
-            precondition(absorbed, "DFlash 2: a checked cache refused its context rows")
-        }
-        return true
-    }
-
     // MARK: The next block before the readback
 
     /// `(held rows, offset)` of every layer when a speculative block fits

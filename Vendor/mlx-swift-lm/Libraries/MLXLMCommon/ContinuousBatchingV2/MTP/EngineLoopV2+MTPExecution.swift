@@ -628,25 +628,36 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
-                } else {
-                    // A unique prompt span decides the ids on the host; the
-                    // drafter then only absorbs this round's context rows
-                    // (`absorbLookupRound`, as the early block path does).
-                    let lookup = CBv2PromptLookupDraft.proposal(
+                } else if let absorbing = block as? any CBv2PromptLookupAbsorbing,
+                    absorbing.lookupSkipReady,
+                    let hit = CBv2PromptLookupDraft.continuation(
                         history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k),
+                    let absorbed = absorbing.absorbCommittedContext(
+                        requestState: requestState)
+                {
+                    // The continuation is already the proposal. Absorb the
+                    // committed rows the block forward would have written,
+                    // and do not build the block.
+                    absorbing.noteLookupProposal(true, requestState: requestState)
+                    proposal = MLXArray(hit.ids, [1, k])
+                    block.trimBlockState(
+                        requestState, toCommittedLength: carry.kvOffset)
+                    assistantEvalTargets.append(contentsOf: absorbed)
+                    FileHandle.standardError.write(
+                        Data("dflash2 lookup skip: match=\(hit.match) depth=\(k)\n".utf8))
+                } else {
+                    let drafted = try block.proposeBlock(
+                        anchor: carry.token, depth: k, requestState: requestState)
+                    proposal = CBv2PromptLookupDraft.override(
+                        drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
-                    if let lookup, let absorbed = block.absorbLookupRound(requestState: requestState) {
-                        proposal = lookup
-                        assistantEvalTargets.append(contentsOf: absorbed)
-                    } else {
-                        let drafted = try block.proposeBlock(
-                            anchor: carry.token, depth: k, requestState: requestState)
-                        proposal = lookup ?? drafted
-                        // The replacement does not depend on the drafter graph.
-                        // Keep that graph live so the cache writes are not dropped.
-                        assistantEvalTargets.append(drafted)
-                    }
-                    block.noteLookupRound(lookup != nil, requestState: requestState)
+                    (block as? any CBv2PromptLookupAbsorbing)?.noteLookupProposal(
+                        CBv2PromptLookupDraft.continuation(
+                            history: row.rec.tokens,
+                            promptLength: row.rec.request.promptTokens.count,
+                            depth: k) != nil,
+                        requestState: requestState)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -654,6 +665,9 @@ extension EngineLoopV2 {
                     // when the carry was captured).
                     block.trimBlockState(
                         requestState, toCommittedLength: carry.kvOffset)
+                    // The replacement does not depend on the drafter graph.
+                    // Keep that graph live so the cache writes are not dropped.
+                    assistantEvalTargets.append(drafted)
                 }
                 proposals.append(proposal)
                 assistantEvalTargets.append(proposal)
