@@ -120,6 +120,60 @@ enum CBv2PromptLookupDraft {
             ?? proposal
     }
 
+    /// Integer-only equivalent of the array splice below. Keep the array path
+    /// for diagnostics and a runtime comparison/disable switch.
+    static let fusedSpliceEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let spliceScore = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_score",
+        inputNames: ["block", "prompt", "runs", "dims"], outputNames: ["ranked"],
+        source: """
+
+        uint x = thread_position_in_grid.x;
+        int n = dims[0], d = dims[1], minimum = dims[2];
+        if (x >= n*d) return;
+        int j = int(x)/n, c = int(x)%n;
+        int a = 0;
+        while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
+        int s = a + (j == 0 ? runs[c] : 0);
+        ranked[x] = a > 0 && s >= minimum ? s : 0;
+        """, ensureRowContiguous: true)
+
+    private static let splicePick = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_pick",
+        inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out"],
+        source: """
+
+        uint tid = thread_position_in_threadgroup.x;
+        int n = dims[0], d = dims[1], minimum = dims[2];
+        int bs = 0, bi = 0;
+        for (int i = int(tid); i < n*d; i += 256) {
+         int s = ranked[i];
+         if (s > bs || (s == bs && i < bi)) { bs=s; bi=i; }
+        }
+        threadgroup int scores[256];
+        threadgroup int indices[256];
+        scores[tid]=bs; indices[tid]=bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride=128; stride>0; stride>>=1) {
+         if (tid < stride) {
+          int s=scores[tid+stride], i=indices[tid+stride];
+          if (s > scores[tid] || (s == scores[tid] && i < indices[tid])) {
+           scores[tid]=s; indices[tid]=i;
+          }
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid < uint(d)) {
+         int j=indices[0]/n, c=indices[0]%n;
+         out[tid] = scores[0] >= minimum && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
+        }
+        """, ensureRowContiguous: true)
+
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
     /// The host lookup above needs 16 committed tokens that run along one
@@ -165,6 +219,20 @@ enum CBv2PromptLookupDraft {
                 length += 1
             }
             runs[c] = Int32(length)
+        }
+
+        if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
+            let block = drafted.reshaped([depth]).asType(.int32)
+            let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
+            let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum)])
+            let ranked = spliceScore(
+                [block, promptIDs, MLXArray(runs), dims],
+                grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
+            return splicePick(
+                [ranked, block, promptIDs, dims],
+                grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, depth]], outputDTypes: [.int32])[0].asType(drafted.dtype)
         }
 
         // The prompt continuation of every alignment, [candidates, depth].
