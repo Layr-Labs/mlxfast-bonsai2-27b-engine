@@ -466,6 +466,80 @@ final class DFlash2SlidingMaskMemo {
 
 // MARK: - Attention
 
+/// The speculative block's attention (16 queries over the held keys) through
+/// MLX's NAX attention, whose one-query-block case (at most 16 query rows, no
+/// causal mask, no sinks) now pipelines the key blocks over the 64-row
+/// tile's four simdgroups (`steel_attention_nax`): each round, simdgroup s
+/// scores key block 4j + s (the loop's loads, mma chain, scale and masks),
+/// every simdgroup runs the running-max chain over the round's blocks,
+/// simdgroup s forms its block's exp2(S - m) and rescale factor, and every
+/// simdgroup then folds the four blocks in key order into its own pair of
+/// O's head-dim fragments with the loop's own statements (l *= factor, the
+/// probabilities' row_reduce, O *= factor, O += P V). Before, simdgroup 0
+/// alone ran the whole chain while the other three repeated it over empty
+/// rows; the scores of four blocks are now computed at once (about 2.5x
+/// faster at 1,000 keys). Every output element is the same operations on
+/// the same operands. `verify` checks it at bind against the untouched path
+/// (the same queries plus one row, 17 rows, which the pipeline does not
+/// take; rows are independent) on the drafter's geometry, every output bit;
+/// on a mismatch the block's queries go in with one zero row appended (the
+/// untouched path) and the extra output row is dropped.
+enum DFlash2AttentionPipeline {
+    nonisolated(unsafe) static var padQueries = false
+    nonisolated(unsafe) private static var verified = false
+
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXArray?
+    ) -> MLXArray {
+        let rows = queries.dim(2)
+        if padQueries, rows <= 16, queries.ndim == 4 {
+            let padded = concatenated(
+                [queries, MLXArray.zeros([queries.dim(0), queries.dim(1), 17 - rows, queries.dim(3)],
+                    dtype: queries.dtype)], axis: 2)
+            return MLXFast.scaledDotProductAttention(
+                queries: padded, keys: keys, values: values, scale: scale, mask: mask)[
+                    0..., 0..., ..<rows, 0...]
+        }
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+    }
+
+    static func verify(dtype: DType, heads: Int, kvHeads: Int, headDim: Int) {
+        guard !verified else { return }
+        verified = true
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for (seed, keysLength) in [(0, 48), (1, 545), (2, 1000), (3, 2080)] {
+                    func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x5d9a + seed * 8 + salt)) }
+                    let q = (MLXRandom.normal([1, heads, 17, headDim], key: key(0)) * 2).asType(dtype)
+                    let k = (MLXRandom.normal([1, kvHeads, keysLength, headDim], key: key(1)) * 2).asType(dtype)
+                    let v = MLXRandom.normal([1, kvHeads, keysLength, headDim], key: key(2)).asType(dtype)
+                    let mask = (MLXArray(Int32(0) ..< Int32(keysLength)) .< MLXArray(Int32(keysLength - 7 * seed - 3)))
+                        .reshaped([1, keysLength])
+                    let scale = 1 / Float(headDim).squareRoot()
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: q, keys: k, values: v, scale: scale, mask: mask)[0..., 0..., ..<16, 0...]
+                    let split = MLXFast.scaledDotProductAttention(
+                        queries: q[0..., 0..., ..<16, 0...], keys: k, values: v, scale: scale, mask: mask)
+                    same = same && split.shape == reference.shape
+                        && all(split.view(dtype: .uint16) .== reference.view(dtype: .uint16)).item(Bool.self)
+                    compared += reference.size
+                }
+                try error.check()
+            }
+        } catch {
+            same = false
+        }
+        padQueries = !same
+        FileHandle.standardError.write(
+            ("dflash2 block attention key pipeline: "
+                + (same ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; pipelined\n"
+                    : "self-test failed; queries padded to 17 rows (untouched path)\n")).data(using: .utf8)!)
+    }
+}
+
 private final class DFlash2Attention: Module {
     let layerType: DFlash2LayerType
     let slidingWindow: Int?
@@ -762,7 +836,7 @@ extension DFlash2Attention {
         let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
         guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
         else { return nil }
-        let output = MLXFast.scaledDotProductAttention(
+        let output = DFlash2AttentionPipeline.attend(
             queries: queries, keys: keys[.ellipsis, ..<(held + n), 0...],
             values: values[.ellipsis, ..<(held + n), 0...], scale: scale, mask: keyMask)
         return (
@@ -2843,7 +2917,7 @@ enum DFlash2TopK {
             ("VEC", vector ? 1 : 0),
             ("HALF", logits.dtype == .float16 ? 1 : 0),
         ]
-        let parts = chunkKernel(
+        let parts = (vector && k % (threads / 32) == 0 && thresholdActive ? thresholdChunkKernel : chunkKernel)(
             [flat], template: template,
             grid: (threads * chunks, rows, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, chunks, k], [rows, chunks, k]],
@@ -2944,6 +3018,160 @@ enum DFlash2TopK {
             uint ok = 0u, oi = 0u;
             mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
             constexpr uint NSG = TPG / 32;
+            threadgroup uint sk[NSG * KK], si[NSG * KK];
+            if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+                if (lane < NSG) {
+                    for (int j = 0; j < KK; j++) { k[j] = sk[lane * KK + j]; id[j] = si[lane * KK + j]; }
+                }
+                mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+                if (lane < uint(KK)) {
+                    size_t o = (size_t(row) * S + chunk) * KK + lane;
+                    part_key[o] = ok; part_idx[o] = oi;
+                }
+            }
+            """,
+        header: header)
+
+    /// `MLXFAST_DFLASH_TOPK_THRESHOLD=0` keeps the one-pass chunk scan.
+    static let thresholdSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_THRESHOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether the chunk pass takes `thresholdChunkKernel`: set once by
+    /// `prepareThreshold` (at bind) when its lists matched the stock pass's.
+    nonisolated(unsafe) static var thresholdActive = false
+    nonisolated(unsafe) private static var thresholdChecked = false
+
+    /// Runs `select` with the one-pass and the two-pass chunk kernels on the
+    /// same logits (FP16 and FP32; random rows, rows with a few large values,
+    /// rows of heavy ties, NaN and signed zeros) and compares every candidate
+    /// id and every gathered value bit for bit; the two-pass scan is used only
+    /// when all match. One stderr line.
+    static func prepareThreshold(vocabularySize: Int, k: Int) {
+        guard !thresholdChecked else { return }
+        thresholdChecked = true
+        guard enabled, thresholdSetting, vocabularySize % (chunks * 4) == 0, k % (threads / 32) == 0
+        else { return }
+        var same = true
+        var values = 0
+        do {
+            try withError { error in
+                for (seed, dtype) in [(0, DType.float16), (1, .float16), (2, .float32), (3, .float16)] {
+                    let rows = 16
+                    var logits = MLXRandom.normal([1, rows, vocabularySize], key: MLXRandom.key(UInt64(0x70c + seed))) * 3
+                    let ids = MLXArray(0 ..< Int32(vocabularySize)).reshaped([1, 1, vocabularySize])
+                    let row = MLXArray(0 ..< Int32(rows)).reshaped([1, rows, 1])
+                    // heavy ties on every fourth row, a few large values elsewhere
+                    logits = MLX.where((row % 4) .== 1, (ids % 5).asType(.float32), logits)
+                    logits = MLX.where(((ids * 7 + row * 131) % 2503) .== 0, logits + 12, logits)
+                    if seed == 3 {
+                        logits = MLX.where(ids .== 777, MLXArray(Float.nan), logits)
+                        logits = MLX.where(ids .== 99999 % vocabularySize, MLXArray(Float(-0.0)), logits)
+                    }
+                    let input = logits.asType(dtype)
+                    thresholdActive = false
+                    guard let stock = select(input, k: k) else { same = false; return }
+                    thresholdActive = true
+                    guard let fast = select(input, k: k) else { same = false; return }
+                    thresholdActive = false
+                    same = same && all(stock.0 .== fast.0).item(Bool.self)
+                        && all(stock.1.view(dtype: .uint32) .== fast.1.view(dtype: .uint32)).item(Bool.self)
+                    values += rows * k
+                }
+                try error.check()
+            }
+        } catch {
+            same = false
+        }
+        thresholdActive = same
+        FileHandle.standardError.write(
+            ("dflash2 top-k threshold scan: "
+                + (same ? "self-test passed: \(values) candidates and values identical; on\n"
+                    : "self-test failed; one-pass scan kept\n")).data(using: .utf8)!)
+    }
+
+    /// `chunkKernel` in two passes. Pass 1 bounds the chunk's KK-th largest
+    /// key from below: each of the NSG simdgroups takes the (KK / NSG)-th
+    /// largest of its lanes' maxima, and T is the smallest of those, so at
+    /// least KK chunk elements have a key >= T and no element below T can rank
+    /// in the chunk's top KK. Pass 2 is the stock scan (same threads, same
+    /// increasing indices, same insertion) offering only keys >= T, then the
+    /// stock merges. The stock scan offers every logit to a 16-slot insertion
+    /// that nearly every simdgroup step takes (some lane's list is still
+    /// filling or beaten); here it is offered a handful per chunk.
+    private static let thresholdChunkKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_topk_chunk_threshold",
+        inputNames: ["logits"],
+        outputNames: ["part_key", "part_idx"],
+        source: """
+            constexpr int KK = KTOP;
+            constexpr uint NSG = TPG / 32;
+            static_assert(TPG % 32 == 0 && NSG <= 32 && KK <= 32 && (KK % NSG) == 0 && VEC, "shape");
+            constexpr int PER = KK / NSG;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr uint CH = (NV + S - 1) / S;
+            static_assert((CH % 4u) == 0u, "four-wide");
+            const uint lo = chunk * CH;
+            const uint hi = min(lo + CH, uint(NV));
+            auto x = logits + size_t(row) * NV;
+            uint mx = 0u;
+            for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                uint k0, k1, k2, k3;
+                if (HALF) {
+                    const half4 q = *(const device half4*)(x + v);
+                    k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                    k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                } else {
+                    const float4 q = *(const device float4*)(x + v);
+                    k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                    k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                }
+                mx = max(mx, max(max(k0, k1), max(k2, k3)));
+            }
+            uint m = mx;
+            uint thr = 0u;
+            for (int r = 0; r < PER; r++) {
+                const uint top = simd_max(m);
+                thr = top;
+                const uint who = simd_min(m == top ? lane : 0xffffffffu);
+                if (lane == who) m = 0u;
+            }
+            threadgroup uint sthr[NSG];
+            if (lane == 0) sthr[sg] = thr;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint T = 0xffffffffu;
+            for (uint j = 0; j < NSG; j++) T = min(T, sthr[j]);
+            uint k[KK], id[KK];
+            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+            for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                uint k0, k1, k2, k3;
+                if (HALF) {
+                    const half4 q = *(const device half4*)(x + v);
+                    k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                    k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                } else {
+                    const float4 q = *(const device float4*)(x + v);
+                    k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                    k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                }
+                if (max(max(k0, k1), max(k2, k3)) >= T) {
+                    if (k0 >= T) mlxfast_topk_consider<KK>(k, id, k0, v);
+                    if (k1 >= T) mlxfast_topk_consider<KK>(k, id, k1, v + 1u);
+                    if (k2 >= T) mlxfast_topk_consider<KK>(k, id, k2, v + 2u);
+                    if (k3 >= T) mlxfast_topk_consider<KK>(k, id, k3, v + 3u);
+                }
+            }
+            uint ok = 0u, oi = 0u;
+            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
             threadgroup uint sk[NSG * KK], si[NSG * KK];
             if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3063,8 +3291,19 @@ enum DFlash2GreedyWalk {
         let projectedRows = projected[0].asType(.float32).reshaped([-1])
         let scores = unary[0].asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
-        let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+        let operands = [anchorPredecessor, previous, next, projectedRows, scores, candidateIds]
+        let path =
+            parallelActive
+            ? walkParallel(operands, length: length, k: k, rank: rank)
+            : walkSerial(operands, length: length, k: k, rank: rank)
+        return path.reshaped([1, length])
+    }
+
+    /// The recorded walk: one simdgroup scores each position's candidates
+    /// against the previous pick and advances, position by position.
+    private static func walkSerial(_ operands: [MLXArray], length: Int, k: Int, rank: Int) -> MLXArray {
+        kernel(
+            operands,
             template: [
                 ("L", length), ("K", k), ("R", rank),
                 ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
@@ -3073,8 +3312,167 @@ enum DFlash2GreedyWalk {
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
             outputDTypes: [.int32])[0]
-        return path.reshaped([1, length])
     }
+
+    /// The same walk with every edge scored up front: one thread per edge
+    /// (position 0's K anchor edges, then each later position's K x K
+    /// predecessor-slot x candidate edges) runs the walk kernel's own chain
+    /// over the rank in the same order, so each edge is the value the walk
+    /// computes for that pair; then one simdgroup walks the table, adding the
+    /// same unary score and taking the same first maximum. The serial walk
+    /// computes 15 x 16 of these edges one position after the other, each
+    /// waiting on the previous pick; here all 3,600 run at once (about 80 us
+    /// -> 13 us per proposal). Self-tested at bind against `walkSerial`
+    /// (`parallelVerified`), every path id compared; `MLXFAST_DFLASH_WALK_PARALLEL=0`
+    /// keeps the serial walk.
+    private static func walkParallel(_ operands: [MLXArray], length: Int, k: Int, rank: Int) -> MLXArray {
+        let edges = length >= 1 ? k + (length - 1) * k * k : 0
+        let table = edgeKernel(
+            operands,
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
+            grid: (edges, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[edges]],
+            outputDTypes: [.float32])[0]
+        return tableKernel(
+            [table, operands[4], operands[5]],
+            template: [("L", length), ("K", k)],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+    }
+
+    static let parallelSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_PARALLEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether the widened walk takes `walkParallel`: set once by
+    /// `parallelVerified` (at bind) when every compared path matched.
+    nonisolated(unsafe) static var parallelActive = false
+    nonisolated(unsafe) private static var parallelChecked = false
+
+    /// Runs `walkSerial` and `walkParallel` on the same random FP32 operands
+    /// (the widened walk's; 64 walks of 15 positions over 16 candidates at
+    /// rank 256, a third of them with tied unary scores and a third with small
+    /// projections so edges tie too) and compares every path id; the parallel
+    /// walk is used only when all match. One stderr line.
+    static func parallelVerified() -> Bool {
+        narrowLock.withLock {
+            if parallelChecked { return parallelActive }
+            parallelChecked = true
+            guard enabled, parallelSetting else { return false }
+            var same = true
+            var walks = 0
+            do {
+                try withError { error in
+                    let (vocab, length, k, rank) = (4096, 15, 16, 256)
+                    for seed in 0 ..< 64 {
+                        func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x3a1f + seed * 8 + salt)) }
+                        let pred = MLXRandom.normal([vocab, rank], key: key(0)).asType(.bfloat16)
+                        let succ = MLXRandom.normal([vocab, rank], key: key(1)).asType(.bfloat16)
+                        var proj = MLXRandom.normal([length, rank], key: key(2))
+                        if seed % 3 == 1 { proj = proj * 0.001 }
+                        var una = (MLXRandom.normal([length, k], key: key(3)) * 4).asType(.float16)
+                        if seed % 3 == 2 { una = MLX.floor(una) }
+                        let cand = MLXRandom.randInt(Int32(0) ..< Int32(vocab), [length, k], key: key(4))
+                            .asType(.uint32)
+                        let anchor = MLXArray([Int32(seed * 97 % vocab)])
+                        let operands = [
+                            take(pred, anchor, axis: 0).asType(.float32).reshaped([-1]),
+                            take(pred, cand[0 ..< (length - 1)], axis: 0).asType(.float32).reshaped([-1]),
+                            take(succ, cand, axis: 0).asType(.float32).reshaped([-1]),
+                            proj.asType(.bfloat16).asType(.float32).reshaped([-1]),
+                            una.asType(.float32).reshaped([-1]),
+                            cand.reshaped([-1]),
+                        ]
+                        let serial = walkSerial(operands, length: length, k: k, rank: rank)
+                        let parallel = walkParallel(operands, length: length, k: k, rank: rank)
+                        same = same && all(serial .== parallel).item(Bool.self)
+                        walks += 1
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            parallelActive = same
+            FileHandle.standardError.write(
+                ("dflash2 greedy walk parallel edges: "
+                    + (same
+                        ? "self-test passed: \(walks) walks of 15 ids identical; on\n"
+                        : "self-test failed; serial walk kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+
+    private static let edgeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_edges",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
+        outputNames: ["edges"],
+        source: """
+            // One thread per edge: gid < K scores position 0's candidate gid
+            // against the anchor; the rest are position i >= 1's
+            // (predecessor slot p, candidate c) pairs. The chain is
+            // `kernel`'s, statement for statement (no unrolling hint, so the
+            // compiler sees the same loop).
+            const uint gid = thread_position_in_grid.x;
+            if (gid >= uint(K + (L - 1) * K * K)) return;
+            uint i, p, c;
+            if (gid < uint(K)) { i = 0; p = 0; c = gid; }
+            else { const uint e = gid - K; i = 1 + e / (K * K); p = (e / K) % K; c = e % K; }
+            const uint pred_base = i == 0 ? 0 : ((i - 1) * K + p) * R;
+            const uint succ_base = (i * K + c) * R;
+            const device float* pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+            const device float* proj_ptr = projected + i * R;
+            const device float* succ_ptr = next + succ_base;
+            float edge = 0.0f;
+            if (WALKVEC && (R % 4u) == 0u) {
+                for (uint d = 0; d < R; d += 4u) {
+                    const float4 pd = *(const device float4*)(pred_ptr + d);
+                    const float4 qd = *(const device float4*)(proj_ptr + d);
+                    const float4 sd = *(const device float4*)(succ_ptr + d);
+                    edge += (pd[0] * qd[0]) * sd[0];
+                    edge += (pd[1] * qd[1]) * sd[1];
+                    edge += (pd[2] * qd[2]) * sd[2];
+                    edge += (pd[3] * qd[3]) * sd[3];
+                }
+            } else {
+                #pragma clang loop unroll(full)
+                for (uint d = 0; d < R; d++) {
+                    edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                }
+            }
+            edges[gid] = edge;
+            """)
+
+    private static let tableKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_table",
+        inputNames: ["edges", "unary", "cand"],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            uint previous_slot = 0;
+            for (uint i = 0; i < L; i++) {
+                float score = -INFINITY;
+                if (c < K) {
+                    const float edge = i == 0
+                        ? edges[c] : edges[K + ((i - 1) * K + previous_slot) * K + c];
+                    score = unary[i * K + c] + edge;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                previous_slot = sel;
+                if (c == 0) path[i] = int(cand[i * K + sel]);
+            }
+            """)
 
     /// The walk reading its operands as they are: the batch axis squeezed
     /// (a view) where `[0]` gathered a copy of candidates, scores and
@@ -3116,6 +3514,7 @@ enum DFlash2GreedyWalk {
 
     /// Runs the narrow walk's self-test for these dtypes now (load time).
     static func prepare(codebook: DType, projected: DType, unary: DType) {
+        _ = parallelVerified()
         guard enabled, narrowOperands else { return }
         _ = narrowVerified(codebook: codebook, projected: projected, unary: unary)
     }
@@ -3341,29 +3740,9 @@ private enum DFlash2ResidencyTouch {
 /// Each group costs one single-thread kernel per 24 arrays on the GPU. No
 /// value of either model is read into any result, and nothing about the
 /// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
-///
-/// WHERE THE LIST IS BUILT. The engine build runs at the head of the seed
-/// window, before any GPU work, so whatever it does there is host time the
-/// seed pays in full: walking the drafter's modules for its arrays and
-/// splitting them into the byte groups took 0.6-2.3 ms of the 0.9-3.5 ms
-/// engine build (local M4 phase markers). Nothing reads the groups before the
-/// prompt forward's first early submission, so `arm` keeps only the drafter
-/// and the window's arrays (read at arm, as before) and the first
-/// `submitDue` builds the same list and the same groups there, behind the
-/// GPU work that submission just queued. The touches, their order, their
-/// groups and the layers they follow are unchanged.
-/// `MLXFAST_RESIDENCY_DEFERRED_ARM=0` builds the groups at `arm` again.
 public enum DFlash2ResidencyPrefetch {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Builds the groups at the prompt forward's first submission rather than
-    /// at `arm` (default on; see the type's comment).
-    static let deferredArm: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_RESIDENCY_DEFERRED_ARM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -3374,9 +3753,6 @@ public enum DFlash2ResidencyPrefetch {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var groups: [[MLXArray]] = []
     nonisolated(unsafe) private static var nextGroup = 0
-    /// An arm whose groups are not built yet: the drafter and the window's
-    /// arrays as `arm` read them.
-    nonisolated(unsafe) private static var unbuilt: (drafter: DFlash2DraftModel, window: [MLXArray])?
 
     /// Arms the prefetch for the next prompt forward: called when an engine
     /// that drafts with `drafter` is built. `window`: the target's arrays the
@@ -3385,28 +3761,8 @@ public enum DFlash2ResidencyPrefetch {
     static func arm(_ drafter: DFlash2DraftModel, window: @autoclosure () -> [MLXArray] = []) {
         guard enabled else { return }
         DFlash2ResidencyTouch.prewarm()
-        let windowArrays = window()
-        if deferredArm {
-            lock.withLock {
-                unbuilt = (drafter, windowArrays)
-                groups = []
-                nextGroup = 0
-            }
-            return
-        }
-        let built = buildGroups(of: drafter, window: windowArrays)
-        lock.withLock {
-            unbuilt = nil
-            groups = built
-            nextGroup = 0
-        }
-    }
-
-    /// The drafter's arrays, then the window's, each once, in four groups of
-    /// about equal bytes.
-    private static func buildGroups(of drafter: DFlash2DraftModel, window: [MLXArray]) -> [[MLXArray]] {
         var seen = Set<ObjectIdentifier>()
-        let arrays = (drafter.residencyArrays() + window).filter {
+        let arrays = (drafter.residencyArrays() + window()).filter {
             seen.insert(ObjectIdentifier($0)).inserted
         }
         let total = arrays.reduce(0) { $0 + $1.nbytes }
@@ -3423,24 +3779,15 @@ public enum DFlash2ResidencyPrefetch {
             }
         }
         if !group.isEmpty { built.append(group) }
-        return built
+        lock.withLock {
+            groups = built
+            nextGroup = 0
+        }
     }
 
     /// Submits every group due once the prompt forward has submitted its
     /// first `completedLayers` layers. A no-op unless armed.
     static func submitDue(completedLayers: Int) {
-        // A deferred arm's groups, built at the forward's first submission.
-        let pending = lock.withLock { () -> (drafter: DFlash2DraftModel, window: [MLXArray])? in
-            defer { unbuilt = nil }
-            return unbuilt
-        }
-        if let pending {
-            let built = buildGroups(of: pending.drafter, window: pending.window)
-            lock.withLock {
-                groups = built
-                nextGroup = 0
-            }
-        }
         let due: [[MLXArray]] = lock.withLock {
             var due: [[MLXArray]] = []
             while nextGroup < groups.count,
@@ -3541,6 +3888,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         DFlash2QKPrework.prepare(
             rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
+        DFlash2AttentionPipeline.verify(
+            dtype: dtype, heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
+        DFlash2TopK.prepareThreshold(vocabularySize: Qwen35TextModel.drafterVocabularyRows > 0
+            ? min(Qwen35TextModel.drafterVocabularyRows, config.vocabularySize) : config.vocabularySize,
+            k: candidateSelector.topK)
         DFlash2GreedyWalk.prepare(
             codebook: candidateSelector.predecessorCodebook.dtype,
             projected: candidateSelector.hiddenProjection.weight.dtype, unary: .float32)
