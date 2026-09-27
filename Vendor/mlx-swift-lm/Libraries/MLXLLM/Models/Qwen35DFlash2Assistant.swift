@@ -602,8 +602,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         if armed {
             try target.armDFlash2Tap(layerIds: drafter.config.targetLayerIds)
             // The engine being built drafts: its prompt forward makes the
-            // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`).
-            DFlash2ResidencyPrefetch.arm(drafter)
+            // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`),
+            // and the target's arrays only the window reads.
+            DFlash2ResidencyPrefetch.arm(drafter, window: target.dFlash2WindowResidencyArrays())
         } else {
             target.dFlash2TapLayerIds = nil
         }

@@ -1411,7 +1411,8 @@ extension Qwen35GDNPrework {
 
     // grid (128 * HK, S, B), threadgroup (128, 1, 1); inputs and template as
     // `stridedSource`; outputs q, k, v, g, beta and ci (`[B, KS - 1 + S, CD]`).
-    private static let verifyLoadsFirstSource = """
+    // Not private: `Qwen35SplitKFold` derives its reads-first variant from it.
+    static let verifyLoadsFirstSource = """
         constexpr int GRP = HV / HK;
         constexpr int KEY = HK * DK;
         constexpr int VOFF = 2 * KEY;
@@ -1545,6 +1546,20 @@ extension Qwen35GDNPrework {
 
     private static let loadsFirstLock = NSLock()
     nonisolated(unsafe) private static var loadsFirstVerdicts: [LoadsFirstGeometry: Bool] = [:]
+
+    /// Whether `run(..., writeConvInput: true, stridedReads: true)` takes the
+    /// loads-first kernel for this geometry and qkv dtype (the switch on and
+    /// the verdict recorded by `prepareVerify`). `Qwen35SplitKFold` mirrors
+    /// the pick so its folded launch is derived from the kernel the verify
+    /// path takes.
+    static func verifyLoadsFirstVerified(
+        keyHeads: Int, valueHeads: Int, cd: Int, ks: Int, dtype: DType
+    ) -> Bool {
+        guard verifyLoadsFirstEnabled else { return false }
+        let geometry = LoadsFirstGeometry(
+            hk: keyHeads, hv: valueHeads, cd: cd, ks: ks, dtype: "\(dtype)")
+        return loadsFirstLock.withLock { loadsFirstVerdicts[geometry] ?? false }
+    }
 
     /// `run(..., writeConvInput: true, stridedReads: true)` by the loads-first
     /// kernel, or nil when this geometry and dtype were not verified (the
