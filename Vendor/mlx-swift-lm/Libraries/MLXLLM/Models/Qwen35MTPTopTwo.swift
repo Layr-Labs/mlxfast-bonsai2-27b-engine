@@ -1838,6 +1838,324 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // Prompt-width int8 kernel forms on the tiled words (`sourceStaged8`,
+    // TILED = 1, reshaped along its bitwise-safe axes). The stock reduction:
+    // each 64 x 64 x 128 op sums one 128-group of a 64 x 64 output tile in
+    // int32 (exact, so the op's internal order is free); every output element
+    // then folds the groups in ascending order from 0.0f, one FP32 update per
+    // group (`acc = fma(s, fma(as, C, -rb), acc)` factored, `fma(b, rb,
+    // fma(as, s * C, acc))` otherwise), and converts once at its store. No sum
+    // crosses elements or threads. So which threadgroup or op computes an
+    // element's group sums, how far ahead and where its operands are staged,
+    // the tile shape, the raster order and the store width are all free as
+    // long as each element keeps that fold. Every form keeps the stock op per
+    // 64 x 64 sub-tile and group (same descriptor, operand types, four
+    // simdgroups and destination lane layout) and the stock epilogue
+    // expression per element in ascending group order. Axes: TM x TN tile
+    // (MT x NT ops per group sharing the staged weights / the A slice); PF = 1:
+    // the words (and AS's codes) loaded one group ahead into registers, each
+    // group's constants loaded before its ops; LG = 1: group g - 1's epilogue
+    // after group g's op, from the other int32 destination (ping-pong), the
+    // same fold one op later; AS = 1: the 64 x 128 A slice staged in
+    // threadgroup memory too; ksz[3] = 1: row tiles first in the raster;
+    // four-wide stores of the same values. Kg must be even (K % 512 == 0).
+    // Grid (N / TN * 128, M / TM, 1), or (M / TM * 128, N / TN, 1) with ksz[3]
+    // = 1; threadgroup (128, 1, 1). Inputs as `sourceStaged8` on the tiled
+    // words, ksz = [K, M, N, raster]. Every form is checked bit for bit
+    // against `sourceStaged8` at load (`PromptZooTrial`).
+    private static let sourceStaged8Zoo = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        constexpr int MT = TM / 64;
+        constexpr int NT = TN / 64;
+        constexpr int CAP = 32;
+        static_assert(LG == 0 || MT * NT == 1, "LG: one op per group");
+        static_assert(AS == 0 || MT == 1, "AS: one 64-row A slice");
+        // ksz[3] != 0: row tiles along the grid's x, so consecutive threadgroups
+        // share one weight tile; column tiles along y.
+        const bool rs = ksz[3] != 0;
+        const int n0 = int(rs ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x) * TN;
+        const int m0 = int(rs ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y) * TM;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        typedef tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> TgT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        // staged B per buffer: TN columns x 128 codes as int8 bytes, k inner (the
+        // stock staging), column half h at word 2048 * h; AS: the 64 x 128 A slice
+        // staged the same way (row r at word 32 * r).
+        threadgroup uint32_t bs[2][TN * 32];
+        threadgroup uint32_t xs[2][AS ? 2048 : 4];
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        TgT B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        typedef typename metal::conditional<AS != 0, TgT, decltype(tA0)>::type AOpT;
+        // cT0 / cT1: the ops of sub-tiles 0 / 1, or (LG) of even / odd groups
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<AOpT>, metal::remove_addrspace_t<TgT>, int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<AOpT>, metal::remove_addrspace_t<TgT>, int32_t>();
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[MT * NT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        float4 s0[NT], s1[NT], b0[NT], b1[NT], u0[NT], u1[NT];
+        float as[MT][4], rb[MT][4];
+        // group g's constants, the stock loads (sub-tile rows r, column half h)
+        auto consts = [&](const int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            s0[h] = float4(sp0[g * NQ + 16 * h]); s1[h] = float4(sp1[g * NQ + 16 * h]);
+            if constexpr (NEGATIVE_SCALE_BIAS) {
+              b0[h] = -s0[h]; b1[h] = -s1[h];
+            } else {
+              b0[h] = float4(bp0[g * NQ + 16 * h]); b1[h] = float4(bp1[g * NQ + 16 * h]);
+            }
+            u0[h] = 0.0f; u1[h] = 0.0f;
+            if (!SIGNED) { u0[h] = up0[g * NQ + 16 * h]; u1[h] = up1[g * NQ + 16 * h]; }
+          }
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < MT; r++) {
+            if (MPERM) {
+              const size_t tb = tbase + (size_t)r * (size_t)Kg * 64 + (size_t)g * 64;
+              const float4 as4 = *(const device float4*)(ascale + tb);
+              const float4 rb4 = *(const device float4*)(rsb + tb);
+              as[r][0] = as4.x; as[r][1] = as4.y; as[r][2] = as4.z; as[r][3] = as4.w;
+              rb[r][0] = rb4.x; rb[r][1] = rb4.y; rb[r][2] = rb4.z; rb[r][3] = rb4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4; q++) {
+                as[r][q] = ascale[(mrow[q] + 64 * r) * Kg + g]; rb[r][q] = rsb[(mrow[q] + 64 * r) * Kg + g];
+              }
+            }
+          }
+        };
+        // the stock per-group epilogue of sub-tile t on cT0 (which 0) or cT1
+        auto apply = [&](const int t, const int which) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const int ci = which == 0 ? cT0[i] : cT1[i];
+            const float s = nh ? s1[h][c] : s0[h][c];
+            const float b = nh ? b1[h][c] : b0[h][c];
+            const float u = nh ? u1[h][c] : u0[h][c];
+            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+              acc[t][i] = fma(s, fma(as[r][mh], float(ci), -rb[r][mh]), acc[t][i]);
+            } else {
+              const float tv = SIGNED ? s * float(ci) : fma(s, float(ci), u);
+              acc[t][i] = fma(b, rb[r][mh], fma(as[r][mh], tv, acc[t][i]));
+            }
+          }
+        };
+        // staging (tiled words): thread t -> column t >> 1 of each column half,
+        // K half t & 1; column half h is two 32-column blocks further on.
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4;
+        const size_t hstep = (size_t)Kg * 512;
+        uint4 wq[NT];
+        auto fetch = [&](const int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) { wq[h] = *(const device uint4*)(wrow + h * hstep + (size_t)g * 256); }
+        };
+        auto put = [&](const int buf) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            threadgroup uint32_t* dst = bs[buf] + 2048 * h + sc * 32 + sh * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const uint32_t wv = wq[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        // AS: thread t -> row t >> 1 of the 64-row tile, 64-code half t & 1
+        const device uint4* xrow = (const device uint4*)(xq + (size_t)(m0 + int(tid >> 1)) * K) + (tid & 1) * 4;
+        uint4 xv[AS ? 4 : 1];
+        auto xfetch = [&](const int g) {
+          if constexpr (AS != 0) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) { xv[j] = xrow[g * 8 + j]; }
+          }
+        };
+        auto xput = [&](const int buf) {
+          if constexpr (AS != 0) {
+            threadgroup uint4* dst = (threadgroup uint4*)(xs[buf] + (tid >> 1) * 32 + (tid & 1) * 16);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) { dst[j] = xv[j]; }
+          }
+        };
+        // group g: stage g + 1 into buffer par ^ 1 (PF: from the registers loaded
+        // one group earlier, then load g + 2), the ops over buffer par, the
+        // epilogue (LG: of group g - 1, from the other destination), one barrier.
+        // LG unrolls the loop by two (Kg is even) so each step's destination
+        // is static; the others keep the stock loop (runtime buffer parity).
+        auto step = [&](const int g, const int par) {
+          if (g + 1 < Kg) {
+            if (PF) {
+              put(par ^ 1); xput(par ^ 1);
+              if (g + 2 < Kg) { fetch(g + 2); xfetch(g + 2); }
+            } else {
+              fetch(g + 1); xfetch(g + 1); put(par ^ 1); xput(par ^ 1);
+            }
+          }
+          if (LG) {
+            if (g > 0) { consts(g - 1); }
+          } else if (PF) {
+            consts(g);
+          }
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < MT * NT; t++) {
+            const int r = t / NT; const int h = t % NT;
+            TgT Bt((threadgroup CodeT*)(bs[par] + 2048 * h), dextents<int, 2>(128, 64));
+            const bool first = LG ? par == 0 : t == 0;
+            if constexpr (AS != 0) {
+              TgT At((threadgroup CodeT*)xs[par], dextents<int, 2>(128, 64));
+              if (first) { op.run(At, Bt, cT0); } else { op.run(At, Bt, cT1); }
+            } else {
+              auto At = A.template slice<128, 64>(g * 128, m0 + 64 * r);
+              if (first) { op.run(At, Bt, cT0); } else { op.run(At, Bt, cT1); }
+            }
+          }
+          if (LG) {
+            if (g > 0) { apply(0, par ^ 1); }
+          } else {
+            if (!PF) { consts(g); }
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < MT * NT; t++) { apply(t, t); }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        };
+        fetch(0); xfetch(0);
+        put(0); xput(0);
+        if (PF) { fetch(1); xfetch(1); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (LG != 0) {
+          for (int g = 0; g < Kg; g += 2) {
+            step(g, 0);
+            step(g + 1, 1);
+          }
+        } else {
+          for (int g = 0; g < Kg; g++) { step(g, g & 1); }
+        }
+        if (LG) {
+          consts(Kg - 1);
+          apply(0, 1);
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 8; q++) {
+            const int i = 4 * q;
+            const int mm = mb + 64 * r + 8 * (q & 1) + 32 * ((q >> 2) & 1);
+            const size_t base = (size_t)mm * N + nb + 64 * h + 32 * ((q >> 1) & 1);
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(acc[t][i], acc[t][i + 1], acc[t][i + 2], acc[t][i + 3]);
+            } else {
+              *(device half4*)(out + base) = half4(half(acc[t][i]), half(acc[t][i + 1]), half(acc[t][i + 2]), half(acc[t][i + 3]));
+            }
+          }
+        }
+        """
+
+    private static let kernelStaged8Zoo = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_zoo",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Zoo,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// A prompt int8 kernel form: the `sourceStaged8Zoo` body `[tm, tn, pf,
+    /// lg, sa]` (`sa` is AS) and the raster flag `rs` (a launch argument).
+    struct PromptZooForm: Hashable, CustomStringConvertible {
+        let name: String
+        let tm: Int, tn: Int, pf: Int, lg: Int, sa: Int, rs: Int
+        var description: String { name }
+        var body: [Int] { [tm, tn, pf, lg, sa] }
+        func takes(m: Int, n: Int) -> Bool { m % tm == 0 && n % tn == 0 }
+    }
+
+    /// The forms in self-test order: the stock staging (b; r with the
+    /// row-first raster), then prefetch (p), prefetch + lagged epilogue (lp),
+    /// prefetch + staged A (ap) and prefetch + 128 columns (n2p), each in the
+    /// stock raster and the row-first one (suffix r).
+    static let promptZooForms: [PromptZooForm] = {
+        let bodies: [(String, Int, Int, Int, Int, Int, [Int])] = [
+            ("b", 64, 64, 0, 0, 0, [0, 1]), ("p", 64, 64, 1, 0, 0, [0, 1]), ("lp", 64, 64, 1, 1, 0, [0, 1]),
+            ("ap", 64, 64, 1, 0, 1, [0, 1]), ("n2p", 64, 128, 1, 0, 0, [0, 1]),
+        ]
+        return bodies.flatMap { b in
+            b.6.map {
+                PromptZooForm(
+                    name: $0 == 1 ? (b.0 == "b" ? "r" : b.0 + "r") : b.0, tm: b.1, tn: b.2, pf: b.3,
+                    lg: b.4, sa: b.5, rs: $0)
+            }
+        }
+    }()
+
+    /// The installed prompt form (nil: the stock kernel) and the combos it
+    /// passed; read at every prompt launch's graph build.
+    nonisolated(unsafe) static var promptZooInstalled: PromptZooForm?
+    nonisolated(unsafe) static var promptZooCombos = Set<Int>()
+    /// The combos the prompt route launched before the trial, one bit each
+    /// (combo = 2 for FP32 output, + 1 for negated offsets).
+    nonisolated(unsafe) static var promptZooSeen = 0
+
+    static func promptZooCombo(_ outputDType: DType, _ negative: Bool) -> Int {
+        (outputDType == .float32 ? 2 : 0) | (negative ? 1 : 0)
+    }
+
+    /// The form for one prompt launch (tiled words), nil for the stock kernel.
+    static func promptZoo(m: Int, n: Int, outputDType: DType, negative: Bool) -> PromptZooForm? {
+        let combo = promptZooCombo(outputDType, negative)
+        if !PromptZooTrial.done, promptZooSeen & (1 << combo) == 0 {
+            dimsLock.withLock { promptZooSeen |= 1 << combo }
+        }
+        guard let form = promptZooInstalled, form.takes(m: m, n: n), promptZooCombos.contains(combo)
+        else { return nil }
+        return form
+    }
+
+    /// One launch of `form`; `inputs` are `sourceStaged8`'s without ksz,
+    /// `template` its OutT, MPERM, SIGNED, NEGATIVE_SCALE_BIAS and FACTORED.
+    static func launchStaged8Zoo(
+        _ inputs: [MLXArray], template: [(String, any KernelTemplateArg)], form: PromptZooForm,
+        k: Int, m: Int, n: Int, outputDType: DType
+    ) -> MLXArray {
+        let ksz = dimsLock.withLock { () -> MLXArray in
+            if let cached = dims[[k, m, n, form.rs]] { return cached }
+            let array = MLXArray([Int32(k), Int32(m), Int32(n), Int32(form.rs)])
+            dims[[k, m, n, form.rs]] = array
+            return array
+        }
+        return kernelStaged8Zoo(
+            inputs + [ksz],
+            template: template + [
+                ("TM", form.tm), ("TN", form.tn), ("PF", form.pf), ("LG", form.lg), ("AS", form.sa),
+            ],
+            grid: form.rs == 1 ? (m / form.tm * 128, n / form.tn, 1) : (n / form.tn * 128, m / form.tm, 1),
+            threadGroup: (128, 1, 1), outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -2224,6 +2542,294 @@ enum Qwen35TensorPackedMatmul {
             FileHandle.standardError.write(log.data(using: .utf8)!)
             sets = []
             roundTimes = []
+        }
+    }
+
+    /// The in-situ choice of the prompt int8 kernel form (`sourceStaged8Zoo`),
+    /// run once from the load-time prompt warm
+    /// (`Qwen35DFlash2Assistant.warmTargetPrefill`), after its first engine
+    /// prompt forward (which records the combos the route launches) and
+    /// before any timed phase.
+    ///
+    /// Self-test: every form against the production `sourceStaged8` launch
+    /// (TILED = 1) on synthetic operands (three shapes, 4 to 24 groups, an odd
+    /// row-tile count) in this process's template (MPERM, SIGNED, FACTORED)
+    /// and the main recorded combo (output dtype, offset form): every output
+    /// bit must match. Each body is compiled and run in its own error scope,
+    /// so a body the toolchain rejects (or any MLX error) drops that body
+    /// alone; bodies not started within `selfTestBudgetMs` are skipped.
+    /// Shortlist: the stock kernel and the passing forms on the five
+    /// production shapes at 512 rows (best of two), weighted by launches per
+    /// forward; the fastest form, and the fastest of another body, each only
+    /// within `shortlistSlack` of the stock kernel (the synthetic timing only
+    /// shortlists) and only after the same self-test in every other recorded
+    /// combo; a form runs only in the combos it passed. Trial: the stock
+    /// kernel and the shortlist installed in turn for one whole engine prompt
+    /// forward on fresh throwaway state, `timedRuns` passes in serpentine
+    /// order (A B C C B A, so a clock drift over the trial cancels in each
+    /// mean), each
+    /// forward timed on the host from its graph build (after a stream
+    /// synchronize) to the end of its evaluation. No run is discarded: the
+    /// warm's forward just ran, the self-test and shortlist built every
+    /// pipeline, and the buffer cache still holds the forward's buffers. A
+    /// form is adopted only when its mean beats the stock kernel's by more
+    /// than `adoptMargin`. No engine round runs here, so the round hooks
+    /// (`proposeBlock`, `adoptSpeculativeBlock`) play no part. Every form is
+    /// the same arithmetic bit for bit, so the forwards and every served
+    /// result are the same whichever wins. One stderr line.
+    ///
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO=0` keeps the stock kernel (no
+    /// self-test, no trial). `DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO_FORCE=<form>`
+    /// installs that form after its self-test (every recorded combo), without
+    /// a trial.
+    enum PromptZooTrial {
+        static let timedRuns = 2
+        static let adoptMargin = 0.005
+        static let selfTestBudgetMs = 700.0
+        static let shortlistSlack = 0.03
+        /// The production shapes (k, n) and their launches per 512-row warm
+        /// forward: qkv|z, attention qkv, o, gate|up, down.
+        static let shapes: [(Int, Int, Double)] = [
+            (5120, 16384, 48), (5120, 14336, 16), (6144, 5120, 63), (5120, 34816, 63),
+            (17408, 5120, 63),
+        ]
+
+        private static func knob(_ name: String) -> String {
+            ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        }
+        static let forced = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO_FORCE")
+        /// `..._PZOO=trial`: shortlist without the synthetic slack (validation).
+        static let trialAll = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO") == "trial"
+        static var armed: Bool {
+            !["0", "off", "false", "no"].contains(knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO"))
+                && installed && support == .staged8 && narrowTiled
+        }
+        nonisolated(unsafe) static var done = false
+
+        /// Synthetic operands: codes in the route's form, random words (read
+        /// as the tiled layout by both kernels), FP16 scales of both signs
+        /// with zeros and signed zeros, offsets that are their FP16 negations
+        /// bit for bit (NEGATIVE_SCALE_BIAS = 1) or independent, folded sums,
+        /// FP32 activation scales and scaled sums.
+        fileprivate struct Operands {
+            let m: Int, k: Int, n: Int
+            let codes: MLXArray, words: MLXArray, scalesT: MLXArray, negatedT: MLXArray
+            let biasesT: MLXArray, folded: MLXArray, ascale: MLXArray, rsb: MLXArray
+
+            init(m: Int, k: Int, n: Int, seed: UInt64) {
+                self.m = m
+                self.k = k
+                self.n = n
+                let kg = k / 128
+                func key(_ i: UInt64) -> MLXArray { MLXRandom.key(seed &* 16 &+ i) }
+                codes = signedCodes
+                    ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: key(0)).asType(.int8)
+                    : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: key(0)).asType(.uint8)
+                words = MLXRandom.randInt(Int32(0) ..< Int32(65536), [n, k / 8], key: key(1))
+                    .asType(.uint16).view(dtype: .uint32)
+                var s = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(2))
+                let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [kg, n], key: key(3))
+                s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+                s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+                scalesT = s.asType(.float16)
+                negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                biasesT = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(4))
+                    .asType(.float16)
+                folded = MLXRandom.normal([kg, n], key: key(5)) * Float(100)
+                ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: key(6))
+                rsb = MLXRandom.normal([m, kg], key: key(7)) * Float(50)
+                eval(codes, words, scalesT, negatedT, biasesT, folded, ascale, rsb)
+            }
+
+            /// `form`, or the stock launch (nil), in this process's template.
+            func run(_ form: PromptZooForm?, _ combo: Int) -> MLXArray {
+                let outputDType: DType = combo & 2 != 0 ? .float32 : .float16
+                let template: [(String, any KernelTemplateArg)] = [
+                    ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                    ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", combo & 1),
+                    ("FACTORED", factoredPromptEpilogue ? 1 : 0),
+                ]
+                let inputs = [codes, words, scalesT, combo & 1 != 0 ? negatedT : biasesT, folded, ascale, rsb]
+                if let form {
+                    return launchStaged8Zoo(
+                        inputs, template: template, form: form, k: k, m: m, n: n, outputDType: outputDType)
+                }
+                return kernelStaged8(
+                    inputs + [dimsArray(k: k, m: m, n: n)], template: template + [("TILED", 1)],
+                    grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+            }
+        }
+
+        /// True when `form` matches the stock launch bit for bit on every
+        /// operand set in every combo; false on a mismatch or on any MLX
+        /// error inside (a failed compile included), scoped to this call.
+        private static func exact(_ form: PromptZooForm, _ combos: [Int], _ operands: [Operands]) -> Bool {
+            let same = try? withError { scoped -> Bool in
+                for combo in combos {
+                    let bits: DType = combo & 2 != 0 ? .uint32 : .uint16
+                    for ops in operands where form.takes(m: ops.m, n: ops.n) {
+                        let reference = ops.run(nil, combo)
+                        let y = ops.run(form, combo)
+                        let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try scoped.check()
+                        if differ.item(Int32.self) != 0 { return false }
+                    }
+                }
+                return true
+            }
+            return same ?? false
+        }
+
+        private static func install(_ form: PromptZooForm?, _ combos: [Int]) {
+            promptZooInstalled = form
+            promptZooCombos = form == nil ? [] : Set(combos)
+        }
+
+        /// Runs the self-test, the shortlist and the trial once. `forward`
+        /// runs one whole engine prompt forward on fresh throwaway state and
+        /// returns its host nanoseconds (nil when it could not run, which
+        /// keeps the stock kernel). Leaves the choice installed.
+        static func run(forward: () -> UInt64?) {
+            guard armed, !done else { return }
+            done = true
+            let start = DispatchTime.now().uptimeNanoseconds
+            func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+            let combos = (0 ..< 4).filter { promptZooSeen & (1 << $0) != 0 }
+            install(nil, combos)
+            var log = "bonsai prompt int8 in-situ: combos ["
+                + combos.map { ($0 & 2 != 0 ? "f32" : "f16") + ($0 & 1 != 0 ? "/neg" : "/off") }
+                .joined(separator: " ") + "]"
+            defer {
+                log += String(format: "; %.0f ms\n", elapsedMs())
+                FileHandle.standardError.write(log.data(using: .utf8)!)
+                Memory.clearCache()
+            }
+            guard !combos.isEmpty else { log += "; no prompt launch seen, stock kernel"; return }
+            let testOps = [(256, 1536, 512), (128, 512, 256), (192, 3072, 128)].enumerated().map {
+                Operands(m: $0.element.0, k: $0.element.1, n: $0.element.2, seed: 91 + UInt64($0.offset))
+            }
+            if !forced.isEmpty {
+                guard let form = promptZooForms.first(where: { $0.name == forced }) else {
+                    log += "; unknown forced form \(forced), stock kernel"
+                    return
+                }
+                if exact(form, combos, testOps) {
+                    install(form, combos)
+                    log += "; forced \(form) (self-test passed), no trial"
+                } else {
+                    log += "; forced \(form) FAILED its self-test, stock kernel"
+                }
+                return
+            }
+            // Self-test in the main combo (negated offsets, FP16 first); the
+            // shortlisted forms take the other recorded combos below.
+            let main = [1, 3, 0, 2].first { combos.contains($0) }!
+            let others = combos.filter { $0 != main }
+            var passed: [PromptZooForm] = [], failed: [PromptZooForm] = [], skipped: [PromptZooForm] = []
+            var started = Set<[Int]>()
+            for form in promptZooForms {
+                if !started.contains(form.body) {
+                    if elapsedMs() > selfTestBudgetMs { skipped.append(form); continue }
+                    started.insert(form.body)
+                }
+                if exact(form, [main], testOps) { passed.append(form) } else { failed.append(form) }
+            }
+            log += "; self-test passed [" + passed.map(\.name).joined(separator: " ") + "]"
+            if !failed.isEmpty { log += " failed [" + failed.map(\.name).joined(separator: " ") + "]" }
+            if !skipped.isEmpty { log += " skipped [" + skipped.map(\.name).joined(separator: " ") + "]" }
+            log += String(format: " (%.0f ms)", elapsedMs())
+            guard !passed.isEmpty else { log += "; stock kernel"; return }
+
+            // Shortlist: synthetic time per forward on the production shapes.
+            let kernels: [PromptZooForm?] = [nil] + passed
+            var estimate = [Double](repeating: 0, count: kernels.count)
+            let timed = try? withError { scoped -> Bool in
+                let timingOps = shapes.enumerated().map {
+                    Operands(m: 512, k: $0.element.0, n: $0.element.1, seed: 100 + UInt64($0.offset))
+                }
+                for kernel in kernels { eval(timingOps.map { $0.run(kernel, main) }) }
+                try scoped.check()
+                var best = [[Double]](
+                    repeating: [Double](repeating: .infinity, count: shapes.count), count: kernels.count)
+                for _ in 0 ..< 2 {
+                    for (s, ops) in timingOps.enumerated() {
+                        for (index, kernel) in kernels.enumerated() {
+                            let outs = (0 ..< 2).map { _ in ops.run(kernel, main) }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 2000
+                            best[index][s] = min(best[index][s], us)
+                        }
+                    }
+                }
+                try scoped.check()
+                for index in kernels.indices {
+                    estimate[index] = zip(best[index], shapes).reduce(0) { $0 + $1.0 * $1.1.2 } / 1000
+                }
+                return true
+            }
+            guard timed == true else { log += "; shortlist timing failed, stock kernel"; return }
+            log += "; synthetic ms/forward [stock " + String(format: "%.1f", estimate[0])
+                + passed.indices.map { " \(passed[$0])=" + String(format: "%.1f", estimate[$0 + 1]) }.joined()
+                + "]"
+            // The fastest form, then the fastest of another body, each within
+            // `shortlistSlack` of the stock kernel and exact in every other
+            // recorded combo too.
+            var shortlist: [PromptZooForm] = [], failedOthers: [PromptZooForm] = []
+            for index in passed.indices.sorted(by: { estimate[$0 + 1] < estimate[$1 + 1] })
+            where shortlist.count < 2 && !shortlist.contains(where: { $0.body == passed[index].body })
+                && (trialAll || estimate[index + 1] < estimate[0] * (1 + shortlistSlack))
+            {
+                if others.isEmpty || exact(passed[index], others, testOps) {
+                    shortlist.append(passed[index])
+                } else {
+                    failedOthers.append(passed[index])
+                }
+            }
+            if !failedOthers.isEmpty {
+                log += "; failed other combos [" + failedOthers.map(\.name).joined(separator: " ") + "]"
+            }
+            guard !shortlist.isEmpty else { log += "; no form shortlisted, stock kernel"; return }
+
+            // Trial: whole prompt forwards, serpentine.
+            let sets: [PromptZooForm?] = [nil] + shortlist
+            var times = [[UInt64]](repeating: [], count: sets.count)
+            var complete = true
+            let trialStart = elapsedMs()
+            trial: for rep in 0 ..< timedRuns {
+                for index in (rep % 2 == 0 ? Array(sets.indices) : Array(sets.indices.reversed())) {
+                    install(sets[index], combos)
+                    guard let ns = forward() else { complete = false; break trial }
+                    times[index].append(ns)
+                }
+            }
+            install(nil, combos)
+            let means = times.map { $0.isEmpty ? nil : Double($0.reduce(0, +)) / Double($0.count) }
+            log += "; mean ms/forward (512 rows, \(timedRuns) serpentine runs"
+                + String(format: ", %.0f ms)", elapsedMs() - trialStart)
+            for (index, set) in sets.enumerated() {
+                log += (index == 0 ? " [stock " : " | \(set!) ")
+                    + (means[index].map { String(format: "%.2f", $0 / 1e6) } ?? "-")
+            }
+            log += "]"
+            guard complete, let stock = means[0] else {
+                log += "; a forward did not run, stock kernel"
+                return
+            }
+            var chosen = 0
+            for index in sets.indices.dropFirst() {
+                if let m = means[index], m < (means[chosen] ?? .infinity) { chosen = index }
+            }
+            if chosen != 0, let m = means[chosen], m < stock * (1 - adoptMargin) {
+                install(sets[chosen], combos)
+                log += "; adopted \(sets[chosen]!)" + String(format: " (%+.2f%%)", (m / stock - 1) * 100)
+            } else {
+                log += "; keeping the stock kernel"
+            }
         }
     }
 
@@ -3034,12 +3640,13 @@ enum Qwen35TensorPackedMatmul {
                 ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
                 ("SIGNED", signedCodes ? 1 : 0),
             ]
+            var negative = false
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
                 packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                negative = cache.biasesAreNegativeScales(scales, biases)
+                template.append(("NEGATIVE_SCALE_BIAS", negative ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
             default: packedKernel = kernelStaged
@@ -3049,6 +3656,17 @@ enum Qwen35TensorPackedMatmul {
             // read could lose its GPU residency between windows).
             let words = support == .staged8 && narrowTiled
                 ? narrowTiledWeight(cache, weight, materialize: true) : weight
+            // The prompt form the in-situ trial adopted (`PromptZooTrial`), on
+            // the tiled words only; the stock launch everywhere else.
+            if support == .staged8, narrowTiled,
+                let form = promptZoo(m: m, n: n, outputDType: outputDType, negative: negative)
+            {
+                return launchStaged8Zoo(
+                    [codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                     activation.scaledSums],
+                    template: Array(template.prefix(5)), form: form, k: k, m: m, n: n,
+                    outputDType: outputDType)
+            }
             return packedKernel(
                 [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
