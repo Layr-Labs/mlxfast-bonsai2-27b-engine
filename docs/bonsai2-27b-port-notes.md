@@ -319,13 +319,15 @@ at the same path, so a participant's local test needs no R2 access.
 ### 5.1 The arming shape
 
 The arming commit fills these fixture keys from the recorded files:
-`timed_prompt_pool` (8 pins), `live_golden`, `hidden_correctness_golden` (the
-live golden's own pin), `live_golden_speculative` and
+`timed_prompt_pool` (8 pins), `live_goldens`, `hidden_correctness_golden` (the
+first live golden's own pin), `live_golden_speculative` and
 `official_scoring_enabled`.
 
 `tools/bonsai2-27b-measure-and-score.sh` refuses a declared decoder and depth
-that has no `live_golden_speculative` entry. The keys are `mtp1` to `mtp7` and
-`dflash1` to `dflash16`, so the arming commit needs all 23.
+that has no `live_golden_speculative` entry for a live golden. The keys are
+`mtp1` to `mtp7` and `dflash1` to `dflash16`. Each key maps every live golden's
+name to its oracle pin, so the arming commit needs all 23 keys for every live
+golden.
 
 A per-depth oracle can differ from the serial tape. A speculative round verifies its
 draft in one forward at M > 1, and MLX dispatches a different kernel there, so

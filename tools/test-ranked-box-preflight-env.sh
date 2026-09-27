@@ -56,16 +56,16 @@ cp "${REPO_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${ROOT}/fixtures/"
 # baseline_reference_commit stay under test, and so does the whole
 # byte-then-sha verification the preflight performs.
 #
-# A FRESHLY STAMPED TRACK HAS NO POOL AT ALL. Its live_golden is empty, its
+# A FRESHLY STAMPED TRACK HAS NO POOL AT ALL. Its live_goldens is empty, its
 # timed_prompt_pool is empty and its hidden correctness golden is still an
 # organizer sentinel, because the tapes do not exist yet. There is nothing to
 # re-pin in that state, so the block below AUTHORS the cohort instead: the 8
-# pool entries this track scores, a live_golden naming one of them, a per-depth
-# oracle for every contract-permitted draft depth, and a real digest for the
-# hidden golden. It also arms the copy, because every check after section 5
-# is unreachable on an unarmed contract (the arm gate keeps its own case
-# below, against a second root that is left unarmed). The shipped fixture is
-# never written.
+# pool entries this track scores, a live_goldens list naming one of them, a
+# per-depth oracle for every contract-permitted draft depth, and a real digest
+# for the hidden golden. It also arms the copy, because every check after
+# section 5 is unreachable on an unarmed contract (the arm gate keeps its own
+# case below, against a second root that is left unarmed). The shipped fixture
+# is never written.
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
 python3 - "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'REPINEOF'
@@ -98,9 +98,9 @@ if not contract.get("timed_prompt_pool"):
     live = "synthetic-live"
     names = [live] + ["synthetic-pool-%d" % n for n in range(1, POOL_SIZE)]
     contract["timed_prompt_pool"] = [entry(name) for name in names]
-    contract["live_golden"] = live
+    contract["live_goldens"] = [live]
     contract["live_golden_speculative"] = {
-        "mtp%d" % depth: entry("%s.mtp%d" % (live, depth))
+        "mtp%d" % depth: {live: entry("%s.mtp%d" % (live, depth))}
         for depth in contract.get("mtp_head", {}).get("permitted_draft_depths", [])
     }
     # The hidden oracle is pinned by digest only and never staged here, so any
@@ -114,8 +114,9 @@ if not contract.get("timed_prompt_pool"):
 else:
     for pool_entry in contract["timed_prompt_pool"]:
         pool_entry["sha256"], pool_entry["bytes"] = stage(pool_entry["r2_path"])
-    for spec_entry in (contract.get("live_golden_speculative") or {}).values():
-        spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
+    for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+        for spec_entry in per_prompt.values():
+            spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
 with open(contract_path, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
@@ -407,8 +408,39 @@ elif ! grep -q "official_scoring_enabled" "${WORK}/out"; then
   fail "case 19 (unarmed contract): the refusal does not name the arm field: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
 fi
 
+# --- cases 20-21: the live_goldens list ------------------------------------
+# Every name in live_goldens must name a pinned pool entry, and the list must
+# not be empty. Each case gets a root of its own, so the root above stays
+# healthy.
+# run_live_goldens_case <label> <needle> <jq filter>
+run_live_goldens_case() {
+  local label="$1" needle="$2" filter="$3" case_root="${WORK}/$1"
+  mkdir -p "${case_root}/tools" "${case_root}/fixtures"
+  cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
+  chmod +x "${case_root}/tools/ranked-box-preflight.sh"
+  jq "${filter}" "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" \
+    > "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json"
+  env -i PATH="${PATH}" HOME="${HOME}" \
+    MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+    MLXFAST_MACMON="${MACMON}" \
+    MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
+    RUNNER_NAME="${BOX_NAME}" \
+    MLXFAST_BASELINE_WORKSPACE="${REF_WS}" \
+    MLXFAST_BASELINE_CALIBRATION="${CALIBRATION}" \
+    "${case_root}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+  rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    fail "${label}: the preflight PASSED; it must refuse"
+  elif ! grep -q -- "${needle}" "${WORK}/out"; then
+    fail "${label}: the refusal does not name '${needle}'; got: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  fi
+}
+run_live_goldens_case case20 "declares no live_goldens" '.live_goldens = []'
+run_live_goldens_case case21 "live golden 'no-such-prompt' names no timed_prompt_pool entry" \
+  '.live_goldens += ["no-such-prompt"]'
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 20 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all 22 cases passed"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

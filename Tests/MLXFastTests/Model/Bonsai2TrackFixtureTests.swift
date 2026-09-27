@@ -5,7 +5,7 @@ import Testing
 // Contract tests for `fixtures/bonsai2_27b_mlx_v1_track.json`.
 //
 // The track is STAMPED AND NOT YET ARMED. `official_scoring_enabled` is false,
-// the timed pool is empty, `live_golden` is unset and the hidden oracle still
+// the timed pool is empty, `live_goldens` is empty and the hidden oracle still
 // carries its pending-organizer sentinel: the goldens are organizer material
 // and are captured on the ranked box. This suite asserts that unarmed state as
 // a COHERENT WHOLE -- an empty pool with scoring switched on, or an armed pin
@@ -65,11 +65,12 @@ struct Bonsai2TrackFixtureTests {
     }
 
     /// THE TRACK IS ARMED, AND COHERENTLY. Scoring on, eight pool pins, a
-    /// live golden that names one of them, a hidden correctness golden equal to
-    /// that row's pin, and one oracle pin for every declarable depth must
-    /// travel together: any of them missing is a fixture that would let a
-    /// ranked run start against material it does not have.
-    @Test("the fixture is coherently armed: scoring, pool, live golden, oracles")
+    /// non-empty list of live goldens that each name one of them, a hidden
+    /// correctness golden equal to the first live golden's pin, and one oracle
+    /// pin per live golden for every declarable depth must travel together:
+    /// any of them missing is a fixture that would let a ranked run start
+    /// against material it does not have.
+    @Test("the fixture is coherently armed: scoring, pool, live goldens, oracles")
     func theFixtureIsCoherentlyArmed() throws {
         let object = try bonsai2TrackContractObject()
         let prefix = "correctness_prompts/bonsai2-27b-mlx-v1/"
@@ -84,8 +85,15 @@ struct Bonsai2TrackFixtureTests {
         let pool = try #require(object["timed_prompt_pool"] as? [[String: Any]])
         #expect(pool.count == 8)
         #expect(pool.allSatisfy(isPin))
-        let live = try #require(object["live_golden"] as? String)
-        let liveRow = try #require(pool.first { ($0["r2_path"] as? String) == "\(prefix)\(live).golden.json" })
+        let live = try #require(object["live_goldens"] as? [String])
+        #expect(!live.isEmpty)
+        #expect(Set(live).count == live.count)
+        let liveRows = try live.map { name in
+            try #require(pool.first { ($0["r2_path"] as? String) == "\(prefix)\(name).golden.json" })
+        }
+        let liveRow = try #require(liveRows.first)
+        let pairs = try #require(object["official_pairs"] as? Int)
+        #expect(pairs % live.count == 0)
         // ROOT level -- benchd's `hidden_correctness_golden_pin_from_contract`
         // reads this key directly off the contract root, never a nested
         // wrapper.
@@ -93,10 +101,11 @@ struct Bonsai2TrackFixtureTests {
         #expect(golden["sha256"] as? String == liveRow["sha256"] as? String)
         #expect(golden["bytes"] as? Int == liveRow["bytes"] as? Int)
         #expect(object["hidden_material"] == nil)
-        let oracles = try #require(object["live_golden_speculative"] as? [String: [String: Any]])
+        let oracles = try #require(object["live_golden_speculative"] as? [String: [String: [String: Any]]])
         let depthKeys = Set((1...7).map { "mtp\($0)" } + (1...16).map { "dflash\($0)" })
         #expect(Set(oracles.keys) == depthKeys)
-        #expect(oracles.values.allSatisfy(isPin))
+        #expect(oracles.values.allSatisfy { Set($0.keys) == Set(live) })
+        #expect(oracles.values.allSatisfy { $0.values.allSatisfy(isPin) })
     }
 
     /// MODE FENCE. This track has TWO speculative arms, each a separate pinned

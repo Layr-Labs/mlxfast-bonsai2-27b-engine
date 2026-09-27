@@ -50,21 +50,21 @@ if python3 "${TOOL}" --dir "${WORK}/set" --live alpha > "${WORK}/patch.json" 2> 
   ok1=1
   [[ "$(q "${P}" 'd["official_scoring_enabled"]')" == "True" ]] || { fail "case 1: official_scoring_enabled is not true"; ok1=0; }
   [[ "$(q "${P}" 'len(d["timed_prompt_pool"])')" == "8" ]] || { fail "case 1: the pool is not 8 tapes"; ok1=0; }
-  [[ "$(q "${P}" 'd["live_golden"]')" == "alpha" ]] || { fail "case 1: live_golden is not alpha"; ok1=0; }
+  [[ "$(q "${P}" 'd["live_goldens"]')" == "['alpha']" ]] || { fail "case 1: live_goldens is not [alpha]"; ok1=0; }
   [[ "$(q "${P}" '[e for e in d["timed_prompt_pool"] if e["r2_path"].endswith("/alpha.golden.json")][0]["sha256"] == d["hidden_correctness_golden"]["sha256"]')" == "True" ]] \
     || { fail "case 1: the hidden oracle is not the live golden's own pin"; ok1=0; }
   [[ "$(q "${P}" 'len(d["live_golden_speculative"])')" == "23" ]] || { fail "case 1: live_golden_speculative does not carry 23 keys"; ok1=0; }
-  [[ "$(q "${P}" 'd["live_golden_speculative"]["mtp7"]["r2_path"]')" == "${pre}/alpha.mtp1.golden.json" ]] \
+  [[ "$(q "${P}" 'd["live_golden_speculative"]["mtp7"]["alpha"]["r2_path"]')" == "${pre}/alpha.mtp1.golden.json" ]] \
     || { fail "case 1: mtp7 does not share the mtp1 object"; ok1=0; }
-  [[ "$(q "${P}" 'd["live_golden_speculative"]["dflash1"]["r2_path"]')" == "${pre}/alpha.golden.json" ]] \
+  [[ "$(q "${P}" 'd["live_golden_speculative"]["dflash1"]["alpha"]["r2_path"]')" == "${pre}/alpha.golden.json" ]] \
     || { fail "case 1: dflash1 (serial-identical) does not point at the live golden"; ok1=0; }
-  [[ "$(q "${P}" 'd["live_golden_speculative"]["dflash16"]["r2_path"]')" == "${pre}/alpha.dflash2.golden.json" ]] \
+  [[ "$(q "${P}" 'd["live_golden_speculative"]["dflash16"]["alpha"]["r2_path"]')" == "${pre}/alpha.dflash2.golden.json" ]] \
     || { fail "case 1: dflash16 does not share the dflash2 object"; ok1=0; }
   [[ "$(q "${P}" '"public_captures" in d')" == "False" ]] \
     || { fail "case 1: the patch carries public_captures; the captures ship in git, not in the fixture"; ok1=0; }
   grep -q "ship: public-local-submit.golden.json -> ${pre}/public-local-submit.golden.json" "${WORK}/case1.err" \
     || { fail "case 1: the local_submit capture is not listed to ship"; ok1=0; }
-  grep -q "10 distinct object(s); 21 of 23 per-depth key(s) share an earlier object" "${WORK}/case1.err" \
+  grep -q "10 distinct object(s); 21 of 23 per-depth oracle(s) share an earlier object" "${WORK}/case1.err" \
     || { fail "case 1: the upload summary is wrong ($(tail -1 "${WORK}/case1.err"))"; ok1=0; }
   if grep -q "${MARKER}" "${P}" "${WORK}/case1.err"; then
     fail "case 1: the output carries golden CONTENT"; ok1=0
@@ -79,7 +79,7 @@ make_set "${WORK}/missing"
 rm "${WORK}/missing/alpha.dflash9.golden.json"
 if python3 "${TOOL}" --dir "${WORK}/missing" --live alpha > /dev/null 2> "${WORK}/case2.err"; then
   fail "case 2: the tool accepted a set with no dflash9 oracle"
-elif grep -q "no per-depth oracle for: dflash9" "${WORK}/case2.err"; then
+elif grep -q "no per-depth oracle for: dflash9 for alpha" "${WORK}/case2.err"; then
   pass "a missing per-depth oracle is refused by key"
 else
   fail "case 2: refused for the wrong reason ($(cat "${WORK}/case2.err"))"

@@ -20,7 +20,7 @@
 # tools/bonsai2-27b-measure-and-score.sh already reads:
 #
 #   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the 8 timed-pool tapes
-#                                      (the live golden this leg scores over
+#                                      (the live goldens the run scores over
 #                                      among them). The name is the FLEET's
 #                                      golden-dir contract, which every box
 #                                      script exports; it is not this track's
@@ -31,11 +31,11 @@
 # and nothing here reaches the network.
 #
 # PAIRED, WITH A PER-BOX BAND (David 2026-09-08). This track scores TWO legs on
-# the same box in the same job, over the ONE live golden: a SERIAL-CONTROL leg
+# the same box in the same job, over each live golden: a SERIAL-CONTROL leg
 # on the organizer-staged reference tree and the CANDIDATE leg on the submission
 # tree at its declared depth. The score is the LIVE ratio. Nothing stores a
 # pair -- not the constants, not the fixture, not the golden. So this preflight
-# verifies the staged pool tapes (and the live golden among them), the fixture
+# verifies the staged pool tapes (and the live goldens among them), the fixture
 # arm state, AND the two names the paired path needs on this box:
 #
 #   MLXFAST_BASELINE_WORKSPACE     the built reference tree, at the fixture's
@@ -264,17 +264,19 @@ EOF
 ok "all 8 staged timed-pool tapes match their contract pins (bytes then sha256)"
 
 # Per-depth oracles (David ruling 2026-09-07): every live_golden_speculative
-# entry must be a well-formed pin AND staged, so a speculative submission never
-# reaches the GPU to find its oracle missing. Absent map = serial-only track.
+# entry (one per depth and live golden) must be a well-formed pin AND staged, so
+# a speculative submission never reaches the GPU to find its oracle missing.
+# Absent map = serial-only track.
 spec_malformed="$(jq -r '
-  (.live_golden_speculative // {})
-  | to_entries
-  | map(select(
-      (.value.r2_path | type != "string" or length == 0)
-      or (.value.sha256 | type != "string" or test("^[0-9a-f]{64}$") | not)
-      or (.value.bytes | type != "number" or . <= 0)
-    ))
-  | map("live_golden_speculative[" + .key + "]")
+  [ (.live_golden_speculative // {})
+    | to_entries[] | .key as $depth
+    | .value | to_entries[]
+    | select(
+        (.value.r2_path | type != "string" or length == 0)
+        or (.value.sha256 | type != "string" or test("^[0-9a-f]{64}$") | not)
+        or (.value.bytes | type != "number" or . <= 0)
+      )
+    | "live_golden_speculative[" + $depth + "][" + .key + "]" ]
   | join(", ")
 ' "${CONTRACT}")"
 [[ -z "${spec_malformed}" ]] || fail "unarmed or malformed per-depth oracle pin(s): ${spec_malformed}"
@@ -290,7 +292,7 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
 "
   fi
   spec_count=$((spec_count + 1))
-done < <(jq -r '(.live_golden_speculative // {}) | to_entries[] | [.value.r2_path, .value.sha256, (.value.bytes|tostring)] | @tsv' "${CONTRACT}")
+done < <(jq -r '(.live_golden_speculative // {})[][] | [.r2_path, .sha256, (.bytes|tostring)] | @tsv' "${CONTRACT}")
 ok "${spec_count} per-depth oracle(s) pinned and staged"
 
 # The staging directory must hold the cohort and NOTHING ELSE.
@@ -321,23 +323,26 @@ else
   ok "MLXFAST_CORRECTNESS_GOLDEN_PATH unset; benchd resolves the oracle from the contract"
 fi
 
-# --- 4b. the live golden the single-leg run scores over is staged -----------
-# Single-leg reads exactly ONE golden: the fixture's live_golden, resolved by
-# tools/bonsai2-27b-measure-and-score.sh as <live_golden>.golden.json. The
-# loop above already pin-verified it AS a pool member; this asserts the
-# fixture's live_golden actually NAMES a pinned pool entry and is staged, so a
-# live_golden rotation that points at a golden absent from the pool -- or a box
-# that staged the pool but not the live golden -- is caught here, pre-GPU,
-# rather than at measure time.
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")"
-[[ -n "${LIVE_GOLDEN_NAME}" ]] \
-  || fail "the fixture declares no live_golden; there is no golden for the single-leg run to score over"
-live_golden_base="${LIVE_GOLDEN_NAME}.golden.json"
-printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
-  || fail "live_golden '${LIVE_GOLDEN_NAME}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
-[[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
-  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the single-leg run scores over"
-ok "live golden ${live_golden_base} is pinned and staged (the single-leg scored golden)"
+# --- 4b. the live goldens the ranked run scores over are staged -------------
+# The ranked run reads the fixture's live_goldens, each resolved by
+# tools/bonsai2-27b-measure-and-score.sh as <name>.golden.json. The loop above
+# already pin-verified each one AS a pool member; this asserts that every name
+# in live_goldens actually NAMES a pinned pool entry and is staged, so a list
+# that points at a golden absent from the pool -- or a box that staged the pool
+# but not a live golden -- is caught here, pre-GPU, rather than at measure
+# time.
+live_count=0
+while IFS= read -r live_name; do
+  live_golden_base="${live_name}.golden.json"
+  printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
+    || fail "live golden '${live_name}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
+  [[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
+    || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; the ranked run scores over it"
+  ok "live golden ${live_golden_base} is pinned and staged"
+  live_count=$((live_count + 1))
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+[[ "${live_count}" -gt 0 ]] \
+  || fail "the fixture declares no live_goldens; there is no golden for the ranked run to score over"
 
 # --- 5. the fixture is armed for official scoring ---------------------------
 # benchd refuses, pre-GPU, to seal an official artifact unless the fixture

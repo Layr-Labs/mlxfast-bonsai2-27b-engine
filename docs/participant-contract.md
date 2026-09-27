@@ -506,8 +506,10 @@ The score is serial-anchored. A faster candidate scores above 1.
 ### 5.1.0 The pair is measured on the box, and no file stores it
 
 **DAVID RULING 2026-09-08: EACH RANKED MACHINE HAS ITS OWN BASELINE.** A ranked
-run measures TWO legs. It measures them on the SAME box, in the SAME job, over
-the ONE prompt the fixture names in `live_golden`:
+run measures pairs, on the SAME box, in the SAME job. The fixture lists the live
+prompts in `live_goldens`. A ranked run measures each live prompt once, one pair
+per prompt, and the score is the lower-median pair. A pair measures TWO legs
+over one prompt:
 
 1. The **serial-control leg**. It runs on the organizer's reference tree, which
    `MLXFAST_BASELINE_WORKSPACE` names. That tree is a build of this repository
@@ -563,8 +565,9 @@ tools/calibrate-box.sh "<runner name>" /path/to/baseline-calibration.json
 
 The command takes the box GPU lock. It then runs the serial-control leg four
 times under the full official methodology: the cool gate before each pass, one
-resident worker for each pass, and the same live golden the ranked run scores
-over. The file it writes carries the values only:
+resident worker for each pass, and the same live goldens the ranked run scores
+over. The file it writes holds one entry per live golden and carries values
+only. The values for one prompt are:
 
 ```json
 {
@@ -572,7 +575,7 @@ over. The file it writes carries the values only:
   "track_id": "bonsai2-27b-mlx-v1",
   "box": "<the runner name>",
   "reference_commit": "<the fixture's baseline_reference_commit>",
-  "prompt": "<the fixture's live_golden>",
+  "prompt": "<one name from the fixture's live_goldens>",
   "passes": 4,
   "prefill_seconds_per_token_mean": 0.0,
   "decode_seconds_per_token_mean": 0.0,
@@ -612,8 +615,8 @@ Each refusal names the failing thing.
 
 **THE SCORED SHAPE IS SINGLE-STREAM.** The fixture pins `scored_batch_size` 1.
 Each leg runs one stream, and the engine agrees: the runner declares
-single-stream regimes only. A scored run times the ONE prompt `live_golden`
-names, on both legs.
+single-stream regimes only. A scored run times each prompt `live_goldens`
+lists, on both legs of that prompt's pair.
 
 Where a run times a pool of prompts rather than one, `aggregate` is the
 **per-prompt sum**. Run each pool prompt in its own single-stream window and
@@ -683,10 +686,13 @@ The short form is the arm state and the goldens: `official_scoring_enabled` is
 | Checked decode steps | 128 |
 | Golden shape | 512 `prompt_tokens` and 129 `expected_tokens` |
 | Streams per window | 1 |
-| Timed prompts per leg | 1 (the fixture's `live_golden`) |
-| Legs per ranked job | 2 (serial control, then candidate) |
+| Timed prompts per leg | 1 (one name from the fixture's `live_goldens`) |
+| Pairs per ranked job | the fixture's `official_pairs`, one pair per live prompt |
+| Legs per pair | 2 (serial control, then candidate) |
 
-The two legs run one after the other, in one job. Each leg loads the weights
+The score is the lower-median pair.
+
+The two legs of a pair run one after the other, in one job. Each leg loads the weights
 once, and each leg gets its own worker residency. The unmeasured warm-up prefill
 pass stays at 1 pass on MLX, and it applies to both legs in the same way.
 
@@ -766,7 +772,7 @@ ruled composite formula. Refuse, not degrade, is the standing posture for this
 track. The `kv_backend` check and the byte-budget check use it too.
 
 The timed prompt pool is EMPTY. `timed_prompt_pool` holds no entry,
-`live_golden` is the empty string, `live_golden_speculative` holds no per-depth
+`live_goldens` is an empty list, `live_golden_speculative` holds no per-depth
 oracle, and `hidden_correctness_golden` carries the pending sentinel
 `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`. An empty pool is legal only
 while the track is unarmed: `tools/lint-benchmark-manifest.py` requires 8
@@ -780,8 +786,8 @@ sentinel. The sentinel is matched exactly; it is never a prefix test.
 |---|---|---|
 | The public captures | This repository, under `correctness_prompts/bonsai2-27b-mlx-v1/`. | **Yes.** They are the local goldens. See section 11.3. |
 | `timed_prompt_pool[]` tapes | R2, at the `r2_path` keys the fixture pins. The ranked box stages them out of band into `MLXFAST_QWEN38_GOLDEN_DIR`. | **No.** They are organizer material and they are never in git. |
-| `live_golden_speculative{}` per-depth oracles | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
-| `hidden_correctness_golden` | The live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
+| `live_golden_speculative{}` per-depth oracles, one per live prompt for each depth | The same: R2 keys, staged on the box. | **No.** Same material, same handling. |
+| `hidden_correctness_golden` | The first live golden, pinned by digest only. It is one of the staged files. | **No.** It is the token-fidelity oracle and it stays on the box. |
 | The reference tree (`MLXFAST_BASELINE_WORKSPACE`) | Built on the ranked box at `baseline_reference_commit`. | **No.** It is the serial-control leg's engine. Its commit is public: the fixture names it. |
 
 `MLXFAST_QWEN38_GOLDEN_DIR` keeps its Qwen spelling because it is the fleet's
@@ -833,6 +839,13 @@ benchd iterate --mode official \
   --score-path score.json
 ```
 
+The script passes one `--golden` per live golden, in the order of
+`live_goldens`, with one `--golden-sha256` and one `--golden-bytes` pin for each.
+It passes the serial tape of each live golden the same way, as
+`--control-golden` with its pins. The benchmarker matches the flags by position.
+Pair k measures live golden (k - 1) mod N, where N is the number of live
+goldens.
+
 `--engine` and `--weights` are RELATIVE to the checkout root. The benchmarker
 re-roots both under `--baseline-workspace` to find the serial-control leg's own
 worker and its own transformed weights. The script refuses an engine or a
@@ -882,7 +895,7 @@ whose `composite_speedup_floor_met` is false, and refuses a run whose sealed
 
 `preSubmitCommand` runs
 `./tools/bonsai2-27b-measure-and-score.sh --preflight-only`.
-That runs the arm gate and, when the live golden is staged, the integrity pin.
+That runs the arm gate and, for each live golden that is staged, the integrity pin.
 It exits without measuring, and it needs no reference tree.
 
 The ranked pipeline is `.github/workflows/benchmark.yml`, which `benchmark.json`
@@ -1085,7 +1098,7 @@ Read this section before you conclude that something is broken.
 ### 11.1 The track is not armed
 
 Section 5.5 states the arm state. `official_scoring_enabled` is `false`, the
-timed prompt pool and the live golden are empty, and the hidden correctness
+timed prompt pool and the live goldens are empty, and the hidden correctness
 oracle is the pending sentinel. No runner advertises the ranked label set
 `[self-hosted, macOS, bonsai2-27b-mlx-v1]`, and the box is not staged.
 

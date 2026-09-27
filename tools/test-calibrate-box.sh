@@ -46,20 +46,20 @@ cp "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
 
 TRACK_ID="$(jq -r '.trackId' "${ROOT}/benchmark.json")"
 
-# A FRESHLY STAMPED TRACK HAS NO LIVE GOLDEN. The real tapes are organizer
-# material, published in R2 and staged on the box, and they do not exist for
-# this track yet, so calibrate-box.sh refuses before it builds any argv. The
-# copy in ${ROOT} therefore gets a synthetic live_golden and the pool entry
+# A FRESHLY STAMPED TRACK HAS NO LIVE GOLDENS. The real tapes are organizer
+# material, published in R2 and staged on the box, and they do not exist for a
+# new track, so calibrate-box.sh refuses before it builds any argv. The copy
+# in ${ROOT} therefore gets a synthetic live_goldens list and the pool entry
 # that pins it; the shipped fixture is never written, and a fixture that
-# already carries a pool is left exactly as it is.
+# already carries a list is left exactly as it is.
 python3 - "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" <<'SYNTHEOF'
 import json, sys
 
 contract_path = sys.argv[1]
 contract = json.load(open(contract_path, encoding="utf-8"))
-if not contract.get("live_golden"):
+if not contract.get("live_goldens"):
     live = "synthetic-live"
-    contract["live_golden"] = live
+    contract["live_goldens"] = [live]
     contract["timed_prompt_pool"] = [{
         "r2_path": "correctness_prompts/%s/%s.golden.json" % (contract["track_id"], live),
         "sha256": "0" * 64,
@@ -70,7 +70,10 @@ if not contract.get("live_golden"):
         fh.write("\n")
 SYNTHEOF
 
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden' "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")"
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '.live_goldens[]' "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")
 
 # --- the synthetic reference tree, and the contract that pins it ------------
 REF_WS="${WORK}/reference"
@@ -94,7 +97,9 @@ mv "${WORK}/contract.tmp" "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json"
 
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
-echo '{}' > "${GOLDEN_DIR}/${LIVE_GOLDEN_NAME}.golden.json"
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"
+done
 
 # --- the stub benchd --------------------------------------------------------
 # Records its argv and the track id it was handed, then writes the calibration
@@ -162,6 +167,19 @@ raise SystemExit(1)
 PYEOF
 }
 
+argv_values() {
+  # argv_values <file> <flag> -- every value that follows <flag>, one per line,
+  # in argv order.
+  python3 - "$1" "$2" <<'PYEOF'
+import sys
+path, flag = sys.argv[1], sys.argv[2]
+args = open(path, encoding="utf-8").read().splitlines()
+for i, arg in enumerate(args):
+    if arg == flag and i + 1 < len(args):
+        print(args[i + 1])
+PYEOF
+}
+
 # --- case 1: the contract invocation ---------------------------------------
 run_calibrate case1 -- "${BOX_NAME}" "${WORK}/case1.out.json"
 if [[ "${rc}" -ne 0 ]]; then
@@ -183,14 +201,16 @@ else
     || fail "case 1: argv does not carry the reference tree's own --weights"
   argv_has_pair "${WORK}/case1.argv" --track "${TRACK_ID}" \
     || fail "case 1: argv does not carry --track ${TRACK_ID}"
-  argv_has_pair "${WORK}/case1.argv" --prompt "${LIVE_GOLDEN_NAME}" \
-    || fail "case 1: argv does not carry --prompt ${LIVE_GOLDEN_NAME}"
+  # ONE --golden AND ONE --prompt PER LIVE GOLDEN, in fixture order. benchd
+  # matches the two flags by position.
+  [[ "$(argv_values "${WORK}/case1.argv" --prompt)" == "$(printf '%s\n' "${LIVE_GOLDEN_NAMES[@]}")" ]] \
+    || fail "case 1: the --prompt values are not the fixture's live_goldens in order: $(argv_values "${WORK}/case1.argv" --prompt | tr '\n' ' ')"
+  [[ "$(argv_values "${WORK}/case1.argv" --golden)" == "$(printf "${GOLDEN_DIR}/%s.golden.json\n" "${LIVE_GOLDEN_NAMES[@]}")" ]] \
+    || fail "case 1: the --golden values are not the fixture's live goldens in order: $(argv_values "${WORK}/case1.argv" --golden | tr '\n' ' ')"
   argv_has_pair "${WORK}/case1.argv" --reference-commit "${REF_COMMIT}" \
     || fail "case 1: argv does not carry --reference-commit ${REF_COMMIT}"
   argv_has_pair "${WORK}/case1.argv" --benchd-source-commit "${BENCHD_SOURCE_COMMIT}" \
     || fail "case 1: argv does not carry the channel manifest's --benchd-source-commit"
-  argv_has_pair "${WORK}/case1.argv" --golden "${GOLDEN_DIR}/${LIVE_GOLDEN_NAME}.golden.json" \
-    || fail "case 1: argv does not name the fixture's live golden"
   argv_has_pair "${WORK}/case1.argv" --passes 4 \
     || fail "case 1: argv does not carry --passes 4 (the contract's pass count)"
   argv_has_pair "${WORK}/case1.argv" --contract "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" \
@@ -351,8 +371,22 @@ if [[ -f "${WORK}/case11.argv" ]]; then
   fail "case 11: benchd was spawned despite the inherited socket"
 fi
 
+# --- case 12: a fixture with no live goldens is refused by name -------------
+cp "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${WORK}/contract.saved"
+jq '.live_goldens = []' "${WORK}/contract.saved" > "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json"
+run_calibrate case12 -- "${BOX_NAME}" "${WORK}/case12.out.json"
+cp "${WORK}/contract.saved" "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json"
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 12: calibrate-box.sh ran with an empty live_goldens list"
+elif ! grep -q "declares no live_goldens" "${WORK}/case12.log"; then
+  fail "case 12: the refusal does not name live_goldens: $(cat "${WORK}/case12.log")"
+fi
+if [[ -f "${WORK}/case12.argv" ]]; then
+  fail "case 12: benchd was spawned with no live goldens"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-calibrate-box.sh: all 13 cases passed"
+  echo "test-calibrate-box.sh: all 14 cases passed"
   exit 0
 fi
 echo "test-calibrate-box.sh: ${failures} case(s) failed" >&2

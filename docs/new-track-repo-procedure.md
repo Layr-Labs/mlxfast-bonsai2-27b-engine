@@ -56,7 +56,7 @@ logic lands:
   runtime configuration.
 - Identity = **sha256 + bytes**, never name/path/location. The gates-bound golden pin is the
   oracle-carrying file's hash; the oracle is mandatory on the timed path.
-- Hidden material (the pool tapes, the per-depth oracles, the live golden) is uploaded
+- Hidden material (the pool tapes, the per-depth oracles, the live goldens) is uploaded
   to R2 under `correctness_prompts/{track_id}/`, append-only, per-instance
   authorization, operator-workstation credentials only, GET + sha + bytes round-trip
   verified after upload. The bucket is part of the endpoint, never part of the object
@@ -90,7 +90,7 @@ What it changes:
   the byte budget and the scoring constants stay as they are.
 - The contract fixture: a copy of the current one under the new name, with the
   new track id, the fork revision, `official_scoring_enabled: false`, an empty
-  timed pool, an empty live golden, and the pending-organizer sentinel. The old
+  timed pool, an empty live goldens list, and the pending-organizer sentinel. The old
   fixture is deleted.
 - The checkpoint file list: rewritten from the Hugging Face tree of
   `--checkpoint`. LFS entries use the LFS object's own sha256. A file the tree

@@ -62,7 +62,7 @@
 #      or any entry whose sha256 is not 64 hex / bytes is not positive: refused,
 #      because there would be no pin to verify a staged file against.
 #   3. Missing staged asset. MLXFAST_QWEN38_GOLDEN_DIR unset or absent, a pool
-#      tape missing, the live golden not staged, or the paired leg pair
+#      tape missing, a live golden not staged, or the paired leg pair
 #      unstaged: MLXFAST_BASELINE_WORKSPACE / MLXFAST_BASELINE_CALIBRATION
 #      absent, a reference tree at the wrong commit, a reference tree with no
 #      staged worker or no transformed weights of its own, or a calibration
@@ -102,7 +102,7 @@
 #   - a registered self-hosted runner on the box advertising the three labels
 #     below (tools/box-runner/ owns that side);
 #   - box staging: the 8 pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
-#     golden among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
+#     goldens among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
 #     no Rust toolchain and this job holds no dist token, so the binary is
 #     placed there out of band), the reference checkpoint, and a macmon GPU
 #     temperature reader at the path this file pins into MLXFAST_MACMON and

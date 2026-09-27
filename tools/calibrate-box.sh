@@ -17,9 +17,9 @@
 # WHAT IT MEASURES. `benchd calibrate-baseline` runs the serial-control leg
 # --passes times under the FULL official methodology -- the quiescence gate and
 # the cool gate per pass,
-# one resident worker per pass, the same live golden the ranked run scores over
-# -- and writes the mean, the coefficient of variation and the band on both
-# axes. It REFUSES to write a file when the CV exceeds 1 % on either axis,
+# one resident worker per pass, the same live goldens the ranked run scores
+# over -- and writes one file with one entry per live golden. Each entry holds
+# the mean, the coefficient of variation and the band on both axes. It REFUSES to write a file when the CV exceeds 1 % on either axis,
 # because a box that cannot repeat itself has no band worth recording. That
 # refusal is the point of the four passes, and this script does not soften it.
 #
@@ -59,8 +59,8 @@
 #   MLXFAST_BASELINE_WORKSPACE   the built reference tree the control leg runs
 #                                 on. Required; there is no default, because a
 #                                 guessed tree is a different denominator.
-#   MLXFAST_QWEN38_GOLDEN_DIR    the staged golden pool. The live golden is
-#                                 resolved from it as <live_golden>.golden.json,
+#   MLXFAST_QWEN38_GOLDEN_DIR    the staged golden pool. Each live golden is
+#                                 resolved from it as <name>.golden.json,
 #                                 exactly as the ranked path resolves it.
 #   BENCHD_BIN_DIR               where tools/fetch-benchd.sh keeps the pinned
 #                                 binary and its benchd.manifest.json. The
@@ -97,7 +97,7 @@ if [[ $# -gt 2 ]]; then
   die "unrecognized argument: $3"
 fi
 
-command -v jq >/dev/null 2>&1 || die "jq is required (it reads the fixture's live_golden and track id)"
+command -v jq >/dev/null 2>&1 || die "jq is required (it reads the fixture's live_goldens and track id)"
 
 # AN INHERITED SOCKET IS A REFUSAL. Every calibration pass is a control leg on
 # the REFERENCE tree, and benchd boots that leg's resident from that tree. A
@@ -139,15 +139,23 @@ if [[ -n "${MLXFAST_QWEN_MTP_TRACK_ID:-}" && "${MLXFAST_QWEN_MTP_TRACK_ID}" != "
 fi
 export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 
-# The live golden -- the ONE prompt both legs run, read FROM the fixture.
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden // empty' "${CONTRACT}")"
-[[ -n "${LIVE_GOLDEN_NAME}" ]] || die "the fixture declares no live_golden"
+# The live goldens -- the prompts both legs run, read FROM the fixture, in
+# fixture order. Each one reaches benchd as a --golden and --prompt pair, and
+# benchd matches the two flags by position.
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+[[ ${#LIVE_GOLDEN_NAMES[@]} -gt 0 ]] || die "the fixture declares no live_goldens"
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
-  || die "MLXFAST_QWEN38_GOLDEN_DIR is unset; the live golden is staged on the box out of band and this script fetches nothing"
-LIVE_GOLDEN_PATH="${GOLDEN_DIR}/${LIVE_GOLDEN_NAME}.golden.json"
-[[ -f "${LIVE_GOLDEN_PATH}" ]] \
-  || die "the live golden is not staged at ${LIVE_GOLDEN_PATH}"
+  || die "MLXFAST_QWEN38_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
+GOLDEN_ARGS=()
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  [[ -f "${GOLDEN_DIR}/${name}.golden.json" ]] \
+    || die "the live golden is not staged at ${GOLDEN_DIR}/${name}.golden.json"
+  GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
+done
 
 # The PINNED benchd, resolved exactly as the ranked path resolves it.
 BENCHD="${BENCHD:-${BENCHCTL:-}}"
@@ -202,7 +210,7 @@ printf '%s' "${GPU_LOCK_TIMEOUT_S}" | grep -Eq '^[1-9][0-9]*$' \
 # pass's resident, so the lock this script takes is the lock those boots check.
 export RESIDENT_UP_LOCK_PATH="${GPU_LOCK_PATH}"
 
-echo "calibrate-box.sh: taking the GPU lock ${GPU_LOCK_PATH}, then calibrating ${PASSES} pass(es) of the serial-control leg on ${BASELINE_WORKSPACE} over ${LIVE_GOLDEN_NAME}. benchd boots ONE resident per pass from the reference tree; this script boots none." >&2
+echo "calibrate-box.sh: taking the GPU lock ${GPU_LOCK_PATH}, then calibrating ${PASSES} pass(es) of the serial-control leg on ${BASELINE_WORKSPACE} over ${LIVE_GOLDEN_NAMES[*]}. benchd boots ONE resident per pass from the reference tree; this script boots none." >&2
 
 # THE LOCK HOLDER IS THE OUTERMOST PROCESS of the calibration window. It holds an
 # exclusive flock on an inheritable descriptor and then becomes benchd through
@@ -232,11 +240,10 @@ os.execv(argv[0], argv)
   --baseline-workspace "${BASELINE_WORKSPACE}" \
   --engine "${REFERENCE_ENGINE_REL}" \
   --weights "${REFERENCE_WEIGHTS}" \
-  --golden "${LIVE_GOLDEN_PATH}" \
+  "${GOLDEN_ARGS[@]}" \
   --passes "${PASSES}" \
   --box "${BOX_NAME}" \
   --track "${MANIFEST_TRACK_ID}" \
-  --prompt "${LIVE_GOLDEN_NAME}" \
   --reference-commit "${REFERENCE_COMMIT}" \
   ${BENCHD_SOURCE_ARGS[@]+"${BENCHD_SOURCE_ARGS[@]}"} \
   --out "${OUT_PATH}"

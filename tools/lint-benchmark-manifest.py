@@ -1191,9 +1191,10 @@ class Linter:
         for entry in contract.get("timed_prompt_pool", []):
             if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                 pinned.add(entry["r2_path"])
-        for entry in (contract.get("live_golden_speculative") or {}).values():
-            if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
-                pinned.add(entry["r2_path"])
+        for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+            for entry in (per_prompt or {}).values():
+                if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                    pinned.add(entry["r2_path"])
         if not pinned:
             # A track stamped by tools/new-track.sh pins nothing yet: its
             # goldens are recorded on its own box after the port runs. That is
@@ -1248,9 +1249,10 @@ class Linter:
         for entry in contract.get("timed_prompt_pool", []):
             if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                 rels.add(entry["r2_path"])
-        for entry in (contract.get("live_golden_speculative") or {}).values():
-            if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
-                rels.add(entry["r2_path"])
+        for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+            for entry in (per_prompt or {}).values():
+                if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                    rels.add(entry["r2_path"])
         # Every golden that SHIPS in the tree, not only the pinned ones: an
         # unpinned file is a candidate for a future pin, and a golden the
         # contract does not name today is exactly where a stale pair would

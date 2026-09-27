@@ -384,10 +384,11 @@ EOF
     || { echo "fetch-goldens.sh: --out is not a directory: ${OUT_PATH}" >&2; exit 1; }
 
   # Every pin the contract declares: the timed-pool tapes and the per-depth
-  # oracles. A depth may reuse another depth's tape, so a key is staged once.
+  # oracles (one per depth and live golden). A depth may reuse another depth's
+  # tape, so a key is staged once.
   PINS="$(jq -r '
     [ (.timed_prompt_pool // [])[],
-      ((.live_golden_speculative // {}) | to_entries[] | .value) ]
+      (.live_golden_speculative // {})[][] ]
     | map(select(type == "object" and (.r2_path | type) == "string"))
     | unique_by(.r2_path)[]
     | [.r2_path, .sha256, (.bytes | tostring)]
