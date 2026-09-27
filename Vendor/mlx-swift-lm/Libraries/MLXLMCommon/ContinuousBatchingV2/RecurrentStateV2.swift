@@ -403,6 +403,14 @@ public final class CBv2RecurrentRequestState {
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
     private var pending: [Generation] = []
+    /// A successor bound over a pending compact replay window as if the window
+    /// commits in full (`bindAssumingFullAcceptance`): the window's generation,
+    /// its stages, the committed layers the successor reads (which a full
+    /// commit of the window installs, the very objects), and whether it has.
+    private var assumedFullCommit: (
+        window: UInt64, successor: UInt64, stages: [Int: CBv2RecurrentPrefixReplayStage],
+        layers: [Int: CBv2RecurrentLayerState], installed: Bool
+    )?
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
     public private(set) var isReleased = false
@@ -499,6 +507,66 @@ public final class CBv2RecurrentRequestState {
         return evaluation
     }
 
+    /// The layers a full commit of `replay` (`keep` = its width) installs:
+    /// exactly `commit(generation:keepPositions:)`'s full-acceptance branch.
+    private static func fullCommitLayers(
+        _ replay: [Int: CBv2RecurrentPrefixReplayStage], keep: Int
+    ) -> [Int: CBv2RecurrentLayerState] {
+        replay.mapValues { stage in
+            if stage.finalState.ssm == nil,
+                let deferred = stage.deferredState(
+                    keep: keep, build: { stage.fullAcceptance?() ?? stage.finalState })
+            {
+                return deferred
+            }
+            return stage.fullAcceptance?() ?? stage.finalState
+        }
+    }
+
+    /// Bind a successor forward over the one pending compact replay window
+    /// (a verify still in flight) as if that window commits in full. A full
+    /// commit of the window then installs the very layers the successor read;
+    /// any other outcome discards the successor first
+    /// (`CBv2RecurrentStateEvaluation.discardAssumedSuccessor`). nil when the
+    /// state is not exactly one pending compact replay window.
+    public func bindAssumingFullAcceptance() -> CBv2RecurrentStateEvaluation? {
+        guard !isReleased, !bindingOpen, assumedFullCommit == nil, pending.count == 1,
+            let window = pending.last, let replay = window.prefixReplay,
+            let positions = replay.values.first?.positions
+        else { return nil }
+        let layers = Self.fullCommitLayers(replay, keep: positions)
+        bindingOpen = true
+        let evaluation = CBv2RecurrentStateEvaluation(
+            owner: self, generation: nextGeneration, input: layers,
+            requiredLayers: Set(spec.modelLayerIndices))
+        assumedFullCommit = (window.id, nextGeneration, replay, layers, false)
+        nextGeneration &+= 1
+        return evaluation
+    }
+
+    /// The successor stays: nothing is left to undo.
+    fileprivate func keepAssumedSuccessor(generation: UInt64) {
+        if assumedFullCommit?.successor == generation { assumedFullCommit = nil }
+    }
+
+    /// The successor is dropped (it must be the newest generation, or never
+    /// evaluated). A window already committed in full gets fresh layers, so
+    /// nothing later reads a state the dropped successor resolved.
+    fileprivate func discardAssumedSuccessor(generation: UInt64, evaluated: Bool) throws {
+        guard let assumed = assumedFullCommit, assumed.successor == generation else {
+            throw CBv2RecurrentStateError.lifecycleViolation("no assumed successor to discard")
+        }
+        if evaluated {
+            try rollback(generation: generation)
+        } else {
+            bindingOpen = false
+        }
+        if assumed.installed, let positions = assumed.stages.values.first?.positions {
+            committed = Self.fullCommitLayers(assumed.stages, keep: positions)
+        }
+        assumedFullCommit = nil
+    }
+
     fileprivate func evaluate(
         generation: UInt64, layers: [Int: CBv2RecurrentLayerState],
         capturedPositions: Int?,
@@ -566,11 +634,20 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
             }
-            clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
+            let assumed = assumedFullCommit?.window == generation
+            guard !assumed || fullAcceptance else {
+                throw CBv2RecurrentStateError.lifecycleViolation(
+                    "a window with an assumed-full successor must commit in full")
+            }
+            clearOlderTransitionRetention()
             // A replayed commit may stay deferred (`CBv2DeferredRecurrentReplay`):
             // its builder is exactly the eager expression beside it.
-            if fullAcceptance {
+            if assumed, let layers = assumedFullCommit?.layers {
+                // The layers the successor bound (`bindAssumingFullAcceptance`).
+                committed = layers
+                assumedFullCommit?.installed = true
+            } else if fullAcceptance {
                 committed = replay.mapValues { stage in
                     if stage.finalState.ssm == nil,
                         let deferred = stage.deferredState(
@@ -614,6 +691,7 @@ public final class CBv2RecurrentRequestState {
             committed = first.layers
         }
         pending.removeFirst()
+        keepAssumedSuccessor(generation: generation)
     }
 
     fileprivate func rollback(generation: UInt64) throws {
@@ -635,6 +713,7 @@ public final class CBv2RecurrentRequestState {
     func discardPendingAfterSynchronization() {
         bindingOpen = false
         pending.removeAll()
+        assumedFullCommit = nil
     }
 
     public func release() throws {
@@ -839,6 +918,25 @@ public final class CBv2RecurrentStateEvaluation {
         }
         try owner.commit(generation: generation, keepPositions: keepPositions)
         finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
+    }
+
+    /// A successor bound by `bindAssumingFullAcceptance` is now an ordinary
+    /// pending generation: its window committed in full.
+    public func keepAssumedSuccessor() {
+        owner.keepAssumedSuccessor(generation: generation)
+    }
+
+    /// Drop a successor bound by `bindAssumingFullAcceptance`, evaluated or
+    /// not, before its window finalizes any other way.
+    public func discardAssumedSuccessor() throws {
+        guard !finalized else {
+            throw CBv2RecurrentStateError.lifecycleViolation("discard of a finalized successor")
+        }
+        try owner.discardAssumedSuccessor(generation: generation, evaluated: evaluated)
+        finalized = true
+        evaluated = true  // the binding is closed; `deinit` must not reopen it
         staged.removeAll(keepingCapacity: false)
         stagedPrefixReplay.removeAll(keepingCapacity: false)
     }

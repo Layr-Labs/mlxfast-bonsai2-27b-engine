@@ -792,6 +792,16 @@ extension DFlash2Attention {
         let (projectedK, projectedV) =
             qkv.applyContext(context, q: qProj, k: kProj, v: vProj)
             ?? (kProj(context), vProj(context))
+        // The cache's first write: the key norm, the rotation and both
+        // buffers in one launch (`DFlash2ContextKVFirst`).
+        if let capacity = block.firstContextCapacity(contextRows: contextLength),
+            let (kb, vb) = DFlash2ContextKVFirst.apply(
+                k: projectedK, v: projectedV, kNorm: kNorm, kvHeads: kvHeads,
+                offset: cache.offset, capacity: capacity)
+        {
+            _ = block.adoptFirstContext(keys: kb, values: vb, contextRows: contextLength)
+            return true
+        }
         let keys = rope(
             DFlash2StridedRMSNorm.apply(
                 kNorm, projectedK.reshaped(B, contextLength, kvHeads, -1))
@@ -805,6 +815,15 @@ extension DFlash2Attention {
     /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
     func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
 
+    /// `MLXFAST_DFLASH_SPEC_STRIDED_NORM=1` turns the speculative block's
+    /// strided head norms on (off by default, as `MLXFAST_DFLASH_STRIDED_NORM`
+    /// for the block forward: the same kernel measured costly on the box).
+    static let speculativeStridedNorms: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_STRIDED_NORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
     var speculativeCapable: Bool {
         dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
             && qkv.applies(q: qProj, k: kProj, v: vProj)
@@ -817,22 +836,71 @@ extension DFlash2Attention {
     /// and the key tail past `held + c + L` is masked (exact zeros).
     func speculative(
         _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray, context: MLXArray? = nil,
+        queryBase: Int? = nil
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
         let (B, L, n) = (x.dim(0), x.dim(1), base.dim(1))
         guard B == 1, n == 2 * L, let held = cache.inPlaceRows else { return nil }
         let start = confirmed.reshaped([1])
-        let rows = dynamicSliceUpdate(base, update: x, start: start, axes: [1])
+        // `DFlash2SpeculativeRows`: the layer's rows and its query norm's rows
+        // at the device-valued `start` without a dynamic slice (update).
+        let rows =
+            context.flatMap {
+                DFlash2SpeculativeRows.rows(context: $0, block: x, start: start, count: n)
+            } ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
         guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
         else { return nil }
+        // Both head norms and both ropes in one launch (`DFlash2QKPrework`'s
+        // speculative form; off unless `MLXFAST_DFLASH_SPEC_QK_PREWORK=1`).
+        if let queryBase, qEnd == heads * qNorm.weight.dim(0),
+            kEnd == qEnd + kvHeads * qNorm.weight.dim(0),
+            let (queries, allKeys) = DFlash2QKPrework.applySpeculative(
+                y, blockRows: L, heads: heads, qNorm: qNorm, kNorm: kNorm,
+                queryBase: queryBase, keyOffset: cache.offset, start: start)
+        {
+            return speculativeTail(
+                queries: queries, allKeys: allKeys, y: y, kEnd: kEnd, n: n, held: held,
+                cache: cache, keyMask: keyMask)
+        }
+        let kRows = y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)
+        let strided = Self.speculativeStridedNorms
+        let allKeys = rope(
+            (strided ? DFlash2StridedRMSNorm.apply(kNorm, kRows, speculative: true) : kNorm(kRows))
+                .transposed(0, 2, 1, 3),
+            offset: cache.offset)
+        if context != nil, strided,
+            let normedQ = DFlash2StridedRMSNorm.applyOffsetRows(
+                qNorm, y[.ellipsis, ..<qEnd].reshaped(B, n, heads, -1), start: start, rows: L)
+        {
+            return speculativeTail(
+                queries: rope(normedQ.transposed(0, 2, 1, 3), offset: queryOffset),
+                allKeys: allKeys, y: y, kEnd: kEnd, n: n, held: held, cache: cache,
+                keyMask: keyMask)
+        }
         let blockRows = dynamicSlice(
             y, start: start, axes: [1], sliceSize: [Int32(B), Int32(L), Int32(y.dim(2))])
+        // The head norms read the stacked product in place
+        // (`DFlash2StridedRMSNorm`, bitwise `RMSNorm`), as the block forward's
+        // norms do: `RMSNorm` would first copy each column-slice view, two
+        // launches per layer and speculative block (ten per round).
+        // Off unless `MLXFAST_DFLASH_SPEC_STRIDED_NORM=1` (its own switch, not
+        // the block forward's `MLXFAST_DFLASH_STRIDED_NORM`).
+        let qRows = blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)
         let queries = rope(
-            qNorm(blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
+            (strided ? DFlash2StridedRMSNorm.apply(qNorm, qRows, speculative: true) : qNorm(qRows))
+                .transposed(0, 2, 1, 3),
             offset: queryOffset)
-        let allKeys = rope(
-            kNorm(y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-            offset: cache.offset)
+        return speculativeTail(
+            queries: queries, allKeys: allKeys, y: y, kEnd: kEnd, n: n, held: held, cache: cache,
+            keyMask: keyMask)
+    }
+
+    /// `speculative` from the rotated queries and keys on.
+    private func speculativeTail(
+        queries: MLXArray, allKeys: MLXArray, y: MLXArray, kEnd: Int, n: Int, held: Int,
+        cache: DFlash2BlockKVCache, keyMask: MLXArray
+    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
+        let (B, L) = (queries.dim(0), queries.dim(2))
         let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
         guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
         else { return nil }
@@ -2783,13 +2851,14 @@ private final class DFlash2DecoderLayer: Module {
     /// `callAsFunction` through `DFlash2Attention.speculative`.
     func speculative(
         _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
-        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray, context: MLXArray? = nil,
+        queryBase: Int? = nil
     ) -> (hidden: MLXArray, keys: MLXArray, values: MLXArray)? {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
         guard
             let a = selfAttn.speculative(
                 attentionInput, base: base, confirmed: confirmed, queryOffset: queryOffset,
-                rope: rope, cache: cache, keyMask: keyMask)
+                rope: rope, cache: cache, keyMask: keyMask, context: context, queryBase: queryBase)
         else { return nil }
         let attended = attentionConv.finish(a.output, projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
@@ -3940,6 +4009,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         DFlash2QKPrework.prepare(
             rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
+        DFlash2ContextKVFirst.prepare(
+            rope: rope, base: config.ropeTheta, dtype: dtype, kvHeads: config.kvHeads,
+            headDim: config.headDim, eps: config.rmsNormEps)
         DFlash2AttentionPipeline.verify(
             dtype: dtype, heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
         DFlash2TopK.prepareThreshold(vocabularySize: Qwen35TextModel.drafterVocabularyRows > 0
@@ -4291,7 +4363,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             guard
                 let out = layer.speculative(
                     h, base: base, confirmed: c, queryOffset: queryOffset, rope: rope,
-                    cache: caches[index], keyMask: keyMask)
+                    cache: caches[index], keyMask: keyMask,
+                    context: DFlash2SpeculativeRows.enabled ? context : nil,
+                    queryBase: geometry.offset)
             else { preconditionFailure("DFlash 2: a checked layer refused its speculative block") }
             h = out.hidden
             writes.append((out.keys, out.values))
@@ -4571,6 +4645,163 @@ enum DFlash2Concat {
     }
 }
 
+// MARK: - Speculative block rows at a device-valued start
+
+/// The speculative block forward (`DFlash2Attention.speculative`) builds each
+/// layer's `[context; zeros]` base with the block's rows written at the
+/// device-valued confirmed count (`dynamicSliceUpdate`: a copy of the base, an
+/// offset launch and the row copy), and slices the block's rows back out of
+/// the stacked q|k|v product for the query norm (`dynamicSlice`: an offset
+/// launch and a copy), after one `[context; zeros]` concatenation per block
+/// (a fill and two copies). Here one launch per layer writes the layer's rows
+/// straight from the context, the block and zero (`rows`); with the
+/// speculative strided norms on (`MLXFAST_DFLASH_SPEC_STRIDED_NORM=1`) the
+/// query norm also reads its rows of the product at `start`
+/// (`DFlash2StridedRMSNorm.applyOffsetRows`, the strided body with an offset
+/// row index). Every element is copied in its own dtype (a zero row is
+/// `T(0)`, as `zeros`), and the norm is the stock body on the same elements,
+/// so the rows, the product and the normed queries are the same bits. Each is
+/// checked once, on first use, bit for bit: the rows against
+/// `dynamicSliceUpdate` (BF16 and FP16, context rows 1, 8 and 16, starts 1, 8
+/// and 16), the query norm rows against `dynamicSlice` + `RMSNorm`; the
+/// drafter's own check of the block built ahead of the readback runs through
+/// them as well. `MLXFAST_DFLASH_SPEC_ROWS=0` keeps the dynamic slices.
+enum DFlash2SpeculativeRows {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_speculative_rows",
+        inputNames: ["ctx", "x", "st", "dims"],
+        outputNames: ["out"],
+        source: """
+            const uint j = thread_position_in_grid.x;
+            const uint r = thread_position_in_grid.y;
+            const size_t W = size_t(dims[0]);
+            const int rel = int(r) - st[0];
+            T v;
+            if (rel >= 0 && rel < dims[2]) {
+              v = x[size_t(rel) * W + j];
+            } else if (r < uint(dims[1])) {
+              v = ctx[size_t(r) * W + j];
+            } else {
+              v = T(0);
+            }
+            out[size_t(r) * W + j] = v;
+            """,
+        ensureRowContiguous: true)
+
+    private static func launch(_ context: MLXArray, _ block: MLXArray, _ start: MLXArray, _ count: Int)
+        -> MLXArray
+    {
+        let w = block.dim(2)
+        // Widths and row counts are runtime operands (the context row count
+        // varies per round): one compiled kernel per dtype.
+        return kernel(
+            [context, block, start, MLXArray([Int32(w), Int32(context.dim(1)), Int32(block.dim(1))])],
+            template: [("T", block.dtype)],
+            grid: (w, count, 1), threadGroup: (min(w, 256), 1, 1),
+            outputShapes: [[1, count, w]], outputDTypes: [block.dtype])[0]
+    }
+
+    /// `dynamicSliceUpdate(concatenated([context, zeros]), update: block,
+    /// start: start, axes: [1])` for `count` rows, or nil when it does not
+    /// apply. The start must keep the block inside the rows (the speculative
+    /// forward's confirmed count, 1 ... L, with `count` = 2 L).
+    static func rows(context: MLXArray, block: MLXArray, start: MLXArray, count: Int) -> MLXArray? {
+        guard enabled, context.ndim == 3, block.ndim == 3, context.dim(0) == 1, block.dim(0) == 1,
+            context.dim(2) == block.dim(2), context.dtype == block.dtype,
+            [DType.bfloat16, .float16].contains(block.dtype), context.dim(1) <= count,
+            2 * block.dim(1) == count, start.size == 1, start.dtype == .int32, verified
+        else { return nil }
+        return launch(context, block, start, count)
+    }
+
+    private static let verified: Bool = {
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for dtype in [DType.bfloat16, .float16] {
+                    let (L, w) = (16, 512)
+                    let block = MLXRandom.normal([1, L, w], key: MLXRandom.key(61)).asType(dtype)
+                    for contextRows in [1, 8, 16] {
+                        let context = MLXRandom.normal([1, contextRows, w], key: MLXRandom.key(64))
+                            .asType(dtype)
+                        let base = concatenated(
+                            [context, MLXArray.zeros([1, 2 * L - contextRows, w], dtype: dtype)], axis: 1)
+                        for c in [1, 8, 16] {
+                            let start = MLXArray([Int32(c)])
+                            let reference = dynamicSliceUpdate(base, update: block, start: start, axes: [1])
+                            let candidate = launch(context, block, start, 2 * L)
+                            let ok = reference.shape == candidate.shape
+                                && all(reference.view(dtype: .uint16) .== candidate.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            try error.check()
+                            same = same && ok
+                            compared += reference.size
+                        }
+                    }
+                }
+            }
+        } catch {
+            same = false
+        }
+        FileHandle.standardError.write(
+            (same
+                ? "dflash2 speculative rows: self-test passed (\(compared) values bitwise); one launch per layer, no dynamic slice update\n"
+                : "dflash2 speculative rows: self-test failed; dynamic slices kept\n").data(using: .utf8)!)
+        return same
+    }()
+
+    /// The query norm's rows at the device-valued start
+    /// (`DFlash2StridedRMSNorm.applyOffsetRows`, used with the speculative
+    /// strided norms on), checked once, on first use, bit for bit against
+    /// `dynamicSlice` + `RMSNorm` (BF16 and FP16, starts 1, 8 and 16).
+    static let queryNormVerified: Bool = {
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for dtype in [DType.bfloat16, .float16] {
+                    let L = 16
+                    let product = (MLXRandom.normal([1, 2 * L, 12 * 128], key: MLXRandom.key(62))
+                        * exp(MLXRandom.uniform(Float(-7) ..< Float(8), [1, 2 * L, 1], key: MLXRandom.key(65))))
+                        .asType(dtype)
+                    let norm = RMSNorm(dimensions: 128, eps: 1e-6)
+                    norm.weight._updateInternal(
+                        (1 + 0.3 * MLXRandom.normal([128], key: MLXRandom.key(63))).asType(dtype))
+                    for c in [1, 8, 16] {
+                        let start = MLXArray([Int32(c)])
+                        let rowsQ = dynamicSlice(
+                            product, start: start, axes: [1],
+                            sliceSize: [Int32(1), Int32(L), Int32(product.dim(2))])
+                        let refQ = norm(rowsQ[.ellipsis, ..<(8 * 128)].reshaped(1, L, 8, 128))
+                        let candQ = DFlash2StridedRMSNorm.launchOffsetRows(
+                            product[.ellipsis, ..<(8 * 128)].reshaped(1, 2 * L, 8, 128),
+                            weight: norm.weight, eps: norm.eps, start: start, rows: L)
+                        let ok = refQ.shape == candQ.shape
+                            && all(refQ.view(dtype: .uint16) .== candQ.view(dtype: .uint16)).item(Bool.self)
+                        try error.check()
+                        same = same && ok
+                        compared += refQ.size
+                    }
+                }
+            }
+        } catch {
+            same = false
+        }
+        FileHandle.standardError.write(
+            (same
+                ? "dflash2 speculative query norm rows: self-test passed (\(compared) values bitwise); no dynamic slice\n"
+                : "dflash2 speculative query norm rows: self-test failed; dynamic slice kept\n").data(using: .utf8)!)
+        return same
+    }()
+}
+
 // MARK: - Head RMSNorm over a strided view
 
 /// The drafter's q and k head norms read the stacked q|k|v product through
@@ -4594,7 +4825,29 @@ enum DFlash2StridedRMSNorm {
         name: "dflash2_strided_rms_single_row",
         inputNames: ["x", "w", "eps"],
         outputNames: ["out"],
-        source: """
+        source: source,
+        ensureRowContiguous: false)
+
+    /// `source` for the rows `st[0] ..< st[0] + TO` of `x` (a device-valued
+    /// first row): the same body on the same elements, only the row index is
+    /// offset (`DFlash2SpeculativeRows.queryNorm`).
+    static let offsetRowsKernel: MLXFast.MLXFastKernel = {
+        var text = source
+        for (target, replacement) in [
+            ("const uint T = uint(x_shape[1]);", "const uint T = uint(TO);"),
+            ("int64_t(t) * x_strides[1]", "int64_t(t + uint(st[0])) * x_strides[1]"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "DFlash 2: the strided head norm source no longer matches")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        return MLXFast.metalKernel(
+            name: "dflash2_strided_rms_offset_rows", inputNames: ["x", "w", "eps", "st"],
+            outputNames: ["out"], source: text, ensureRowContiguous: false)
+    }()
+
+    private static let source = """
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -4656,21 +4909,47 @@ enum DFlash2StridedRMSNorm {
                 }
               }
             }
-            """,
-        ensureRowContiguous: false)
+            """
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
     nonisolated(unsafe) private static var epsArrays: [Float: MLXArray] = [:]
 
-    private static func epsArray(_ eps: Float) -> MLXArray {
+    static func epsArray(_ eps: Float) -> MLXArray {
         if let hit = epsArrays[eps] { return hit }
         let made = MLXArray([eps])
         epsArrays[eps] = made
         return made
     }
 
-    private static func launch(_ x: MLXArray, weight: MLXArray, eps: MLXArray) -> MLXArray {
+    /// `apply(norm, x[0..., st ..< st + rows])` for a device-valued first row
+    /// `start` (`[1]` int32), or nil when `apply` would not take the kernel.
+    static func applyOffsetRows(_ norm: RMSNorm, _ x: MLXArray, start: MLXArray, rows: Int)
+        -> MLXArray?
+    {
+        let weight = norm.weight
+        guard x.ndim == 4, x.dim(3) <= 128, x.dim(3) % 4 == 0, rows <= x.dim(1),
+            weight.ndim == 1, weight.dim(0) == x.dim(3), weight.dtype == x.dtype,
+            [DType.bfloat16, .float16].contains(x.dtype), x.size < Int(Int32.max),
+            start.size == 1, start.dtype == .int32,
+            verified(x.dtype, headDim: x.dim(3), eps: norm.eps),
+            DFlash2SpeculativeRows.queryNormVerified
+        else { return nil }
+        return launchOffsetRows(x, weight: weight, eps: norm.eps, start: start, rows: rows)
+    }
+
+    static func launchOffsetRows(
+        _ x: MLXArray, weight: MLXArray, eps: Float, start: MLXArray, rows: Int
+    ) -> MLXArray {
+        let epsA: MLXArray = lock.withLock { epsArray(eps) }
+        let (b, h, d) = (x.dim(0), x.dim(2), x.dim(3))
+        return offsetRowsKernel(
+            [x, weight, epsA, start], template: [("OutT", x.dtype), ("D", d), ("TO", rows)],
+            grid: (32 * b * rows * h, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[b, rows, h, d]], outputDTypes: [x.dtype])[0]
+    }
+
+    static func launch(_ x: MLXArray, weight: MLXArray, eps: MLXArray) -> MLXArray {
         let (b, t, h, d) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
         return kernel(
             [x, weight, eps],
@@ -4680,9 +4959,11 @@ enum DFlash2StridedRMSNorm {
     }
 
     /// `norm(x)` for a `[B, T, H, D]` view whose rows of `D` are contiguous.
-    static func apply(_ norm: RMSNorm, _ x: MLXArray) -> MLXArray {
+    /// `speculative`: the speculative block's call, under its own switch
+    /// (`DFlash2Attention.speculativeStridedNorms`) rather than `enabled`.
+    static func apply(_ norm: RMSNorm, _ x: MLXArray, speculative: Bool = false) -> MLXArray {
         let weight = norm.weight
-        guard enabled, x.ndim == 4, x.dim(3) <= 128, x.dim(3) % 4 == 0,
+        guard speculative || enabled, x.ndim == 4, x.dim(3) <= 128, x.dim(3) % 4 == 0,
             weight.ndim == 1, weight.dim(0) == x.dim(3), weight.dtype == x.dtype,
             [DType.bfloat16, .float16].contains(x.dtype),
             x.size < Int(Int32.max),
@@ -4694,7 +4975,7 @@ enum DFlash2StridedRMSNorm {
 
     /// Runs the self-test for this dtype and head size now (load time).
     static func prepare(dtype: DType, headDim: Int, eps: Float) {
-        guard enabled, [DType.bfloat16, .float16].contains(dtype), headDim <= 128,
+        guard enabled || DFlash2Attention.speculativeStridedNorms, [DType.bfloat16, .float16].contains(dtype), headDim <= 128,
             headDim % 4 == 0
         else { return }
         _ = verified(dtype, headDim: headDim, eps: eps)
@@ -4774,7 +5055,40 @@ enum DFlash2QKPrework {
         name: "dflash2_qk_prework",
         inputNames: ["y", "qw", "kw", "p", "pos"],
         outputNames: ["q", "k"],
-        source: """
+        source: source,
+        ensureRowContiguous: true)
+
+    /// `source` for the speculative block (`DFlash2Attention.speculative`):
+    /// the q rows start at the device-valued confirmed count `st[0]` instead
+    /// of `n - BL`, and rotate at `pos[0] + st[0]` (the block's query offset);
+    /// every other expression is the stock text.
+    private static let speculativeKernel: MLXFast.MLXFastKernel = {
+        var text = source
+        for (target, replacement) in [
+            ("(isQ ? n - BL + t : t)", "(isQ ? uint(st[0]) + t : t)"),
+            ("static_cast<float>(t + uint(pos[isQ ? 0 : 1]))",
+             "static_cast<float>(t + uint(pos[isQ ? 0 : 1]) + (isQ ? uint(st[0]) : 0u))"),
+        ] {
+            precondition(
+                text.components(separatedBy: target).count == 2,
+                "DFlash 2: the q/k prework source no longer matches")
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        return MLXFast.metalKernel(
+            name: "dflash2_qk_prework_spec", inputNames: ["y", "qw", "kw", "p", "pos", "st"],
+            outputNames: ["q", "k"], source: text, ensureRowContiguous: true)
+    }()
+
+    /// `MLXFAST_DFLASH_SPEC_QK_PREWORK=1` turns the speculative form on (off
+    /// by default, as `MLXFAST_DFLASH_QK_PREWORK` for the block forward: the
+    /// same kernel text measured costly on the box). Independent of it.
+    static let speculativeEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_QK_PREWORK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    private static let source = """
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -4840,12 +5154,48 @@ enum DFlash2QKPrework {
               float rx2 = x1 * sintheta + x2 * costheta;
               o[i] = static_cast<T>(lo ? rx1 : rx2);
             }
-            """,
-        ensureRowContiguous: true)
+            """
 
     private static let lock = NSLock()
     /// `[eps, log2(base), scale]` per self-tested geometry.
     nonisolated(unsafe) private static var ready: [String: MLXArray] = [:]
+    /// The geometries whose speculative form also passed.
+    nonisolated(unsafe) private static var readySpeculative: Set<String> = []
+
+    private static func launchSpeculative(
+        _ y: MLXArray, _ l: Int, _ hq: Int, _ hk: Int, _ qw: MLXArray, _ kw: MLXArray,
+        _ p: MLXArray, queryBase: Int, keyOffset: Int, start: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let (b, n, d) = (y.dim(0), y.dim(1), qw.dim(0))
+        let out = speculativeKernel(
+            [y, qw, kw, p, MLXArray([Int32(queryBase), Int32(keyOffset), Int32(l)]), start],
+            template: [("T", y.dtype), ("D", d), ("HQ", hq), ("HK", hk)],
+            grid: (32 * b * (l * hq + n * hk), 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[b, hq, l, d], [b, hk, n, d]], outputDTypes: [y.dtype, y.dtype])
+        return (out[0], out[1])
+    }
+
+    /// The speculative block's `(rope(qNorm(q)), rope(kNorm(k)))`: the q rows
+    /// `start ..< start + l` of the stacked product rotated at `queryBase +
+    /// start`, every row's k at `keyOffset`; nil when it does not apply.
+    static func applySpeculative(
+        _ y: MLXArray, blockRows l: Int, heads hq: Int, qNorm: RMSNorm, kNorm: RMSNorm,
+        queryBase: Int, keyOffset: Int, start: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let d = qNorm.weight.dim(0)
+        let hk = (y.dim(-1) / d - hq) / 2
+        let key = "\(y.dtype) \(hq) \(hk) \(qNorm.eps)"
+        guard speculativeEnabled, y.ndim == 3, y.dim(0) == 1, d == 128,
+            y.dim(2) == (hq + 2 * hk) * d, hk > 0, 2 * l == y.dim(1), qNorm.eps == kNorm.eps,
+            kNorm.weight.shape == [d], qNorm.weight.dtype == y.dtype,
+            kNorm.weight.dtype == y.dtype, queryBase >= 0, keyOffset >= 0,
+            queryBase + y.dim(1) < Int(Int32.max), start.size == 1, start.dtype == .int32,
+            let p = lock.withLock({ readySpeculative.contains(key) ? ready[key] : nil })
+        else { return nil }
+        return launchSpeculative(
+            y, l, hq, hk, qNorm.weight, kNorm.weight, p, queryBase: queryBase,
+            keyOffset: keyOffset, start: start)
+    }
 
     private static func launch(
         _ y: MLXArray, _ l: Int, _ hq: Int, _ hk: Int, _ qw: MLXArray, _ kw: MLXArray,
@@ -4883,7 +5233,9 @@ enum DFlash2QKPrework {
         rope: RoPELayer, base: Float, dtype: DType, heads hq: Int, kvHeads hk: Int,
         headDim d: Int, eps: Float
     ) {
-        guard enabled, d == 128, hk > 0, [DType.bfloat16, .float16].contains(dtype) else { return }
+        guard enabled || speculativeEnabled, d == 128, hk > 0,
+            [DType.bfloat16, .float16].contains(dtype)
+        else { return }
         lock.withLock {
             let key = "\(dtype) \(hq) \(hk) \(eps)"
             guard ready[key] == nil else { return }
@@ -4931,10 +5283,54 @@ enum DFlash2QKPrework {
                 same = false
             }
             if same { ready[key] = p }
+            if same, speculativeEnabled {
+                var spec = true
+                var specCompared = 0
+                do {
+                    try withError { error in
+                        let (l, n, w) = (16, 32, hq + 2 * hk)
+                        let y = (MLXRandom.normal([1, n, w * d], key: MLXRandom.key(74))
+                            * exp(MLXRandom.uniform(Float(-7) ..< Float(8), [1, n, 1], key: MLXRandom.key(75))))
+                            .asType(dtype)
+                        let qw = (1 + 0.3 * MLXRandom.normal([d], key: MLXRandom.key(76))).asType(dtype)
+                        let kw = (1 + 0.3 * MLXRandom.normal([d], key: MLXRandom.key(77))).asType(dtype)
+                        for (c, base, koff) in [(1, 37, 53), (8, 4077, 4077), (16, 65514, 65500)] {
+                            let (fq, fk) = launchSpeculative(
+                                y, l, hq, hk, qw, kw, p, queryBase: base, keyOffset: koff,
+                                start: MLXArray([Int32(c)]))
+                            let rq = rope(
+                                MLXFast.rmsNorm(
+                                    y[0..., c ..< (c + l), ..<(hq * d)].reshaped(1, l, hq, d),
+                                    weight: qw, eps: eps
+                                ).transposed(0, 2, 1, 3), offset: MLXArray(Int32(base)) + MLXArray(Int32(c)))
+                            let rk = rope(
+                                MLXFast.rmsNorm(
+                                    y[0..., 0..., (hq * d) ..< ((hq + hk) * d)].reshaped(1, n, hk, d),
+                                    weight: kw, eps: eps
+                                ).transposed(0, 2, 1, 3), offset: koff)
+                            for (f, r) in [(fq, rq), (fk, rk)] {
+                                spec = spec && f.shape == r.shape
+                                    && all(f.view(dtype: .uint16) .== r.view(dtype: .uint16)).item(Bool.self)
+                                specCompared += r.size
+                            }
+                        }
+                        try error.check()
+                    }
+                } catch {
+                    spec = false
+                }
+                if spec { readySpeculative.insert(key) }
+                FileHandle.standardError.write(
+                    ("dflash2 q/k norm+rope prework, speculative block (\(key)): "
+                        + (spec
+                            ? "self-test passed: \(specCompared) values compared bitwise; one launch\n"
+                            : "self-test failed; norms and ropes kept\n")).data(using: .utf8)!)
+            }
             FileHandle.standardError.write(
                 ("dflash2 q/k norm+rope prework (\(key)): "
                     + (same
-                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; "
+                            + (enabled ? "one launch\n" : "block forward off\n")
                         : "self-test failed; norms and ropes kept\n")).data(using: .utf8)!)
         }
     }
@@ -5051,6 +5447,195 @@ enum DFlash2SwiGLU {
                         ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
                         : "self-test failed; silu(g) * u kept\n")).data(using: .utf8)!)
             return same
+        }
+    }
+}
+
+/// A prompt's context rows entering a DFlash 2 layer's empty cache
+/// (`DFlash2Attention.absorbContext`) in ONE launch: per (row, kv head) the
+/// key is read through its strides from the k|v product, normed as MLX's
+/// `rms_single_row` norms it (the same `acc += x * x` chain, `simd_sum`,
+/// zeroed 32-slot pass, `precise::rsqrt(acc / axis + eps)`,
+/// `w * T(x * inv)`), rotated as MLX's `rope` kernel rotates it (pair
+/// `(j, j + D/2)`, `exp2(-(i / (D/2)) * log2(base))`, `fast::cos`/`fast::sin`
+/// of `scale * float(t + offset) * inv_freq`) and stored straight into the key
+/// buffer; the value rows are copied element for element into the value
+/// buffer. The chain it replaces is four launches per layer (the strided copy
+/// the norm makes, the norm, the rotation and the cache's one-launch first
+/// append, `CBv2KVFirstAppend`); every stored value is that chain's, and the
+/// rows past the context are left unwritten as that append leaves them.
+/// Checked bit for bit against the chain once per geometry at bind; a
+/// mismatch keeps the chain. `MLXFAST_DFLASH2_CONTEXT_KV_FUSED=0` keeps it.
+enum DFlash2ContextKVFirst {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_CONTEXT_KV_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // grid (32 * 2 * n * HK), threadgroup 32: the first n * HK threadgroups
+    // own a key row each (row t, head h), the rest a value row.
+    private static let source = """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint axis_size = uint(D);
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+
+            const uint n = uint(k_shape[1]);
+            const bool isK = gid < n * uint(HK);
+            const uint r = isK ? gid : gid - n * uint(HK);
+            const uint h = r % uint(HK);
+            const uint t = r / uint(HK);
+            const size_t obase = (size_t(h) * size_t(capn) + size_t(t)) * size_t(D) + lid * N_READS;
+            if (!isK) {
+              const int64_t vb = int64_t(t) * v_strides[1] + int64_t(h * D + lid * N_READS) * v_strides[2];
+              for (int i = 0; i < N_READS; i++) {
+                vo[obase + i] = v[vb + int64_t(i) * v_strides[2]];
+              }
+              return;
+            }
+            const int64_t kb = int64_t(t) * k_strides[1] + int64_t(h * D + lid * N_READS) * k_strides[2];
+            const device auto* wr = kw + lid * N_READS;
+
+            float acc = 0;
+            float thread_x[N_READS];
+            for (int i = 0; i < N_READS; i++) {
+              thread_x[i] = k[kb + int64_t(i) * k_strides[2]];
+              acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+              local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+              local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              acc = simd_sum(local_sums[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + p[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const bool lo = lid < 16;
+            float Lp = p[2] * static_cast<float>(t + uint(pos[0]));
+            for (int i = 0; i < N_READS; i++) {
+              const T nv = wr[i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+              const float xv = static_cast<float>(nv);
+              const float other = simd_shuffle_xor(xv, ushort(16));
+              float d = static_cast<float>((lid & 15) * N_READS + i) / static_cast<float>(D / 2);
+              float inv_freq = metal::exp2(-d * p[1]);
+              float theta = Lp * inv_freq;
+              float costheta = metal::fast::cos(theta);
+              float sintheta = metal::fast::sin(theta);
+              float x1 = lo ? xv : other;
+              float x2 = lo ? other : xv;
+              float rx1 = x1 * costheta - x2 * sintheta;
+              float rx2 = x1 * sintheta + x2 * costheta;
+              ko[obase + i] = static_cast<T>(lo ? rx1 : rx2);
+            }
+            """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_context_kv_first",
+        inputNames: ["k", "v", "kw", "p", "pos", "capn"],
+        outputNames: ["ko", "vo"],
+        source: source,
+        ensureRowContiguous: false)
+
+    private static let lock = NSLock()
+    /// `[eps, log2(base), scale]` per verified `"dtype kvHeads eps"`.
+    nonisolated(unsafe) private static var ready: [String: MLXArray] = [:]
+
+    private static func launch(
+        _ k: MLXArray, _ v: MLXArray, _ kw: MLXArray, _ p: MLXArray, hk: Int, offset: Int,
+        capacity: Int
+    ) -> (MLXArray, MLXArray) {
+        let (n, d) = (k.dim(1), kw.dim(0))
+        let out = kernel(
+            [k, v, kw, p, MLXArray([Int32(offset)]), MLXArray(Int32(capacity))],
+            template: [("T", k.dtype), ("D", d), ("HK", hk)],
+            grid: (32 * 2 * n * hk, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, hk, capacity, d], [1, hk, capacity, d]],
+            outputDTypes: [k.dtype, v.dtype])
+        return (out[0], out[1])
+    }
+
+    /// The key and value buffers of the chain's first write for `k`, `v`
+    /// (`[1, n, kvHeads * D]`, any strides) at `offset`; nil when it does
+    /// not apply.
+    static func apply(
+        k: MLXArray, v: MLXArray, kNorm: RMSNorm, kvHeads hk: Int, offset: Int, capacity: Int
+    ) -> (MLXArray, MLXArray)? {
+        let d = kNorm.weight.dim(0)
+        guard enabled, k.ndim == 3, v.ndim == 3, k.shape == v.shape, k.dim(0) == 1, d == 128,
+            hk > 0, k.dim(2) == hk * d, k.dtype == v.dtype, kNorm.weight.dtype == k.dtype,
+            kNorm.weight.shape == [d], capacity >= k.dim(1), k.dim(1) > 0, offset >= 0,
+            offset + k.dim(1) < (1 << 24), capacity * hk * d < Int(Int32.max),
+            let p = lock.withLock({ ready["\(k.dtype) \(hk) \(kNorm.eps)"] })
+        else { return nil }
+        return launch(k, v, kNorm.weight, p, hk: hk, offset: offset, capacity: capacity)
+    }
+
+    /// The check against the chain (`rope(rmsNorm(k))`, the head-transposed
+    /// values) on column slices of a stacked k|v product, at bind.
+    static func prepare(
+        rope: RoPELayer, base: Float, dtype: DType, kvHeads hk: Int, headDim d: Int, eps: Float
+    ) {
+        guard enabled, d == 128, hk > 0, [DType.bfloat16, .float16].contains(dtype) else { return }
+        lock.withLock {
+            let key = "\(dtype) \(hk) \(eps)"
+            guard ready[key] == nil else { return }
+            let p = MLXArray([eps, log2(base), 1])
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    for (seed, n, off, cap) in [(81, 512, 0, 2047), (82, 37, 4077, 64)] {
+                        let w = 2 * hk
+                        let index = MLXArray(0 ..< n * w).reshaped(n, w, 1)
+                        // Head rows from 1e-3 to 3e3 and a zero key row.
+                        let scale = exp(MLXRandom.uniform(
+                            Float(-7) ..< Float(8), [n, w, 1], key: MLXRandom.key(UInt64(seed))))
+                            * (index .!= MLXArray(Int32((n - 1) * w + 1))).asType(.float32)
+                        let y = (MLXRandom.normal(
+                            [n, w, d], key: MLXRandom.key(UInt64(seed + 100))) * scale)
+                            .asType(dtype).reshaped(1, n, w * d)
+                        let kw = (1 + 0.3 * MLXRandom.normal(
+                            [d], key: MLXRandom.key(UInt64(seed + 300)))).asType(dtype)
+                        let k = y[.ellipsis, ..<(hk * d)]
+                        let v = y[.ellipsis, (hk * d)...]
+                        let (fk, fv) = launch(k, v, kw, p, hk: hk, offset: off, capacity: cap)
+                        let rk = rope(
+                            MLXFast.rmsNorm(k.reshaped(1, n, hk, d), weight: kw, eps: eps)
+                                .transposed(0, 2, 1, 3), offset: off)
+                        let rv = v.reshaped(1, n, hk, d).transposed(0, 2, 1, 3)
+                        for (f, r) in [(fk[.ellipsis, ..<n, 0...], rk), (fv[.ellipsis, ..<n, 0...], rv)] {
+                            same = same && f.shape == r.shape
+                                && all(f.view(dtype: .uint16) .== r.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            compared += r.size
+                        }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            if same { ready[key] = p }
+            FileHandle.standardError.write(
+                ("dflash2 context K/V first write: self-test "
+                    + (same
+                        ? "passed (\(compared) values bitwise); norm, rope and both buffers in one launch\n"
+                        : "FAILED; chain kept\n")).data(using: .utf8)!)
         }
     }
 }

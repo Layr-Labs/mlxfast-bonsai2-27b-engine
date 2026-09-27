@@ -742,13 +742,17 @@ public final class EngineLoopV2: @unchecked Sendable {
     var logitDiagnostic: CBv2LogitDiagnosticState?
     var attentionMetadata: CBv2AttentionMetadataState?
     var attentionPacket: CBv2AttentionPacketState?
-    private var draining = false
+    private(set) var draining = false
     private var drainWaiters: [CBv2DrainWaiter] = []
     /// True after a rejecting MTP round advanced rows OUTSIDE the eager
     /// provider's caches' host truth: the next eager bind must be forced to
     /// rebuild `positionOffsets` from host truth (see `eagerCaches`).
     /// Sole writer: `mtpFinalize` in EngineLoopV2+MTPFinalize.swift.
     var eagerCompositionStale = false
+    /// The next lookup round's verify, built before this round's readback and
+    /// kept by it (`CBv2LookupSpeculativeVerify`); adopted or dropped within
+    /// the same engine step.
+    var mtpLookupSpeculation: CBv2MTPLookupSpeculation?
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -1029,6 +1033,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             Stream.gpu.synchronize()
             Stream.cpu.synchronize()
         }
+        mtpDropLookupSpeculation(settle: true)
         mtp?.removeAllRequestState()
         logitDiagnostic = nil
         attentionMetadata?.discardPendingForward()
@@ -2177,6 +2182,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func engineStep() {
         let joinedWorkInterval = engineWorkInterval.stepBegan()
         defer { if joinedWorkInterval { engineWorkInterval.stepEnded() } }
+        // A verify built ahead that this step's round did not adopt.
+        defer { mtpDropLookupSpeculation() }
         guard running else { return }
         if let suspendedAt = suspendStepExecutionAtCountForTesting,
             stepCount >= suspendedAt
@@ -3946,6 +3953,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ id: CBv2RequestID, reason: CBv2FinishReason, nowNanos: UInt64? = nil,
         now: ContinuousClock.Instant? = nil
     ) {
+        // A verify built ahead never outlives its request, nor runs past it.
+        if mtpLookupSpeculation?.id == id { mtpDropLookupSpeculation(settle: true) }
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous

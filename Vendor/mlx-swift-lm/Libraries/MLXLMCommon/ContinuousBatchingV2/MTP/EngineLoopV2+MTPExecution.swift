@@ -144,6 +144,12 @@ extension EngineLoopV2 {
     func mtpBuildRoundGraph(
         _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver, launchNanos: UInt64
     ) throws -> CBv2MTPGraphBuild {
+        // A verify built ahead serves only a step that is that one round.
+        if let ahead = mtpLookupSpeculation,
+            work.count != 1 || work[0].carry == nil || work[0].rec.id != ahead.id
+        {
+            mtpDropLookupSpeculation()
+        }
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
@@ -525,6 +531,10 @@ extension EngineLoopV2 {
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
+        // The verify built before the previous round's readback, when this
+        // is the round it assumed (`CBv2LookupSpeculativeVerify`).
+        let adopted = mtpAdoptLookupSpeculation(rows: verifyRows, k: k)
+        var lookupIDs: [Int]?
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
         var assistantOwnersTransferred = false
@@ -573,8 +583,10 @@ extension EngineLoopV2 {
                 captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
                 captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
             } else {
+                // An adopted verify already wrote its window.
+                let offset = carry.kvOffset + (adopted == nil ? 0 : 1 + k)
                 precondition(
-                    state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
+                    state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == offset },
                     "CBv2 request-stateful MTP target KV is not aligned with its carry")
             }
             rowMetadata.append(
@@ -630,12 +642,15 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                    lookupIDs = k == early.depth ? early.lookupIDs : nil
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
-                    proposal = CBv2PromptLookupDraft.override(
+                    let overridden = CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
+                    proposal = overridden.tokens
+                    lookupIDs = overridden.ids
                     CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
@@ -742,10 +757,19 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp,
-            stackedTokens: CBv2VerifyTokenStack.tokens(
-                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
+        let target: CBv2MTPTargetBuild
+        if let adopted {
+            target = adopted.target
+            mtp.recordVerificationStrategy(rectangular: true)
+        } else {
+            guard
+                let built = try mtpBuildTargetVerification(
+                    columns: targetColumns, rows: verifyRows, driver: mtp,
+                    stackedTokens: CBv2VerifyTokenStack.tokens(
+                        seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
+            else { preconditionFailure("CBv2 MTP: target verification built nothing") }
+            target = built
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -774,6 +798,7 @@ extension EngineLoopV2 {
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.lookupIDs = batch == 1 ? lookupIDs : nil
         return result
     }
 

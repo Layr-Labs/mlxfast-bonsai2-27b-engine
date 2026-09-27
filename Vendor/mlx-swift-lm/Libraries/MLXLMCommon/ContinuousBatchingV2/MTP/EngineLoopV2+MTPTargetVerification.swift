@@ -43,6 +43,17 @@ enum CBv2VerifyTokenStack {
     }
 }
 
+/// One target verification's lazy outputs (`mtpBuildTargetVerification`).
+typealias CBv2MTPTargetBuild = (
+    scores: MLXArray, hidden: MLXArray,
+    shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+    policyTopTwo: (ids: MLXArray, values: MLXArray)?,
+    cacheInnerState: [MLXArray],
+    diagnostics: [CBv2LogitDiagnosticPacket],
+    recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
+    blockContext: MLXArray?
+)
+
 extension EngineLoopV2 {
 
     /// Serial mode is the chip-independent authority path: every column
@@ -66,18 +77,16 @@ extension EngineLoopV2 {
     /// with genuine target samples drawn with the request's real sampler
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
+    ///
+    /// `speculative`: a verify built ahead of its round
+    /// (`CBv2LookupSpeculativeVerify`) over these already-bound recurrent
+    /// transactions. It records no strategy (the adopting round does) and
+    /// returns nil, before building anything, unless it verifies
+    /// rectangularly. nil only then.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        stackedTokens: MLXArray? = nil
-    ) throws -> (
-        scores: MLXArray, hidden: MLXArray,
-        shortlist: (ids: MLXArray, massScaled: MLXArray)?,
-        policyTopTwo: (ids: MLXArray, values: MLXArray)?,
-        cacheInnerState: [MLXArray],
-        diagnostics: [CBv2LogitDiagnosticPacket],
-        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
-        blockContext: MLXArray?
-    ) {
+        stackedTokens: MLXArray? = nil, speculative: [CBv2RecurrentStateEvaluation]? = nil
+    ) throws -> CBv2MTPTargetBuild? {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let scores: MLXArray
@@ -167,6 +176,7 @@ extension EngineLoopV2 {
         if useRectangular, recurrentModel != nil,
             recurrentModel?.supportsCapturedVerifyWindow != true
         {
+            if speculative != nil { return nil }
             if mtp.usesRequestStatefulDrafter {
                 preconditionFailure(
                     "CBv2 production request-stateful MTP requires captured rectangular verification")
@@ -196,6 +206,7 @@ extension EngineLoopV2 {
         if useRectangular {
             serializingCaches = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
             if serializingCaches.count != caches.count {
+                if speculative != nil { return nil }
                 if mtp.usesRequestStatefulDrafter, recurrentModel != nil {
                     preconditionFailure(
                         "CBv2 production request-stateful MTP cache lacks rectangular serialization")
@@ -204,7 +215,11 @@ extension EngineLoopV2 {
                 useRectangular = false
             }
         }
-        mtp.recordVerificationStrategy(rectangular: useRectangular)
+        if speculative != nil {
+            guard useRectangular, recurrentModel != nil else { return nil }
+        } else {
+            mtp.recordVerificationStrategy(rectangular: useRectangular)
+        }
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
@@ -288,7 +303,7 @@ extension EngineLoopV2 {
                 // recurrent layer. Finalize commits the accepted position
                 // (device-side slice) or rolls the transaction back — no
                 // repair forward on either path.
-                let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
+                let evaluations = speculative ?? rows.map { row -> CBv2RecurrentStateEvaluation in
                     guard let state = recurrentStates[row.rec.id] else {
                         preconditionFailure(
                             "CBv2 recurrent MTP state missing for \(row.rec.id)")

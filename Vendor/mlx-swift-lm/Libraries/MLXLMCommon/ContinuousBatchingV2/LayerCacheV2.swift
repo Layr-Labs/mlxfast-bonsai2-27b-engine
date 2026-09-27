@@ -180,6 +180,34 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return blocks
     }
 
+    /// `CBv2PromptFirstAppendAdopting`: the capacity when this chunk would
+    /// take `updateAndAttendQueryBlocks` with its row's one-launch first append.
+    public func promptFirstAppendCapacity(queryCount: Int) -> Int? {
+        guard kind.sharesKVWithLayer == nil, attentionMetadata == nil, attentionPacket == nil,
+            rows.count == 1, boundSpanContexts?.contains(where: { $0 != nil }) != true,
+            CBv2AttentionV1.shouldBlockQueries(queryCount), !kind.isBidirectional,
+            let row = rows[0] as? CBv2FullSequenceKV
+        else { return nil }
+        return row.firstAppendCapacity(rows: queryCount)
+    }
+
+    public func adoptFirstAppendAndAttendQueryBlocks(
+        queries: MLXArray, keysBuffer: MLXArray, valuesBuffer: MLXArray, count: Int,
+        advancedOffsets: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]? {
+        guard queries.dim(0) == 1, queries.dim(2) == count,
+            promptFirstAppendCapacity(queryCount: count) == keysBuffer.dim(2),
+            let row = rows[0] as? CBv2FullSequenceKV
+        else { return nil }
+        let blocks = CBv2AttentionV1.adoptAndAttendQueryBlocks(
+            row: row, kind: kind, queries: queries, keysBuffer: keysBuffer,
+            valuesBuffer: valuesBuffer, count: count, scale: scale, sinks: sinks,
+            softcap: attentionSoftcap)
+        // `updateAndAttendQueryBlocks`'s offset advance, formed by the caller.
+        cachedPositionOffsets = advancedOffsets
+        return blocks
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk
@@ -297,6 +325,21 @@ enum CBv2HostPositionOffsets {
 // MARK: - Final-layer last-query prefill
 
 extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
+
+/// A cache whose one-row prompt chunk's first K/V append can take buffers the
+/// model formed in its own launch (the attention prework writing the keys and
+/// values straight into them) together with the advanced position offsets;
+/// the same state, the same views and the same block attention as
+/// `updateAndAttendQueryBlocks`. Capacity nil: take the ordinary update.
+public protocol CBv2PromptFirstAppendAdopting: CBv2AttendingLayerCache {
+    func promptFirstAppendCapacity(queryCount: Int) -> Int?
+    func adoptFirstAppendAndAttendQueryBlocks(
+        queries: MLXArray, keysBuffer: MLXArray, valuesBuffer: MLXArray, count: Int,
+        advancedOffsets: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]?
+}
+
+extension CBv2LayerCache: CBv2PromptFirstAppendAdopting {}
 
 // MARK: - Keep-mask support
 

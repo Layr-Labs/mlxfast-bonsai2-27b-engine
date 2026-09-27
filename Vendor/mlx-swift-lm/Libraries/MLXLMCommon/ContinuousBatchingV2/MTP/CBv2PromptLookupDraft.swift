@@ -70,14 +70,17 @@ enum CBv2PromptLookupDraft {
         return lock.withLock { fromPrompt.contains(id) }
     }
 
-    /// The next round's ids from the prompt, or nil (then the drafter runs).
-    static func lookup(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+    /// The next round's ids from the prompt (also on the host), or nil (then
+    /// the drafter runs).
+    static func lookup(history: [Int], promptLength: Int, depth: Int) -> (
+        tokens: MLXArray, ids: [Int]
+    )? {
         guard enabled, depth > 0,
             let hit = continuation(history: history, promptLength: promptLength, depth: depth)
         else { return nil }
         FileHandle.standardError.write(
             Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth), drafter skipped\n".utf8))
-        return MLXArray(hit.ids, [1, depth])
+        return (MLXArray(hit.ids, [1, depth]), hit.ids)
     }
 
     /// `MLXFAST_DFLASH_SPLICE=0` keeps the host lookup alone (the block is
@@ -103,21 +106,24 @@ enum CBv2PromptLookupDraft {
     static let spliceTrace: Bool =
         ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_TRACE"] == "1"
 
-    /// The proposal, or the same object when lookup does not apply.
+    /// The proposal, or the same object when lookup does not apply; `ids`
+    /// holds a prompt lookup's ids on the host.
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
-    ) -> MLXArray {
+    ) -> (tokens: MLXArray, ids: [Int]?) {
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
-        else { return proposal }
+        else { return (proposal, nil) }
         if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
             FileHandle.standardError.write(
                 Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
-            return MLXArray(hit.ids, [1, depth])
+            return (MLXArray(hit.ids, [1, depth]), hit.ids)
         }
-        guard spliceEnabled else { return proposal }
-        return splice(proposal, history: history, promptLength: promptLength, depth: depth)
-            ?? proposal
+        guard spliceEnabled else { return (proposal, nil) }
+        return (
+            splice(proposal, history: history, promptLength: promptLength, depth: depth)
+                ?? proposal, nil
+        )
     }
 
     /// The drafter's block, continued along the prompt span it is quoting.
@@ -278,21 +284,56 @@ enum CBv2PromptLookupDraft {
     }
 }
 
-/// Whether the next verify forward has no drafter block queued ahead of it on
-/// the GPU (a round whose ids came from the prompt with the drafter skipped).
-/// The verify's early-submission plan assumes a ~6 ms block ahead to hide the
-/// host's first layers; without it the GPU waits for them, so that verify
-/// submits sooner (`Qwen35TrunkSubmission.verifyUnqueued`). Set and taken on
-/// the engine thread, which builds the verify right after the finalize that
-/// sets it.
-public enum CBv2VerifyQueueHint {
-    nonisolated(unsafe) private static var nothingAhead = false
+// THE NEXT LOOKUP ROUND BEFORE THE READBACK. A lookup round's ids are the
+// prompt's own tokens; when that round is accepted in full its bonus is the
+// target's argmax after the span, and a prompt that keeps being copied puts the
+// token the span's continuation holds there. The round after it is then a
+// lookup round too, whose ids and anchor the committed history ALREADY fixes if
+// the round in flight commits in full. So its verify is built while the
+// round in flight still runs on the GPU, on the KV rows and the recurrent state
+// that round's full commit leaves (`bindAssumingFullAcceptance`), and its
+// leading layers are submitted before the readback: the GPU goes from one
+// verify into the next without waiting on the host's readback, finalize and
+// graph build. The readback then decides. A round accepted in full whose bonus
+// is the predicted anchor keeps the built verify: the next round's step adopts
+// it after checking that its plan, carry, anchor, ids and offsets are the ones
+// assumed (`EngineLoopV2.mtpBuildVerifyGraph`). Anything else drops it before
+// the round's finalize touches any state: the KV rows get their arrays,
+// capacity and offsets back (`CBv2FullSequenceKV.restore`), the recurrent
+// successor is discarded, and the round finalizes and the next verify is built
+// exactly as without it. The target still decides every token; the verify it
+// runs is the same graph over the same inputs, only built earlier.
+//
+// Only a greedy single row on contiguous storage whose round in flight took
+// its ids from the prompt lookup, with the next round's drafter skipped
+// (`CBv2PromptLookupDraft.skipEnabled`), takes it, and only while the
+// request's budget leaves a whole round after the next.
+// `MLXFAST_LOOKUP_SPEC_VERIFY=0` turns it off.
+public enum CBv2LookupSpeculativeVerify {
+    public static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_LOOKUP_SPEC_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return CBv2PromptLookupDraft.enabled && CBv2PromptLookupDraft.skipEnabled
+            && !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
-    public static func markNothingAhead() { nothingAhead = true }
+    /// `MLXFAST_LOOKUP_SPEC_VERIFY=drop` (test aid): every verify built ahead
+    /// is dropped, alternately at the readback and when its round would adopt
+    /// it, so both discard paths run; the output must not change.
+    static let dropsAll = ProcessInfo.processInfo.environment["MLXFAST_LOOKUP_SPEC_VERIFY"] == "drop"
+    nonisolated(unsafe) static var drops = 0
 
-    /// The hint for the verify being built now, cleared as it is read.
-    public static func takeNothingAhead() -> Bool {
-        defer { nothingAhead = false }
-        return nothingAhead
+    /// Early submissions of the verify being built ahead, held instead of
+    /// submitted (nil when no such build runs): the leading one goes to the
+    /// GPU right before the readback, the rest with the adopted round.
+    nonisolated(unsafe) static var held: [[MLXArray]]?
+
+    /// A target forward's early submission (`Qwen35TrunkSubmission`).
+    public static func submit(_ arrays: [MLXArray]) {
+        if held != nil {
+            held!.append(arrays)
+        } else {
+            asyncEval(arrays)
+        }
     }
 }

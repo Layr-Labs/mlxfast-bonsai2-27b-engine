@@ -158,6 +158,10 @@ extension EngineLoopV2 {
         {
             speculation = (metadata.id, block, speculative)
         }
+        // The next lookup round's verify, built and led onto the GPU before
+        // this round's readback (`CBv2LookupSpeculativeVerify`).
+        let lookupSpeculation =
+            speculation == nil ? mtpSpeculateLookupRound(step, verify: verify, driver: mtp) : nil
         // Host readbacks of the MTP round, each counted: an MTP-round
         // finalize adds up to three syncs to the step's one (seed policy
         // margin above, acceptance packet, verify policy margin). Serial
@@ -173,6 +177,24 @@ extension EngineLoopV2 {
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
+        // Kept only when this round took its ids in full and its bonus is the
+        // anchor assumed; else dropped before anything below reads the state.
+        if let lookupSpeculation {
+            let drafts = (0 ..< k).map { Int(host[$0]) }
+            let targets = (0 ..< targetWidth).map { Int(host[draftCount + $0]) }
+            let live =
+                !step.discard.contains(lookupSpeculation.id)
+                && scheduler.record(for: lookupSpeculation.id) != nil
+            if live,
+                drafts == lookupSpeculation.roundIDs, Array(targets[..<k]) == drafts,
+                targets[k] == lookupSpeculation.anchor,
+                !CBv2LookupSpeculativeVerify.dropsAll || CBv2LookupSpeculativeVerify.drops % 2 == 1
+            {
+                mtpLookupSpeculation = lookupSpeculation
+            } else {
+                mtpDiscardLookupSpeculation(lookupSpeculation, settle: !live)
+            }
+        }
 
         struct RowOutcome {
             let batchIndex: Int
@@ -290,6 +312,12 @@ extension EngineLoopV2 {
                 }
             }
 
+            // The kept verify ahead assumed exactly this round's outcome.
+            if let ahead = mtpLookupSpeculation, ahead.id == id,
+                finishReason != nil || kept.count != targetWidth
+            {
+                mtpDropLookupSpeculation(settle: finishReason != nil)
+            }
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
             round.committedVerifyTokenCount += kept.filter {
@@ -472,17 +500,18 @@ extension EngineLoopV2 {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
                 }
-                if let tokens = promptProposal {
+                if let prompt = promptProposal {
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
-                    CBv2VerifyQueueHint.markNothingAhead()
                     earlyBlock = CBv2MTPEarlyBlockProposal(
-                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                        tokens: prompt.tokens, depth: k, anchor: anchor, kvOffset: kvOffset,
+                        lookupIDs: prompt.ids)
                 } else if let drafted = proposal {
                     // Same object when no unique prompt span matches. The
                     // drafter graph stays in `drafted` either way.
-                    let tokens = CBv2PromptLookupDraft.override(
+                    let overridden = CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
+                    let tokens = overridden.tokens
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets = [tokens, drafted] + block.evaluationTargets(for: state)
@@ -492,8 +521,15 @@ extension EngineLoopV2 {
                         asyncEval(targets)
                     }
                     earlyBlock = CBv2MTPEarlyBlockProposal(
-                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset,
+                        lookupIDs: overridden.ids)
                 }
+            }
+            // The kept verify ahead assumed exactly these next ids.
+            if let ahead = mtpLookupSpeculation, ahead.id == id,
+                earlyBlock?.lookupIDs != ahead.ids
+            {
+                mtpDropLookupSpeculation()
             }
             // No next block from this finalize (the row finished, or its next
             // round is not a fixed-depth block): its next proposal starts over.
@@ -514,7 +550,10 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
-                    submitCommittedRecurrentState(for: id)
+                    // A verify built ahead already reads this state.
+                    if mtpLookupSpeculation?.id != id {
+                        submitCommittedRecurrentState(for: id)
+                    }
                 } else {
                     precondition(
                         evaluations.count == 1 + k,
@@ -631,5 +670,172 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
+    }
+}
+
+/// The next lookup round's verify, built before its predecessor's readback
+/// (`CBv2LookupSpeculativeVerify`).
+final class CBv2MTPLookupSpeculation {
+    let id: CBv2RequestID
+    let k: Int
+    /// The predecessor's ids; its bonus, predicted, is this round's anchor.
+    let roundIDs: [Int]
+    let anchor: Int
+    /// This round's ids and its anchor's KV offset (the predecessor's end).
+    let ids: [Int]
+    let kvOffset: Int
+    /// The storage rows as they were before this verify's writes.
+    let marks: [(row: CBv2FullSequenceKV, mark: CBv2FullSequenceKV.Mark)]
+    let evaluation: CBv2RecurrentStateEvaluation
+    let target: CBv2MTPTargetBuild
+    /// The only part already on the GPU: the leading layers' submission.
+    let leading: [MLXArray]
+
+    init(
+        id: CBv2RequestID, k: Int, roundIDs: [Int], anchor: Int, ids: [Int], kvOffset: Int,
+        marks: [(row: CBv2FullSequenceKV, mark: CBv2FullSequenceKV.Mark)],
+        evaluation: CBv2RecurrentStateEvaluation, target: CBv2MTPTargetBuild,
+        leading: [MLXArray]
+    ) {
+        (self.id, self.k, self.roundIDs, self.anchor, self.ids, self.kvOffset) =
+            (id, k, roundIDs, anchor, ids, kvOffset)
+        (self.marks, self.evaluation, self.target, self.leading) =
+            (marks, evaluation, target, leading)
+    }
+}
+
+extension EngineLoopV2 {
+    /// Build the next round's verify before this lookup round's readback, on
+    /// the state this round's full commit leaves, and submit its leading
+    /// layers; nil when the next round is not known to be a lookup round of
+    /// this row's (`CBv2LookupSpeculativeVerify`).
+    func mtpSpeculateLookupRound(
+        _ step: CBv2InFlightStep, verify: CBv2MTPRoundInFlight.Verify,
+        driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPLookupSpeculation? {
+        let k = verify.k
+        guard CBv2LookupSpeculativeVerify.enabled, mtpLookupSpeculation == nil,
+            let roundIDs = verify.lookupIDs, roundIDs.count == k, verify.rows.count == 1,
+            let id = verify.rows.first?.id, !step.discard.contains(id),
+            let rec = scheduler.record(for: id), mtp.config.fixedDraftTokens == k,
+            mtp.usesRequestStatefulDrafter, mtp.blockDrafter != nil,
+            CBv2PromptLookupDraft.expectsPromptProposal(id),
+            logitDiagnostic == nil, hybridPrefixCache == nil, completeCheckpointCapture == nil,
+            forwardShapeRecorder == nil, attentionMetadata == nil, attentionPacket == nil,
+            !backend.requiresMaterializedSnapshots, multimodalByID[id] == nil,
+            rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon,
+            rec.request.stopStrings.isEmpty, rec.request.tokenConstraint == nil,
+            let recurrent = recurrentStates[id], let state = kvStates[id]
+        else { return nil }
+        let promptLength = rec.request.promptTokens.count
+        // The history a full commit leaves: this round's ids, then the token
+        // the prompt holds after them as the bonus. Its finalize then scans
+        // and skips the drafter for the next round: no stop token among them,
+        // and a whole round left after it.
+        guard
+            let wide = CBv2PromptLookupDraft.continuation(
+                history: rec.tokens, promptLength: promptLength, depth: k + 1),
+            Array(wide.ids.prefix(k)) == roundIDs
+        else { return nil }
+        let emitted = wide.ids
+        guard !emitted.contains(where: { rec.request.stopTokens.contains($0) }),
+            rec.request.maxTokens - (rec.generatedTokenCount + emitted.count) > k,
+            let next = CBv2PromptLookupDraft.continuation(
+                history: rec.tokens + emitted, promptLength: promptLength, depth: k)
+        else { return nil }
+        let kvOffset = rec.numComputedTokens
+        var marks: [(row: CBv2FullSequenceKV, mark: CBv2FullSequenceKV.Mark)] = []
+        for row in state.compactMap({ $0 }) {
+            guard let full = row as? CBv2FullSequenceKV, full.absoluteOffset == kvOffset
+            else { return nil }
+            marks.append((full, full.mark()))
+        }
+        guard !marks.isEmpty, let evaluation = recurrent.bindAssumingFullAcceptance() else {
+            return nil
+        }
+        let anchor = emitted[k]
+        let seed = MLXArray([Int32(anchor)]).reshaped([1, 1])
+        let block = MLXArray(next.ids.map(Int32.init)).reshaped([1, k])
+        let columns = [seed] + (0 ..< k).map { block[0..., $0].reshaped([1, 1]) }
+        let row = CBv2MTPRowWork(
+            rec: rec, start: kvOffset, count: 1 + k, samples: true, isDecode: false,
+            isSeed: false,
+            carry: CBv2MTPCarry(
+                token: anchor, hidden: verify.lastHidden, shortlist: nil,
+                previousTopTwoMargin: nil, needsHistoryTransition: false,
+                tokensCount: rec.tokens.count + emitted.count, kvOffset: kvOffset),
+            historyCarry: nil)
+        CBv2LookupSpeculativeVerify.held = []
+        let target = try? mtpBuildTargetVerification(
+            columns: columns, rows: [row], driver: mtp,
+            stackedTokens: CBv2VerifyTokenStack.tokens(seed: seed, block: block, columns: columns),
+            speculative: [evaluation])
+        let held = CBv2LookupSpeculativeVerify.held ?? []
+        CBv2LookupSpeculativeVerify.held = nil
+        guard let target, target.recurrent[id]?.count == 1,
+            target.recurrent[id]?.first === evaluation
+        else {
+            for (row, mark) in marks { row.restore(mark) }
+            try? evaluation.discardAssumedSuccessor()
+            eagerCompositionStale = true
+            return nil
+        }
+        // Behind the round in flight: the next verify's leading layers.
+        let leading = held.first ?? []
+        if !leading.isEmpty { asyncEval(leading) }
+        return CBv2MTPLookupSpeculation(
+            id: id, k: k, roundIDs: roundIDs, anchor: anchor, ids: next.ids, kvOffset: kvOffset,
+            marks: marks, evaluation: evaluation, target: target, leading: leading)
+    }
+
+    /// Drop a verify built ahead: the storage rows and the recurrent state as
+    /// if it had never been built. Its arrays go with the object. `settle`
+    /// (the request is ending, or the engine stopping) also waits until its
+    /// leading layers, the only part it submitted, have finished on the GPU,
+    /// so no work of it is left running once the request is reported done
+    /// and nothing of it reaches the allocator cache after a phase's drain.
+    func mtpDiscardLookupSpeculation(_ speculation: CBv2MTPLookupSpeculation, settle: Bool) {
+        CBv2LookupSpeculativeVerify.drops += 1
+        for (row, mark) in speculation.marks { row.restore(mark) }
+        do { try speculation.evaluation.discardAssumedSuccessor() } catch {
+            preconditionFailure("CBv2 lookup speculation discard failed: \(error)")
+        }
+        eagerCompositionStale = true
+        if settle, !speculation.leading.isEmpty { eval(speculation.leading) }
+    }
+
+    /// Drop the kept verify ahead, if any (see `mtpDiscardLookupSpeculation`);
+    /// it settles by itself when its request is gone or the engine drains.
+    func mtpDropLookupSpeculation(settle: Bool = false) {
+        guard let speculation = mtpLookupSpeculation else { return }
+        mtpLookupSpeculation = nil
+        mtpDiscardLookupSpeculation(
+            speculation,
+            settle: settle || draining || scheduler.record(for: speculation.id) == nil)
+    }
+
+    /// The kept verify, when the round being built is the one it assumed.
+    func mtpAdoptLookupSpeculation(
+        rows: [CBv2MTPRowWork], k: Int
+    ) -> CBv2MTPLookupSpeculation? {
+        guard let speculation = mtpLookupSpeculation else { return nil }
+        mtpLookupSpeculation = nil
+        let end = speculation.kvOffset + 1 + k
+        guard !CBv2LookupSpeculativeVerify.dropsAll, rows.count == 1, let row = rows.first, row.rec.id == speculation.id,
+            k == speculation.k, let carry = row.carry, carry.token == speculation.anchor,
+            carry.kvOffset == speculation.kvOffset, let early = carry.earlyBlock,
+            early.depth == k, early.lookupIDs == speculation.ids,
+            row.rec.numComputedTokens == end,
+            let state = kvStates[row.rec.id],
+            state.compactMap({ $0 }).count == speculation.marks.count,
+            zip(state.compactMap { $0 }, speculation.marks).allSatisfy({
+                $0 === $1.row && $1.row.absoluteOffset == end
+            })
+        else {
+            mtpDiscardLookupSpeculation(speculation, settle: false)
+            return nil
+        }
+        speculation.evaluation.keepAssumedSuccessor()
+        return speculation
     }
 }

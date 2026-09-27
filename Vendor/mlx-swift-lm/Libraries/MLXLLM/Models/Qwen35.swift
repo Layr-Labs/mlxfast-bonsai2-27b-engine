@@ -312,25 +312,18 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        // A first boundary after layer 2 as well: in a round whose ids came
+        // from the prompt no drafter block is queued ahead of the verify, so
+        // the GPU waits for the host's first submission; after two layers it
+        // starts ~0.4 ms sooner (M4: readback to first submission 0.85 to
+        // 0.48 ms). `MLXFAST_VERIFY_FIRST_SLICE=0` keeps [8, 24].
+        let first = env["MLXFAST_VERIFY_FIRST_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let early = ["0", "false", "no", "off"].contains(first ?? "") ? [] : [2]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? early + [8] : early + [8, 24]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
-    }()
-
-    /// The verify plan when nothing is queued ahead of the verify on the GPU
-    /// (`CBv2VerifyQueueHint`: a prompt-lookup round, whose drafter only
-    /// absorbed its context rows). The default plan's first boundary after 8
-    /// layers is sized to hide behind a drafter block; with none, the GPU
-    /// would wait for the host's ~0.8 ms on those 8 layers, so it starts after
-    /// the first 2. `DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES` sets another plan
-    /// (same syntax); `0` keeps the default one.
-    static let verifyUnqueued: Plan = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
-        let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
-        let plan = Plan.parse(raw, default: fallback)
-        return plan.isOff ? verify : plan
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -367,7 +360,7 @@ enum Qwen35TrunkSubmission {
     ) -> Plan? {
         let plan: Plan
         if captureRecurrentWindow {
-            plan = CBv2VerifyQueueHint.takeNothingAhead() ? verifyUnqueued : verify
+            plan = verify
         } else if rows >= promptMinimumRows {
             plan = prompt
         } else {
@@ -2735,6 +2728,12 @@ final class Qwen35DenseSiblingStack {
             capture.partials = partials
             capture.boundary = boundary
             y = Qwen35SmallNMatmul.reduce(partials, after: after)
+        } else if let capture, let partials = Qwen35PromptBAFold.partials(x, weight!) {
+            // Prompt width: the same split-K launches `Qwen35SmallNMatmul.apply`
+            // runs there, the partials handed over (`Qwen35PromptBAFold`).
+            capture.partials = partials
+            capture.boundary = boundary
+            y = Qwen35WideNMatmul.reduce(partials)
         } else {
             y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
         }
@@ -2888,6 +2887,9 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35SplitKFold.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
+            hidden: hiddenSize)
+        Qwen35PromptBAFold.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
         Qwen35GatedDeltaChunked.prepareFresh(
@@ -3287,7 +3289,8 @@ final class Qwen35GatedDeltaNet: Module {
     /// width) and whatever reads `out` see the same arrays.
     private func freshPromptChunk(
         _ inputs: MLXArray, qkv: MLXArray, a: MLXArray, b: MLXArray,
-        modelLayerIndex: Int, recurrentState: [CBv2RecurrentStateEvaluation]
+        modelLayerIndex: Int, recurrentState: [CBv2RecurrentStateEvaluation],
+        baCapture: Qwen35BAPartialsCapture? = nil
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)? {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
@@ -3301,7 +3304,7 @@ final class Qwen35GatedDeltaNet: Module {
                 aDecay: derived.decay(aLog), dtBias: dtBias,
                 normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
                 keyHeads: numKHeads, valueHeads: numVHeads, headKDim: headKDim,
-                headVDim: headVDim)
+                headVDim: headVDim, baCapture: baCapture)
         else { return nil }
         let stateShape = [B, numVHeads, headVDim, headKDim]
         // Whole chunks from the zero state without the zeros array
@@ -3609,14 +3612,18 @@ final class Qwen35GatedDeltaNet: Module {
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
+        // At prompt width the b|a chunk partials may go to the prework
+        // (`Qwen35PromptBAFold`); nil keeps the reduce launch.
+        let promptBA = Qwen35PromptBAFold.active(rows: B * S) ? Qwen35BAPartialsCapture() : nil
         let (qkv, z, b, a) = projectInputs(
             inputs, B: B, S: S, quantized: quantizedInput,
-            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows)
+            narrowStack: Self.narrowStackEnabled && B * S >= BonsaiPromptWidth.minimumRows,
+            baCapture: promptBA)
 
         let processed: (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)
         if let fresh = freshPromptChunk(
             inputs, qkv: qkv, a: a, b: b, modelLayerIndex: modelLayerIndex,
-            recurrentState: recurrentState)
+            recurrentState: recurrentState, baCapture: promptBA)
         {
             processed = fresh
         } else {
@@ -4074,6 +4081,8 @@ final class Qwen35Attention: Module {
 
         super.init()
 
+        CBv2PromptCausalAttention.prepareJoin(
+            heads: attentionHeads, kvHeads: kvHeads, headDim: headDim, scale: scale)
         if let fusedRope {
             Qwen35AttentionPrework.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
@@ -4230,9 +4239,31 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
         var queries: MLXArray
         var keys: MLXArray
-        // The fused prework reads the cache's offsets array as it stands
-        // before the cache advances (the value the copy below captures).
-        if !exactTargetVerify, positionIds == nil,
+        // A prompt chunk on the query-block path whose cache takes its first
+        // K/V append from the prework's own launch (`Qwen35AttentionPrework.
+        // runKV`): the blocks, with the cache already updated.
+        var adoptedBlocks: [MLXArray]? = nil
+        let promptBlockPath =
+            !exactTargetVerify && !narrowsToLastQuery && B == 1
+            && L >= BonsaiPromptWidth.minimumRows && Qwen35FusedHadamard.rowBlocksEnabled
+            && oProj is HadamardQuantizedLinear
+        if promptBlockPath, positionIds == nil, let fusedRope,
+            ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+            ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+            let adopting = cache as? any CBv2PromptFirstAppendAdopting,
+            let capacity = adopting.promptFirstAppendCapacity(queryCount: L),
+            let (q, kb, vb, advanced) = Qwen35AttentionPrework.runKV(
+                q: qSplit[0], k: kProjection.reshaped(B, L, kvHeads, -1),
+                v: vProjection.reshaped(B, L, kvHeads, -1), qNorm: qNorm, kNorm: kNorm,
+                offsets: cache.positionOffsets, ropeDims: fusedRope.dims,
+                ropeBase: fusedRope.base, capacity: capacity),
+            let blocks = adopting.adoptFirstAppendAndAttendQueryBlocks(
+                queries: q, keysBuffer: kb, valuesBuffer: vb, count: L,
+                advancedOffsets: advanced, scale: scale, sinks: nil)
+        {
+            adoptedBlocks = blocks
+            (queries, keys) = (q, kb[0..., 0..., ..<L, 0...])
+        } else if !exactTargetVerify, positionIds == nil,
             let fused = fusedPrework(
                 qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
                 offsets: cache.positionOffsets)
@@ -4279,11 +4310,10 @@ final class Qwen35Attention: Module {
             // are not concatenated; where it declines they are concatenated
             // here exactly as the cache would have.
             var joined: MLXArray? = nil
-            if !exactTargetVerify, B == 1, L >= BonsaiPromptWidth.minimumRows,
-                Qwen35FusedHadamard.rowBlocksEnabled,
-                let packed = oProj as? HadamardQuantizedLinear,
-                let blocks = cache.updateAndAttendQueryBlocks(
-                    queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+            if promptBlockPath, let packed = oProj as? HadamardQuantizedLinear,
+                let blocks = adoptedBlocks
+                    ?? cache.updateAndAttendQueryBlocks(
+                        queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
             {
                 if let y = packed.applyAfterSigmoidGateRowBlocksOnRoute(
                     blocks.map { $0.transposed(0, 2, 1, 3) }, gate: qSplit[1], widenOutput: false)
@@ -5574,7 +5604,7 @@ public class Qwen35TextModelInner: Module {
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
                     if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
-                    asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
+                    CBv2LookupSpeculativeVerify.submit(out.f.map { [out.h, $0] } ?? [out.h])
                     // Behind the layers just submitted: the drafter's weights
                     // for a request that will draft (`DFlash2ResidencyPrefetch`).
                     if promptPrefetch {
@@ -5610,7 +5640,7 @@ public class Qwen35TextModelInner: Module {
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
                 if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
-                asyncEval([hiddenStates])
+                CBv2LookupSpeculativeVerify.submit([hiddenStates])
                 if promptPrefetch {
                     DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
                 }
@@ -6059,7 +6089,7 @@ enum Qwen35GDNPrework {
         return text
     }()
 
-    private static let freshStridedKernel = MLXFast.metalKernel(
+    static let freshStridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
@@ -6077,7 +6107,8 @@ enum Qwen35GDNPrework {
     static func runFreshState(
         qkv: MLXArray, convStateShape: [Int], convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
-        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int,
+        baCapture: Qwen35BAPartialsCapture? = nil
     ) -> Outputs? {
         guard enabled, qkv.ndim == 3, convStateShape.count == 3, convWeight.ndim == 3
         else { return nil }
@@ -6100,6 +6131,14 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        if strided,
+            let split = freshSplit(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
+                normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim, baCapture: baCapture)
+        {
+            return split
+        }
         if strided, B == 1, S % rowTile == 0,
             rowTileVerified(
                 keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
@@ -6299,6 +6338,145 @@ enum Qwen35AttentionPrework {
         return (outputs[0], outputs[1])
     }
 
+    /// The prework with the prompt chunk's first K/V append in the same
+    /// launch (`CBv2PromptFirstAppendAdopting`): the k heads' outputs go
+    /// straight into the key buffer's first `L` rows (`capn` rows per head,
+    /// the capacity the cache's one-launch first append allocates), a third
+    /// group of threadgroups copies each v head row, element for element in
+    /// its dtype through its strides, into the value buffer, and the offsets
+    /// the cache would advance by `L` are advanced here (`offn`). Every stored
+    /// value is the one the prework or the append kernel stores; the rows past
+    /// `L` are left unwritten as the append leaves them. Three launches per
+    /// attention layer of a prompt chunk become one (the append and the
+    /// one-element offset add). `MLXFAST_ATTN_PREWORK_KV=0` keeps them.
+    static let kvEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ATTN_PREWORK_KV"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kvSource: String? = {
+        var text = source
+        let values = """
+            if (hh >= uint(HQ + HK)) {
+              const uint hv = hh - uint(HQ + HK);
+              const int64_t vb = int64_t(bb) * v_strides[0] + int64_t(t) * v_strides[1]
+                  + int64_t(hv) * v_strides[2];
+              const size_t vbase = ((size_t(bb) * size_t(HK) + size_t(hv)) * size_t(capn) + size_t(t)) * size_t(D);
+              for (int i = 0; i < NR; i++) {
+                const uint c = lid * NR + uint(i);
+                vo[vbase + c] = v[vb + int64_t(c) * v_strides[3]];
+              }
+              return;
+            }
+            if (hh == 0 && t == 0 && bb == 0 && lid == 0) {
+              offn[0] = offs[0] + Ln;
+            }
+            const bool isq = hh < uint(HQ);
+            """
+        for (target, replacement) in [
+            ("const bool isq = hh < uint(HQ);", values),
+            ("* size_t(Ln) + size_t(t)) * size_t(D);", "* size_t(isq ? Ln : int(capn)) + size_t(t)) * size_t(D);"),
+        ] {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        return text
+    }()
+
+    private static let kvKernel: MLXFast.MLXFastKernel? = kvSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_attn_prework_kv",
+            inputNames: ["q", "k", "v", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale", "capn"],
+            outputNames: ["qo", "ko", "vo", "offn"],
+            source: $0,
+            ensureRowContiguous: false)
+    }
+
+    nonisolated(unsafe) private static var kvVerdicts: [Geometry: Bool] = [:]
+
+    /// `run` with the first append and the offset advance: `(queries, key
+    /// buffer, value buffer, offsets + L)` for one row (`B == 1`, one offset)
+    /// at `capacity`; nil when it does not apply.
+    static func runKV(
+        q: MLXArray, k: MLXArray, v: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
+        offsets: MLXArray, ropeDims: Int, ropeBase: Float, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard kvEnabled, q.ndim == 4,
+            lock.withLock({
+                kvVerdicts[
+                    Geometry(hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims, dtype: "\(q.dtype)")]
+                    ?? false
+            })
+        else { return nil }
+        return runKVUnchecked(
+            q: q, k: k, v: v, wq: qNorm.weight, wk: kNorm.weight, epsQ: qNorm.eps,
+            epsK: kNorm.eps, offsets: offsets, ropeDims: ropeDims, ropeBase: ropeBase,
+            capacity: capacity)
+    }
+
+    private static func runKVUnchecked(
+        q: MLXArray, k: MLXArray, v: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float,
+        epsK: Float, offsets: MLXArray, ropeDims: Int, ropeBase: Float, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard let kvKernel, k.ndim == 4, v.ndim == 4, q.dim(0) == 1, k.shape == v.shape,
+            k.dim(0) == 1, k.dim(1) == q.dim(1), k.dim(3) == q.dim(3), q.dtype == k.dtype,
+            v.dtype == .float32, [DType.float32, .float16, .bfloat16].contains(q.dtype),
+            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [q.dim(3)],
+            wk.shape == [q.dim(3)], offsets.dtype == .int32, offsets.size == 1,
+            offsets.ndim <= 1, q.dim(1) > 0, q.dim(1) < 65536, capacity >= q.dim(1),
+            capacity * k.dim(2) * k.dim(3) < Int(Int32.max)
+        else { return nil }
+        let (L, HQ, HK, D) = (q.dim(1), q.dim(2), k.dim(2), q.dim(3))
+        let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let outputs = kvKernel(
+            [q, k, v, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
+             MLXArray(log2(ropeBase)), MLXArray(Float(1)), MLXArray(Int32(capacity))],
+            template: [("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK), ("OB", 1)],
+            grid: ((D / 4) * (HQ + 2 * HK), L, 1), threadGroup: (D / 4, 1, 1),
+            outputShapes: [[1, HQ, L, D], [1, HK, capacity, D], [1, HK, capacity, D], [1]],
+            outputDTypes: [.float32, .float32, v.dtype, .int32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
+    /// Check `runKV` against `run`, the values' head-transposed rows and the
+    /// offsets plus `L`, bit for bit (the buffers' first `L` rows), once per
+    /// geometry at model construction; a mismatch keeps the separate launches.
+    private static func kvSelfCheck(
+        _ geo: Geometry, dtype: DType, ropeBase: Float, epsQ: Float, epsK: Float
+    ) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6B76_6170), into: 4)
+        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
+        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
+        var same = MLXArray(true)
+        for (rows, offset, slack) in [(512, 0, 256), (200, 611, 57)] {
+            let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+            let wide = (MLXRandom.normal([1, rows, width], key: keys[2])
+                * exp(MLXRandom.normal([1, rows, width], key: keys[3]))).asType(dtype)
+            let parts = MLX.split(
+                wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d], axis: -1)
+            let q = parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0]
+            let k = parts[1].reshaped(1, rows, geo.hk, -1)
+            let v = parts[2].reshaped(1, rows, geo.hk, -1).asType(.float32)
+            let offsets = MLXArray([Int32(offset)])
+            guard
+                let (refQ, refK) = runUnchecked(
+                    q: q, k: k, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
+                    ropeDims: geo.rd, ropeBase: ropeBase),
+                let (newQ, kb, vb, offn) = runKVUnchecked(
+                    q: q, k: k, v: v, wq: wq, wk: wk, epsQ: epsQ, epsK: epsK, offsets: offsets,
+                    ropeDims: geo.rd, ropeBase: ropeBase, capacity: rows + slack),
+                refQ.shape == newQ.shape
+            else { return false }
+            let refV = v.transposed(0, 2, 1, 3)
+            same = same .&& all(refQ.view(dtype: .uint32) .== newQ.view(dtype: .uint32))
+                .&& all(refK.view(dtype: .uint32) .== kb[.ellipsis, ..<rows, 0...].view(dtype: .uint32))
+                .&& all(refV.view(dtype: .uint32) .== vb[.ellipsis, ..<rows, 0...].view(dtype: .uint32))
+                .&& all(offn .== (offsets + Int32(rows)))
+        }
+        return same.item(Bool.self)
+    }
+
     private struct Geometry: Hashable {
         let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
     }
@@ -6331,6 +6509,15 @@ enum Qwen35AttentionPrework {
                     FileHandle.standardError.write(
                         "qwen35: fused attention prework disagrees with the op chain on this device (\(dtype)); using the op chain\n"
                             .data(using: .utf8)!)
+                }
+                if verdict, kvEnabled, kvKernel != nil, kvVerdicts[geometry] == nil {
+                    let kv = kvSelfCheck(
+                        geometry, dtype: dtype, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
+                    kvVerdicts[geometry] = kv
+                    FileHandle.standardError.write(
+                        ("qwen35 attention prework + first K/V append: self-test "
+                            + (kv ? "passed (2 cases bitwise); one launch per prompt layer\n"
+                                : "FAILED; separate launches kept\n")).data(using: .utf8)!)
                 }
             }
         }

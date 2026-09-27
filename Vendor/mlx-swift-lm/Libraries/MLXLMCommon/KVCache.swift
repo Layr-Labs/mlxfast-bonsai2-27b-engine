@@ -823,6 +823,12 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         return MLXArray(result)
     }
 
+    static let firstAppend: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_KV_FIRST_APPEND"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// Context rows held in the buffer (`offset` is absolute and may start
     /// past zero when the prompt was longer than the window).
     private var rows = 0
@@ -850,6 +856,23 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
             return nil
         }
         let end = rows + total
+        // The first write (the prompt's context rows) allocates both buffers
+        // and writes its rows in one launch (`CBv2KVFirstAppend`) instead of
+        // two zero-filled buffers and two slice updates: every view this cache
+        // hands out, and every read of the speculative block, stops at rows
+        // it has written, so the unwritten tail is never observed.
+        // `MLXFAST_DFLASH2_KV_FIRST_APPEND=0` keeps the zero-filled buffers.
+        if self.keys == nil, rows == 0, Self.firstAppend,
+            let (firstK, firstV) = CBv2KVFirstAppend.apply(
+                keys, values, capacity: Swift.max(end, maxCacheSize + blockRows))
+        {
+            self.keys = firstK
+            self.values = firstV
+            rows += contextRows
+            idx = rows
+            offset += contextRows
+            return (firstK[.ellipsis, ..<end, 0...], firstV[.ellipsis, ..<end, 0...])
+        }
         if self.keys == nil || self.keys!.dim(2) < end {
             let capacity = Swift.max(end, maxCacheSize + blockRows)
             let kShape = [keys.dim(0), keys.dim(1), capacity, keys.dim(3)]
@@ -878,6 +901,35 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
             self.keys![.ellipsis, ..<end, 0...],
             self.values![.ellipsis, ..<end, 0...]
         )
+    }
+
+    /// The buffer capacity `updateBlock`'s one-launch first write of
+    /// `contextRows` context rows and no block rows allocates, or nil when
+    /// the next `updateBlock` of those rows would not be that write.
+    public func firstContextCapacity(contextRows: Int) -> Int? {
+        guard !rotating, self.keys == nil, rows == 0, Self.firstAppend, contextRows >= 1,
+            contextRows <= maxCacheSize, CBv2KVFirstAppend.adoptable
+        else { return nil }
+        return Swift.max(contextRows, maxCacheSize)
+    }
+
+    /// `updateBlock(keys:values:contextRows:)` for that first write, with the
+    /// buffers (`firstContextCapacity` rows, the leading `contextRows`
+    /// written, the rest never exposed) formed by the caller's own launch:
+    /// the state and the views that write leaves.
+    public func adoptFirstContext(keys newK: MLXArray, values newV: MLXArray, contextRows: Int)
+        -> (MLXArray, MLXArray)
+    {
+        precondition(
+            firstContextCapacity(contextRows: contextRows) == newK.dim(2)
+                && newK.shape == newV.shape,
+            "DFlash2BlockKVCache: adopted first write does not fit")
+        self.keys = newK
+        self.values = newV
+        rows += contextRows
+        idx = rows
+        offset += contextRows
+        return (newK[.ellipsis, ..<contextRows, 0...], newV[.ellipsis, ..<contextRows, 0...])
     }
 
     /// True when `updateBlock` can take `contextRows` more context rows on the

@@ -66,6 +66,9 @@ struct CBv2MTPEarlyBlockProposal {
     let depth: Int
     let anchor: Int
     let kvOffset: Int
+    /// The ids on the host when a prompt lookup supplied them with the
+    /// drafter skipped (`CBv2PromptLookupDraft.skip`), else nil.
+    var lookupIDs: [Int]? = nil
 }
 
 // MARK: - In-flight round payload
@@ -131,6 +134,9 @@ final class CBv2MTPRoundInFlight {
         let blockContext: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// A one-row round's ids when a drafter-skipping prompt lookup
+        /// supplied them (`CBv2LookupSpeculativeVerify`), else nil.
+        var lookupIDs: [Int]? = nil
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

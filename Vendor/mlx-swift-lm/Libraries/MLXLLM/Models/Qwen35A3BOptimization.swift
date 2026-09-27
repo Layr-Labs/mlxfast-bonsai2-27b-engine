@@ -737,6 +737,16 @@ enum Qwen35WideNMatmul {
     nonisolated(unsafe) private static var announced = false
 
     static func apply(_ x: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int) -> MLXArray? {
+        guard let p = partials(x, w, rows: rows, k: k, n: n) else { return nil }
+        return reduce(p)
+    }
+
+    /// The partial launch alone: chunk partials `[K / 512, rows, N]` (FP32,
+    /// chunk-major), which `reduce` adds in chunk order from 0.0f. Nil where
+    /// `apply` would not run.
+    static func partials(_ x: MLXArray, _ w: MLXArray, rows: Int, k: Int, n: Int)
+        -> Qwen35SmallNMatmul.Partials?
+    {
         guard enabled, rows % 64 == 0, n % 32 == 0, k % chunk == 0 else { return nil }
         if !announced {
             announced = true
@@ -748,10 +758,16 @@ enum Qwen35WideNMatmul {
             [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
             grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        return Qwen35SmallNMatmul.Partials(
+            part: part, rows: rows, n: n, chunks: k / chunk,
+            leading: Array(x.shape.dropLast()), dims: dims)
+    }
+
+    static func reduce(_ p: Qwen35SmallNMatmul.Partials) -> MLXArray {
         let y = reduceKernel(
-            [part, dims], template: [("KC", chunk)],
-            grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
-        return y.reshaped(Array(x.shape.dropLast()) + [n])
+            [p.part, p.dims], template: [("KC", chunk)],
+            grid: ((p.rows * p.n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[p.rows, p.n]], outputDTypes: [.float32])[0]
+        return y.reshaped(p.leading + [p.n])
     }
 }

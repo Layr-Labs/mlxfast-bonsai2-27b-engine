@@ -669,6 +669,23 @@ enum CBv2AttentionV1 {
             sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
     }
 
+    /// `updateAndAttendQueryBlocks` for a first append whose buffers the
+    /// caller formed (`CBv2FullSequenceKV.adoptFirstAppend`): the same row
+    /// state, the same views and the same block attention.
+    static func adoptAndAttendQueryBlocks(
+        row: CBv2FullSequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keysBuffer: MLXArray, valuesBuffer: MLXArray, count: Int,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> [MLXArray] {
+        let effectiveSinks = dispatchSinks(sinks, kind: kind, queries: queries, softcap: softcap)
+        let (cachedKeys, cachedValues) = row.adoptFirstAppend(
+            keys: keysBuffer, values: valuesBuffer, rows: count)
+        return attendQueryBlockList(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: count, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
+    }
+
     /// The query blocks' outputs of `attendQueryBlocks`, in query order.
     private static func attendQueryBlockList(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -684,6 +701,26 @@ enum CBv2AttentionV1 {
         let keyCount = keys.dim(2)
         let historyCount = keyCount - newTokenCount
         precondition(historyCount >= 0)
+        // Every block on the composed causal path: its softmaxes in one launch.
+        if keepMask == nil, spanContext == nil, window == nil, sinks == nil, softcap == nil,
+            CBv2PromptCausalAttention.joinEnabled, newTokenCount > blockSize
+        {
+            var blocks: [(q: Range<Int>, k: Range<Int>)] = []
+            var start = 0
+            while start < newTokenCount {
+                let count = min(blockSize, newTokenCount - start)
+                let bounds = queryBlockBounds(
+                    historyCount: historyCount, offset: start, count: count, window: nil)
+                blocks.append((start ..< start + count, bounds.visibleStart ..< bounds.visibleEnd))
+                start += count
+            }
+            if let joined = CBv2PromptCausalAttention.attendBlocks(
+                queries: queries, keys: keys, values: values, scale: scale,
+                promptRows: newTokenCount, blocks: blocks)
+            {
+                return joined
+            }
+        }
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
         var offset = 0
@@ -1074,11 +1111,7 @@ package enum CBv2PromptCausalAttention {
     /// mode MLX builds its own kernels in. The one new contraction candidate,
     /// `s * scale - max`, has an exact product (a power-of-two scale), so an
     /// FMA would round it exactly as the stored product was.
-    private static let softmaxKernel = MLXFast.metalKernel(
-        name: "bonsai_prompt_causal_scale_select_softmax",
-        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
-        outputNames: ["out"],
-        source: """
+    private static let softmaxSource = """
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -1155,7 +1188,13 @@ package enum CBv2PromptCausalAttention {
                 }
               }
             }
-            """,
+            """
+
+    private static let softmaxKernel = MLXFast.metalKernel(
+        name: "bonsai_prompt_causal_scale_select_softmax",
+        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
+        outputNames: ["out"],
+        source: softmaxSource,
         ensureRowContiguous: true)
 
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
@@ -1251,4 +1290,218 @@ package enum CBv2PromptCausalAttention {
         }
         return out
     }
+}
+
+/// A prompt chunk's query blocks (`attendQueryBlockList`) with their causal
+/// softmaxes in ONE launch: every block's score GEMM and output GEMM stay
+/// exactly the calls `attend` makes, but the per-block
+/// `bonsai_prompt_causal_scale_select_softmax` launches (one per block, four
+/// per attention layer at 512 rows) become one grid over all the blocks'
+/// score rows. Each threadgroup finds its block from the row offsets, then
+/// runs `softmaxSource` verbatim on that block's row, with the threadgroup
+/// sized for the widest block: the simdgroups a narrower block's own launch
+/// would not have had read no scores and store neither a partial nor an
+/// output (the 32-slot passes see the same partials and the same padding
+/// slots as that block's launch), so every probability is the same bit.
+/// Checked at model construction against the per-block path, bit for bit
+/// (`prepareJoin`); a mismatch keeps the per-block launches.
+/// `MLXFAST_PROMPT_SOFTMAX_JOIN=0` keeps them.
+extension CBv2PromptCausalAttention {
+    static let joinEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_SOFTMAX_JOIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let maximumJoinedBlocks = 8
+
+    /// `softmaxSource` behind a prologue that binds this row's block: its
+    /// scores, output and (off, rows, keys); the two partial stores skip the
+    /// simdgroups past the block's own launch. Nil if the stock text moved.
+    private static func joinedSource(blocks nb: Int) -> String? {
+        var text = softmaxSource
+        let pick = { (prefix: String) -> String in
+            (0 ..< nb - 1).map { "blk_ == \($0) ? \(prefix)\($0) : " }.joined() + "\(prefix)\(nb - 1)"
+        }
+        let prologue = """
+            int blk_ = 0;
+            for (int j = 1; j < \(nb); j++) {
+              if (threadgroup_position_in_grid.x >= uint(meta[4 * j])) { blk_ = j; }
+            }
+            const uint gid = threadgroup_position_in_grid.x - uint(meta[4 * blk_]);
+            const int c_ql = meta[4 * blk_ + 1];
+            const int c_kl = meta[4 * blk_ + 2];
+            const int c_off = meta[4 * blk_ + 3];
+            const device float* scores = \(pick("s"));
+            device float* out = \(pick("o"));
+            """
+        for (target, replacement, count) in [
+            ("const uint gid = threadgroup_position_in_grid.x;\n", "", 1),
+            ("if (simd_lane_id == 0) {", "if (simd_lane_id == 0 && simd_group_id < groups) {", 2),
+        ] {
+            guard text.components(separatedBy: target).count == count + 1 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        // `groups` must be declared before the first partial store.
+        guard let g = text.range(of: "const uint groups"),
+            let st = text.range(of: "simd_group_id < groups"), g.lowerBound < st.lowerBound
+        else { return nil }
+        return prologue + "\n" + text
+    }
+
+    private static let joinedKernels: [Int: MLXFast.MLXFastKernel] = {
+        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+        for nb in 2 ... maximumJoinedBlocks {
+            guard let source = joinedSource(blocks: nb) else { return [:] }
+            kernels[nb] = MLXFast.metalKernel(
+                name: "bonsai_prompt_causal_softmax_join\(nb)",
+                inputNames: (0 ..< nb).map { "s\($0)" } + ["meta", "c_scale", "c_fill"],
+                outputNames: (0 ..< nb).map { "o\($0)" },
+                source: source,
+                ensureRowContiguous: true)
+        }
+        return kernels
+    }()
+
+    private static let joinLock = NSLock()
+    nonisolated(unsafe) private static var joinVerdicts: [[Int]: Bool] = [:]
+
+    /// `attend` of every block (`queries` rows `q`, keys/values rows `k`),
+    /// with the softmaxes in one launch; nil where any block's `attend`
+    /// would decline or the geometry was not verified at load.
+    static func attendBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
+        blocks: [(q: Range<Int>, k: Range<Int>)], checked: Bool = true
+    ) -> [MLXArray]? {
+        guard joinEnabled, enabled, promptRows >= BonsaiPromptWidth.minimumRows,
+            blocks.count >= 2, let kernel = joinedKernels[blocks.count],
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            scale > 0, scale.isNormal, scale.significandBitPattern == 0
+        else { return nil }
+        let B = queries.dim(0)
+        let H = queries.dim(1)
+        let D = queries.dim(3)
+        let kvHeads = keys.dim(1)
+        guard D == 192 || D == 256, keys.dim(0) == B, values.dim(0) == B, keys.dim(3) == D,
+            values.dim(1) == kvHeads, kvHeads > 0, H % kvHeads == 0,
+            !checked || joinLock.withLock({ joinVerdicts[[H, kvHeads, D]] ?? false })
+        else { return nil }
+        for block in blocks {
+            let L = block.q.count
+            let kL = block.k.count
+            guard L > 8, L < 1024, kL >= L, kL % 4 == 0, kL <= softmaxSingleRowLimit,
+                block.q.upperBound <= queries.dim(2), block.k.upperBound <= keys.dim(2),
+                block.k.upperBound <= values.dim(2), B * H * L * kL < Int(Int32.max)
+            else { return nil }
+        }
+        let repeats = H / kvHeads
+        var scores: [MLXArray] = []
+        var vs: [MLXArray] = []
+        var meta: [Int32] = []
+        var rows = 0
+        var widest = 0
+        for block in blocks {
+            // `attendQueryBlockList`'s slices and `attend`'s operands.
+            var q = queries[0..., 0..., block.q, 0...]
+            var k = keys[0..., 0..., block.k, 0...]
+            var v = values[0..., 0..., block.k, 0...]
+            let L = block.q.count
+            let kL = block.k.count
+            if repeats > 1 {
+                q = q.reshaped([B, kvHeads, repeats, L, D])
+                k = k.expandedDimensions(axis: 2)
+                v = v.expandedDimensions(axis: 2)
+            }
+            let s = matmul(q, k.swappedAxes(-1, -2))
+            meta += [Int32(rows), Int32(L), Int32(kL), Int32(kL - L)]
+            rows += s.size / kL
+            widest = max(widest, kL)
+            scores.append(s)
+            vs.append(v)
+        }
+        let threads = 32 * (((widest + 3) / 4 + 31) / 32)
+        let probabilities = kernel(
+            scores + [MLXArray(meta), MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude)],
+            grid: (rows * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: scores.map { $0.shape },
+            outputDTypes: Array(repeating: .float32, count: scores.count))
+        return zip(probabilities, zip(vs, blocks)).map { p, vb in
+            let out = matmul(p, vb.0)
+            return repeats > 1 ? out.reshaped([B, H, vb.1.q.count, out.dim(-1)]) : out
+        }
+    }
+
+    /// Check the joined softmax against the per-block path bit for bit, once
+    /// per attention geometry, at model construction: fresh chunks of two to
+    /// eight blocks, a chunk behind 36 history rows ending in a short block,
+    /// scores of wide magnitude spread.
+    package static func prepareJoin(heads: Int, kvHeads: Int, headDim: Int, scale: Float) {
+        guard joinEnabled, enabled, heads > 0, kvHeads > 0, heads % kvHeads == 0,
+            headDim == 192 || headDim == 256, !joinedKernels.isEmpty
+        else { return }
+        let key = [heads, kvHeads, headDim]
+        guard joinLock.withLock({ joinVerdicts[key] == nil }) else { return }
+        var compared = 0
+        var mismatches = 0
+        var ok = true
+        do {
+            try withError { error in
+                let rk = MLXRandom.split(key: MLXRandom.key(0x6A6F_696E), into: 4)
+                for (history, rows) in [
+                    (0, 512), (36, 400), (0, 256), (0, 384), (0, 640), (0, 768), (0, 896), (0, 1024),
+                ] {
+                    let kL = history + rows
+                    let q = MLXRandom.normal([1, heads, rows, headDim], key: rk[0])
+                        * exp(MLXRandom.normal([1, heads, rows, 1], key: rk[1]))
+                    let k = MLXRandom.normal([1, kvHeads, kL, headDim], key: rk[2])
+                    let v = MLXRandom.normal([1, kvHeads, kL, headDim], key: rk[3])
+                    eval(q, k, v)
+                    var blocks: [(q: Range<Int>, k: Range<Int>)] = []
+                    var offset = 0
+                    while offset < rows {
+                        let count = min(128, rows - offset)
+                        blocks.append((offset ..< offset + count, 0 ..< history + offset + count))
+                        offset += count
+                    }
+                    guard
+                        let joined = attendBlocks(
+                            queries: q, keys: k, values: v, scale: scale, promptRows: rows,
+                            blocks: blocks, checked: false)
+                    else { throw JoinFailure.declined }
+                    var differ: [MLXArray] = []
+                    for (block, y) in zip(blocks, joined) {
+                        guard
+                            let x = attend(
+                                queries: q[0..., 0..., block.q, 0...],
+                                keys: k[0..., 0..., block.k, 0...],
+                                values: v[0..., 0..., block.k, 0...], scale: scale,
+                                promptRows: rows),
+                            x.shape == y.shape
+                        else { throw JoinFailure.declined }
+                        differ.append(
+                            (x.view(dtype: .uint32) .!= y.view(dtype: .uint32)).asType(.int32).sum())
+                        compared += x.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            ok = false
+        }
+        let verdict = ok && mismatches == 0 && compared > 0
+        joinLock.withLock { joinVerdicts[key] = verdict }
+        FileHandle.standardError.write(
+            Data(
+                ("mlxfast prompt causal softmax join: self-test "
+                    + (verdict ? "passed" : "FAILED")
+                    + " (\(compared) values compared bitwise, \(ok ? "\(mismatches)" : "error") mismatches); "
+                    + (verdict ? "one softmax launch per chunk\n" : "per-block launches kept\n")).utf8))
+    }
+
+    private enum JoinFailure: Error { case declined }
 }

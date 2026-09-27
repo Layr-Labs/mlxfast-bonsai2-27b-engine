@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 /// Counters for the v2 core runtime's own host-interaction points.
 ///
@@ -149,6 +150,17 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
 
+        if keys == nil, absoluteOffset == 0,
+            let (firstKeys, firstValues) = CBv2KVFirstAppend.apply(
+                newKeys, newValues, capacity: min(maxLength, max(capacity, n)))
+        {
+            capacity = firstKeys.dim(2)
+            keys = firstKeys
+            values = firstValues
+            absoluteOffset = n
+            return (firstKeys[.ellipsis, ..<n, 0...], firstValues[.ellipsis, ..<n, 0...])
+        }
+
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
         let (writtenKeys, writtenValues) = CBv2SqueezedKVUpdate.updates(newKeys, newValues)
@@ -200,7 +212,61 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         [keys, values].compactMap { $0 }
     }
 
+    /// The storage before a window whose writes may be dropped
+    /// (`CBv2MTPLookupSpeculation`). `restore` puts back the arrays, capacity
+    /// and offset: the dropped window's lazy writes are then unreachable, and
+    /// any slot it already wrote lies past the offset (see `rollback`).
+    struct Mark {
+        fileprivate let keys: MLXArray?
+        fileprivate let values: MLXArray?
+        fileprivate let capacity: Int
+        fileprivate let offset: Int
+    }
+
+    /// New handles on the current values: an append assigns through
+    /// `keys![...] =`, which replaces the handle inside the same object.
+    func mark() -> Mark {
+        func handle(_ array: MLXArray?) -> MLXArray? {
+            array.map { array in
+                let handle = MLXArray(Int32(0))
+                handle._updateInternal(array)
+                return handle
+            }
+        }
+        return Mark(
+            keys: handle(keys), values: handle(values), capacity: capacity, offset: absoluteOffset)
+    }
+
+    func restore(_ mark: Mark) {
+        (keys, values, capacity, absoluteOffset) = (mark.keys, mark.values, mark.capacity, mark.offset)
+    }
+
     // MARK: - Private
+
+    /// The buffer capacity `update`'s one-launch first append of `n` rows
+    /// allocates, or nil when the next append of `n` rows is not that append.
+    func firstAppendCapacity(rows n: Int) -> Int? {
+        guard keys == nil, absoluteOffset == 0, n > 0, n <= maxLength, CBv2KVFirstAppend.adoptable
+        else { return nil }
+        return min(maxLength, max(capacity, n))
+    }
+
+    /// `update` for a first append whose buffers (`firstAppendCapacity(rows:)`
+    /// rows, the leading `n` written, the rest never exposed) were formed by
+    /// the caller's own launch: the state and the views that append leaves.
+    func adoptFirstAppend(keys firstKeys: MLXArray, values firstValues: MLXArray, rows n: Int)
+        -> (MLXArray, MLXArray)
+    {
+        precondition(
+            firstAppendCapacity(rows: n) == firstKeys.dim(2) && firstKeys.shape == firstValues.shape
+                && firstKeys.dim(0) == 1 && firstKeys.dim(1) == kvHeads,
+            "CBv2FullSequenceKV: adopted first append does not fit")
+        capacity = firstKeys.dim(2)
+        keys = firstKeys
+        values = firstValues
+        absoluteOffset = n
+        return (firstKeys[.ellipsis, ..<n, 0...], firstValues[.ellipsis, ..<n, 0...])
+    }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
@@ -225,6 +291,97 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             axis: 2)
         capacity = newCapacity
     }
+}
+
+/// A sequence's first K/V append (its prompt chunk) as ONE launch that
+/// allocates both buffers and writes the appended rows, instead of two
+/// zero-filled `[1, kvHeads, capacity, headDim]` allocations (MLX `Full`) and
+/// two slice updates: three launches and the fill of both buffers fewer per
+/// attention layer and prompt. The slots past the appended rows are left
+/// unwritten; they are structurally unreachable (every view this class hands
+/// out is sliced to `..<absoluteOffset`, and each later append writes its
+/// slots before the offset exposes them; see `rollback`), so every value the
+/// cache exposes is the same. The kernel copies each element in its own
+/// dtype through the operands' strides. Checked once, on first use, bit for
+/// bit against the zero-filled slice updates (FP32, FP16, BF16; a
+/// head-transposed key view and a contiguous value, then a second append on
+/// both). `MLXFAST_KV_FIRST_APPEND=0` keeps the zero-filled allocation.
+enum CBv2KVFirstAppend {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_KV_FIRST_APPEND"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "mlxfast_kv_first_append",
+        inputNames: ["k", "v", "dims"],
+        outputNames: ["ko", "vo"],
+        source: """
+            const uint d = thread_position_in_grid.x;
+            const uint r = thread_position_in_grid.y;
+            const uint h = thread_position_in_grid.z;
+            const size_t o = (size_t(h) * size_t(dims[0]) + size_t(r)) * size_t(dims[1]) + size_t(d);
+            ko[o] = k[int64_t(h) * k_strides[1] + int64_t(r) * k_strides[2] + int64_t(d) * k_strides[3]];
+            vo[o] = v[int64_t(h) * v_strides[1] + int64_t(r) * v_strides[2] + int64_t(d) * v_strides[3]];
+            """,
+        ensureRowContiguous: false)
+
+    private static func launch(_ k: MLXArray, _ v: MLXArray, capacity: Int) -> (MLXArray, MLXArray) {
+        let (heads, n, d) = (k.dim(1), k.dim(2), k.dim(3))
+        // The capacity and head size are runtime operands, not template
+        // constants: one compiled kernel serves every prompt length.
+        let outputs = kernel(
+            [k, v, MLXArray([Int32(capacity), Int32(d)])],
+            grid: (d, n, heads), threadGroup: (min(d, 256), 1, 1),
+            outputShapes: [[1, heads, capacity, d], [1, heads, capacity, d]],
+            outputDTypes: [k.dtype, v.dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    /// The one-launch first append is on and passed its check (what `apply`
+    /// requires beyond the operands' shapes).
+    static var adoptable: Bool { enabled && verified }
+
+    static func apply(_ k: MLXArray, _ v: MLXArray, capacity: Int) -> (MLXArray, MLXArray)? {
+        guard enabled, k.ndim == 4, v.ndim == 4, k.shape == v.shape, k.dtype == v.dtype,
+            k.dim(0) == 1, k.dim(3) <= 1024, capacity >= k.dim(2), k.dim(2) > 0,
+            [DType.float32, .float16, .bfloat16].contains(k.dtype), verified
+        else { return nil }
+        return launch(k, v, capacity: capacity)
+    }
+
+    private static let verified: Bool = {
+        var same = true
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            let wide = MLXRandom.normal([1, 20, 7, 64], key: MLXRandom.key(43)).asType(dtype)
+            let k = wide[0..., 0..., 1 ..< 5, 0...].transposed(0, 2, 1, 3)
+            let v = MLXRandom.normal([1, 4, 20, 64], key: MLXRandom.key(44)).asType(dtype)
+            let more = MLXRandom.normal([1, 4, 3, 64], key: MLXRandom.key(45)).asType(dtype)
+            var plainK = MLXArray.zeros([1, 4, 32, 64], dtype: dtype)
+            var plainV = MLXArray.zeros([1, 4, 32, 64], dtype: dtype)
+            plainK[.ellipsis, 0 ..< 20, 0...] = k
+            plainV[.ellipsis, 0 ..< 20, 0...] = v
+            var (firstK, firstV) = launch(k, v, capacity: 32)
+            let bits = dtype == .float32 ? DType.uint32 : .uint16
+            func equal(_ a: MLXArray, _ b: MLXArray, _ n: Int) -> Bool {
+                all(a[.ellipsis, ..<n, 0...].view(dtype: bits) .== b[.ellipsis, ..<n, 0...].view(dtype: bits))
+                    .item(Bool.self)
+            }
+            same = same && equal(plainK, firstK, 20) && equal(plainV, firstV, 20)
+            plainK[.ellipsis, 20 ..< 23, 0...] = more
+            plainV[.ellipsis, 20 ..< 23, 0...] = more
+            firstK[.ellipsis, 20 ..< 23, 0...] = more
+            firstV[.ellipsis, 20 ..< 23, 0...] = more
+            same = same && equal(plainK, firstK, 23) && equal(plainV, firstV, 23)
+        }
+        FileHandle.standardError.write(
+            (same
+                ? "mlxfast KV first append: self-test passed (3 dtypes bitwise); one launch\n"
+                : "mlxfast KV first append: mismatch; zero-filled allocation kept\n")
+                .data(using: .utf8)!)
+        return same
+    }()
 }
 
 /// The KV append's updates with the batch axis squeezed (a view) before the
