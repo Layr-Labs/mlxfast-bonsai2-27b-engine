@@ -33,53 +33,6 @@ enum CBv2PromptLookupDraft {
         return max(8, raw.flatMap(Int.init) ?? 16)
     }()
 
-    /// `MLXFAST_DFLASH_LOOKUP_SKIP=0` runs the drafter's block in every round.
-    ///
-    /// While the output quotes the prompt, the next round's ids come from the
-    /// prompt, and the drafter's block forward (its heaviest work: every
-    /// drafter weight read for sixteen rows) produces a proposal nobody uses.
-    /// So after a round whose proposal came from the prompt, the engine does
-    /// not build the next block before the readback; after the readback it
-    /// looks the continuation up first and runs the drafter only on a miss.
-    /// The committed context rows of a skipped round stay pending in the
-    /// drafter's state (a layer's context keys and values are a function of
-    /// those rows alone), and the next block that runs absorbs them all.
-    /// Only the draft changes; the target verifies every id.
-    static let skipEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP_SKIP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let lock = NSLock()
-    /// Requests whose newest proposal came from the prompt.
-    nonisolated(unsafe) private static var fromPrompt: Set<CBv2RequestID> = []
-
-    /// Records where `id`'s newest proposal came from.
-    static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool) {
-        guard enabled, skipEnabled else { return }
-        lock.withLock {
-            if prompt { fromPrompt.insert(id) } else { fromPrompt.remove(id) }
-        }
-    }
-
-    /// True when `id`'s newest proposal came from the prompt, so its next
-    /// round looks the continuation up before running the drafter.
-    static func expectsPromptProposal(_ id: CBv2RequestID) -> Bool {
-        guard enabled, skipEnabled else { return false }
-        return lock.withLock { fromPrompt.contains(id) }
-    }
-
-    /// The next round's ids from the prompt, or nil (then the drafter runs).
-    static func lookup(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
-        guard enabled, depth > 0,
-            let hit = continuation(history: history, promptLength: promptLength, depth: depth)
-        else { return nil }
-        FileHandle.standardError.write(
-            Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth), drafter skipped\n".utf8))
-        return MLXArray(hit.ids, [1, depth])
-    }
-
     /// `MLXFAST_DFLASH_SPLICE=0` keeps the host lookup alone (the block is
     /// then the drafter's whenever no unique 16-token prompt span matches).
     static let spliceEnabled: Bool = {
@@ -102,22 +55,27 @@ enum CBv2PromptLookupDraft {
     /// prints it. Diagnostic only: the readback waits for the drafter.
     static let spliceTrace: Bool =
         ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_TRACE"] == "1"
-
     /// The proposal, or the same object when lookup does not apply.
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
-        guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
-            proposal.dim(1) == depth
-        else { return proposal }
-        if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
-            FileHandle.standardError.write(
-                Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
-            return MLXArray(hit.ids, [1, depth])
+        guard proposal.ndim == 2, proposal.dim(0) == 1, proposal.dim(1) == depth else { return proposal }
+        if let ids = self.proposal(history: history, promptLength: promptLength, depth: depth) {
+            return ids
         }
         guard spliceEnabled else { return proposal }
         return splice(proposal, history: history, promptLength: promptLength, depth: depth)
             ?? proposal
+    }
+
+    /// The looked-up `[1, depth]` ids, or nil when lookup does not apply.
+    static func proposal(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+        guard enabled, depth > 0,
+            let hit = continuation(history: history, promptLength: promptLength, depth: depth)
+        else { return nil }
+        FileHandle.standardError.write(
+            Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+        return MLXArray(hit.ids, [1, depth])
     }
 
     /// The drafter's block, continued along the prompt span it is quoting.
@@ -238,6 +196,15 @@ enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
+        // Every longer eligible match contains this suffix and leaves the
+        // same continuation inside the prompt. Prove a miss in one scan
+        // before scanning all longer lengths; ambiguous hits still use the
+        // original longest-match selection below.
+        let minimumSuffix = history[(count - minimum) ..< count]
+        let lastMinimumStart = prompt - minimum - depth
+        guard (0 ... lastMinimumStart).contains(where: { start in
+            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
+        }) else { return nil }
         for length in stride(from: longest, through: minimum, by: -1) {
             let suffix = count - length
             let lastStart = prompt - length - depth

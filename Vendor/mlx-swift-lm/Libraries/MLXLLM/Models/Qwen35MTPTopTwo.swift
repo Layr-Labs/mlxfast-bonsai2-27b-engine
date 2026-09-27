@@ -264,8 +264,13 @@ enum Qwen35TensorPackedMatmul {
 
     /// 32-column blocks per threadgroup (`DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB`,
     /// 1 to 8) and simdgroups splitting K per block (`..._HEAD_KS`, 2 or 4).
+    /// Default 1: each threadgroup is one 32-column block (two K-split
+    /// simdgroups). Every block's arithmetic is the same at any CB (a block
+    /// never reads another's partials), so the output is bitwise the CB = 4
+    /// one; on the drafter's 16 x 100,352 head one block per threadgroup runs
+    /// about 4% faster on M5 Max (460 vs 482 us, standalone).
     private static let headColumnBlocks: Int = {
-        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 4
+        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 1
         return min(max(value, 1), 8)
     }()
     private static let headKSplit: Int = {
@@ -2428,6 +2433,357 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // The prompt-width int8 kernel with the weight operand in registers
+    // (`promptRegisterWeights`): a 32 x 64 output tile per threadgroup of
+    // two simdgroups, each running its own 32 x 32 x 128 op
+    // (`execution_simdgroup`) whose right operand is a cooperative tensor
+    // the simdgroup builds from the tiled 2-bit words directly: lane l holds
+    // columns nl + 8c (c = 0..3) and the k-quad kq of every 16-block of the
+    // group, which is plane kq of the column's word for that block ((w >> 2 kq)
+    // & 0x03030303, the staged8 kernel's K order). No threadgroup memory, no
+    // staging stores, no barriers. Same integer product per 128-group (exact),
+    // the same FP32 epilogue per element in ascending group order and the same
+    // conversion at the store, so every output is bitwise the staged8
+    // kernel's (checked at load, `promptRegisterSelfTest`). Hot configuration
+    // only: signed codes, negated offsets, factored epilogue, row-tiled
+    // constants and the tiled word copy. grid (N / 64 * 64, M / 32, 1),
+    // threadgroup (64, 1, 1); inputs as `sourceStaged8`. Four-wide stores.
+    private static let sourceStaged8Reg = """
+
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int ms = int(threadgroup_position_in_grid.y) * 32;
+        const int ns = int(threadgroup_position_in_grid.x) * 64 + 32 * int(sg);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        thread uint32_t* bw = (thread uint32_t*)&bT;
+        auto tA0 = A.template slice<128, 32>(0, ms);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = ns + fn;
+        const int mb = ms + fm;
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+        const uint kq = (lane & 1) + 2 * ((lane >> 3) & 1);
+        const device uint4* wcol = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256 + (size_t)nl * 8);
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 16);
+        const int NQ = N / 4;
+        const size_t tb0 = (size_t)(ms / 64) * (size_t)Kg * 64 + (size_t)(fm * 4) + (size_t)((ms & 32) >> 4);
+        const size_t tb1 = tb0 + 32;
+        const uint sh = 2 * kq;
+        uint4 wv[8];
+        auto load = [&](int g) {
+          const device uint4* src = wcol + (size_t)g * 64;
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * 16]; wv[2 * c + 1] = src[c * 16 + 1]; }
+        };
+        auto extract = [&]() {
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) {
+            const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];
+            bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;
+            bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;
+            bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;
+            bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;
+          }
+        };
+        auto epi = [&](int g) {
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float2 a0 = *(const device float2*)(ascale + tb0 + (size_t)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tb1 + (size_t)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);
+          const float as[4] = {a0.x, a0.y, a1.x, a1.y};
+          const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
+          }
+        };
+        for (int g = 0; g < Kg; g++) {
+          load(g); extract();
+          auto tA = A.template slice<128, 32>(g * 128, ms);
+          op.run(tA, bT, cT);
+          epi(g);
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+          const size_t base = (size_t)mm * N + nb + 16 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          } else {
+            *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
+          }
+        }
+        """
+
+    private static let kernelStaged8Reg = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_rb",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Reg,
+        header: header,
+        ensureRowContiguous: true)
+
+    // The int8-staged prompt kernel's other schedules, for the load-time
+    // per-shape trial (`PromptFormTrial`). Same op (64 x 64 x 128 `matmul2d`
+    // over the four simdgroups, one `multiply` per 128-group into int32, so
+    // each group's integer product is exact whatever the schedule), same
+    // staging, same destination layout, and the per-group FP32 epilogue of
+    // `sourceStaged8` verbatim, applied to every output in group order: the
+    // outputs are the stock kernel's bit for bit. Templates beyond the stock
+    // ones: MT row tiles of 64 per threadgroup share each staged slice (1,
+    // 2); GS 128-groups staged per barrier (1, 2: a K step of 256); NB
+    // staging buffers (2; 3 with GS = MT = 1: the next group's op is issued
+    // before this group's epilogue); PP two destination tensors, the second
+    // op issued before the first epilogue (0, 1); ST with GS = 1 and NB = 2
+    // the staging's register prefetch (0: stock, load then stores before the
+    // ops; 1: the next group's words loaded before this group's ops, stored
+    // after its epilogue; 2: loaded one group earlier still); SW the
+    // threadgroup raster, bands of 2^SW row tiles walked before the next
+    // column tile (MLX's NAX GEMM swizzle). grid: ((N / 64) << SW) * 128,
+    // M / (64 * MT) >> SW;
+    // threadgroup (128, 1, 1). Same inputs as `sourceStaged8`.
+    private static let sourceStaged8Forms = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int tgx = int(threadgroup_position_in_grid.x);
+        const int tgy = int(threadgroup_position_in_grid.y);
+        const int n0 = (tgx >> SW) * 64;
+        const int mt0 = ((tgy << SW) + (tgx & ((1 << SW) - 1))) * MT;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        threadgroup uint32_t bs[NB * GS][64 * 128 / 4];
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, mt0 * 64);
+        auto cTa = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cTb = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mlane = 16 * int(sg >> 1) + fm;
+        float acc[MT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t tlane = (size_t)((8 * int(sg >> 1) + fm) * 4);
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = TILED
+            ? w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4
+            : w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        // `sourceStaged8`'s staging, split into the words' load and the
+        // codes' stores (the register-prefetch schedules put time between).
+        auto load = [&](int g) -> uint4 {
+          return *(const device uint4*)(wrow + (size_t)g * (TILED ? 256 : 8));
+        };
+        auto put = [&](const uint4 v, int slot) {
+          threadgroup uint32_t* dst = bs[slot] + sc * 32 + sh * 16;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint32_t wv = v[j];
+            const uint4 codes = uint4(
+                wv & 0x03030303u,
+                (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u,
+                (wv >> 6) & 0x03030303u);
+            *(threadgroup uint4*)(dst + 4 * j) = codes;
+          }
+        };
+        auto stage = [&](int g, int slot) { put(load(g), slot); };
+        // Group g's product for row tile t from staging slot `slot`.
+        auto run = [&](int g, int slot, int t, thread decltype(cTa)& cT) {
+          auto tA = A.template slice<128, 64>(g * 128, (mt0 + t) * 64);
+          tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> Bt((threadgroup CodeT*)bs[slot], dextents<int, 2>(128, 64));
+          op.run(tA, Bt, cT);
+        };
+        // Group g's epilogue for row tile t: `sourceStaged8`'s, verbatim.
+        auto epilogue = [&](thread decltype(cTa)& cT, int t, int g) {
+          const int m0 = (mt0 + t) * 64;
+          const int mb = m0 + mlane;
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          float4 b0, b1;
+          if constexpr (NEGATIVE_SCALE_BIAS) {
+            b0 = -s0; b1 = -s1;
+          } else {
+            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+          }
+          float4 u0 = 0.0f, u1 = 0.0f;
+          if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
+          float as[4], rb[4];
+          if (MPERM) {
+            const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + tlane;
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          } else {
+            const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float u = nh ? u1[c] : u0[c];
+            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+              acc[t][i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[t][i]);
+            } else {
+              const float tt = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+              acc[t][i] = fma(b, rb[mh], fma(as[mh], tt, acc[t][i]));
+            }
+          }
+        };
+        if constexpr (NB == 3) {
+          // Pipelined: group g + 1's op goes into the other destination
+          // tensor before group g's epilogue. Staging g + 2 reuses the slot
+          // of g - 1, whose op every simdgroup finished before the barrier
+          // that closed g - 1's epilogue.
+          stage(0, 0);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          run(0, 0, 0, cTa);
+          if (Kg > 1) { stage(1, 1); }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int g = 0; g < Kg; g += 2) {
+            if (g + 1 < Kg) { run(g + 1, (g + 1) % 3, 0, cTb); }
+            if (g + 2 < Kg) { stage(g + 2, (g + 2) % 3); }
+            epilogue(cTa, 0, g);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (g + 1 < Kg) {
+              if (g + 2 < Kg) { run(g + 2, (g + 2) % 3, 0, cTa); }
+              if (g + 3 < Kg) { stage(g + 3, (g + 3) % 3); }
+              epilogue(cTb, 0, g + 1);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        } else if constexpr (GS == 2) {
+          // Two groups per stage and barrier, double-buffered (slots 2b, 2b + 1).
+          stage(0, 0);
+          stage(1, 1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int g = 0; g < Kg; g += 2) {
+            const int cur = (g >> 1) & 1;
+            if (g + 2 < Kg) { stage(g + 2, 2 * (cur ^ 1)); stage(g + 3, 2 * (cur ^ 1) + 1); }
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < MT; t++) {
+              if constexpr (PP != 0) {
+                run(g, 2 * cur, t, cTa);
+                run(g + 1, 2 * cur + 1, t, cTb);
+                epilogue(cTa, t, g);
+                epilogue(cTb, t, g + 1);
+              } else {
+                run(g, 2 * cur, t, cTa);
+                epilogue(cTa, t, g);
+                run(g + 1, 2 * cur + 1, t, cTa);
+                epilogue(cTa, t, g + 1);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        } else {
+          // One group per stage and barrier (the stock schedule): group g's
+          // ops and epilogues from slot g & 1.
+          auto compute = [&](int g, int cur) {
+            if constexpr (PP != 0 && MT == 2) {
+              run(g, cur, 0, cTa);
+              run(g, cur, 1, cTb);
+              epilogue(cTa, 0, g);
+              epilogue(cTb, 1, g);
+            } else {
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < MT; t++) {
+                run(g, cur, t, cTa);
+                epilogue(cTa, t, g);
+              }
+            }
+          };
+          stage(0, 0);
+          if constexpr (ST == 0) {
+            // Stock: group g + 1 staged (load, then its stores) before g's ops.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int g = 0; g < Kg; g++) {
+              const int cur = g & 1;
+              if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+              compute(g, cur);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          } else {
+            // Register prefetch: group g + ST's words are loaded at the top of
+            // group g (ST - 1 groups earlier than they are stored) and group
+            // g + 1's codes are stored after g's epilogue, into the slot of
+            // g - 1, whose ops every simdgroup finished before the last barrier.
+            uint4 vnext = uint4(0);
+            if (ST == 2 && Kg > 1) { vnext = load(1); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int g = 0; g < Kg; g++) {
+              const int cur = g & 1;
+              uint4 vload = uint4(0);
+              if (g + ST < Kg) { vload = load(g + ST); }
+              compute(g, cur);
+              if (g + 1 < Kg) { put(ST == 2 ? vnext : vload, cur ^ 1); }
+              vnext = vload;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT; t++) {
+          const int mb = (mt0 + t) * 64 + mlane;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int nh = (i >> 3) & 1;
+            const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+            const float v0 = acc[t][i];
+            const float v1 = acc[t][i + 1];
+            const float v2 = acc[t][i + 2];
+            const float v3 = acc[t][i + 3];
+            const size_t base = (size_t)mm * N + nb + 32 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
+          }
+        }
+        """
+
+    private static let kernelStaged8Forms = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_forms",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Forms,
+        header: header,
+        ensureRowContiguous: true)
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -2770,40 +3126,32 @@ enum Qwen35TensorPackedMatmul {
         narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
     }
 
-    /// The in-situ choice of the verify int8 kernels: candidate choices
-    /// (shortlisted by the synthetic self-test and timing at load) run in turn
-    /// on real speculative rounds of the load-time engine warm, and a
-    /// candidate replaces the record's pick only when its median round beats
-    /// the record's pick's by more than 0.5 %. The synthetic timing streams
-    /// each kernel for 0.5-0.7 ms bursts in which the GPU never reaches the
-    /// clock state of the decode window, so it mispicks; a whole round does
-    /// reach it. Every candidate passed the bitwise self-test at the output
-    /// types its shapes take, so the rounds and their tokens are the same
-    /// whichever runs.
+    /// The in-situ choice of the verify int8 kernels, in two stages. Every
+    /// candidate passed the bitwise self-test at the output types its shapes
+    /// take, so the rounds and their tokens are the same whichever runs.
     ///
-    /// Up to `singleStageMax` sets (the base's trial, e.g. without the zoo):
-    /// `roundsPerSet` rounds each, interleaved. More sets (the zoo's family
-    /// sets): two stages in one request. Stage 1 runs every set for
-    /// `stage1Rounds` rounds, interleaved. Stage 2 then takes up to
-    /// `stage2Sets` candidates by their stage-1 median, where a set combining
-    /// the best N = 5120-class set's bodies with the best wide-class set's is
-    /// estimated as the sum of their gains, and runs them and the record's pick
-    /// for `roundsPerSet` rounds each, interleaved; only stage 2's rounds
-    /// decide. A candidate whose stage-1 estimate is more than `stage2Slack`
-    /// slower than the record's pick is not taken; with none left, the
-    /// record's pick is kept after stage 1.
+    /// Stage 1, a GPU-bound microbench (`shortlist`): the int8 launches of one
+    /// real verify forward (`beginCapture`, on the deferred warm's engine
+    /// round: each projection's packed words, scales and layout cache as the
+    /// verify route receives them, in the forward's order, the 64 layers and
+    /// the head) replayed as one dependent chain per candidate set. Each launch
+    /// reads the previous launch's output as its scaled sums, so it waits for
+    /// it as in the verify (independent launches overlap one kernel's tail with
+    /// the next one's head, which the verify never does); the activations are
+    /// synthetic per K (a launch's time does not depend on its values). One
+    /// warm-up chain, then `chainRuns` passes over all sets in rotated order;
+    /// each set keeps its best chain (≈20 ms on the M5, not the 0.5 ms bursts
+    /// of the load-time synthetic timing). A set combining one of the two
+    /// fastest N = 5120-class sets with one of the two fastest wide-class sets
+    /// is estimated as the sum of their gains (the chain is serial, so launch
+    /// times add). The stage only shortlists: up to `maxFinalists` sets,
+    /// effective-distinct from the record's pick, whose chain beats the
+    /// record's by more than `PairedRoundTrial.admits` asks (half the adoption
+    /// margin). With none, the record's pick stays and no round runs.
     ///
-    /// Per shape, between the stages (`perShapeKeys`): each production shape
-    /// is one factor whose levels are the record's kernel on it and the two
-    /// kernels the fastest stage-1 sets (within `stage2Slack`) put on it; the
-    /// 18 runs of an L18 orthogonal array over the five factors, one round
-    /// each, give every kernel's per-shape effect (its mean round minus the
-    /// record kernel's; the array is balanced, so these are the additive
-    /// model's least-squares effects). Stage 2 then runs the mix of each
-    /// shape's best kernel first and ranks the next mix with the other
-    /// candidates; the head follows the gate|up level's set. The adoption
-    /// rule is unchanged. `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_SHAPE=0` skips
-    /// this step (the trial of zoo 3a).
+    /// Stage 2, paired rounds (`PairedRoundTrial`): one engine request whose
+    /// timed rounds run cycles of the record's pick and each finalist; a
+    /// finalist is adopted only under the paired rule.
     ///
     /// `roundBoundary()` runs at the top of every block proposal and of every
     /// adopted speculative block (one static bool check when no trial is
@@ -2811,9 +3159,10 @@ enum Qwen35TensorPackedMatmul {
     /// one, and the choice installed at a boundary is what the next verify
     /// graph build reads. The first round after the seed is discarded. Runs
     /// only inside the deferred load warm (`Qwen35DFlash2Assistant`), never in
-    /// a served request. One stderr line names every set's medians and the
-    /// set installed. `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps
-    /// the record's pick without a trial.
+    /// a served request. One stderr line gives every set's chain, the
+    /// finalists, each finalist's paired statistics and the set installed.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps the record's
+    /// pick without a trial.
     enum NarrowInSituTrial {
         nonisolated(unsafe) static var active = false
         /// The candidate sets (the first is the record's pick), their names,
@@ -2825,60 +3174,34 @@ enum Qwen35TensorPackedMatmul {
         nonisolated(unsafe) static var roundIndex = 0
         nonisolated(unsafe) static var lastBoundary: UInt64 = 0
         nonisolated(unsafe) static var onEnough: (() -> Void)?
-        // The running trial: `pool` holds the sets, then stage 2's combined
-        // sets; a timing slot is one set in one stage; `schedule` holds the
-        // slot of each timed round (round 1 on).
-        nonisolated(unsafe) private static var pool: [NarrowChoice] = []
-        nonisolated(unsafe) private static var poolLabels: [String] = []
-        nonisolated(unsafe) private static var slotSet: [Int] = []
-        nonisolated(unsafe) private static var slotTimes: [[UInt64]] = []
-        nonisolated(unsafe) private static var schedule: [Int] = []
-        nonisolated(unsafe) private static var stage1Slots = 0
-        nonisolated(unsafe) private static var stage2Built = false
-        nonisolated(unsafe) private static var stage2First = -1
-        nonisolated(unsafe) private static var current = -1
-        // Per shape: each factor's level kernels (the record's first), the
-        // head's kernel per gate|up level, the first L18 slot, the log part.
-        nonisolated(unsafe) private static var perShapeBuilt = false
-        nonisolated(unsafe) private static var levels: [[NarrowKernel]] = []
-        nonisolated(unsafe) private static var headLevels: [NarrowKernel] = []
-        nonisolated(unsafe) private static var perShapeFirst = -1
-        nonisolated(unsafe) private static var perShapeLog = ""
+        // Stage 2: the record's pick then the finalists, their names, each
+        // timed round's arm and time; stage 1's log part and duration.
+        nonisolated(unsafe) private static var finalists: [NarrowChoice] = []
+        nonisolated(unsafe) private static var finalistLabels: [String] = []
+        nonisolated(unsafe) private static var arms: [Int] = []
+        nonisolated(unsafe) private static var times: [Double?] = []
+        nonisolated(unsafe) private static var stage1Log = ""
+        nonisolated(unsafe) private static var stage1Nanoseconds: UInt64 = 0
 
-        /// The per-shape factors: attention qkv, GDN qkv|z, gate|up, o/out,
-        /// down (the head follows gate|up).
+        /// One captured verify launch: the operands the route received.
+        private struct Launch {
+            let weight: MLXArray, scales: MLXArray, biases: MLXArray
+            let k: Int, n: Int, outputDType: DType
+            let cache: HadamardConstantLayoutCache
+        }
+        nonisolated(unsafe) private(set) static var capturing = false
+        nonisolated(unsafe) private static var captured: [Launch] = []
+
+        /// The per-shape keys (`..._TZOO_FORCE` maps): attention qkv, GDN
+        /// qkv|z, gate|up, o/out, down; and the head.
         static let perShapeKeys: [[Int]] = [[5120, 14336], [5120, 16384], [5120, 34816], [6144, 5120], [17408, 5120]]
         static let perShapeNames = ["attn", "qkv|z", "gate|up", "o", "down"]
         static let headKey = [5120, 248320]
-        /// L18: OA(18, 3^5) (columns 2-5 and 7 of the standard table; every
-        /// two columns hold each level pair twice), rows ordered so no
-        /// column's levels trend with the run order.
-        static let perShapeArray: [[Int]] =
-            "21010 02121 10202 10021 21102 02210 22222 00000 11111 22001 11220 00112 20120 12012 01201 12100 01022 20211"
-            .split(separator: " ").map { $0.compactMap(\.wholeNumberValue) }
-        static let perShapeEnabled: Bool = {
-            let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_SHAPE"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return !["0", "false", "no", "off"].contains(value ?? "")
-        }()
 
-        /// Timed rounds per candidate (one stage, and stage 2).
-        static let roundsPerSet = 8
-        /// Timed rounds per set in stage 1.
-        static let stage1Rounds = 3
-        /// Candidates stage 2 runs beside the record's pick.
-        static let stage2Sets = 3
-        /// Up to this many sets the trial is one stage (the base's).
-        static let singleStageMax = 4
-        /// A candidate must beat the record's pick by more than this.
-        static let adoptMargin = 0.005
-        /// Stage 2 takes a candidate only if its stage-1 estimate is at most
-        /// this much slower than the record's pick's median.
-        static let stage2Slack = 0.02
-        /// Rounds above this multiple of their candidate's median are dropped.
-        static let outlierFactor = 1.5
-        /// A candidate is adopted only with at least this many kept rounds.
-        static let minimumRounds = 4
+        /// Finalists stage 2 runs beside the record's pick.
+        static let maxFinalists = 2
+        /// Timed chain passes (each set keeps its best).
+        static let chainRuns = 5
 
         static let enabled: Bool = {
             let value = ProcessInfo.processInfo.environment[
@@ -2890,16 +3213,10 @@ enum Qwen35TensorPackedMatmul {
         /// Whether a trial is set up (two or more distinct candidates; the
         /// first is the record's pick).
         static var armed: Bool { enabled && sets.count >= 2 }
-        static var twoStage: Bool { sets.count > singleStageMax }
 
-        /// Proposals the trial can need (the warm request's budget): the
-        /// discarded round, the seed-side boundary, then every timed round.
-        static var roundsNeeded: Int {
-            twoStage
-                ? 2 + stage1Rounds * sets.count + (perShapeEnabled ? perShapeArray.count : 0)
-                    + roundsPerSet * (1 + stage2Sets)
-                : 2 + roundsPerSet * sets.count
-        }
+        /// Proposals stage 2 needs (the warm request's budget): the discarded
+        /// round, the seed-side boundary, then every timed round.
+        static var roundsNeeded: Int { 2 + arms.count }
 
         @inline(__always) static func roundBoundary() {
             guard active else { return }
@@ -2911,27 +3228,33 @@ enum Qwen35TensorPackedMatmul {
             narrowByShape = set.1
         }
 
-        /// New timing slots for these pool sets, `rounds` each, interleaved
-        /// (the first set's rounds last, as the base's rotation).
-        private static func appendRounds(_ poolIndices: [Int], rounds: Int) {
-            let first = slotSet.count
-            for index in poolIndices {
-                slotSet.append(index)
-                slotTimes.append([])
+        /// Records the int8 launches of the next verify forward (`capture`).
+        static func beginCapture() {
+            captured = []
+            capturing = armed
+        }
+
+        /// The verify route's hook: one launch, until the forward's first
+        /// projection comes round again.
+        static func capture(
+            _ weight: MLXArray, _ scales: MLXArray, _ biases: MLXArray, k: Int, n: Int,
+            outputDType: DType, cache: HadamardConstantLayoutCache
+        ) {
+            if let first = captured.first, first.weight === weight || captured.count >= 1024 {
+                capturing = false
+                return
             }
-            let count = poolIndices.count
-            schedule += (1 ... rounds * count).map { first + $0 % count }
+            captured.append(
+                Launch(
+                    weight: weight, scales: scales, biases: biases, k: k, n: n,
+                    outputDType: outputDType, cache: cache))
         }
 
         private static func boundary() {
             let now = DispatchTime.now().uptimeNanoseconds
-            if roundIndex >= 2, current >= 0 { slotTimes[current].append(now - lastBoundary) }
+            if roundIndex >= 2, roundIndex - 2 < times.count { times[roundIndex - 2] = Double(now - lastBoundary) }
             lastBoundary = now
-            if roundIndex >= 1, roundIndex - 1 >= schedule.count, twoStage {
-                if !perShapeBuilt { buildPerShape() }
-                if roundIndex - 1 >= schedule.count, !stage2Built { buildStage2() }
-            }
-            if roundIndex >= 1, roundIndex - 1 >= schedule.count {
+            if roundIndex >= 1, roundIndex - 1 >= arms.count {
                 // every scheduled round is timed
                 roundIndex += 1
                 active = false
@@ -2940,51 +3263,165 @@ enum Qwen35TensorPackedMatmul {
                 enough?()
                 return
             }
-            current = roundIndex == 0 ? -1 : schedule[roundIndex - 1]
-            install(pool[current < 0 ? 0 : slotSet[current]])
+            install(finalists[roundIndex == 0 ? 0 : arms[roundIndex - 1]])
             roundIndex += 1
         }
 
-        /// Arms the round hook. `onEnough` runs (on the engine's thread) once
-        /// every candidate has its rounds.
+        /// Arms the round hook for stage 2. `onEnough` runs (on the engine's
+        /// thread) once every scheduled round is timed.
         static func begin(onEnough: @escaping () -> Void) {
-            guard armed else { return }
-            pool = sets
-            poolLabels = sets.indices.map { $0 < labels.count ? labels[$0] : "set \($0)" }
-            slotSet = []
-            slotTimes = []
-            schedule = []
-            appendRounds(Array(sets.indices), rounds: twoStage ? stage1Rounds : roundsPerSet)
-            stage1Slots = sets.count
-            stage2Built = false
-            stage2First = -1
-            perShapeBuilt = false
-            levels = []
-            headLevels = []
-            perShapeFirst = -1
-            perShapeLog = ""
-            current = -1
+            guard armed, !arms.isEmpty else { return }
+            times = Array(repeating: nil, count: arms.count)
             roundIndex = 0
             lastBoundary = 0
             self.onEnough = onEnough
             active = true
         }
 
-        private static func median(_ values: [UInt64]) -> Double? {
-            guard !values.isEmpty else { return nil }
-            let sorted = values.sorted()
-            let mid = sorted.count / 2
-            return sorted.count % 2 == 1
-                ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
+        /// Each set's best chain (ns) and the record's runs; nil when the
+        /// chain cannot be built or an MLX error occurs.
+        private static func chainTimes(
+            _ launches: [Launch], _ matmul: HadamardQuantizedLinear.TensorPackedMatmulNarrowInt8
+        ) -> (best: [Double], record: [Double], warm: Double)? {
+            var inputs: [Int: (MLXArray, MLXArray, MLXArray)] = [:]
+            for (index, launch) in launches.enumerated() where inputs[launch.k] == nil {
+                let kg = launch.k / 128
+                let seed = UInt64(9001 + 8 * index)
+                inputs[launch.k] = (
+                    MLXRandom.randInt(
+                        Int32(-127) ..< Int32(128), [16, launch.k], key: MLXRandom.key(seed)
+                    ).asType(.int8),
+                    MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [16, kg], key: MLXRandom.key(seed + 1)),
+                    MLXRandom.normal([16, kg], key: MLXRandom.key(seed + 2)) * Float(50))
+            }
+            eval(inputs.values.flatMap { [$0.0, $0.1, $0.2] })
+            func chain(_ set: NarrowChoice) -> MLXArray? {
+                install(set)
+                var y: MLXArray?
+                for launch in launches {
+                    guard let (codes, ascale, rowsum) = inputs[launch.k] else { return nil }
+                    let kg = launch.k / 128
+                    var sums = rowsum
+                    if let previous = y {
+                        // the previous output's bytes as the scaled sums
+                        var flat = previous.reshaped([-1])
+                        if flat.dtype != .float32 { flat = flat.view(dtype: .float32) }
+                        if flat.size >= 16 * kg { sums = flat[0 ..< 16 * kg].reshaped([16, kg]) }
+                    }
+                    y = matmul(
+                        SignedBlockHadamard.Int8Activation(codes: codes, scales: ascale, scaledSums: sums),
+                        launch.weight, launch.scales, launch.biases, 128, launch.outputDType, launch.cache)
+                    if y == nil { return nil }
+                }
+                return y
+            }
+            var best = Array(repeating: Double.infinity, count: sets.count)
+            var record: [Double] = []
+            var warmNanoseconds = 0.0
+            let completed = try? withError { error -> Bool in
+                guard let warm = chain(sets[0]) else { return false }
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                eval(warm)
+                warmNanoseconds = Double(DispatchTime.now().uptimeNanoseconds - t0)
+                try error.check()
+                for pass in 0 ..< chainRuns {
+                    let order = sets.indices.map { (pass + $0) % sets.count }
+                    let graphs = order.map { chain(sets[$0]) }
+                    for (index, graph) in zip(order, graphs) {
+                        guard let graph else { continue }
+                        let t0 = DispatchTime.now().uptimeNanoseconds
+                        eval(graph)
+                        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0)
+                        best[index] = min(best[index], elapsed)
+                        if index == 0 { record.append(elapsed) }
+                    }
+                    try error.check()
+                }
+                return true
+            }
+            install(sets[0])
+            guard completed == true, best[0].isFinite else { return nil }
+            return (best, record, warmNanoseconds)
         }
 
-        /// A slot's median over its rounds within `outlierFactor` of the raw
-        /// median, the rounds kept and the rounds run.
-        private static func summary(_ slot: Int) -> (Double?, Int, Int) {
-            let times = slot < slotTimes.count ? slotTimes[slot] : []
-            guard let first = median(times) else { return (nil, 0, times.count) }
-            let kept = times.filter { Double($0) <= outlierFactor * first }
-            return (median(kept), kept.count, times.count)
+        /// Stage 1 (see the type's notes): the chains, the finalists and the
+        /// stage-2 schedule. True when stage 2 is to run.
+        static func shortlist() -> Bool {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let launches = captured
+            captured = []
+            capturing = false
+            finalists = []
+            finalistLabels = []
+            arms = []
+            times = []
+            guard armed else { return false }
+            var chosen: [(NarrowChoice, String)] = []
+            var log = ""
+            if let matmul = HadamardQuantizedLinear.tensorPackedMatmulNarrowInt8, !launches.isEmpty,
+                let (best, recordRuns, warm) = chainTimes(launches, matmul)
+            {
+                let record = best[0]
+                PairedRoundTrial.roundFloor = record
+                let sortedRuns = recordRuns.sorted()
+                let spread = sortedRuns.isEmpty ? 0 : sortedRuns[sortedRuns.count / 2] / record - 1
+                func ms(_ ns: Double, _ estimate: Bool = false) -> String {
+                    String(format: "%.2f", ns / 1e6)
+                        + (ns == record ? "" : String(format: " %+.2f%%", (ns / record - 1) * 100))
+                        + (estimate ? " est" : "")
+                }
+                log = "stage 1 chain (\(launches.count) launches, "
+                    + String(format: "warm-up %.1f ms, best of %d, record spread %.2f%%", warm / 1e6, chainRuns, spread * 100)
+                    + ") ms ["
+                    + sets.indices.map { labels[$0] + " " + ms(best[$0]) }.joined(separator: " | ") + "]"
+                var ranked: [(NarrowChoice, String, Double)] = (1 ..< sets.count).map {
+                    (sets[$0], labels[$0], best[$0])
+                }
+                func fastest(_ scope: Int) -> [Int] {
+                    Array(
+                        (1 ..< sets.count).filter { $0 < scopes.count && scopes[$0] == scope && best[$0].isFinite }
+                            .sorted { best[$0] < best[$1] }.prefix(2))
+                }
+                var combos: [String] = []
+                for a in fastest(1) {
+                    for b in fastest(2) {
+                        var map = sets[a].1
+                        for (key, kernel) in sets[b].1 where narrowShapeClass(key) == 2 { map[key] = kernel }
+                        let estimate = best[a] + best[b] - record
+                        ranked.append(((sets[a].0, map), labels[a] + "+" + labels[b], estimate))
+                        combos.append(labels[a] + "+" + labels[b] + " " + ms(estimate, true))
+                    }
+                }
+                if !combos.isEmpty { log += " [" + combos.joined(separator: " | ") + "]" }
+                ranked.sort { $0.2 < $1.2 }
+                let recordKernels = effective(sets[0])
+                for (set, label, time) in ranked
+                where chosen.count < maxFinalists
+                    && PairedRoundTrial.admits(gain: record - time, reference: record, fallback: 0)
+                {
+                    let kernels = effective(set)
+                    if kernels != recordKernels, !chosen.contains(where: { effective($0.0) == kernels }) {
+                        chosen.append((set, label))
+                    }
+                }
+                log += chosen.isEmpty
+                    ? "; no set's chain beats the record's by \(PairedRoundTrial.adoptMargin * 50) %"
+                    : "; finalists [" + chosen.map(\.1).joined(separator: ", ") + "]"
+            } else {
+                log = "stage 1 skipped (no verify forward captured or a chain failed)"
+            }
+            if PairedRoundTrial.nullRun {
+                chosen = (1 ... maxFinalists).map { (sets[0], "null\($0)") }
+                log += "; MLXFAST_TRIAL_NULL: the finalists are the record's pick"
+            }
+            install(sets[0])
+            finalists = [sets[0]] + chosen.map(\.0)
+            finalistLabels = ["record"] + chosen.map(\.1)
+            arms = PairedRoundTrial.schedule(challengers: chosen.count)
+            times = Array(repeating: nil, count: arms.count)
+            stage1Log = log
+            stage1Nanoseconds = DispatchTime.now().uptimeNanoseconds - start
+            return !arms.isEmpty
         }
 
         /// The kernel each production shape and the head resolve to.
@@ -2997,175 +3434,10 @@ enum Qwen35TensorPackedMatmul {
             kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
         }
 
-        /// A set's kernel on each per-shape factor and the head.
+        /// A set's kernel on each per-shape key and the head.
         static func mapping(_ set: NarrowChoice) -> String {
             zip(perShapeNames + ["head"], perShapeKeys + [headKey])
                 .map { "\($0.0)=" + name(set.1[$0.1] ?? set.0) }.joined(separator: " ")
-        }
-
-        /// The level factor `f` takes at array entry `level` (a factor with
-        /// fewer than three kernels repeats its last).
-        private static func levelIndex(_ f: Int, _ level: Int) -> Int { min(level, levels[f].count - 1) }
-
-        /// The record's pick with factor f at `row[f]` (the head per gate|up).
-        private static func perShapeSet(_ row: [Int]) -> NarrowChoice {
-            var map = pool[0].1
-            for (f, key) in perShapeKeys.enumerated() { map[key] = levels[f][levelIndex(f, row[f])] }
-            map[headKey] = headLevels[levelIndex(2, row[2])]
-            return (pool[0].0, map)
-        }
-
-        /// The per-shape levels from stage 1's ranking and the L18 runs, one
-        /// round each (see the type's notes). Nothing when no shape has a
-        /// second kernel.
-        private static func buildPerShape() {
-            perShapeBuilt = true
-            perShapeLog = "; per shape " + (perShapeEnabled ? "none (no second kernel on any shape)" : "off")
-            guard perShapeEnabled, let record = summary(0).0 else { return }
-            let ranked = (1 ..< stage1Slots).compactMap { slot in summary(slot).0.map { (slot, $0) } }
-                .filter { $0.1 < record * (1 + stage2Slack) }.sorted { $0.1 < $1.1 }
-            levels = []
-            for (f, key) in perShapeKeys.enumerated() {
-                var list = [pool[0].1[key] ?? pool[0].0]
-                var heads = [pool[0].1[headKey] ?? pool[0].0]
-                for (slot, _) in ranked where list.count < 3 {
-                    let set = pool[slotSet[slot]]
-                    let kernel = set.1[key] ?? set.0
-                    if !list.contains(kernel) {
-                        list.append(kernel)
-                        heads.append(set.1[headKey] ?? set.0)
-                    }
-                }
-                levels.append(list)
-                if f == 2 { headLevels = heads }
-            }
-            guard levels.contains(where: { $0.count > 1 }) else { return }
-            perShapeFirst = slotSet.count
-            for row in perShapeArray {
-                pool.append(perShapeSet(row))
-                poolLabels.append("L18 " + row.map(String.init).joined())
-                slotSet.append(pool.count - 1)
-                slotTimes.append([])
-            }
-            schedule += Array(perShapeFirst ..< perShapeFirst + perShapeArray.count)
-            perShapeLog = "; per shape (L18) not finished"
-        }
-
-        /// Per factor, each level's effect in ns per round against the
-        /// record's kernel (nil: no kept run), from the L18 rounds within
-        /// `outlierFactor` of their median; and the rounds kept.
-        private static func perShapeEffects() -> ([[Double?]], Int) {
-            guard perShapeFirst >= 0 else { return ([], 0) }
-            let runs = perShapeArray.indices.compactMap { r -> (Int, UInt64)? in
-                let slot = perShapeFirst + r
-                return slot < slotTimes.count ? slotTimes[slot].first.map { (r, $0) } : nil
-            }
-            guard let mid = median(runs.map(\.1)) else { return ([], 0) }
-            let kept = runs.filter { Double($0.1) <= outlierFactor * mid }
-            let effects = levels.indices.map { f -> [Double?] in
-                var sums = [Double](repeating: 0, count: levels[f].count)
-                var counts = [Int](repeating: 0, count: levels[f].count)
-                for (r, t) in kept {
-                    let j = levelIndex(f, perShapeArray[r][f])
-                    sums[j] += Double(t)
-                    counts[j] += 1
-                }
-                guard counts[0] > 0 else { return levels[f].map { _ in nil } }
-                return levels[f].indices.map { counts[$0] > 0 ? sums[$0] / Double(counts[$0]) - sums[0] / Double(counts[0]) : nil }
-            }
-            return (effects, kept.count)
-        }
-
-        /// Stage 2's candidates from stage 1's medians and the per-shape
-        /// effects (see the type's notes).
-        private static func buildStage2() {
-            stage2Built = true
-            let medians = (0 ..< stage1Slots).map { summary($0).0 }
-            guard let record = medians[0] else { return }
-            var candidates: [(Int, Double)] = []
-            for index in 1 ..< stage1Slots {
-                if let m = medians[index] { candidates.append((index, m)) }
-            }
-            func best(_ scope: Int) -> [(Int, Double)] {
-                Array(
-                    candidates.filter { $0.0 < scopes.count && scopes[$0.0] == scope }
-                        .sorted { $0.1 < $1.1 }.prefix(2))
-            }
-            let narrow = best(1)
-            let wide = best(2)
-            for a in narrow {
-                for b in wide {
-                    var map = pool[a.0].1
-                    for (key, kernel) in pool[b.0].1 where narrowShapeClass(key) == 2 { map[key] = kernel }
-                    pool.append((pool[a.0].0, map))
-                    poolLabels.append(poolLabels[a.0] + "+" + poolLabels[b.0])
-                    candidates.append((pool.count - 1, a.1 + b.1 - record))
-                }
-            }
-            // Per shape: the mix of each factor's best level, and the mix one
-            // step from it (the swap that costs least), when predicted faster.
-            var firstMix: Int?
-            let (effects, kept) = perShapeEffects()
-            if !effects.isEmpty {
-                func gain(_ picks: [Int]) -> Double {
-                    picks.enumerated().reduce(0) { $0 + (effects[$1.0][$1.1] ?? 0) }
-                }
-                let picks = effects.map { row -> Int in
-                    var pick = 0
-                    for (j, e) in row.enumerated() where j > 0 {
-                        if let e, e < (row[pick] ?? 0) { pick = j }
-                    }
-                    return pick
-                }
-                var next: [Int]?
-                for f in picks.indices {
-                    for j in levels[f].indices where j != picks[f] && effects[f][j] != nil {
-                        var alt = picks
-                        alt[f] = j
-                        if next == nil || gain(alt) < gain(next!) { next = alt }
-                    }
-                }
-                for (label, mix) in [("shape1", picks), ("shape2", next)] {
-                    guard let mix, gain(mix) < 0 else { continue }
-                    pool.append(perShapeSet(mix))
-                    poolLabels.append(label)
-                    if label == "shape1" { firstMix = pool.count - 1 }
-                    else { candidates.append((pool.count - 1, record + gain(mix))) }
-                }
-                var parts: [String] = []
-                for f in levels.indices {
-                    var cells: [String] = []
-                    for (j, kernel) in levels[f].enumerated() {
-                        let effect = effects[f][j].map { String(format: " %+.3f", $0 / 1e6) } ?? " -"
-                        cells.append(name(kernel) + (j == 0 ? "" : effect))
-                    }
-                    parts.append(perShapeNames[f] + ": " + cells.joined(separator: " | "))
-                }
-                perShapeLog = "; per shape (L18, \(kept)/\(perShapeArray.count) rounds kept, ms vs the record's kernel) ["
-                    + parts.joined(separator: "; ") + "]"
-                if let firstMix {
-                    perShapeLog += String(format: ", best mix %+.3f = ", gain(picks) / 1e6) + mapping(pool[firstMix])
-                } else {
-                    perShapeLog += ", no faster mix"
-                }
-            }
-            candidates.sort { $0.1 < $1.1 }
-            var chosen: [Int] = []
-            let recordKernels = effective(pool[0])
-            func take(_ index: Int) {
-                let kernels = effective(pool[index])
-                if kernels != recordKernels, !chosen.contains(where: { effective(pool[$0]) == kernels }) {
-                    chosen.append(index)
-                }
-            }
-            if let firstMix { take(firstMix) }
-            for (index, estimate) in candidates
-            where chosen.count < stage2Sets && estimate < record * (1 + stage2Slack) {
-                take(index)
-            }
-            guard !chosen.isEmpty else { return }
-            stage2First = slotSet.count
-            appendRounds([0] + chosen, rounds: roundsPerSet)
         }
 
         static func describe(_ set: NarrowChoice) -> String {
@@ -3179,74 +3451,40 @@ enum Qwen35TensorPackedMatmul {
                 .joined(separator: ",") + "}"
         }
 
-        /// Ends the trial: installs the winner (or the record's pick), logs
-        /// one line and disarms. Safe to call when nothing ran.
+        /// Ends the trial: installs the adopted finalist (or the record's
+        /// pick), logs one line and disarms. Safe to call when nothing ran.
         static func finish(elapsedNanoseconds: UInt64) {
             active = false
             onEnough = nil
             guard armed else { return }
-            if pool.isEmpty {
-                pool = sets
-                poolLabels = sets.indices.map { $0 < labels.count ? labels[$0] : "set \($0)" }
-            }
-            // The deciding slots: stage 2's (the record's pick first) when the
-            // trial has two stages, else the single stage's.
-            let deciding: [Int] = twoStage
-                ? (stage2First >= 0 ? Array(stage2First ..< slotSet.count) : [])
-                : Array(0 ..< min(stage1Slots, slotSet.count))
             var chosen = 0
-            if let first = deciding.first, let record = summary(first).0 {
-                var best = record
-                for slot in deciding.dropFirst() {
-                    let (m, kept, _) = summary(slot)
-                    if let m, kept >= minimumRounds, m < best { best = m; chosen = slotSet[slot] }
-                }
-                if chosen != 0, !(best < record * (1 - adoptMargin)) { chosen = 0 }
+            var log = "bonsai verify int8 in-situ: " + stage1Log
+                + String(format: " (%.0f ms)", Double(stage1Nanoseconds) / 1e6)
+            if finalists.count >= 2, !arms.isEmpty {
+                let verdicts = PairedRoundTrial.verdicts(arms: arms, times: times, challengers: finalists.count - 1)
+                chosen = PairedRoundTrial.choose(verdicts)
+                log += "; stage 2 (\(roundIndex) proposals, "
+                    + PairedRoundTrial.header(arms: arms, times: times, reference: "record") + ") ["
+                    + verdicts.enumerated().map { finalistLabels[$0.0 + 1] + " " + $0.1.summary }
+                    .joined(separator: " | ") + "]"
             }
-            let set = pool[chosen]
+            let set = chosen == 0 ? sets[0] : finalists[chosen]
             install(set)
             setNarrowOperandNeeds([set])
-            func line(_ slots: Range<Int>) -> String {
-                slots.map { slot in
-                    let (m, kept, total) = summary(slot)
-                    return poolLabels[slotSet[slot]] + " "
-                        + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
-                }.joined(separator: " | ")
-            }
-            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; "
-            if twoStage {
-                log += "stage 1 (\(stage1Slots) sets x \(stage1Rounds)) median ms/round ["
-                    + line(0 ..< min(stage1Slots, slotSet.count)) + "]" + perShapeLog + "; stage 2 ("
-                    + (deciding.isEmpty
-                        ? "none within \(Int(stage2Slack * 100)) % of the record's pick)"
-                        : "\(deciding.count) sets x \(roundsPerSet)) [" + line(stage2First ..< slotSet.count) + "]")
-            } else {
-                log += "median ms/round [" + line(0 ..< min(stage1Slots, slotSet.count)) + "]"
-            }
-            log += "; "
-            if chosen == 0 {
-                log += "keeping the record's pick " + describe(set)
-            } else if let first = deciding.first, let record = summary(first).0,
-                let slot = deciding.first(where: { slotSet[$0] == chosen }), let m = summary(slot).0
-            {
-                log += "adopted \(poolLabels[chosen]) = " + describe(set)
-                    + String(format: " (%+.2f%%)", (m / record - 1) * 100)
-            }
+            log += chosen == 0
+                ? "; keeping the record's pick " + describe(set)
+                : "; adopted \(finalistLabels[chosen]) = " + describe(set)
             log += "; per-shape mapping [" + mapping(set) + "]"
             log += String(format: "; %.0f ms\n", Double(elapsedNanoseconds) / 1e6)
             FileHandle.standardError.write(log.data(using: .utf8)!)
             sets = []
             labels = []
             scopes = []
-            pool = []
-            poolLabels = []
-            slotSet = []
-            slotTimes = []
-            schedule = []
-            levels = []
-            headLevels = []
-            perShapeFirst = -1
-            perShapeLog = ""
+            finalists = []
+            finalistLabels = []
+            arms = []
+            times = []
+            stage1Log = ""
         }
     }
 
@@ -3371,6 +3609,89 @@ enum Qwen35TensorPackedMatmul {
                     + (same ? "passed; both routes read the tiled copy\n"
                         : "FAILED; the stored layout is kept\n")).utf8))
         return same
+    }
+
+    /// The prompt-width int8 kernel with the weight operand built in
+    /// registers (`sourceStaged8Reg`) in place of the staged8 kernel, for the
+    /// hot configuration (signed codes, factored epilogue, row-tiled
+    /// constants, the tiled word copy; per projection: negated offsets). On
+    /// unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_REG=0`, and only after its
+    /// bitwise self-test against the staged8 kernel (`promptRegisterSelfTest`).
+    static let promptRegisterWeights: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_REG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""), support == .staged8,
+            signedCodes, factoredPromptEpilogue, rowTiledConstants, narrowTiled
+        else { return false }
+        return promptRegisterSelfTest()
+    }()
+
+    /// The projections the register-weight kernel takes: all of them (the
+    /// 6144 x 5120 output projections too, measured faster in the engine).
+    static func promptRegisterTakes(k: Int, n: Int) -> Bool { true }
+
+    nonisolated(unsafe) private static var promptRegisterFailed = false
+    nonisolated(unsafe) static var promptRegisterAnnounced = false
+
+    /// `sourceStaged8Reg` against `sourceStaged8` (TILED, the hot template) on
+    /// synthetic operands: three shapes (1, 2 and 3 row tiles; 8, 20 and 12
+    /// groups), FP32 and FP16 outputs, every output bit compared. A compile or
+    /// run error counts as a failure.
+    private static func promptRegisterSelfTest() -> Bool {
+        var same = true
+        var compared = 0
+        promptRegisterFailed = false
+        withErrorHandler({ _ in Qwen35TensorPackedMatmul.promptRegisterFailed = true }) {
+            for (index, (m, k, n)) in [(128, 1024, 192), (64, 2560, 128), (192, 1536, 320)].enumerated() {
+                let kg = k / 128
+                let seed = UInt64(91 + 8 * index)
+                let codes = MLXRandom.randInt(
+                    Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)
+                ).asType(.int8)
+                let weight = MLXRandom.randInt(
+                    Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+                ).asType(.uint16).view(dtype: .uint32)
+                var s = MLXRandom.uniform(
+                    Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(seed + 2))
+                let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [kg, n], key: MLXRandom.key(seed + 3))
+                s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+                s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+                let scalesT = s.asType(.float16)
+                let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                let folded = MLXRandom.normal([kg, n], key: MLXRandom.key(seed + 4))
+                let ascale = MLXRandom.uniform(
+                    Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(seed + 5))
+                let asums = MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 6)) * Float(50)
+                let tiled = tileNarrowWeight(weight, n: n, k: k)
+                let inputs = [codes, tiled, scalesT, biasesT, folded, ascale, asums, dimsArray(k: k, m: m, n: n)]
+                for outputDType in [DType.float32, .float16] {
+                    let stock = kernelStaged8(
+                        inputs,
+                        template: [
+                            ("OutT", outputDType), ("MPERM", 1), ("SIGNED", 1),
+                            ("NEGATIVE_SCALE_BIAS", 1), ("FACTORED", 1), ("TILED", 1),
+                        ],
+                        grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let reg = kernelStaged8Reg(
+                        inputs, template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let bits: DType = outputDType == .float32 ? .uint32 : .uint16
+                    let equal = (stock.view(dtype: bits) .== reg.view(dtype: bits)).all()
+                    eval(equal)
+                    if !equal.item(Bool.self) { same = false }
+                    compared += m * n
+                }
+            }
+        }
+        let passed = same && !promptRegisterFailed
+        FileHandle.standardError.write(
+            Data(
+                ("bonsai prompt register-weight kernel: self-test "
+                    + (passed ? "passed (\(compared) values bitwise, 0 mismatches)\n"
+                        : "FAILED; the staged8 kernel is kept\n")).utf8))
+        return passed
     }
 
     /// `[N, K/16]` packed words reordered to `[N/32, K/128, 32, 8]`: for each
@@ -3545,10 +3866,10 @@ enum Qwen35TensorPackedMatmul {
     /// the family's fastest body over the wide shapes on all of them and the
     /// head (k32, wide, acoop; xtg without the head). Every body on a wide
     /// shape passes the FP32 self-test too.
-    /// With the record's own candidates that is more than four sets, so the
-    /// in-situ trial runs in two stages (`NarrowInSituTrial`).
+    /// The in-situ trial (`NarrowInSituTrial`) shortlists them by a dependent
+    /// chain of the verify's launches and decides on paired rounds.
     /// Only with the tiled copy. `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO=0` leaves
-    /// the record's candidates alone (and the trial one stage);
+    /// the record's candidates alone;
     /// `..._TZOO_FORCE=<body>` (e.g. `k32pd2`, `p4k16pd1`) installs that body
     /// on every shape (a zoo 3a body: but the head), without a trial, once it
     /// passes; `..._TZOO_FORCE=down=x4k32pd2,o=pk32pd2,...` installs one body
@@ -3596,9 +3917,9 @@ enum Qwen35TensorPackedMatmul {
     /// keeps its fastest kernel and every other shape takes the fastest in
     /// total. That is what is installed; the timing only shortlists the
     /// in-situ candidates (`NarrowInSituTrial`): the record's pick, `v0` with
-    /// the negated offset, the tiled zoo's family sets (`zooSets`), and the
-    /// two fastest K3 bodies in total, each after its FP32 self-test (a zoo
-    /// body where its shapes take FP32), and every candidate kernel is then
+    /// the negated offset and the tiled zoo's family sets (`zooSets`), each
+    /// after its FP32 self-test (a zoo body where its shapes take FP32), and
+    /// every candidate kernel is then
     /// launched once per production shape at each output type it may run at. A candidate not
     /// started within 4 s of the self-test is skipped (load time is not
     /// timed). Runs at model init, before any timed phase, and builds every
@@ -3815,24 +4136,17 @@ enum Qwen35TensorPackedMatmul {
                 }
 
                 // The in-situ candidates: the record's pick, v0 with the
-                // negated offset, the zoo's family sets, and the two fastest
-                // K3 bodies in total, each exact at FP32 as well (a zoo body at
-                // the output types of its shapes). Choices equal on every
-                // shape collapse.
+                // negated offset and the zoo's family sets, each exact at FP32
+                // as well (a zoo body at the output types of its shapes).
+                // Choices equal on every shape collapse. (The K3 bodies read
+                // no gain on the box: they are no longer stage-1 candidates.)
                 guard NarrowInSituTrial.enabled else { return }
                 var shortlist: [(NarrowChoice, String, Int)] = [((fallback, byShape), "record", 0)]
                 let v0Negative = NarrowKernel(variant: .v0, form: .negativeBias)
                 if passed.contains(v0Negative), try exactF32(v0Negative) {
                     shortlist.append(((v0Negative, [:]), "v0neg", 0))
                 }
-                let k3 = passed.filter { !narrowRecordVariants.contains($0.variant) }
-                    .sorted { timings[$0]!.reduce(0, +) < timings[$1]!.reduce(0, +) }
-                var k3Sets: [(NarrowChoice, String, Int)] = []
-                for kernel in k3 where k3Sets.count < 2 {
-                    if try exactF32(kernel) { k3Sets.append(((kernel, [:]), "k3 \(kernel)", 0)) }
-                }
                 if narrowZoo { shortlist += zooSets(fallback, byShape, sets, zooForm, zooExact, &log) }
-                shortlist += k3Sets
                 for candidate in shortlist
                 where !trial.contains(where: {
                     NarrowInSituTrial.effective($0.0) == NarrowInSituTrial.effective(candidate.0)
@@ -4085,6 +4399,10 @@ enum Qwen35TensorPackedMatmul {
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
                 recordVerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType)
+                if NarrowInSituTrial.capturing {
+                    NarrowInSituTrial.capture(
+                        weight, scales, biases, k: k, n: n, outputDType: outputDType, cache: cache)
+                }
                 let choice = narrowKernel(
                     cache, scales, biases, k: k, n: n, outputDType: outputDType, materialize: false)
                 let scalesT: MLXArray
@@ -4198,8 +4516,25 @@ enum Qwen35TensorPackedMatmul {
             case .native2b: packedKernel = kernel
             case .staged8:
                 packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                let negative = cache.biasesAreNegativeScales(scales, biases)
+                // The register-weight form of the same kernel (hot template,
+                // self-tested bitwise at load): same inputs, same grid.
+                if negative, promptRegisterTakes(k: k, n: n), promptRegisterWeights {
+                    if !promptRegisterAnnounced {
+                        promptRegisterAnnounced = true
+                        FileHandle.standardError.write(
+                            "bonsai prompt register-weight kernel: in use (m \(m), k \(k), n \(n), \(outputDType))\n"
+                                .data(using: .utf8)!)
+                    }
+                    let words = narrowTiledWeight(cache, weight, materialize: true)
+                    return kernelStaged8Reg(
+                        [codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                         activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                        template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                }
+                template.append(("NEGATIVE_SCALE_BIAS", negative ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
             default: packedKernel = kernelStaged
@@ -4209,6 +4544,22 @@ enum Qwen35TensorPackedMatmul {
             // read could lose its GPU residency between windows).
             let words = support == .staged8 && narrowTiled
                 ? narrowTiledWeight(cache, weight, materialize: true) : weight
+            // The load-time per-shape schedule (`PromptFormTrial`): noted at
+            // the load's prompt forwards, the adopted form launched after.
+            if support == .staged8, PromptFormTrial.recording || !PromptFormTrial.adopted.isEmpty {
+                let key = PromptFormTrial.Key(
+                    k: k, n: n, f32: outputDType == .float32,
+                    negative: cache.biasesAreNegativeScales(scales, biases))
+                if PromptFormTrial.recording {
+                    PromptFormTrial.note(
+                        key, .init(words: words, scalesT: scalesT, biasesT: biasesT, folded: foldedSums))
+                } else if let form = PromptFormTrial.adopted[key], form.fits(m: m) {
+                    return launchStaged8(
+                        form, codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                        activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType,
+                        negative: key.negative)
+                }
+            }
             return packedKernel(
                 [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
@@ -4301,6 +4652,550 @@ extension Qwen35TensorPackedMatmul {
     }
 }
 
+// MARK: - The paired in-situ decision
+
+/// The decision rule of the load-time in-situ trials (the verify int8
+/// kernels, the fused head top-2, the drafter kernel). A trial's timed rounds
+/// run in `cycles` cycles: one round of the reference (the record's pick, the
+/// head's stock launch, the drafter's stored layout), then one round of each
+/// challenger, their order rotated from cycle to cycle; one closing reference
+/// round ends the run. A challenger round's control is the reference's time
+/// interpolated linearly between the reference rounds on either side of it,
+/// so a drift of the box's state over a cycle cancels, and its paired
+/// difference is its time over that control, minus one. A challenger is
+/// adopted only if the `trimFraction`-trimmed mean of its differences is
+/// below `-adoptMargin` AND the count of negative differences passes a
+/// one-sided sign test at `signLevel`, over at least `minimumPairs` pairs; a
+/// round above `outlierFactor` times the median round (a hiccup) voids the
+/// pairs it enters. Of several qualifying challengers, the lowest trimmed mean
+/// wins. `MLXFAST_TRIAL_NULL=1` makes every challenger the reference itself
+/// (the false-adoption check; nothing else changes).
+enum PairedRoundTrial {
+    static let cycles = 24
+    static let adoptMargin = 0.005
+    static let signLevel = 0.05
+    static let trimFraction = 0.2
+    static let minimumPairs = 20
+    static let outlierFactor = 1.5
+
+    static let nullRun: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_TRIAL_NULL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// The verify's matmul chain (ns, the verify trial's stage 1 record
+    /// chain): a floor under a round's time; 0 when not measured.
+    nonisolated(unsafe) static var roundFloor = 0.0
+
+    /// Whether a challenger whose stage-1 chain gains `gain` ns a round is
+    /// worth stage 2's rounds: more than half the adoption margin of the
+    /// round floor (a smaller gain cannot clear the margin in the rounds),
+    /// or, with no floor measured, more than `fallback` of `reference` (its
+    /// reference's chain).
+    static func admits(gain: Double, reference: Double, fallback: Double) -> Bool {
+        roundFloor > 0 ? gain > 0.5 * adoptMargin * roundFloor : gain > fallback * reference
+    }
+
+    /// Each timed round's arm (0 the reference, 1... the challengers); empty
+    /// without challengers.
+    static func schedule(challengers: Int) -> [Int] {
+        guard challengers > 0 else { return [] }
+        var arms: [Int] = []
+        for cycle in 0 ..< cycles {
+            arms.append(0)
+            for j in 0 ..< challengers { arms.append(1 + (j + cycle) % challengers) }
+        }
+        return arms + [0]
+    }
+
+    struct Verdict {
+        var pairs = 0
+        var faster = 0
+        var trimmedMean = Double.nan
+        var median = Double.nan
+        var deviation = Double.nan
+        var p = 1.0
+        var adopt: Bool {
+            pairs >= PairedRoundTrial.minimumPairs && trimmedMean < -PairedRoundTrial.adoptMargin
+                && p < PairedRoundTrial.signLevel
+        }
+        var summary: String {
+            String(
+                format: "%+.2f%% trimmed (median %+.2f%%, sd %.2f%%), %d/%d faster, sign p %.2g",
+                trimmedMean * 100, median * 100, deviation * 100, faster, pairs, p)
+                + (adopt ? " PASS" : "")
+        }
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return .nan }
+        let s = values.sorted()
+        return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+    }
+
+    /// Per challenger (1...), from each timed round's arm and time (nil: void).
+    static func verdicts(arms: [Int], times: [Double?], challengers: Int) -> [Verdict] {
+        let limit = outlierFactor * median(times.compactMap { $0 })
+        func time(_ i: Int) -> Double? {
+            guard i < times.count, let t = times[i], t <= limit else { return nil }
+            return t
+        }
+        var differences = Array(repeating: [Double](), count: challengers)
+        let references = arms.indices.filter { arms[$0] == 0 }
+        for (a, b) in zip(references, references.dropFirst()) {
+            guard let ta = time(a), let tb = time(b) else { continue }
+            for i in (a + 1) ..< b where arms[i] >= 1 && arms[i] <= challengers {
+                guard let ti = time(i) else { continue }
+                let w = Double(i - a) / Double(b - a)
+                differences[arms[i] - 1].append(ti / (ta * (1 - w) + tb * w) - 1)
+            }
+        }
+        return differences.map { d in
+            var v = Verdict()
+            v.pairs = d.count
+            guard !d.isEmpty else { return v }
+            let s = d.sorted()
+            let cut = Int(Double(s.count) * trimFraction)
+            let kept = s[cut ..< (s.count - cut)]
+            v.trimmedMean = kept.reduce(0, +) / Double(kept.count)
+            v.median = median(d)
+            let mean = d.reduce(0, +) / Double(d.count)
+            v.deviation = (d.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(max(d.count - 1, 1))).squareRoot()
+            v.faster = d.filter { $0 < 0 }.count
+            v.p = signTail(v.faster, v.pairs)
+            return v
+        }
+    }
+
+    /// P(X >= k) for X ~ Binomial(n, 1/2).
+    static func signTail(_ k: Int, _ n: Int) -> Double {
+        guard n > 0 else { return 1 }
+        var c = 1.0
+        var total = 0.0
+        for i in 0 ... n {
+            if i >= k { total += c }
+            c = c * Double(n - i) / Double(i + 1)
+        }
+        return total / pow(2.0, Double(n))
+    }
+
+    /// The challenger to adopt (1...), or 0.
+    static func choose(_ verdicts: [Verdict]) -> Int {
+        var best = 0
+        for (j, v) in verdicts.enumerated() where v.adopt {
+            if best == 0 || v.trimmedMean < verdicts[best - 1].trimmedMean { best = j + 1 }
+        }
+        return best
+    }
+
+    /// "<cycles> cycles, <reference> median <ms>" for the logs.
+    static func header(arms: [Int], times: [Double?], reference: String) -> String {
+        let r = median(arms.indices.compactMap { arms[$0] == 0 && $0 < times.count ? times[$0] : nil })
+        return "\(cycles) cycles, \(reference) median " + String(format: "%.2f ms", r / 1e6)
+    }
+}
+// MARK: - Prompt-width int8 GEMM schedules, chosen per shape at load
+
+extension Qwen35TensorPackedMatmul {
+    /// One schedule of the int8-staged prompt kernel (`sourceStaged8Forms`);
+    /// every schedule's outputs are the stock kernel's bit for bit.
+    struct PromptForm: Hashable, CustomStringConvertible {
+        let mt: Int, gs: Int, nb: Int, pp: Int, st: Int, sw: Int
+        let name: String
+
+        /// `[m2][g2 | g2n | p3 | pp][r1 | r2][s0-s3]`: `m2` two 64-row tiles
+        /// per threadgroup share each staged weight slice; `g2` two
+        /// 128-groups per stage and barrier, both ops issued before their
+        /// epilogues (`g2n`: each op then its epilogue); `p3` the pipelined
+        /// schedule (three staging buffers, the next group's op before this
+        /// group's epilogue); `pp` both row tiles' ops before their
+        /// epilogues (with `m2`); `r1` / `r2` the staging's register
+        /// prefetch (not with `g2` / `p3`); `s<d>` the raster in bands of
+        /// 2^d row tiles. Nil for the stock schedule and for combinations the
+        /// kernel does not take.
+        init?(name raw: String) {
+            let name = raw.trimmingCharacters(in: .whitespaces).lowercased()
+            var rest = Substring(name)
+            var mt = 1, gs = 1, nb = 2, pp = 0, st = 0, sw = 0
+            if rest.hasPrefix("m2") { mt = 2; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("g2n") { gs = 2; rest = rest.dropFirst(3) }
+            else if rest.hasPrefix("g2") { gs = 2; pp = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("p3") { nb = 3; pp = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("pp") { pp = 1; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("r1") { st = 1; rest = rest.dropFirst(2) }
+            else if rest.hasPrefix("r2") { st = 2; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("s"), let d = Int(rest.dropFirst()), (0 ... 3).contains(d) {
+                sw = d
+                rest = ""
+            }
+            guard rest.isEmpty, nb == 2 || (mt == 1 && gs == 1), pp == 0 || mt == 2 || gs == 2 || nb == 3,
+                st == 0 || (gs == 1 && nb == 2),
+                !(mt == 1 && gs == 1 && nb == 2 && pp == 0 && st == 0 && sw == 0)
+            else { return nil }
+            (self.mt, self.gs, self.nb, self.pp, self.st, self.sw) = (mt, gs, nb, pp, st, sw)
+            self.name = name
+        }
+
+        var description: String { name }
+        /// A launch needs `m` to be a multiple of this (one raster band).
+        var rowQuantum: Int { (64 * mt) << sw }
+        func fits(m: Int) -> Bool { m % rowQuantum == 0 }
+    }
+
+    /// One launch of the int8-staged prompt kernel: the stock schedule for a
+    /// nil form (the call and templates the prompt route makes), else the
+    /// form's (`form.fits(m:)` must hold).
+    static func launchStaged8(
+        _ form: PromptForm?, _ codes: MLXArray, _ words: MLXArray, _ scalesT: MLXArray,
+        _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
+        k: Int, m: Int, n: Int, outputDType: DType, negative: Bool
+    ) -> MLXArray {
+        var template: [(String, any KernelTemplateArg)] = [
+            ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+            ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", negative ? 1 : 0),
+            ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", narrowTiled ? 1 : 0),
+        ]
+        let inputs = [codes, words, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)]
+        guard let form else {
+            return kernelStaged8(
+                inputs, template: template, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+        template += [
+            ("MT", form.mt), ("GS", form.gs), ("NB", form.nb), ("PP", form.pp), ("ST", form.st),
+            ("SW", form.sw),
+        ]
+        return kernelStaged8Forms(
+            inputs, template: template,
+            grid: (((n / 64) << form.sw) * 128, (m / (64 * form.mt)) >> form.sw, 1),
+            threadGroup: (128, 1, 1), outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// The load-time per-shape choice of the prompt route's int8 schedule.
+    ///
+    /// The prompt route notes every distinct projection shape it launches
+    /// (`k`, `n`, output type, negated-offset form) with the operands of up
+    /// to `setsPerShape` of its projections (`note`); the load-time prompt
+    /// forwards (`warmTargetPrefill`, the engine warm's seed) fill it. `run`,
+    /// called once from the deferred load warm (`Qwen35DFlash2Assistant`,
+    /// before the socket serves anything), takes each noted shape at the
+    /// scored prompt width (`rows`): every candidate schedule runs on the
+    /// shape's first projection with synthetic activations, once at `rows`
+    /// and once at three raster bands, and must match the stock launch bit
+    /// for bit or is dropped; then stock and the survivors run in turn, one
+    /// command buffer per sample (a burst of launches on distinct
+    /// projections where one launch is short, each launch on the next
+    /// projection so the weights stream from memory as in a forward), a
+    /// discarded first round and `reps` timed rounds; a candidate's score is
+    /// the median of its per-round time ratio to stock, and the best is
+    /// adopted only if, after `confirmReps` more rounds of it against stock
+    /// alone, its score over all its rounds beats stock by more than
+    /// `adoptMargin`. One stderr line per shape and a summary. The route
+    /// then launches the adopted schedule for that shape at every row count
+    /// it fits, and stock elsewhere.
+    ///
+    /// Only where the int8-staged kernel is the prompt route (`staged8`).
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM=0` keeps stock with no trial;
+    /// `..._PFORM_FORCE=<form>` installs that schedule on every shape where it
+    /// passes the bitwise check, without timing (`stock`: no trial);
+    /// `..._PFORM_LIST=s2,r1,...` replaces the candidate list (`PromptForm`).
+    enum PromptFormTrial {
+        struct Key: Hashable, CustomStringConvertible {
+            let k: Int, n: Int, f32: Bool, negative: Bool
+            var description: String {
+                "k \(k) n \(n) \(f32 ? "fp32" : "fp16")\(negative ? "" : " offsets")"
+            }
+        }
+
+        struct Operands {
+            let words: MLXArray, scalesT: MLXArray, biasesT: MLXArray, folded: MLXArray
+        }
+
+        static let enabled: Bool = {
+            let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }()
+
+        static let forcedName: String? = {
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_FORCE"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return raw?.isEmpty == false ? raw : nil
+        }()
+        static let stockNames: Set<String> = ["stock", "0", "off", "none"]
+
+        /// nil: not forced; `.some(nil)`: stock (or an unrecognized name);
+        /// `.some(form)`: that form.
+        static let forced: PromptForm?? = {
+            guard let raw = forcedName else { return nil }
+            if stockNames.contains(raw) { return .some(nil) }
+            return PromptForm(name: raw).map { .some($0) } ?? .some(nil)
+        }()
+
+        /// The candidates, and the list's names that are not a form.
+        static let list: (forms: [PromptForm], rejected: [String]) = {
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_LIST"]
+                ?? "s2,r1,r1s2,p3,m2"
+            var forms: [PromptForm] = []
+            var rejected: [String] = []
+            for name in raw.split(separator: ",") {
+                if let form = PromptForm(name: String(name)) {
+                    if !forms.contains(form) { forms.append(form) }
+                } else {
+                    rejected.append(String(name))
+                }
+            }
+            return (forms, rejected)
+        }()
+        static var candidates: [PromptForm] { list.forms }
+
+        /// The scored prompt width (the timed prompts and the load warm's).
+        static let rows = 512
+        static let setsPerShape = 4
+        static let reps = 4
+        static let confirmReps = 4
+        static let adoptMargin = 0.02
+
+        /// True until `run` (or until the route has noted `noteLimit` launches
+        /// without a trial coming).
+        nonisolated(unsafe) static var recording = true
+        nonisolated(unsafe) private static var noted = 0
+        static let noteLimit = 8192
+        nonisolated(unsafe) private static var shapes: [Key: [Operands]] = [:]
+        nonisolated(unsafe) private static var order: [Key] = []
+        /// The adopted schedule per shape (read at every prompt launch).
+        nonisolated(unsafe) static var adopted: [Key: PromptForm] = [:]
+        nonisolated(unsafe) private static var launchFailed = false
+
+        /// The prompt route's record of one launch (graph build, load time).
+        static func note(_ key: Key, _ operands: Operands) {
+            noted += 1
+            if noted > noteLimit {
+                recording = false
+                shapes = [:]
+                order = []
+                return
+            }
+            if var list = shapes[key] {
+                guard list.count < setsPerShape, !list.contains(where: { $0.words === operands.words })
+                else { return }
+                list.append(operands)
+                shapes[key] = list
+            } else {
+                shapes[key] = [operands]
+                order.append(key)
+            }
+        }
+
+        private static func log(_ line: String) {
+            FileHandle.standardError.write(Data(("bonsai prompt int8 forms: " + line + "\n").utf8))
+        }
+
+        /// Synthetic activations for `m` rows of `k`: signed (or shifted)
+        /// codes over the full range, positive scales, scaled sums of both
+        /// signs. Nothing depends on a request.
+        private static func activations(k: Int, m: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let kg = k / 128
+            let seed = UInt64(7700 + k / 128 + m)
+            let codes = signedCodes
+                ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)).asType(.int8)
+                : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: MLXRandom.key(seed)).asType(.uint8)
+            let ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(seed + 1))
+            let rsb = MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 2)) * Float(50)
+            eval(codes, ascale, rsb)
+            return (codes, ascale, rsb)
+        }
+
+        /// Output elements whose bits differ, or nil when a launch failed.
+        private static func mismatches(_ a: MLXArray, _ b: MLXArray, f32: Bool) -> Int? {
+            launchFailed = false
+            var count: Int?
+            withErrorHandler({ _ in PromptFormTrial.launchFailed = true }) {
+                let bits: DType = f32 ? .uint32 : .uint16
+                let differ = (a.view(dtype: bits) .!= b.view(dtype: bits)).asType(.int32).sum()
+                eval(differ)
+                count = differ.item(Int.self)
+            }
+            return launchFailed ? nil : count
+        }
+
+        private static func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            let mid = sorted.count / 2
+            return sorted.count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+        }
+
+        private static func median(_ values: [UInt64]) -> Double { median(values.map { Double($0) }) }
+
+        /// The trial (see the type's notes). Runs once; safe with nothing noted.
+        static func run() {
+            guard recording else { return }
+            recording = false
+            let registry = shapes
+            let keys = order.filter { $0.n < 65536 }
+            shapes = [:]
+            order = []
+            // Nothing to choose without the int8-staged prompt route.
+            guard Qwen35TensorPackedMatmul.enabled, installed, support == .staged8 else { return }
+            guard enabled else {
+                log("off; stock kept")
+                return
+            }
+            guard !keys.isEmpty else {
+                log("no prompt shape noted before the trial; stock kept")
+                return
+            }
+            if case .some(.none) = forced {
+                let raw = forcedName ?? ""
+                log(stockNames.contains(raw)
+                    ? "forced stock; no trial"
+                    : "DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_FORCE=\(raw) is not a form; stock kept, no trial")
+                return
+            }
+            if !list.rejected.isEmpty {
+                log("DARKBLOOM_BONSAI_TENSOR_ROUTE_PFORM_LIST: not forms, ignored: "
+                    + list.rejected.joined(separator: ", "))
+            }
+            let start = DispatchTime.now().uptimeNanoseconds
+            var checkNanoseconds: UInt64 = 0
+            var adoptedNames: [String] = []
+            var acts: [[Int]: (MLXArray, MLXArray, MLXArray)] = [:]
+            for key in keys {
+                guard let sets = registry[key], !sets.isEmpty else { continue }
+                let checkStart = DispatchTime.now().uptimeNanoseconds
+                let outputDType: DType = key.f32 ? .float32 : .float16
+                func operands(_ m: Int) -> (MLXArray, MLXArray, MLXArray) {
+                    if let cached = acts[[key.k, m]] { return cached }
+                    let made = activations(k: key.k, m: m)
+                    acts[[key.k, m]] = made
+                    return made
+                }
+                func launch(_ form: PromptForm?, _ set: Operands, m: Int) -> MLXArray {
+                    let (codes, ascale, rsb) = operands(m)
+                    return launchStaged8(
+                        form, codes, set.words, set.scalesT, set.biasesT, set.folded, ascale, rsb,
+                        k: key.k, m: m, n: key.n, outputDType: outputDType, negative: key.negative)
+                }
+                // Bitwise: every candidate against stock, at `rows` and at
+                // three raster bands, on the shape's first projection.
+                let pool: [PromptForm] = {
+                    if case .some(.some(let form)) = forced { return [form] }
+                    return candidates
+                }()
+                var passing: [PromptForm] = []
+                var notes: [String] = []
+                var references: [Int: MLXArray] = [:]
+                for form in pool where form.fits(m: rows) {
+                    var ok = true
+                    for m in [rows, 3 * form.rowQuantum] where ok {
+                        let reference: MLXArray
+                        if let cached = references[m] {
+                            reference = cached
+                        } else {
+                            reference = launch(nil, sets[0], m: m)
+                            eval(reference)
+                            references[m] = reference
+                        }
+                        let bad = mismatches(launch(form, sets[0], m: m), reference, f32: key.f32)
+                        if bad != 0 {
+                            ok = false
+                            notes.append(
+                                "\(form) " + (bad.map { "FAILED at m \(m) (\($0) of \(m * key.n) differ)" }
+                                    ?? "did not launch"))
+                        }
+                    }
+                    if ok { passing.append(form) }
+                }
+                references = [:]
+                checkNanoseconds += DispatchTime.now().uptimeNanoseconds - checkStart
+                if case .some(.some(let form)) = forced {
+                    if passing.contains(form) {
+                        adopted[key] = form
+                        adoptedNames.append("\(key.k)x\(key.n)=\(form)")
+                    }
+                    log("\(key): forced \(form), " + (passing.contains(form) ? "bitwise passed, installed" : notes.joined(separator: "; ") + ", stock kept"))
+                    continue
+                }
+                // Timing: a discarded round, then `reps` rounds, every form once
+                // per round in rotated order, one command buffer per sample. A
+                // candidate's score is the median over rounds of its time over
+                // stock's in the same round (so clock drift between rounds
+                // cancels); the best is confirmed by `confirmReps` more rounds of
+                // it and stock alone and adopted only if its score over all its
+                // rounds still beats stock by more than `adoptMargin`.
+                let forms: [PromptForm?] = [nil] + passing
+                var next = 0
+                func sample(_ form: PromptForm?, burst: Int) -> UInt64 {
+                    var outputs: [MLXArray] = []
+                    for _ in 0 ..< burst {
+                        outputs.append(launch(form, sets[next % sets.count], m: rows))
+                        next += 1
+                    }
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    eval(outputs)
+                    return (DispatchTime.now().uptimeNanoseconds - begin) / UInt64(burst)
+                }
+                let single = sample(nil, burst: 1)
+                let burst = single < 250_000 ? 4 : (single < 500_000 ? 2 : 1)
+                var line = "\(key) (m \(rows), \(sets.count) projections, x\(burst)): "
+                guard forms.count > 1 else {
+                    log(line + "no candidate passed [" + notes.joined(separator: "; ") + "]; stock kept")
+                    continue
+                }
+                var times = [[UInt64]](repeating: [], count: forms.count)
+                for round in 0 ... reps {
+                    var row = [UInt64](repeating: 0, count: forms.count)
+                    for j in forms.indices {
+                        let f = (j + round) % forms.count
+                        row[f] = sample(forms[f], burst: burst)
+                    }
+                    if round > 0 { for f in forms.indices { times[f].append(row[f]) } }
+                }
+                func score(_ f: Int) -> Double {
+                    median(zip(times[f], times[0]).map { Double($0) / Double($1) }) - 1
+                }
+                let scores = forms.indices.map { $0 == 0 ? 0 : score($0) }
+                line += String(format: "stock %.3f ms", median(times[0]) / 1e6)
+                for f in 1 ..< forms.count {
+                    line += " | \(forms[f]!) "
+                        + String(format: "%.3f %+.1f%%", median(times[f]) / 1e6, scores[f] * 100)
+                }
+                if !notes.isEmpty { line += " | " + notes.joined(separator: " | ") }
+                var best = 1
+                for f in 2 ..< forms.count where scores[f] < scores[best] { best = f }
+                var adopt = false
+                if scores[best] < -adoptMargin, let form = forms[best] {
+                    for round in 0 ..< confirmReps {
+                        let first = round % 2 == 0 ? 0 : best
+                        let a = sample(forms[first], burst: burst)
+                        let b = sample(forms[best - first], burst: burst)
+                        times[0].append(first == 0 ? a : b)
+                        times[best].append(first == 0 ? b : a)
+                    }
+                    let confirmed = score(best)
+                    adopt = confirmed < -adoptMargin
+                    line += " -> \(form) " + (adopt ? "confirmed" : "not confirmed")
+                        + String(format: " (%+.1f%% over %d rounds)", confirmed * 100, times[best].count)
+                    if adopt {
+                        adopted[key] = form
+                        adoptedNames.append("\(key.k)x\(key.n)=\(form)")
+                    } else {
+                        line += "; stock kept"
+                    }
+                } else {
+                    line += " -> stock"
+                }
+                log(line)
+            }
+            let total = DispatchTime.now().uptimeNanoseconds - start
+            log(
+                "\(keys.count) shapes, adopted [" + adoptedNames.joined(separator: " ") + "]; "
+                    + String(format: "%.0f ms (bitwise checks incl. first-use compiles %.0f ms)", Double(total) / 1e6, Double(checkNanoseconds) / 1e6))
+        }
+    }
+}
+
 // MARK: - The verify head's top two, fused into the int8 head launch
 
 /// The capture verify's vocabulary head without its FP32 logits store (D2),
@@ -4330,8 +5225,8 @@ extension Qwen35TensorPackedMatmul {
 /// `on` is OFF by default. After the verify kernels' in-situ trial (so the
 /// head's kernel is final) the deferred load warm self-tests the fused form
 /// of that kernel (`prepareHeadTop2`) and times real engine rounds with it
-/// off and on, interleaved (`Trial`); `on` is adopted only if its median
-/// round beats off's by more than 0.5 %. `MLXFAST_HEAD_TOP2=1` turns it on
+/// off and on in paired cycles (`Trial`); `on` is adopted only under
+/// `PairedRoundTrial`'s rule. `MLXFAST_HEAD_TOP2=1` turns it on
 /// after the self-test without a trial, `=0` keeps it off with neither.
 enum Qwen35HeadTopTwo {
     /// `MLXFAST_HEAD_TOP2`: true / false force the choice (no trial), nil
@@ -4403,24 +5298,49 @@ enum Qwen35HeadTopTwo {
         return (entry.ids[0 ..< rows], entry.values[0 ..< rows])
     }
 
-    /// The in-situ trial (as `Qwen35TensorPackedMatmul.NarrowInSituTrial`):
-    /// one load-time engine request whose block proposals switch `on` off and
-    /// on in turn (`roundBoundary`, from `proposeBlock`); round r's time is
-    /// the host time from its proposal to the next. After the discarded first
-    /// round, `roundsPerArm` timed rounds per arm; rounds above 1.5x their
-    /// arm's median are dropped; on is adopted only if its median beats off's
-    /// by more than `adoptMargin`. Every round's tokens are the same either
+    /// The in-situ trial, in the verify trial's two stages. Stage 1
+    /// (`shortlist`): the self-test's chain of heads with the stock top two
+    /// against the fused form (`Qwen35TensorPackedMatmul.headTop2Chain`); on
+    /// runs rounds only if its gain per head passes `PairedRoundTrial.admits`.
+    /// Stage 2: one load-time engine request whose block proposals switch
+    /// `on` per `PairedRoundTrial` cycles (off the reference, on the
+    /// challenger; `roundBoundary`, from `proposeBlock` and
+    /// `adoptSpeculativeBlock`); round r's time is the host time from its
+    /// boundary to the next. After the discarded first round, on is adopted
+    /// only under the paired rule. Every round's tokens are the same either
     /// way (the fused pair is bitwise the stock top two).
     enum Trial {
         nonisolated(unsafe) static var active = false
-        nonisolated(unsafe) static var roundTimes: [[UInt64]] = [[], []]
         nonisolated(unsafe) static var roundIndex = 0
         nonisolated(unsafe) static var lastBoundary: UInt64 = 0
         nonisolated(unsafe) static var onEnough: (() -> Void)?
+        nonisolated(unsafe) private static var arms: [Int] = []
+        nonisolated(unsafe) private static var times: [Double?] = []
+        nonisolated(unsafe) private static var stage1Log = ""
 
-        static let roundsPerArm = 8
-        static let adoptMargin = 0.005
-        static var roundsNeeded: Int { 2 + 2 * roundsPerArm }
+        static var roundsNeeded: Int { 2 + arms.count }
+
+        /// Stage 1 (see the type's notes). True when stage 2 is to run.
+        static func shortlist() -> Bool {
+            roundIndex = 0
+            var admitted = true
+            if let chain = Qwen35TensorPackedMatmul.headTop2Chain {
+                let length = Double(Qwen35TensorPackedMatmul.headTop2ChainLength)
+                let gain = (chain.off - chain.on) / length
+                admitted = PairedRoundTrial.admits(gain: gain, reference: chain.off / length, fallback: 0.002)
+                stage1Log = String(
+                    format: "stage 1 chain of %.0f heads, best of %d: off %.3f ms, on %.3f ms (%+.1f us a head)",
+                    length, Qwen35TensorPackedMatmul.NarrowInSituTrial.chainRuns, chain.off / 1e6,
+                    chain.on / 1e6, -gain / 1e3)
+                    + (admitted ? "" : ", below half the adoption margin of the round floor; no round")
+            } else {
+                stage1Log = "stage 1 not measured"
+            }
+            if PairedRoundTrial.nullRun { admitted = true }
+            arms = admitted ? PairedRoundTrial.schedule(challengers: 1) : []
+            times = Array(repeating: nil, count: arms.count)
+            return admitted
+        }
 
         @inline(__always) static func roundBoundary() {
             guard active else { return }
@@ -4429,20 +5349,24 @@ enum Qwen35HeadTopTwo {
 
         private static func boundary() {
             let now = DispatchTime.now().uptimeNanoseconds
-            if roundIndex >= 2 { roundTimes[(roundIndex - 1) & 1].append(now - lastBoundary) }
+            if roundIndex >= 2, roundIndex - 2 < times.count { times[roundIndex - 2] = Double(now - lastBoundary) }
             lastBoundary = now
-            Qwen35HeadTopTwo.on = roundIndex & 1 == 1
-            roundIndex += 1
-            if roundIndex >= roundsNeeded {
+            if roundIndex >= 1, roundIndex - 1 >= arms.count {
+                roundIndex += 1
                 active = false
                 let enough = onEnough
                 onEnough = nil
                 enough?()
+                return
             }
+            // the challenger's rounds run on (off under MLXFAST_TRIAL_NULL)
+            Qwen35HeadTopTwo.on = roundIndex >= 1 && arms[roundIndex - 1] == 1 && !PairedRoundTrial.nullRun
+            roundIndex += 1
         }
 
         static func begin(onEnough: @escaping () -> Void) {
-            roundTimes = [[], []]
+            guard !arms.isEmpty else { return }
+            times = Array(repeating: nil, count: arms.count)
             roundIndex = 0
             lastBoundary = 0
             Qwen35HeadTopTwo.hits = 0
@@ -4450,35 +5374,29 @@ enum Qwen35HeadTopTwo {
             active = true
         }
 
-        private static func median(_ values: [UInt64]) -> Double? {
-            guard !values.isEmpty else { return nil }
-            let sorted = values.sorted()
-            let mid = sorted.count / 2
-            return sorted.count % 2 == 1
-                ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
-        }
-
         /// Ends the trial: sets `on`, logs one line. Safe when nothing ran.
         static func finish(elapsedNanoseconds: UInt64) {
             active = false
             onEnough = nil
-            let arms: [(Double?, Int)] = roundTimes.map { times in
-                guard let first = median(times) else { return (nil, 0) }
-                let kept = times.filter { Double($0) <= 1.5 * first }
-                return (median(kept), kept.count)
-            }
             var adopt = false
-            if let off = arms[0].0, let fused = arms[1].0 { adopt = fused < off * (1 - adoptMargin) }
-            Qwen35HeadTopTwo.on = adopt
+            var log = "bonsai head top-2 trial: " + stage1Log
+            if !arms.isEmpty {
+                let verdict = PairedRoundTrial.verdicts(arms: arms, times: times, challengers: 1).first
+                    ?? PairedRoundTrial.Verdict()
+                adopt = verdict.adopt
+                log += "; stage 2 (\(roundIndex) proposals, "
+                    + PairedRoundTrial.header(arms: arms, times: times, reference: "off")
+                    + (PairedRoundTrial.nullRun ? ") on vs off (MLXFAST_TRIAL_NULL: on is off) " : ") on vs off ")
+                    + verdict.summary
+            }
+            Qwen35HeadTopTwo.on = adopt && !PairedRoundTrial.nullRun
             Qwen35HeadTopTwo.last = nil
-            func ms(_ value: Double?) -> String { value.map { String(format: "%.2f", $0 / 1e6) } ?? "-" }
-            let log = "bonsai head top-2 trial: off \(ms(arms[0].0)) ms, on \(ms(arms[1].0)) ms, adopted "
-                + (adopt ? "on" : "off")
-                + " (kept \(arms[0].1)/\(roundTimes[0].count) off, \(arms[1].1)/\(roundTimes[1].count) on;"
-                + " fused pair read \(Qwen35HeadTopTwo.hits)x; "
+            log += "; adopted " + (adopt ? "on" : "off")
+                + " (fused pair read \(Qwen35HeadTopTwo.hits)x; "
                 + String(format: "%.0f ms)\n", Double(elapsedNanoseconds) / 1e6)
             FileHandle.standardError.write(log.data(using: .utf8)!)
-            roundTimes = [[], []]
+            arms = []
+            times = []
         }
     }
 }
@@ -4787,6 +5705,64 @@ extension Qwen35TensorPackedMatmul {
     nonisolated(unsafe) private static var headTop2Shape: [Int] = []
     nonisolated(unsafe) private static var headTop2Verified: Set<NarrowKernel> = []
 
+    /// The head top-2 trial's stage 1 (`headTop2ChainTimes`): the best chain
+    /// of `headTop2ChainLength` heads with the stock top two and with the
+    /// fused form (ns); nil when not measured.
+    nonisolated(unsafe) static var headTop2Chain: (off: Double, on: Double)?
+    static let headTop2ChainLength = 8
+
+    /// `headTop2ChainLength` head launches on the self-test's random operands
+    /// as one dependent chain (each launch's scaled sums read the previous
+    /// launch's top two, so it waits for it), with the stock top two (FP32
+    /// logits, then `qwen35MTPTopTwoRows`) and with the fused form: one
+    /// warm-up of each, then the best of `NarrowInSituTrial.chainRuns`
+    /// alternating runs of each; nil on an MLX error.
+    private static func headTop2ChainTimes(_ base: NarrowOperands, _ kernel: NarrowKernel) -> (off: Double, on: Double)? {
+        let kg = base.k / 128
+        func chain(_ fused: Bool) -> MLXArray? {
+            var sums = base.rowsum
+            var last: MLXArray?
+            for _ in 0 ..< headTop2ChainLength {
+                let operands = NarrowOperands(
+                    k: base.k, n: base.n, codes: base.codes, weight: base.weight,
+                    tiledWeight: base.tiledWeight, scalesT: base.scalesT, biasesT: base.biasesT,
+                    scalesT32: base.scalesT32, ascale: base.ascale, rowsum: sums)
+                let pair: (ids: MLXArray, values: MLXArray)
+                if fused {
+                    guard let fusedPair = operands.runTop2(kernel) else { return nil }
+                    pair = fusedPair
+                } else {
+                    pair = qwen35MTPTopTwoRows(operands.run(kernel, .float32).reshaped([1, 16, base.n]))
+                }
+                let flat = concatenated([pair.ids.reshaped([-1]).asType(.float32), pair.values.reshaped([-1]).asType(.float32)])
+                guard flat.size <= 16 * kg else { return nil }
+                sums = concatenated([flat, MLXArray.zeros([16 * kg - flat.size], dtype: .float32)]).reshaped([16, kg])
+                last = sums
+            }
+            return last
+        }
+        var best = [Double.infinity, .infinity]
+        let completed = try? withError { error -> Bool in
+            for fused in [false, true] {
+                guard let warm = chain(fused) else { return false }
+                eval(warm)
+            }
+            try error.check()
+            for _ in 0 ..< NarrowInSituTrial.chainRuns {
+                for (index, fused) in [false, true].enumerated() {
+                    guard let graph = chain(fused) else { return false }
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    eval(graph)
+                    best[index] = min(best[index], Double(DispatchTime.now().uptimeNanoseconds - t0))
+                }
+            }
+            try error.check()
+            return true
+        }
+        guard completed == true, best.allSatisfy(\.isFinite) else { return nil }
+        return (best[0], best[1])
+    }
+
     /// Whether the int8 head launch of `kernel` at `[k, n]` may take its
     /// fused form (the caller checks `Qwen35HeadTopTwo.on`).
     static func headTop2Applies(k: Int, n: Int, kernel: NarrowKernel) -> Bool {
@@ -4877,6 +5853,10 @@ extension Qwen35TensorPackedMatmul {
         let passed = kernels.filter { failed[$0] == nil && mismatchesByKernel[$0] == 0 }
         headTop2Shape = [k, n]
         headTop2Verified = Set(passed)
+        headTop2Chain = nil
+        if Qwen35HeadTopTwo.forced == nil, let kernel = passed.first {
+            headTop2Chain = headTop2ChainTimes(base, kernel)
+        }
         Memory.clearCache()
         let total = mismatchesByKernel.values.reduce(0, +)
         log += (passed.count == kernels.count ? "self-test passed" : "self-test FAILED")

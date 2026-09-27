@@ -585,8 +585,7 @@ enum Qwen35GDNReplayFused {
     /// the prework's row-contiguous FP32 outputs). Nil when it does not fit.
     static func launch(
         tape: ArraysCache.PrefixReplayTape, keep: Int, aLog: MLXArray, dtBias: MLXArray,
-        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
-        staged: Bool? = nil
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray
     ) -> (y: MLXArray, state: MLXArray)? {
         guard let kernel, Qwen35GatedDeltaV3.enabled, let ps = tape.ssmPre, tape.mask == nil,
             k.ndim == 4, v.ndim == 4
@@ -620,12 +619,7 @@ enum Qwen35GDNReplayFused {
             let aRows = Qwen35GDNReplayBatch.gateRowStride(tape.a),
             let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
         else { return nil }
-        // Both windows fit the staging buffers (and the verify window is a
-        // full one, where staging pays): the staged form (same values).
-        let useStaged =
-            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
-            && P <= stagedRows
-        let out = (useStaged ? stagedKernel : kernel)(
+        let out = kernel(
             [q, k, v, g, beta, MLXArray(Int32(T))] + previous
                 + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))],
             template: [
@@ -690,21 +684,13 @@ enum Qwen35GDNReplayFused {
         verdictLock.lock()
         defer { verdictLock.unlock() }
         guard verdicts[key] == nil else { return }
-        var (passed, detail) = selfTest(layer: layer)
-        if !passed, stagedActive {
-            // The staged form failed: retest (and keep) the stock fused kernel.
-            stagedLive = false
-            let first = detail
-            (passed, detail) = selfTest(layer: layer)
-            detail += "; staged form FAILED (\(first)), stock fused kernel"
-        }
+        let (passed, detail) = selfTest(layer: layer)
         verdicts[key] = passed
         Memory.clearCache()
         FileHandle.standardError.write(
             ("qwen35 GDN replay fused: self-test " + (passed ? "passed" : "FAILED") + " ("
                 + detail + ")"
-                + (passed ? "; the next verify replays the committed prefix" : "; replay kept")
-                + (passed && stagedActive ? ", rows staged in threadgroup memory\n" : "\n"))
+                + (passed ? "; the next verify replays the committed prefix\n" : "; replay kept\n"))
                 .data(using: .utf8)!)
     }
 
@@ -807,16 +793,6 @@ enum Qwen35GDNReplayFused {
                         try compare(fused.y, y)
                         try compare(fused.state, committed)
                         if let states { try compare(fused.state, states[j].ssm) }
-                        if stagedActive {
-                            guard
-                                let stock = launch(
-                                    tape: operand.tape, keep: keep, aLog: operand.aLog,
-                                    dtBias: operand.dtBias, q: w[0], k: w[1], v: w[2], g: w[3],
-                                    beta: w[4], staged: false)
-                            else { throw SelfTestFailure.message("no stock launch at \(keep) rows") }
-                            try compare(fused.y, stock.y)
-                            try compare(fused.state, stock.state)
-                        }
                     }
                     let count = stacked(differ).sum()
                     eval(count)
@@ -828,274 +804,14 @@ enum Qwen35GDNReplayFused {
         } catch {
             return (false, "\(error)")
         }
-        let expected = 4 * G * 2 + (batched ? 3 * G : 0) + (stagedActive ? 4 * G * 2 : 0)
+        let expected = 4 * G * 2 + (batched ? 3 * G : 0)
         let passed = mismatches == 0 && comparisons == expected
         return (
             passed,
             "\(G) tapes at 0, 1, 7 and \(S) kept rows, \(comparisons) comparisons, "
                 + "\(values) values, \(mismatches) mismatches"
-                + (batched ? ", batched replay included" : "")
-                + (stagedActive ? ", staged form vs stock fused kernel included" : ""))
+                + (batched ? ", batched replay included" : ""))
     }
-}
-
-/// `qwen35_gdn_replay_fused` with each window's rows staged in threadgroup
-/// memory (`BONSAI_GDN_REPLAY_STAGED=0` keeps the stock fused kernel).
-///
-/// The stock kernel reads every step's inputs from device memory inside its
-/// sequential step loop: per replayed row the previous tape's k and v rows and
-/// a/b, from which each of the 128 threads computes the same gates, and per
-/// output row q, k, v, g and beta. The previous tape is long out of the
-/// caches by the next verify, so each replayed step waits for a DRAM round
-/// trip, and the output steps wait for their own loads. Here each window is
-/// read once, coalesced, into threadgroup memory before its loop (the replay
-/// window at the start, next to the state load; the output window after the
-/// committed-state store, reusing the replay's k/v space): the k rows as
-/// float4 (swizzled so the eight lanes of a row read different banks), the
-/// threadgroup's 32 v columns, and the per-step gates (thread t computes step
-/// t's gates with the stock expressions). The loops then read those values
-/// from threadgroup memory: every step does the stock arithmetic in the stock
-/// order (the output pass reads the updated state exactly as the stock loop's
-/// interleaved `o` accumulation does), so y and the committed state are the
-/// stock kernel's, bit for bit. Both windows must hold at most 16 rows (the
-/// verify window is 16); otherwise the stock kernel runs.
-///
-/// The fused replay's self-test runs through this form, compared both with
-/// the unfused replay and output-only scan (as for the stock kernel) and with
-/// the stock fused kernel on the same inputs; on a mismatch the stock fused
-/// kernel is retested and kept.
-extension Qwen35GDNReplayFused {
-    static let stagedEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_REPLAY_STAGED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Cleared when the staged form fails its self-test.
-    nonisolated(unsafe) static var stagedLive = true
-    static var stagedActive: Bool { stagedEnabled && stagedLive }
-
-    /// Rows per staged window (the threadgroup buffers' size).
-    static let stagedRows = 16
-
-    private static let stagedHeader = Qwen35GDNReplayBatch.header + """
-        // float4 j of the 16-float k (or q) slice c of a staged row; the
-        // swizzle spreads the eight slices of one read over the banks.
-        inline uint qwen35_staged_slot(uint c, uint j) {
-          return c * 4 + (j ^ ((c >> 1) & 3));
-        }
-
-        """
-
-    // The stock kernel's inputs, outputs, template and grid.
-    private static let stagedSource = """
-        constexpr int R = 16;
-        constexpr int LPD = Dk / R;
-        constexpr int DVPS = (32 / LPD) * DVPL;
-        constexpr int DVPT = DVPS * 4;
-        constexpr uint NT = 128;
-        static_assert(Dk == 128 && LPD == 8, "16-float k slices, 8 lanes per row");
-        const uint n = threadgroup_position_in_grid.z;
-        const uint b_idx = n / Hv;
-        const uint hv_idx = n % Hv;
-        const uint hk_idx = hv_idx / (Hv / Hk);
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = sg * 32 + lane;
-        const uint c = lane % LPD;
-        const uint dk0 = c * R;
-        const uint row0 = threadgroup_position_in_grid.y * DVPT;
-        const uint rbase = sg * DVPS + (lane / LPD) * DVPL;
-        const uint dvbase = row0 + rbase;
-        threadgroup float4 tk[16 * 32];
-        threadgroup float4 tq[16 * 32];
-        threadgroup float tv[16 * DVPT];
-        threadgroup float tgate[32];
-
-        float state[DVPL][R];
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
-          }
-        }
-
-        // Phase 1: the previous tape's KP rows, the batched replay's step.
-        {
-          const int a_rs = ab_rows[0];
-          const int b_rs = ab_rows[1];
-          const float g_nexp = -metal::precise::exp(alog[hv_idx]);
-          const float g_dtb = dtb[hv_idx];
-          const device float4* k4src = (const device float4*)(pk + hk_idx * Dk);
-          for (uint e = tid; e < uint(KP) * 32u; e += NT) {
-            const uint t = e >> 5, f = e & 31u;
-            tk[t * 32u + qwen35_staged_slot(f >> 2, f & 3u)] = k4src[t * uint(Hk * Dk / 4) + f];
-          }
-          for (uint e = tid; e < uint(KP) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
-          }
-          if (tid < uint(KP)) {
-            const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
-            tgate[tid] = metal::precise::exp(g_nexp * g_sp);
-            tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          for (int t = 0; t < KP; ++t) {
-            const float gt = tgate[t];
-            const float bt = tgate[16 + t];
-            const threadgroup float4* kt = tk + t * 32;
-            float kv[DVPL];
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < R / 4; ++j) {
-                const float4 k4 = kt[qwen35_staged_slot(c, j)];
-                state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
-                state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
-                a0 = fma(state[d][4 * j], k4.x, a0);
-                a1 = fma(state[d][4 * j + 1], k4.y, a1);
-                a2 = fma(state[d][4 * j + 2], k4.z, a2);
-                a3 = fma(state[d][4 * j + 3], k4.w, a3);
-              }
-              kv[d] = (a0 + a1) + (a2 + a3);
-            }
-            #pragma clang loop unroll(full)
-            for (int o = LPD / 2; o > 0; o >>= 1) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                kv[d] += simd_shuffle_xor(kv[d], o);
-              }
-            }
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              const float delta = (tv[t * DVPT + rbase + d] - kv[d]) * bt;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < R / 4; ++j) {
-                const float4 k4 = kt[qwen35_staged_slot(c, j)];
-                state[d][4 * j] = fma(k4.x, delta, state[d][4 * j]);
-                state[d][4 * j + 1] = fma(k4.y, delta, state[d][4 * j + 1]);
-                state[d][4 * j + 2] = fma(k4.z, delta, state[d][4 * j + 2]);
-                state[d][4 * j + 3] = fma(k4.w, delta, state[d][4 * j + 3]);
-              }
-            }
-          }
-        }
-
-        // The committed state.
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
-          }
-        }
-
-        // Phase 2: this verify's T rows, the output-only scan's step.
-        {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          const device float4* k4src = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
-          const device float4* q4src = (const device float4*)(q + (b_idx * T * Hk + hk_idx) * Dk);
-          for (uint e = tid; e < uint(T) * 32u; e += NT) {
-            const uint t = e >> 5, f = e & 31u;
-            const uint slot = t * 32u + qwen35_staged_slot(f >> 2, f & 3u);
-            tk[slot] = k4src[t * uint(Hk * Dk / 4) + f];
-            tq[slot] = q4src[t * uint(Hk * Dk / 4) + f];
-          }
-          for (uint e = tid; e < uint(T) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = v[((b_idx * T + t) * Hv + hv_idx) * Dv + row0 + r];
-          }
-          if (tid < uint(T)) {
-            tgate[tid] = g[(b_idx * T + tid) * Hv + hv_idx];
-            tgate[16 + tid] = beta[(b_idx * T + tid) * Hv + hv_idx];
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-          for (int t = 0; t < T; ++t) {
-            const float gt = tgate[t];
-            const float bt = tgate[16 + t];
-            const threadgroup float4* kt = tk + t * 32;
-            const threadgroup float4* qt = tq + t * 32;
-            float kv[DVPL];
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < R / 4; ++j) {
-                const float4 k4 = kt[qwen35_staged_slot(c, j)];
-                state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
-                state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
-                a0 = fma(state[d][4 * j], k4.x, a0);
-                a1 = fma(state[d][4 * j + 1], k4.y, a1);
-                a2 = fma(state[d][4 * j + 2], k4.z, a2);
-                a3 = fma(state[d][4 * j + 3], k4.w, a3);
-              }
-              kv[d] = (a0 + a1) + (a2 + a3);
-            }
-            #pragma clang loop unroll(full)
-            for (int o = LPD / 2; o > 0; o >>= 1) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                kv[d] += simd_shuffle_xor(kv[d], o);
-              }
-            }
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              const float delta = (tv[t * DVPT + rbase + d] - kv[d]) * bt;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < R / 4; ++j) {
-                const float4 k4 = kt[qwen35_staged_slot(c, j)];
-                state[d][4 * j] = fma(k4.x, delta, state[d][4 * j]);
-                state[d][4 * j + 1] = fma(k4.y, delta, state[d][4 * j + 1]);
-                state[d][4 * j + 2] = fma(k4.z, delta, state[d][4 * j + 2]);
-                state[d][4 * j + 3] = fma(k4.w, delta, state[d][4 * j + 3]);
-              }
-            }
-            float out[DVPL];
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < R / 4; ++j) {
-                const float4 q4 = qt[qwen35_staged_slot(c, j)];
-                o0 = fma(state[d][4 * j], q4.x, o0);
-                o1 = fma(state[d][4 * j + 1], q4.y, o1);
-                o2 = fma(state[d][4 * j + 2], q4.z, o2);
-                o3 = fma(state[d][4 * j + 3], q4.w, o3);
-              }
-              out[d] = (o0 + o1) + (o2 + o3);
-            }
-            #pragma clang loop unroll(full)
-            for (int o = LPD / 2; o > 0; o >>= 1) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                out[d] += simd_shuffle_xor(out[d], o);
-              }
-            }
-            if (lane % LPD == 0) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                y_[d] = out[d];
-              }
-            }
-            y_ += Hv * Dv;
-          }
-        }
-        """
-
-    static let stagedKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_replay_fused_staged",
-        inputNames: [
-            "q", "k", "v", "g", "beta", "T", "ps", "pk", "pv", "pa", "pb", "alog", "dtb",
-            "ab_rows", "KP",
-        ],
-        outputNames: ["y", "state_out"],
-        source: stagedSource,
-        header: stagedHeader,
-        ensureRowContiguous: false)
 }
 
 // MARK: - Row-tiled fresh strided GDN prompt prework (znan2)
