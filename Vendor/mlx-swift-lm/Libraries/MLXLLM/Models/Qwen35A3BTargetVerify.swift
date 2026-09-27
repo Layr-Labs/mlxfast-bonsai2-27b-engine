@@ -1037,161 +1037,13 @@ extension Qwen35GDNPrework {
         source: freshStridedRowsSource,
         ensureRowContiguous: false)
 
-    /// `BONSAI_GDN_PREWORK_NARROW=0` keeps 64-bit offsets in the row-tiled launch.
-    static let narrowOffsetsEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_NARROW"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `BONSAI_GDN_PREWORK_FUSED_PREP=0` keeps the chunked scan's prep launch.
-    static let fusedPrepEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_FUSED_PREP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `BONSAI_GDN_PREWORK_SPLIT=0` keeps the value columns in the q/k launch.
-    static let splitValuesEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_SPLIT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `freshStridedRowsSource` with 32-bit element offsets. The row-tiled
-    /// launch is bound by its index arithmetic (every load and store forms
-    /// 64-bit products; M4 Max, 48 back-to-back layers: 135 -> 108 us). Here
-    /// the strides are read as `int` and every `int64_t` / `size_t` index is
-    /// `int` / `uint`: the same elements are read and written, and no
-    /// arithmetic on values changes. Taken only where every offset fits in 31
-    /// bits (`narrowFits`).
-    private static let narrowRowsSource: String = {
-        var text = freshStridedRowsSource
-        for name in ["qkv", "w", "a", "b"] {
-            let target = "\(name)_strides["
-            precondition(
-                text.contains(target) && !text.contains("(int)" + target),
-                "Qwen35 GDN prework rows: the narrow source no longer matches")
-            text = text.replacingOccurrences(of: target, with: "(int)" + target)
-        }
-        return text.replacingOccurrences(of: "int64_t", with: "int")
-            .replacingOccurrences(of: "size_t", with: "uint")
-    }()
-
-    /// The value columns' span of `narrowRowsSource` (the GRP value heads'
-    /// conv, SiLU and store), which reads no norm and nothing the q/k block
-    /// writes.
-    private static func valueSpan(_ text: String) -> Range<String.Index> {
-        let marker = "// The GRP value heads of this key head"
-        guard text.components(separatedBy: marker).count == 2,
-            let start = text.range(of: marker),
-            let end = text.range(
-                of: "threadgroup_barrier(mem_flags::mem_threadgroup);",
-                range: start.upperBound ..< text.endIndex)
-        else { preconditionFailure("Qwen35 GDN prework split: the row source no longer matches") }
-        return start.lowerBound ..< end.lowerBound
-    }
-
-    /// `narrowRowsSource` without its value span: q, k, the gates and the tail.
-    private static let splitQKSource: String = {
-        var text = narrowRowsSource
-        text.removeSubrange(valueSpan(text))
-        precondition(!text.contains("v[vrow"))
-        return text
-    }()
-
-    /// The value span alone behind the header and conv helpers (the text
-    /// before the q/k block), one launch of the same grid. The q/k launch's
-    /// consumer (the chunk prep) is enqueued before it, so the two overlap.
-    private static let splitValueSource: String = {
-        let text = narrowRowsSource
-        guard let qk = text.range(of: "// q and k channel c of key head h") else {
-            preconditionFailure("Qwen35 GDN prework split: the row source no longer matches")
-        }
-        let value = String(text[..<qk.lowerBound]) + String(text[valueSpan(text)])
-        precondition(!value.contains("q[qkrow") && !value.contains("tail[") && !value.contains("g[grow"))
-        return value
-    }()
-
-    /// `splitQKSource` launched one chunk per threadgroup (RW = C) with the
-    /// chunked scan's prep (`Qwen35GatedDeltaChunked.prepSource`, verbatim
-    /// but for the (b, key head) id and its three barriers, which only its own
-    /// simdgroup's lanes cross) run by simdgroup 0 behind a device barrier:
-    /// it reads the chunk's q, k, g and beta this threadgroup just stored,
-    /// the values its own launch would have read. Saves the prep launch and
-    /// its latency (M4 Max, 48 dependent layers: -20 us per layer).
-    private static let fusedPrepSource: String = {
-        var prep = Qwen35GatedDeltaChunked.prepSource
-        for (target, replacement, count) in [
-            ("const int bk = int(thread_position_in_grid.z);",
-             "const int bk = int(bb) * Hk + int(h);", 1),
-            ("threadgroup_barrier(mem_flags::mem_threadgroup);",
-             "simdgroup_barrier(mem_flags::mem_threadgroup);", 3),
-        ] {
-            precondition(
-                prep.components(separatedBy: target).count == count + 1,
-                "Qwen35 GDN prework fused prep: the prep source no longer matches")
-            prep = prep.replacingOccurrences(of: target, with: replacement)
-        }
-        precondition(!prep.contains("threadgroup_barrier"))
-        return splitQKSource + """
-
-            threadgroup_barrier(mem_flags::mem_device);
-            if (simdgroup_index_in_threadgroup == 0) {
-            constexpr int C = RW;
-            constexpr int Dk = DK;
-            constexpr int Hk = HK;
-            constexpr int Hv = HV;
-            const int T = Sn;
-            \(prep)
-            }
-
-            """
-    }()
-
-    private static let fusedPrepKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prework_fresh_rows_qk_prep",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
-        outputNames: ["q", "k", "g", "beta", "tail", "tp", "pm", "gf"],
-        source: fusedPrepSource, ensureRowContiguous: false)
-
-    private static let narrowRowsKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prework_fresh_strided_rows_n",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
-        outputNames: ["q", "k", "v", "g", "beta", "tail"],
-        source: narrowRowsSource, ensureRowContiguous: false)
-
-    private static let splitQKKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prework_fresh_rows_qk",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
-        outputNames: ["q", "k", "g", "beta", "tail"],
-        source: splitQKSource, ensureRowContiguous: false)
-
-    private static let splitValueKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prework_fresh_rows_v",
-        inputNames: ["qkv", "w", "S"], outputNames: ["v"],
-        source: splitValueSource, ensureRowContiguous: false)
-
-    /// Every element offset below 2^31 with each input row at most 4 * CD
-    /// elements apart (`qkv`, `a` and `b` are column slices of the qkv|z and
-    /// b|a stacks, or of one stack of all four, each narrower; a lazy slice
-    /// does not report its parent's strides before it is evaluated). Every
-    /// output has at most B * S * CD elements.
-    static func narrowFits(batch: Int, rows: Int, convDim: Int) -> Bool {
-        batch * max(rows, 4) * 4 * convDim < Int(Int32.max)
-    }
-
     /// The row-tiled launch on `runFreshState`'s arguments (after its guards
     /// and dtype conversions), `rows` rows per threadgroup; `rows` must divide
     /// the chunk. The outputs have `freshStridedKernel`'s shapes and dtypes.
-    /// `form` 0 is the row-tiled kernel, 1 its narrow offsets, 2 those as a
-    /// q/k launch and a value launch, 3 that with the chunked scan's prep in
-    /// the q/k launch (`Outputs.prepared`); nil takes the verified form.
     static func freshStridedRows(
         qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
-        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, rows: Int,
-        form: Int? = nil
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, rows: Int
     ) -> Outputs {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
@@ -1201,45 +1053,7 @@ extension Qwen35GDNPrework {
             headKDim == 128 && rows > 0 && S % rows == 0
                 && (valueHeads / keyHeads) * rows <= headKDim,
             "Qwen35 GDN prework rows: unsupported launch")
-        let form =
-            form
-            ?? (narrowFits(batch: B, rows: S, convDim: CD)
-                ? rowForm(
-                    RowTileGeometry(
-                        hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, dtype: "\(qkv.dtype)"))
-                : 0)
-        if form >= 2 {
-            let C = Qwen35GatedDeltaChunked.chunk
-            let fused = form >= 3 && S % C == 0 && (valueHeads / keyHeads) * C <= headKDim
-            let qkRows = fused ? C : rows
-            let qk = (fused ? fusedPrepKernel : splitQKKernel)(
-                [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
-                 MLXArray(Int32(S))],
-                template: [
-                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
-                    ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", qkRows),
-                ],
-                grid: (128 * keyHeads, S / qkRows, B), threadGroup: (128, 1, 1),
-                outputShapes: [
-                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
-                    [B, S, valueHeads], [B, S, valueHeads], [B, KS - 1, CD],
-                ] + (fused
-                    ? [[B, valueHeads, S / C, C, C], [B, valueHeads, S / C, C, C],
-                       [B, valueHeads, S / C, 2, C]] : []),
-                outputDTypes: [DType](repeating: .float32, count: fused ? 8 : 5))
-            let v = splitValueKernel(
-                [qkv, convWeight, MLXArray(Int32(S))],
-                template: [
-                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
-                    ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
-                ],
-                grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
-                outputShapes: [[B, S, valueHeads, headVDim]], outputDTypes: [.float32])
-            return Outputs(
-                q: qk[0], k: qk[1], v: v[0], g: qk[2], beta: qk[3], tail: qk[4],
-                prepared: fused ? Array(qk[5 ..< 8]) : nil)
-        }
-        let outputs = (form == 1 ? narrowRowsKernel : freshStridedRowsKernel)(
+        let outputs = freshStridedRowsKernel(
             [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
              MLXArray(Int32(S))],
             template: [
@@ -1264,15 +1078,6 @@ extension Qwen35GDNPrework {
 
     private static let rowTileLock = NSLock()
     nonisolated(unsafe) private static var rowTileVerdicts: [RowTileGeometry: Bool] = [:]
-    /// The highest `freshStridedRows` form that matched, per geometry and dtype.
-    nonisolated(unsafe) private static var rowFormVerdicts: [RowTileGeometry: Int] = [:]
-    private static var rowForms: Int {
-        !narrowOffsetsEnabled ? 1 : !splitValuesEnabled ? 2 : !fusedPrepEnabled ? 3 : 4
-    }
-
-    private static func rowForm(_ geometry: RowTileGeometry) -> Int {
-        min(rowTileLock.withLock { rowFormVerdicts[geometry] ?? 0 }, rowForms - 1)
-    }
 
     /// Verdict lookup only (the check runs in `prepare`, never inside a
     /// forward); a geometry or qkv dtype that was not prepared, or failed its
@@ -1299,19 +1104,11 @@ extension Qwen35GDNPrework {
         for dtype in [DType.float16, .bfloat16, .float32] {
             let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
             if rowTileLock.withLock({ rowTileVerdicts[geometry] != nil }) { continue }
-            let passed = rowTileSelfCheck(
-                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype, forms: rowForms)
-            let verdict = passed > 0
+            let verdict = rowTileSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
             let recorded = rowTileLock.withLock { () -> Bool in
                 guard rowTileVerdicts[geometry] == nil else { return false }
                 rowTileVerdicts[geometry] = verdict
-                rowFormVerdicts[geometry] = max(passed - 1, 0)
                 return true
-            }
-            if recorded && verdict && rowForms > 1 {
-                FileHandle.standardError.write(
-                    "qwen35 GDN prompt prework (\(dtype)): \(passed - 1) of \(rowForms - 1) forms (narrow offsets, split value launch, fused chunk prep) match the row-tiled kernel bit for bit\n"
-                        .data(using: .utf8)!)
             }
             if recorded && !verdict {
                 FileHandle.standardError.write(
@@ -1321,13 +1118,9 @@ extension Qwen35GDNPrework {
         }
     }
 
-    /// How many of the first `forms` launch forms match the stock launch bit
-    /// for bit, stopping at the first that does not (0: the row-tiled kernel
-    /// does not).
     private static func rowTileSelfCheck(
-        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType, forms: Int
-    ) -> Int {
-        var passed = forms
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> Bool {
         let cd = 2 * hk * dk + hv * dv
         // qkv is a column slice of a wider stack, as the model's qkv|z product.
         let width = cd + hv * dv
@@ -1356,34 +1149,21 @@ extension Qwen35GDNPrework {
                     qkv: qkv, convStateShape: [1, ks - 1, cd], convWeight: convWeight,
                     a: a, b: b, aDecay: aDecay, dtBias: dtBias, normScales: normScales,
                     keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv)
-            else { return 0 }
-            for form in 0 ..< passed {
-                let tiled = freshStridedRows(
-                    qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
-                    normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
-                    headVDim: dv, rows: rowTile, form: form)
-                var pairs = [
-                    (stock.q, tiled.q), (stock.k, tiled.k), (stock.v, tiled.v),
-                    (stock.g, tiled.g), (stock.beta, tiled.beta), (stock.tail, tiled.tail),
-                ]
-                if form == 3 {
-                    guard let fused = tiled.prepared, fused.count == 3 else { passed = form; break }
-                    let prep = Qwen35GatedDeltaChunked.prep(
-                        q: stock.q, k: stock.k, g: stock.g, beta: stock.beta)
-                    pairs += zip(prep, fused).map { ($0, $1) }
-                }
-                var same = MLXArray(true)
-                for (x, y) in pairs {
-                    same = same .&& all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
-                }
-                if !same.item(Bool.self) {
-                    passed = form
-                    break
-                }
+            else { return false }
+            let tiled = freshStridedRows(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
+                normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                headVDim: dv, rows: rowTile)
+            var same = MLXArray(true)
+            for (x, y) in [
+                (stock.q, tiled.q), (stock.k, tiled.k), (stock.v, tiled.v),
+                (stock.g, tiled.g), (stock.beta, tiled.beta), (stock.tail, tiled.tail),
+            ] {
+                same = same .&& all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
             }
-            if passed == 0 { return 0 }
+            if !same.item(Bool.self) { return false }
         }
-        return passed
+        return true
     }
 }
 
