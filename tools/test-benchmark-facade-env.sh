@@ -56,6 +56,11 @@
 #       win over the flag, so on a runner the flag is dead argv; on a hand run
 #       it is the only box identity benchd has, and it comes from the
 #       calibration file's own `box`.
+#   21. MLXFAST_BOX_NAME, when set, reaches benchd as RUNNER_NAME, so a
+#       single-use runner name never decides which calibration band applies.
+#   22. with RESIDENT_UP_LOG_DIR unset, benchd gets a resident log directory
+#       outside both trees, because the reference workspace is read-only to the
+#       ranked job account.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -285,6 +290,8 @@ for arg in "$@"; do
 done
 printf '%s\n' "${BENCH_WORKER_RESIDENT_SOCKET-__UNSET__}" > "${STUB_CAPTURE_ENV}"
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
+printf '%s\n' "${RUNNER_NAME-__UNSET__}" > "${STUB_CAPTURE_ARGV}.runner-name"
+printf '%s\n' "${RESIDENT_UP_LOG_DIR-__UNSET__}" > "${STUB_CAPTURE_ARGV}.resident-log-dir"
 echo '{}'
 exit 0
 MEASURESTUBEOF
@@ -634,8 +641,29 @@ if [[ -f "${WORK}/case20.argv" ]]; then
   fail "case 20: benchd was spawned with no engine"
 fi
 
+# Case 21: MLXFAST_BOX_NAME reaches benchd as RUNNER_NAME. A single-use runner
+# has a new RUNNER_NAME for each job; the box name is the fixed one.
+run_measure case21 "MLXFAST_BOX_NAME=${CALIBRATION_BOX_NAME}" "RUNNER_NAME=${CALIBRATION_BOX_NAME}-20260927T120000Z-4242"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 21: the measure script exited ${rc} with MLXFAST_BOX_NAME set; output: $(cat "${WORK}/case21.out")"
+elif [[ "$(cat "${WORK}/case21.argv.runner-name" 2>/dev/null)" != "${CALIBRATION_BOX_NAME}" ]]; then
+  fail "case 21: benchd got RUNNER_NAME '$(cat "${WORK}/case21.argv.runner-name" 2>/dev/null)', not the box name ${CALIBRATION_BOX_NAME} from MLXFAST_BOX_NAME"
+elif grep -qx -- '--box' "${WORK}/case21.argv"; then
+  fail "case 21: --box was passed while benchd has a RUNNER_NAME"
+fi
+
+# Case 22: with no RESIDENT_UP_LOG_DIR, benchd gets one outside both trees.
+mkdir -p "${WORK}/case22-tmp"
+run_measure case22 "RESIDENT_UP_LOG_DIR=" "RUNNER_TEMP=" "TMPDIR=${WORK}/case22-tmp"
+case22_dir="$(cat "${WORK}/case22.argv.resident-log-dir" 2>/dev/null)"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 22: the measure script exited ${rc} with RESIDENT_UP_LOG_DIR unset; output: $(cat "${WORK}/case22.out")"
+elif [[ "${case22_dir}" != "${WORK}/case22-tmp/resident-up."* || ! -d "${case22_dir}" ]]; then
+  fail "case 22: benchd got RESIDENT_UP_LOG_DIR '${case22_dir}', not a new directory in the job's temporary directory"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-benchmark-facade-env.sh: all 20 cases passed (trackId=${EXPECTED})"
+  echo "test-benchmark-facade-env.sh: all 22 cases passed (trackId=${EXPECTED})"
   exit 0
 fi
 echo "test-benchmark-facade-env.sh: ${failures} case(s) failed" >&2

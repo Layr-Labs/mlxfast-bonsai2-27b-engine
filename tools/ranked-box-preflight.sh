@@ -45,6 +45,13 @@
 # Section 6 holds both. Nothing here fetches or builds the reference tree: it is
 # staged on the box out of band, the same way the goldens are.
 #
+# THE BOX NAME. The calibration names the box it was measured on, and section 6
+# compares that name with this box. The box name is MLXFAST_BOX_NAME, which the
+# box converge writes into the runner environment. A single-use runner gets a
+# new RUNNER_NAME for each job, so RUNNER_NAME cannot identify the box. When
+# MLXFAST_BOX_NAME is unset, RUNNER_NAME is the box name (a persistent runner
+# with a fixed name). When both are unset (a hand run), the name is not checked.
+#
 # WHAT THE PINS ARE. fixtures/bonsai2_27b_mlx_v1_track.json is trusted-side (not an
 # editable path), and its timed_prompt_pool[] carries {r2_path, sha256, bytes}
 # per tape plus hidden_correctness_golden's {sha256, bytes}. A staged file is
@@ -431,13 +438,14 @@ reference_commit_date="$(git -C "${BASELINE_WORKSPACE}" show -s --format=%cI "${
 # require python3), checks every field the ranked path depends on, and prints
 # ONE refusal naming the first thing that is wrong.
 CALIBRATION_TRACK_ID="$(jq -r '.track_id' "${CONTRACT}")"
+BOX_IDENTITY="${MLXFAST_BOX_NAME:-${RUNNER_NAME:-}}"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate the baseline calibration file"
 calibration_error="$(
   MLXFAST_CAL_PATH="${BASELINE_CALIBRATION}" \
   MLXFAST_CAL_TRACK_ID="${CALIBRATION_TRACK_ID}" \
   MLXFAST_CAL_REF_COMMIT="${REFERENCE_COMMIT}" \
   MLXFAST_CAL_REF_DATE="${reference_commit_date}" \
-  MLXFAST_CAL_BOX="${RUNNER_NAME:-}" \
+  MLXFAST_CAL_BOX="${BOX_IDENTITY}" \
   python3 - <<'PYEOF'
 import datetime
 import json
@@ -479,7 +487,7 @@ want_box = os.environ["MLXFAST_CAL_BOX"]
 if want_box:
     if cal.get("box") != want_box:
         refuse(
-            f"baseline calibration box is {cal.get('box')!r} but this runner is "
+            f"baseline calibration box is {cal.get('box')!r} but this box is "
             f"{want_box!r}; the band was measured on another machine and says nothing "
             "about this one"
         )
@@ -543,10 +551,218 @@ if captured <= reference_date:
 PYEOF
 )" || fail "the baseline calibration validator failed to run against ${BASELINE_CALIBRATION}"
 [[ -z "${calibration_error}" ]] || fail "${calibration_error} (${BASELINE_CALIBRATION})"
-if [[ -n "${RUNNER_NAME:-}" ]]; then
-  ok "baseline calibration parses and names this track, this box (${RUNNER_NAME}) and the reference commit"
+if [[ -n "${MLXFAST_BOX_NAME:-}" ]]; then
+  ok "baseline calibration parses and names this track, this box (${BOX_IDENTITY}, from MLXFAST_BOX_NAME) and the reference commit"
+elif [[ -n "${RUNNER_NAME:-}" ]]; then
+  ok "baseline calibration parses and names this track, this box (${BOX_IDENTITY}, from RUNNER_NAME) and the reference commit"
 else
-  ok "baseline calibration parses and names this track and the reference commit (RUNNER_NAME unset, so the box name is not checked)"
+  ok "baseline calibration parses and names this track and the reference commit (MLXFAST_BOX_NAME and RUNNER_NAME unset, so the box name is not checked)"
+fi
+
+# --- 7. the job account boundary (official runs only) ------------------------
+# GHSA-rc55-jfmg-gvc9 and GHSA-2j7x-cjrv-43wv. A ranked job runs participant
+# code as the job account. The box converge makes that account a single-use,
+# unprivileged account that can read the evaluator material but cannot change
+# it. This section refuses the run when the box is not in that state, before
+# any participant code runs and before anything loads.
+#
+# The checks run on an official run only: a self-hosted Actions runner
+# (RUNNER_ENVIRONMENT=self-hosted) or MLXFAST_OFFICIAL_BENCHMARK_RUN=1. A hand
+# run by the operator owns these paths by design, and is not checked.
+#
+#   7a. The job account does not own, and cannot write, the evaluator material:
+#       the goldens, the correctness golden, benchd-bin and every file in it,
+#       the reference workspace, the calibration file, the reference
+#       checkpoint, the temperature reader and the metallib stage. For each
+#       path the parent directory must not be writable either, because a
+#       writable parent lets the job replace the path. Ownership is checked
+#       for every item under the path. Write access is checked with a real
+#       access test (`-w`) on the path, its parent, and a sample of the
+#       directories and files under it.
+#   7b. The job account has no privilege: its uid is not 0, it is not in the
+#       admin, wheel or sudo group, and `sudo -n true` fails.
+#   7c. The runner is single-use: the actions-runner `.runner` file, two
+#       levels above RUNNER_WORKSPACE, has "ephemeral": true. The runner reads
+#       and writes its `.runner` and `.credentials` files as the job account,
+#       so the job can read them too. That is what a standard single-use
+#       actions-runner allows. The registration ends with this job, and the
+#       transform and resident Seatbelt profiles deny those files.
+#   7d. The worker build cache root (MLXFAST_BUILD_CACHE_DIR, else
+#       ~/.cache/mlxfast-engine-build) is absent, or the job account does not
+#       own it and cannot write it.
+#   7e. Seatbelt works for this account on this box. A child under
+#       sandbox-exec, with the same rule set as the transform profile (deny
+#       all writes, allow writes to one output directory, deny reads and
+#       writes of the evaluator paths), must fail to read a golden and must
+#       fail to write outside its output directory. It must also succeed to
+#       write inside its output directory, which proves that the child ran.
+#       The trusted CLI is not built yet when this script runs, so the rule
+#       set is written here. At transform time the CLI writes its own profile
+#       and its child proves again that a write outside the output tree fails.
+official_run=0
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+  official_run=1
+fi
+
+# boundary_refuse <check> <message>
+boundary_refuse() {
+  fail "account boundary check $1: $2"
+}
+
+# job_owned_item <path>: prints the first item under <path> (the path itself
+# included) that the job account owns. Prints nothing when there is none.
+job_owned_item() {
+  { find "$1" -user "${JOB_UID}" -print 2>/dev/null || true; } | head -n 1
+}
+
+# sample_items <path>: the path, and up to 64 directories and 64 files under it.
+sample_items() {
+  printf '%s\n' "$1"
+  if [[ -d "$1" ]]; then
+    { find "$1" -mindepth 1 -type d -print 2>/dev/null || true; } | head -n 64
+    { find "$1" -mindepth 1 -type f -print 2>/dev/null || true; } | head -n 64
+  fi
+}
+
+# require_not_job_writable <label> <path> <sample|all>
+require_not_job_writable() {
+  local label="$1" path="$2" scope="$3" owned parent item
+  [[ -e "${path}" ]] || boundary_refuse 7a "${label} does not exist at ${path}"
+  owned="$(job_owned_item "${path}")"
+  [[ -z "${owned}" ]] \
+    || boundary_refuse 7a "the job account (uid ${JOB_UID}) owns ${owned}, which is part of ${label}. The operator account must own it. Run the box converge."
+  parent="$(dirname "${path}")"
+  [[ ! -w "${parent}" ]] \
+    || boundary_refuse 7a "the job account can write ${parent}, the parent directory of ${label}, so it can replace ${path}. Run the box converge."
+  if [[ "${scope}" == "all" ]]; then
+    while IFS= read -r item; do
+      [[ ! -w "${item}" ]] || boundary_refuse 7a "the job account can write ${item}, which is part of ${label}. Run the box converge."
+    done < <(printf '%s\n' "${path}"; { find "${path}" -mindepth 1 -print 2>/dev/null || true; })
+  else
+    while IFS= read -r item; do
+      [[ ! -w "${item}" ]] || boundary_refuse 7a "the job account can write ${item}, which is part of ${label}. Run the box converge."
+    done < <(sample_items "${path}")
+  fi
+}
+
+if [[ "${official_run}" == "1" ]]; then
+  JOB_UID="$(id -u)"
+  [[ "${JOB_UID}" =~ ^[0-9]+$ ]] || boundary_refuse 7b "cannot read the uid of the job account"
+
+  # 7a
+  for var in BENCHD_BIN_DIR MLXFAST_REFERENCE_DIR; do
+    eval "value=\${${var}:-}"
+    [[ -n "${value}" ]] || boundary_refuse 7a "${var} is not set; an official run needs the runner environment to name it"
+  done
+  require_not_job_writable "the golden directory (MLXFAST_QWEN38_GOLDEN_DIR)" "${GOLDEN_DIR}" sample
+  if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+    require_not_job_writable "the correctness golden (MLXFAST_CORRECTNESS_GOLDEN_PATH)" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" sample
+  fi
+  require_not_job_writable "benchd-bin (BENCHD_BIN_DIR)" "${BENCHD_BIN_DIR}" all
+  require_not_job_writable "the reference workspace (MLXFAST_BASELINE_WORKSPACE)" "${BASELINE_WORKSPACE}" sample
+  require_not_job_writable "the calibration file (MLXFAST_BASELINE_CALIBRATION)" "${BASELINE_CALIBRATION}" sample
+  require_not_job_writable "the reference checkpoint (MLXFAST_REFERENCE_DIR)" "${MLXFAST_REFERENCE_DIR}" sample
+  require_not_job_writable "the temperature reader (MLXFAST_MACMON)" "${MLXFAST_MACMON}" sample
+  if [[ -n "${MLXFAST_METALLIB_STAGE:-}" ]]; then
+    require_not_job_writable "the metallib stage (MLXFAST_METALLIB_STAGE)" "${MLXFAST_METALLIB_STAGE}" sample
+  fi
+  ok "account boundary 7a: the job account (uid ${JOB_UID}) owns none of the evaluator material and cannot write it"
+
+  # 7b
+  [[ "${JOB_UID}" != "0" ]] || boundary_refuse 7b "the job runs as root (uid 0); it must run as the unprivileged runner account"
+  for group in $(id -Gn); do
+    case "${group}" in
+      admin|wheel|sudo)
+        boundary_refuse 7b "the job account is in the ${group} group; it must have no privilege" ;;
+    esac
+  done
+  if command -v sudo >/dev/null 2>&1 && sudo -n true </dev/null >/dev/null 2>&1; then
+    boundary_refuse 7b "sudo -n true succeeds for the job account; it must have no privilege"
+  fi
+  ok "account boundary 7b: the job account is not root, not in admin, wheel or sudo, and has no sudo"
+
+  # 7c
+  [[ -n "${RUNNER_WORKSPACE:-}" ]] || boundary_refuse 7c "RUNNER_WORKSPACE is not set, so the runner registration cannot be found"
+  runner_root="$(cd "${RUNNER_WORKSPACE}/../.." 2>/dev/null && pwd -P)" \
+    || boundary_refuse 7c "cannot open the runner directory two levels above RUNNER_WORKSPACE (${RUNNER_WORKSPACE})"
+  runner_file="${runner_root}/.runner"
+  [[ -r "${runner_file}" ]] || boundary_refuse 7c "cannot read the runner registration ${runner_file}"
+  python3 - "${runner_file}" <<'PYEOF' || boundary_refuse 7c "the runner registration ${runner_file} does not have \"ephemeral\": true; the box must run a single-use runner"
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8-sig") as handle:
+        settings = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(settings, dict):
+    sys.exit(1)
+values = [v for k, v in settings.items() if isinstance(k, str) and k.lower() == "ephemeral"]
+sys.exit(0 if values == [True] else 1)
+PYEOF
+  ok "account boundary 7c: the runner is single-use (${runner_file} has \"ephemeral\": true)"
+
+  # 7d
+  cache_root="${MLXFAST_BUILD_CACHE_DIR:-${HOME}/.cache/mlxfast-engine-build}"
+  if [[ -e "${cache_root}" ]]; then
+    owned="$(job_owned_item "${cache_root}")"
+    [[ -z "${owned}" ]] \
+      || boundary_refuse 7d "the job account owns ${owned} in the build cache ${cache_root}; a cache that a job can write can give its products to a later job"
+    [[ ! -w "${cache_root}" ]] \
+      || boundary_refuse 7d "the job account can write the build cache ${cache_root}; a cache that a job can write can give its products to a later job"
+  fi
+  ok "account boundary 7d: the build cache ${cache_root} is absent or the job account cannot write it"
+
+  # 7e
+  sandbox_exec=/usr/bin/sandbox-exec
+  [[ -x "${sandbox_exec}" ]] || boundary_refuse 7e "${sandbox_exec} is not on this box; the transform and the resident need Seatbelt"
+  probe_golden="$({ find "${GOLDEN_DIR}" -type f -name '*.json' -print 2>/dev/null || true; } | head -n 1)"
+  [[ -n "${probe_golden}" ]] || boundary_refuse 7e "no golden file in ${GOLDEN_DIR} to probe"
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/ranked-preflight-sandbox.XXXXXX")" \
+    || boundary_refuse 7e "cannot make a probe directory"
+  mkdir "${probe_dir}/out"
+  python3 - "${probe_dir}" "${GOLDEN_DIR}" "${BASELINE_WORKSPACE}" "${BASELINE_CALIBRATION}" \
+    "${BENCHD_BIN_DIR}" "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" > "${probe_dir}/probe.sb" <<'PYEOF'
+import os
+import sys
+
+
+def quote(path):
+    return os.path.realpath(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+probe_dir = sys.argv[1]
+print("(version 1)")
+print("(allow default)")
+print("(deny file-write*)")
+print('(allow file-write* (literal "/dev/null"))')
+print('(allow file-write* (subpath "%s"))' % quote(os.path.join(probe_dir, "out")))
+for path in sys.argv[2:]:
+    if path:
+        print('(deny file-read* file-write* (subpath "%s"))' % quote(path))
+PYEOF
+  cat > "${probe_dir}/child.sh" <<'CHILDEOF'
+: > "$1/out/inside" || exit 10
+cat "$2" > /dev/null 2>&1 && exit 11
+: > "$1/outside" 2>/dev/null && exit 12
+exit 0
+CHILDEOF
+  probe_rc=0
+  "${sandbox_exec}" -f "${probe_dir}/probe.sb" /bin/sh "${probe_dir}/child.sh" \
+    "${probe_dir}" "${probe_golden}" > /dev/null 2>&1 || probe_rc=$?
+  outside_written=0
+  [[ ! -e "${probe_dir}/outside" ]] || outside_written=1
+  rm -rf "${probe_dir}"
+  case "${probe_rc}:${outside_written}" in
+    0:0) ;;
+    11:*) boundary_refuse 7e "a sandboxed child read the golden ${probe_golden}; Seatbelt does not deny the evaluator paths for this account" ;;
+    12:*|*:1) boundary_refuse 7e "a sandboxed child wrote outside its output directory; Seatbelt does not deny writes for this account" ;;
+    *) boundary_refuse 7e "the sandboxed probe child did not run (exit ${probe_rc}); Seatbelt cannot be applied for this account" ;;
+  esac
+  ok "account boundary 7e: a sandboxed child cannot read a golden and cannot write outside its output directory"
+else
+  ok "account boundary not checked: this is not an official run (RUNNER_ENVIRONMENT is not self-hosted and MLXFAST_OFFICIAL_BENCHMARK_RUN is not 1)"
 fi
 
 echo "ranked-box-preflight: all checks passed"

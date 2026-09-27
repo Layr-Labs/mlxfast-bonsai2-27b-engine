@@ -104,6 +104,7 @@ cat > "${STUB}" <<'STUBEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
 printf '%s\n' "${MLXFAST_QWEN_MTP_TRACK_ID-__UNSET__}" > "${STUB_CAPTURE_ENV}"
+printf '%s\n' "${RUNNER_NAME-__UNSET__}" > "${STUB_CAPTURE_ENV}.runner-name"
 printf '%s\n' "${BENCH_WORKER_RESIDENT_SOCKET-__UNSET__}" > "${STUB_CAPTURE_SOCKET}"
 if [[ "${STUB_WRITE_OUT:-1}" == "1" ]]; then
   out=""
@@ -134,7 +135,7 @@ run_calibrate() {
   local extra=()
   while [[ $# -gt 0 && "$1" != "--" ]]; do extra+=("$1"); shift; done
   [[ $# -eq 0 ]] || shift
-  env -u MLXFAST_QWEN_MTP_TRACK_ID -u RUNNER_NAME -u BENCH_WORKER_RESIDENT_SOCKET \
+  env -u MLXFAST_QWEN_MTP_TRACK_ID -u RUNNER_NAME -u MLXFAST_BOX_NAME -u BENCH_WORKER_RESIDENT_SOCKET \
     STUB_CAPTURE_ARGV="${WORK}/${case_name}.argv" \
     STUB_CAPTURE_ENV="${WORK}/${case_name}.env" \
     STUB_CAPTURE_SOCKET="${WORK}/${case_name}.socket-env" \
@@ -351,8 +352,30 @@ if [[ -f "${WORK}/case11.argv" ]]; then
   fail "case 11: benchd was spawned despite the inherited socket"
 fi
 
+# --- cases 14-15: the box name defaults to MLXFAST_BOX_NAME -----------------
+# A single-use runner has a new RUNNER_NAME for each job; the box converge
+# writes the fixed box name as MLXFAST_BOX_NAME, and it wins.
+run_calibrate case14 "MLXFAST_BOX_NAME=${BOX_NAME}" "RUNNER_NAME=${BOX_NAME}-20260927T120000Z-4242" -- "" "${WORK}/case14.out.json"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 14: calibrate-box.sh refused an empty box name with MLXFAST_BOX_NAME exported: $(cat "${WORK}/case14.log")"
+elif ! argv_has_pair "${WORK}/case14.argv" --box "${BOX_NAME}"; then
+  fail "case 14: argv does not carry the MLXFAST_BOX_NAME box name"
+fi
+# benchd lets RUNNER_NAME win over --box, so benchd must see the box name there.
+[[ "$(cat "${WORK}/case14.env.runner-name" 2>/dev/null)" == "${BOX_NAME}" ]] \
+  || fail "case 14: benchd saw RUNNER_NAME '$(cat "${WORK}/case14.env.runner-name" 2>/dev/null)', not the box name ${BOX_NAME}"
+
+# An explicit argument wins over both names, and benchd sees it as RUNNER_NAME.
+run_calibrate case15 "MLXFAST_BOX_NAME=other-box" "RUNNER_NAME=other-runner" -- "${BOX_NAME}" "${WORK}/case15.out.json"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 15: calibrate-box.sh exited ${rc}: $(cat "${WORK}/case15.log")"
+elif ! argv_has_pair "${WORK}/case15.argv" --box "${BOX_NAME}" \
+    || [[ "$(cat "${WORK}/case15.env.runner-name" 2>/dev/null)" != "${BOX_NAME}" ]]; then
+  fail "case 15: the explicit box name did not reach benchd as both --box and RUNNER_NAME"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-calibrate-box.sh: all 13 cases passed"
+  echo "test-calibrate-box.sh: all 15 cases passed"
   exit 0
 fi
 echo "test-calibrate-box.sh: ${failures} case(s) failed" >&2

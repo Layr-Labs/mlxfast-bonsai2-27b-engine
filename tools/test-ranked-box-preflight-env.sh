@@ -25,7 +25,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# The official-run cases make read-only trees; make them writable to remove them.
+trap 'chmod -R u+w "${WORK}" 2>/dev/null; rm -rf "${WORK}"' EXIT
 
 failures=0
 fail() {
@@ -407,8 +408,161 @@ elif ! grep -q "official_scoring_enabled" "${WORK}/out"; then
   fail "case 19 (unarmed contract): the refusal does not name the arm field: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
 fi
 
+# --- cases 20-21: the box name comes from MLXFAST_BOX_NAME ------------------
+# A single-use runner has a new RUNNER_NAME for each job. The box converge
+# writes the box name into the runner environment as MLXFAST_BOX_NAME, and the
+# preflight compares the calibration with that name, not with RUNNER_NAME.
+run_preflight "MLXFAST_BOX_NAME=${BOX_NAME}" "RUNNER_NAME=${BOX_NAME}-20260927T120000Z-4242"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 20 (MLXFAST_BOX_NAME, single-use RUNNER_NAME): the preflight refused a calibration that names this box: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+elif ! grep -q "this box (${BOX_NAME}, from MLXFAST_BOX_NAME)" "${WORK}/out"; then
+  fail "case 20 (MLXFAST_BOX_NAME, single-use RUNNER_NAME): the pass line does not name MLXFAST_BOX_NAME as the source of the box name"
+fi
+
+# MLXFAST_BOX_NAME wins over RUNNER_NAME: a runner whose name happens to equal
+# the calibration's box does not make another box's band valid here.
+expect_refusal "case 21 (MLXFAST_BOX_NAME names another box)" "but this box is 'some-other-box'" \
+  "MLXFAST_BOX_NAME=some-other-box" "RUNNER_NAME=${BOX_NAME}"
+
+# --- cases 22-32: the account boundary on an official run -------------------
+# GHSA-rc55-jfmg-gvc9, GHSA-2j7x-cjrv-43wv. On a self-hosted runner the
+# preflight refuses a box whose job account can change the evaluator material,
+# has privilege, runs a runner that is not single-use, can write the build
+# cache, or cannot apply Seatbelt. The job account is simulated: a stub `id`
+# gives the job a uid that owns nothing here (570), and a stub `sudo` fails.
+# The evaluator trees are copies under a read-only directory, so the real
+# access test (`-w`) fails for them as it does on the box.
+OFF="${WORK}/official"
+RO="${OFF}/ro"
+mkdir -p "${RO}" "${OFF}/stubs" "${OFF}/home" "${OFF}/tmp"
+cp -R "${GOLDEN_DIR}" "${RO}/goldens"
+cp -R "${REF_WS}" "${RO}/reference"
+cp "${CALIBRATION}" "${RO}/baseline-calibration.json"
+mkdir -p "${RO}/benchd-bin" "${RO}/reference-checkpoint" "${RO}/bin" "${RO}/metallib-stage"
+printf 'benchd\n' > "${RO}/benchd-bin/benchd"
+printf '{}\n' > "${RO}/benchd-bin/benchd.manifest.json"
+printf '{}\n' > "${RO}/reference-checkpoint/config.json"
+cp "${MACMON}" "${RO}/bin/macmon"
+printf 'metallib\n' > "${RO}/metallib-stage/mlx.metallib"
+chmod -R a-w "${RO}"
+RUNNER_ROOT="${OFF}/runner"
+mkdir -p "${RUNNER_ROOT}/_work/mlxfast-bonsai2-27b-engine"
+printf '\xef\xbb\xbf{"AgentName":"%s-20260927T120000Z-4242","Ephemeral":true}' "${BOX_NAME}" > "${RUNNER_ROOT}/.runner"
+cat > "${OFF}/stubs/id" <<'IDEOF'
+#!/bin/sh
+case "$1" in
+  -u) echo "${STUB_ID_UID}" ;;
+  -Gn) echo "${STUB_ID_GROUPS}" ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+IDEOF
+cat > "${OFF}/stubs/sudo" <<'SUDOEOF'
+#!/bin/sh
+exit "${STUB_SUDO_RC}"
+SUDOEOF
+chmod +x "${OFF}/stubs/id" "${OFF}/stubs/sudo"
+
+# run_official [ENV=VAL...] -- the REAL preflight as a simulated job account on a
+# self-hosted runner. Output lands in ${WORK}/out; sets rc.
+run_official() {
+  env -i \
+    PATH="${OFF}/stubs:${PATH}" \
+    HOME="${OFF}/home" \
+    TMPDIR="${OFF}/tmp" \
+    STUB_ID_UID=570 \
+    STUB_ID_GROUPS="bench everyone" \
+    STUB_SUDO_RC=1 \
+    MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+    MLXFAST_MACMON="${RO}/bin/macmon" \
+    MLXFAST_QWEN38_GOLDEN_DIR="${RO}/goldens" \
+    MLXFAST_BASELINE_WORKSPACE="${RO}/reference" \
+    MLXFAST_BASELINE_CALIBRATION="${RO}/baseline-calibration.json" \
+    BENCHD_BIN_DIR="${RO}/benchd-bin" \
+    MLXFAST_REFERENCE_DIR="${RO}/reference-checkpoint" \
+    MLXFAST_METALLIB_STAGE="${RO}/metallib-stage" \
+    MLXFAST_BOX_NAME="${BOX_NAME}" \
+    RUNNER_NAME="${BOX_NAME}-20260927T120000Z-4242" \
+    RUNNER_ENVIRONMENT=self-hosted \
+    RUNNER_WORKSPACE="${RUNNER_ROOT}/_work/mlxfast-bonsai2-27b-engine" \
+    "$@" \
+    "${ROOT}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+  rc=$?
+}
+
+# expect_official_refusal <label> <needle> [ENV=VAL...]
+expect_official_refusal() {
+  local label="$1" needle="$2"
+  shift 2
+  run_official "$@"
+  if [[ "${rc}" -eq 0 ]]; then
+    fail "${label}: the preflight PASSED; it must refuse"
+  elif ! grep -qF -- "${needle}" "${WORK}/out"; then
+    fail "${label}: the refusal does not name '${needle}'; got: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  fi
+}
+
+# Case 22: a converged box passes every boundary check. Seatbelt exists only on
+# macOS; on another host the run must pass 7a-7d and then refuse at 7e by name.
+run_official
+if [[ -x /usr/bin/sandbox-exec ]]; then
+  if [[ "${rc}" -ne 0 ]]; then
+    fail "case 22 (converged box): the preflight refused: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  else
+    for check in 7a 7b 7c 7d 7e; do
+      grep -q "ok    account boundary ${check}:" "${WORK}/out" \
+        || fail "case 22 (converged box): no pass line for account boundary ${check}"
+    done
+  fi
+else
+  for check in 7a 7b 7c 7d; do
+    grep -q "ok    account boundary ${check}:" "${WORK}/out" \
+      || fail "case 22 (converged box, no Seatbelt on this host): no pass line for account boundary ${check}: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  done
+  if [[ "${rc}" -eq 0 ]] || ! grep -q "account boundary check 7e: /usr/bin/sandbox-exec is not on this box" "${WORK}/out"; then
+    fail "case 22 (converged box, no Seatbelt on this host): the preflight did not refuse at 7e by name: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  fi
+fi
+
+# Case 23: a build cache that the job can write.
+mkdir -p "${OFF}/home/.cache/mlxfast-engine-build"
+expect_official_refusal "case 23 (writable build cache)" "account boundary check 7d: the job account can write the build cache ${OFF}/home/.cache/mlxfast-engine-build"
+# Case 24: the same box state is refused when only MLXFAST_OFFICIAL_BENCHMARK_RUN marks the run.
+expect_official_refusal "case 24 (official flag, writable build cache)" "account boundary check 7d" \
+  RUNNER_ENVIRONMENT= MLXFAST_OFFICIAL_BENCHMARK_RUN=1
+rm -rf "${OFF}/home/.cache"
+
+# Case 25: the job account owns the evaluator material (the operator runner).
+expect_official_refusal "case 25 (job owns the goldens)" "account boundary check 7a: the job account (uid $(/usr/bin/id -u)) owns ${RO}/goldens" \
+  STUB_ID_UID="$(/usr/bin/id -u)"
+
+# Case 26: one file in benchd-bin is writable.
+chmod u+w "${RO}/benchd-bin/benchd"
+expect_official_refusal "case 26 (writable benchd)" "account boundary check 7a: the job account can write ${RO}/benchd-bin/benchd"
+chmod a-w "${RO}/benchd-bin/benchd"
+
+# Case 27: the parent directory of the evaluator trees is writable.
+chmod u+w "${RO}"
+expect_official_refusal "case 27 (writable parent)" "account boundary check 7a: the job account can write ${RO}, the parent directory of the golden directory"
+chmod a-w "${RO}"
+
+# Cases 28-30: privilege.
+expect_official_refusal "case 28 (job in admin)" "account boundary check 7b: the job account is in the admin group" \
+  STUB_ID_GROUPS="bench admin"
+expect_official_refusal "case 29 (sudo works)" "account boundary check 7b: sudo -n true succeeds" \
+  STUB_SUDO_RC=0
+expect_official_refusal "case 30 (root)" "account boundary check 7b: the job runs as root" \
+  STUB_ID_UID=0
+
+# Case 31: a runner that is not single-use.
+cp "${RUNNER_ROOT}/.runner" "${OFF}/runner.single-use"
+printf '{"agentName":"%s","ephemeral":false}' "${BOX_NAME}" > "${RUNNER_ROOT}/.runner"
+expect_official_refusal "case 31 (persistent runner)" "/runner/.runner does not have \"ephemeral\": true"
+printf '{"agentName":"%s"}' "${BOX_NAME}" > "${RUNNER_ROOT}/.runner"
+expect_official_refusal "case 32 (runner with no ephemeral field)" "account boundary check 7c"
+mv "${OFF}/runner.single-use" "${RUNNER_ROOT}/.runner"
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 20 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all 33 cases passed"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

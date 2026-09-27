@@ -47,10 +47,12 @@
 # Usage:
 #   tools/calibrate-box.sh <box name> <output file>
 #
-#   <box name>     the runner name this box runs under (Actions RUNNER_NAME).
-#                  tools/ranked-box-preflight.sh refuses a calibration whose
-#                  `box` does not equal it, so it is an argument rather than a
-#                  guess. Defaults to RUNNER_NAME when that is exported.
+#   <box name>     the name of this box: MLXFAST_BOX_NAME in the runner
+#                  environment (the box converge writes it), or the fixed
+#                  RUNNER_NAME of a persistent runner. tools/ranked-box-preflight.sh
+#                  refuses a calibration whose `box` does not equal it, so it is
+#                  an argument rather than a guess. Defaults to
+#                  MLXFAST_BOX_NAME, then to RUNNER_NAME, when exported.
 #   <output file>  where to write baseline-calibration.json. Export its path as
 #                  MLXFAST_BASELINE_CALIBRATION in the runner service
 #                  environment afterwards.
@@ -87,10 +89,14 @@ die() {
   exit 1
 }
 
-BOX_NAME="${1:-${RUNNER_NAME:-}}"
+BOX_NAME="${1:-${MLXFAST_BOX_NAME:-${RUNNER_NAME:-}}}"
 OUT_PATH="${2:-}"
 [[ -n "${BOX_NAME}" ]] \
-  || die "usage: tools/calibrate-box.sh <box name> <output file> -- the box name must equal this runner's RUNNER_NAME, because the preflight refuses a calibration that names another machine"
+  || die "usage: tools/calibrate-box.sh <box name> <output file> -- the box name must equal this box's MLXFAST_BOX_NAME (or the fixed RUNNER_NAME of a persistent runner), because the preflight refuses a calibration that names another machine"
+# benchd reads RUNNER_NAME and lets it win over --box. It gets the box name
+# under both names, so a runner name in the environment cannot replace it.
+RUNNER_NAME="${BOX_NAME}"
+export RUNNER_NAME
 [[ -n "${OUT_PATH}" ]] \
   || die "usage: tools/calibrate-box.sh <box name> <output file> -- no output path given"
 if [[ $# -gt 2 ]]; then

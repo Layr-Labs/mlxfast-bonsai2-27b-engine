@@ -602,7 +602,8 @@ recording.
   or no transformed weights of its own;
 - the calibration file does not parse, or its `version` is not 1;
 - its `track_id` is not this track;
-- its `box` is not this runner's `RUNNER_NAME`;
+- its `box` is not this box's name: `MLXFAST_BOX_NAME` from the runner
+  environment, or `RUNNER_NAME` when `MLXFAST_BOX_NAME` is unset;
 - its `reference_commit` is not the fixture's `baseline_reference_commit`;
 - its `captured_at` is not later than the reference commit's date;
 - any numeric value is not finite and positive;
@@ -851,8 +852,15 @@ benchd has neither flag.
 
 `--box` is passed only on a hand run. On a runner the benchmarker reads
 `RUNNER_NAME` itself and lets it win over the flag, so passing the flag there
-would be argv that cannot matter. A hand run has no `RUNNER_NAME`, and the value
-then comes from the calibration file's own `box`.
+would be argv that cannot matter. A single-use runner has a new `RUNNER_NAME`
+for each job, so when the runner environment sets `MLXFAST_BOX_NAME`, the
+measure script gives the benchmarker that value as `RUNNER_NAME`. A hand run
+has no `RUNNER_NAME`, and the value then comes from the calibration file's own
+`box`.
+
+The measure script sets `RESIDENT_UP_LOG_DIR` to a new directory in the job's
+temporary directory when it is unset. Both legs' residents keep their logs
+there, because the ranked job account cannot write the reference workspace.
 
 The measure script refuses by name when `MLXFAST_BASELINE_WORKSPACE` or
 `MLXFAST_BASELINE_CALIBRATION` is absent on a real run. `--preflight-only`

@@ -467,7 +467,9 @@ jobs:
         # participant submission neither restores nor saves: the cache lives in
         # the job account's home beside its MANIFEST, so a product planted
         # there would pass the manifest check. A submission therefore builds
-        # cold every time.
+        # cold every time. On a box that runs each job as a single-use account
+        # whose home is removed after the job, the cache is always empty and
+        # every dispatch builds cold.
         run: |
           set -euo pipefail
           if [[ "${MLXFAST_BUILD_CACHE_TRUSTED}" != "1" ]]; then
@@ -628,14 +630,18 @@ jobs:
         # contract between the legs.
         run: |
           set -euo pipefail
+          # The runner environment names the reader (MLXFAST_MACMON_BIN, written
+          # by the box converge). The job account is not the operator, so
+          # ${HOME}/bin is not where the box keeps it; the named file comes first.
           MLXFAST_MACMON=""
-          if command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
+          if [[ -n "${MLXFAST_MACMON_BIN:-}" && -x "${MLXFAST_MACMON_BIN}" ]]; then MLXFAST_MACMON="${MLXFAST_MACMON_BIN}"; fi
+          if [[ -z "${MLXFAST_MACMON}" ]] && command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
             IFS=: read -r -a candidates <<< "${MLXFAST_MACMON_CANDIDATES}:${HOME}/bin/macmon"
             for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
           fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
-            echo "::error::macmon was not found (PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
+            echo "::error::macmon was not found (MLXFAST_MACMON_BIN, PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
             exit 1
           fi
           export MLXFAST_MACMON MLXFAST_MACMON_BIN="${MLXFAST_MACMON}"

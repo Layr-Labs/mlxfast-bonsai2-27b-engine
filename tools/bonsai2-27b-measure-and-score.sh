@@ -607,6 +607,31 @@ else
   echo "bonsai2-27b-measure-and-score.sh: the declaration is serial; benchd sends no spec (depth 0)." >&2
 fi
 
+# THE BOX NAME IS MLXFAST_BOX_NAME WHEN THE BOX SETS IT. benchd compares the
+# calibration's `box` with RUNNER_NAME and lets RUNNER_NAME win over --box. A
+# single-use runner gets a new RUNNER_NAME for each job, so the box converge
+# writes the fixed box name into the runner environment as MLXFAST_BOX_NAME.
+# This script gives benchd that name as RUNNER_NAME. The value only changes the
+# environment of the benchd process that this script starts.
+# tools/ranked-box-preflight.sh has already compared the same name with the
+# calibration file.
+if [[ -n "${MLXFAST_BOX_NAME:-}" ]]; then
+  RUNNER_NAME="${MLXFAST_BOX_NAME}"
+  export RUNNER_NAME
+fi
+
+# THE RESIDENT LOG DIRECTORY IS OUTSIDE BOTH TREES. benchd boots each leg's
+# resident with that leg's own tools/resident-up.sh. That script keeps its
+# pidfile, identity file, log and sandbox profile in RESIDENT_UP_LOG_DIR, which
+# is <tree>/.build/resident by default. The ranked job account cannot write the
+# reference workspace, so the control leg must not write there. One directory
+# in this job's temporary directory serves both legs. The legs run one after
+# the other, inside the GPU lock that this script holds.
+if [[ -z "${RESIDENT_UP_LOG_DIR:-}" ]]; then
+  RESIDENT_UP_LOG_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/resident-up.XXXXXX")"
+  export RESIDENT_UP_LOG_DIR
+fi
+
 # --box, AND THE CONDITION IS INVERTED FROM THE OBVIOUS ONE. benchd lets
 # RUNNER_NAME win over the flag, so passing --box on a runner would be dead
 # argv: the flag can never change what benchd checks the calibration band
