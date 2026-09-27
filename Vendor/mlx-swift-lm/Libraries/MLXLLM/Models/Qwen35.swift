@@ -5274,6 +5274,14 @@ enum Qwen35GDNPrework {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Four-wide load of one channel's convolution taps (KS == 4).
+    /// `DARKBLOOM_QWEN35_PREWORK_W4=0` keeps the scalar tap loads.
+    static let wideTaps: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PREWORK_W4"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     // grid (128 * HK, S, B), threadgroup (128, 1, 1).
     // Template: InT, HK, HV, DK, DV, CD (conv channels), KS (taps). Inputs:
     // qkv [B, S, CD], cs [B, KS-1, CD], w [CD, KS, 1], a/b [B, S, HV],
@@ -5293,14 +5301,30 @@ enum Qwen35GDNPrework {
         threadgroup float red[8];
 
         auto conv_silu = [&](uint col) -> float {
-          float acc = 0.0f;
+          float xj[KS];
           #pragma clang loop unroll(full)
           for (int j = 0; j < KS; j++) {
             const int r = int(t) + j - NK;
             const float xv = (r < 0)
                 ? cs[csbase + size_t(r + NK) * size_t(CD) + col]
                 : float(qkv[rowbase + size_t(r) * size_t(CD) + col]);
-            acc = fma(xv, w[size_t(col) * size_t(KS) + size_t(j)], acc);
+            xj[j] = xv;
+          }
+          float acc = 0.0f;
+          // KS == 4: one channel's taps are four contiguous floats. One
+          // float4, then the same fma chain as the scalar loop (j = 0..3).
+          // W4 = 0 keeps the scalar loads.
+          if constexpr (W4 != 0 && KS == 4) {
+            const float4 wv = *(const device float4*)(w + size_t(col) * size_t(KS));
+            acc = fma(xj[0], wv[0], acc);
+            acc = fma(xj[1], wv[1], acc);
+            acc = fma(xj[2], wv[2], acc);
+            acc = fma(xj[3], wv[3], acc);
+          } else {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < KS; j++) {
+              acc = fma(xj[j], w[size_t(col) * size_t(KS) + size_t(j)], acc);
+            }
           }
           // MLX's silu: x * sigmoid(x), sigmoid in its stable functor form.
           const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
@@ -5463,6 +5487,8 @@ enum Qwen35GDNPrework {
              "float(qkv[qb + int64_t(r) * qs1 + int64_t(col) * qs2])"),
             ("w[size_t(col) * size_t(KS) + size_t(j)]",
              "w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]]"),
+            ("*(const device float4*)(w + size_t(col) * size_t(KS))",
+             "*(const device float4*)(w + int64_t(col) * w_strides[0])"),
             ("(xq * invq) * wq[c]", "(xq * invq) * wq[int64_t(c) * wq_strides[0]]"),
             ("(xk * invk) * wk[c]", "(xk * invk) * wk[int64_t(c) * wk_strides[0]]"),
             ("const float av = a[grow] + dtb[hv];",
@@ -5558,7 +5584,7 @@ enum Qwen35GDNPrework {
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
-                ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("W4", wideTaps ? 1 : 0),
             ],
             grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
             outputShapes: outputShapes,
@@ -5615,6 +5641,8 @@ enum Qwen35GDNPrework {
              "float(qkv[qb + int64_t(r) * qs1 + int64_t(col) * qs2])"),
             ("w[size_t(col) * size_t(KS) + size_t(j)]",
              "w[int64_t(col) * w_strides[0] + int64_t(j) * w_strides[1]]"),
+            ("*(const device float4*)(w + size_t(col) * size_t(KS))",
+             "*(const device float4*)(w + int64_t(col) * w_strides[0])"),
             ("const float av = a[grow] + dtb[hv];",
              "const float av = a[ab + int64_t(hv) * a_strides[2]] + dtb[hv];"),
             ("const float bv = b[grow];",
@@ -5691,7 +5719,7 @@ enum Qwen35GDNPrework {
              MLXArray(Int32(S))],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
-                ("DV", headVDim), ("CD", CD), ("KS", KS),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("W4", wideTaps ? 1 : 0),
             ],
             grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
             outputShapes: [

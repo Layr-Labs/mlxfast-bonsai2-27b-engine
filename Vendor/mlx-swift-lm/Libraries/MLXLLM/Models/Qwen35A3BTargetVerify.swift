@@ -919,9 +919,20 @@ extension Qwen35GDNPrework {
             // window element i + j.
             auto conv_silu_rows = [&](uint col, thread float* out) {
               float wt[KS];
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < KS; j++) {
-                wt[j] = @TAPWEIGHT@;
+              // W4: KS == 4 and a unit tap stride. One float4, then the same
+              // wt[j] the scalar loads would have written. Otherwise the
+              // stock tap expression.
+              if constexpr (W4 != 0 && KS == 4) {
+                if (w_strides[1] == 1) {
+                  const float4 wv = *(const device float4*)(w + int64_t(col) * w_strides[0]);
+                  wt[0] = wv[0]; wt[1] = wv[1]; wt[2] = wv[2]; wt[3] = wv[3];
+                } else {
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < KS; j++) { wt[j] = @TAPWEIGHT@; }
+                }
+              } else {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) { wt[j] = @TAPWEIGHT@; }
               }
               float xw[RW + NK];
               #pragma clang loop unroll(full)
@@ -1022,7 +1033,8 @@ extension Qwen35GDNPrework {
                 through: "beta[grow] = (bv < 0.0f) ? by : 1.0f - by;")),
             ("@TAIL@", tail),
         ] {
-            text = replacing(text, placeholder, piece)
+            let n = placeholder == "@TAPWEIGHT@" ? 2 : 1
+            text = replacing(text, placeholder, piece, count: n)
         }
         if text.contains("@") || text.contains("conv_silu(") || text.contains("red[sg]") {
             fail("assembly")
@@ -1059,6 +1071,7 @@ extension Qwen35GDNPrework {
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+                ("W4", wideTaps ? 1 : 0),
             ],
             grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
             outputShapes: [
