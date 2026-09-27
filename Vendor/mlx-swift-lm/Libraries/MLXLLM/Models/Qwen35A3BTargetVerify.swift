@@ -1166,3 +1166,130 @@ extension Qwen35GDNPrework {
         return true
     }
 }
+
+// MARK: - Load-time DVPL choice for the GDN verify scan
+
+/// The tuned `DVPL` (dv rows per lane) for `Qwen35GatedDeltaV3` and every
+/// kernel derived from its body (the replay-fused verify scan). The two
+/// layouts are bit-identical by construction — dv rows never mix, a
+/// threadgroup just covers `16 * DVPL` of them — and `choose` proves it
+/// again on the running GPU before timing: both layouts' outputs (each
+/// window's rows and its final state) must match every bit on synthetic
+/// verify windows of 16 and 32 rows (the window and the replay-plus-window
+/// lengths a round scans). Timing is best of five `eval`ed launches per
+/// layout per width; the four-row layout is adopted only when it beats the
+/// two-row one by at least `margin` at BOTH widths. Any error, any bitwise
+/// mismatch, or a forced `BONSAI_GDN_V3_DVPL` keeps 2. Both templates are
+/// launched here, so whichever layout runs later compiles nothing inside a
+/// timed phase. Called from `Qwen35GatedDeltaNet.init` before any
+/// V3-templated `prepare`, so every load-time pipeline build uses the
+/// chosen layout.
+enum Qwen35GDNKernelTunes {
+    nonisolated(unsafe) static var dvpl: Int = 2
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var chosen = false
+    /// The four-row layout must beat the two-row one by this fraction at
+    /// both timed widths to be adopted.
+    private static let margin = 0.03
+
+    private enum TuneFailure: Error {
+        case message(String)
+    }
+
+    static func choose(hk: Int, dk: Int, hv: Int, dv: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !chosen else { return }
+        let forced = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard forced == nil, Qwen35GatedDeltaV3.enabled, hk > 0, dk == 128,
+            dv % 64 == 0, hv % hk == 0
+        else { return }
+        chosen = true
+        var adopted = false
+        var detail = ""
+        do {
+            try withError { error in
+                let widths = [16, 32]
+                var operands: [(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray)] = []
+                for (index, rows) in widths.enumerated() {
+                    let key = MLXRandom.key(0x4456_504C &+ UInt64(index))
+                    let q = MLXRandom.normal([1, rows, hk, dk], key: key) * 0.09
+                    let v = MLXRandom.normal([1, rows, hv, dv], key: MLXRandom.key(UInt64(index) &+ 7)) * 0.09
+                    // Realistic decay gates and betas, with the first row of
+                    // each window replaced by edge values (an underflowing
+                    // gate among them) so the bitwise compare sees them.
+                    let g = MLXRandom.uniform(0.5 ..< 0.999, [1, rows, hv], key: MLXRandom.key(UInt64(index) &+ 8))
+                        .asType(.float32)
+                    let edgeValues = [Float(0.0), 1e-8, 0.999, 60, -60, 1, 1, 1]
+                    let edgeRow = concatenated(
+                        [
+                            MLXArray(Array(edgeValues.prefix(hv))),
+                            MLXArray.ones([max(hv - edgeValues.count, 0)]),
+                        ], axis: 0).reshaped(1, 1, hv)
+                    let firstRow = (MLXArray(0 ..< rows) .== MLXArray(0)).reshaped(1, rows, 1)
+                    let gated = MLX.where(firstRow, edgeRow, g)
+                    let beta = MLXRandom.uniform(0.1 ..< 0.9, [1, rows, hv], key: MLXRandom.key(UInt64(index) &+ 9)).asType(.float32)
+                    let state = MLXRandom.normal([1, hv, dv, dk], key: MLXRandom.key(UInt64(index) &+ 10)) * 0.05
+                    operands.append((q: q.asType(.float32), k: q.asType(.float32), v: v.asType(.float32), g: gated, beta: beta, state: state.asType(.float32)))
+                }
+                eval(operands.flatMap { [$0.q, $0.k, $0.v, $0.g, $0.beta, $0.state] })
+                try error.check()
+                func outputs(_ layout: Int) throws -> [(MLXArray, MLXArray)] {
+                    dvpl = layout
+                    return try operands.map {
+                        guard let out = Qwen35GatedDeltaV3.run(
+                            q: $0.q, k: $0.k, v: $0.v, g: $0.g, beta: $0.beta, state: $0.state)
+                        else { throw TuneFailure.message("the scan declined layout \(layout)") }
+                        return out
+                    }
+                }
+                let two = try outputs(2)
+                let four = try outputs(4)
+                for (a, b) in zip(two, four) {
+                    for (x, y) in [(a.0, b.0), (a.1, b.1)] {
+                        let differ = (x.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        if differ.item(Int32.self) != 0 {
+                            throw TuneFailure.message("a bitwise mismatch between the layouts")
+                        }
+                    }
+                }
+                func best(_ layout: Int) throws -> [Double] {
+                    var bests = Array(repeating: Double.infinity, count: widths.count)
+                    for _ in 0 ..< 5 {
+                        for (index, op) in operands.enumerated() {
+                            dvpl = layout
+                            let start = DispatchTime.now().uptimeNanoseconds
+                            guard let out = Qwen35GatedDeltaV3.run(
+                                q: op.q, k: op.k, v: op.v, g: op.g, beta: op.beta, state: op.state)
+                            else { throw TuneFailure.message("the scan declined layout \(layout)") }
+                            eval(out.0, out.1)
+                            try error.check()
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 1000
+                            bests[index] = min(bests[index], us)
+                        }
+                    }
+                    return bests
+                }
+                let t2 = try best(2)
+                let t4 = try best(4)
+                adopted = (0 ..< widths.count).allSatisfy { t4[$0] < t2[$0] * (1 - margin) }
+                detail = zip(zip(widths, t2), t4).map {
+                    String(format: "T%d 2-row %.1f us vs 4-row %.1f us", $0.0, $0.1, $1)
+                }.joined(separator: ", ")
+            }
+        } catch {
+            adopted = false
+            detail = "error \(error)"
+        }
+        dvpl = adopted ? 4 : 2
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN DVPL tune: " + detail + "; layout \(dvpl) installed\n")
+                .data(using: .utf8)!)
+    }
+}
