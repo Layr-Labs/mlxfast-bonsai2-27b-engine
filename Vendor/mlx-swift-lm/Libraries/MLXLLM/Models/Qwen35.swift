@@ -301,7 +301,7 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // A leading submission after layer 8 (pochita0's `11cb04a`; see the
+        // A leading submission after layer 2 (was 8; the GPU idles until the first slice) and
         // type's comment) and a second one after layer 24: the host builds the
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
@@ -311,7 +311,7 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [2] : [2, 24]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
