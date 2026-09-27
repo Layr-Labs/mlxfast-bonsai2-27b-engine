@@ -1,10 +1,9 @@
 import Foundation
 import Testing
 @testable import MLXFastCore
-@testable import MLXFastTransform
 
 @Test
-func checkpointIndexToolsReturnsUniqueSortedSafetensorShards() throws {
+func checkpointShardListReturnsUniqueSortedSafetensorShards() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let index = root.appendingPathComponent("model.safetensors.index.json")
@@ -17,13 +16,13 @@ func checkpointIndexToolsReturnsUniqueSortedSafetensorShards() throws {
         ]
     )
 
-    let shards = try CheckpointIndexTools.safetensorShardNames(from: index.path)
+    let shards = try CheckpointShardList.safetensorShardNames(fromIndexAt: index.path)
 
     #expect(shards == ["model-00001.safetensors", "model-00002.safetensors"])
 }
 
 @Test
-func checkpointIndexToolsRejectsUnsupportedShard() throws {
+func checkpointShardListRejectsUnsupportedShard() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let index = root.appendingPathComponent("model.safetensors.index.json")
@@ -35,12 +34,12 @@ func checkpointIndexToolsRejectsUnsupportedShard() throws {
     )
 
     #expect(throws: MLXFastError.self) {
-        _ = try CheckpointIndexTools.safetensorShardNames(from: index.path)
+        _ = try CheckpointShardList.safetensorShardNames(fromIndexAt: index.path)
     }
 }
 
 @Test
-func checkpointIndexToolsRejectsUnsafeShardPath() throws {
+func checkpointShardListRejectsUnsafeShardPath() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let index = root.appendingPathComponent("model.safetensors.index.json")
@@ -52,7 +51,7 @@ func checkpointIndexToolsRejectsUnsafeShardPath() throws {
     )
 
     #expect(throws: MLXFastError.self) {
-        _ = try CheckpointIndexTools.safetensorShardNames(from: index.path)
+        _ = try CheckpointShardList.safetensorShardNames(fromIndexAt: index.path)
     }
 }
 

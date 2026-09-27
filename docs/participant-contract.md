@@ -1057,6 +1057,25 @@ reuse stays legal.
 Keep every change prompt-independent and model-general. The hidden prompts
 differ from the public fixtures.
 
+### 8.1 The ranked box confines your code
+
+On the ranked box, the code from your editable paths runs in a sandbox.
+
+- The transform (`mlxfast-swift transform`) can write only three things: its
+  output directory, the hidden staging directories beside it whose names start
+  with `.<output name>.`, and its own temporary directory (`TMPDIR`). It cannot
+  use the network. It cannot start another program.
+- The resident `bench-worker` can write only its Unix socket and its own
+  temporary directory (`TMPDIR`). It cannot use the network except through its
+  socket. It cannot start another program.
+- Neither process can read or write the organizer material on the box.
+
+Make your transform obey these limits. A transform that writes to a different
+location fails on the ranked box, and the run gets no score.
+
+The ranked run also records every non-editable file at checkout. The run stops
+before the measurement when one of these files changes during the job.
+
 ## 9. Submitting
 
 Use the Yukon CLI for every account operation and every submission operation.

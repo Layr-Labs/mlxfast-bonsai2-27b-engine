@@ -260,6 +260,14 @@ jobs:
       # env-driven)"), so leaving it unset takes the same value without asserting
       # a track-specific derivation nobody has done yet.
       MLXFAST_MACMON_CANDIDATES: /opt/homebrew/bin/macmon
+      # --- The worker build cache is for trusted dispatches only ------------
+      # Yukon dispatches a participant submission on a `submissions/*` branch.
+      # Its checkout carries participant code, so it must not restore products
+      # another job left in the box cache, and it must not save products a
+      # later job would restore. Only a dispatch on `main` or on a Yukon
+      # baseline branch (`yukon/baseline/*`, cut at a main commit) uses the
+      # cache. Every other dispatch builds cold.
+      MLXFAST_BUILD_CACHE_TRUSTED: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/yukon/baseline/')) && '1' || '0' }}
       # THE TIMED-POOL TAPES ARE NOT NAMED HERE. They are organizer material
       # published in R2 and staged on the box out of band, so no checkout
       # carries them and there is nothing here to point at. The runner service
@@ -276,6 +284,56 @@ jobs:
           # This job must hold no credential, and a persisted checkout token
           # would be one.
           persist-credentials: false
+
+      - name: Record the non-editable file digests (before any candidate code runs)
+        # The first step after the checkout, so no participant code has run
+        # yet. It records the sha256 of every tracked file that is NOT on the
+        # editable surface of the checked-out benchmark.json, and passes the
+        # digest of that record out as a step output. The runner holds step
+        # outputs itself, so a later process cannot change the digest. The
+        # step before the measurement checks the files against the record.
+        id: trusted-files
+        run: |
+          set -euo pipefail
+          record="${RUNNER_TEMP}/trusted-files.sha256"
+          python3 - "${record}" <<'PY'
+          import hashlib, json, os, subprocess, sys
+
+          record = sys.argv[1]
+          manifest = json.loads(subprocess.run(
+              ["git", "show", "HEAD:benchmark.json"], check=True, capture_output=True).stdout)
+          editable = list(manifest.get("editablePaths") or []) + list(manifest.get("optionalEditablePaths") or [])
+          if not editable or not all(isinstance(p, str) and p for p in editable):
+              sys.exit("benchmark.json editablePaths is empty or malformed; refusing to record")
+          editable = [p.rstrip("/") for p in editable]
+
+          def is_editable(path):
+              return any(path == p or path.startswith(p + "/") for p in editable)
+
+          listing = subprocess.run(["git", "ls-files", "-s", "-z"], check=True, capture_output=True).stdout
+          lines = []
+          for entry in listing.split(b"\0"):
+              if not entry:
+                  continue
+              meta, path = entry.split(b"\t", 1)
+              mode = meta.split(b" ")[0]
+              path = path.decode()
+              if mode == b"160000" or is_editable(path):
+                  continue
+              # A tracked symlink is recorded by the content it points at, the
+              # same bytes `shasum --check` reads later.
+              if os.path.islink(path) and not os.path.exists(path):
+                  sys.exit(f"tracked symlink {path} points at nothing; refusing to record")
+              hasher = hashlib.sha256()
+              with open(path, "rb") as handle:
+                  for chunk in iter(lambda: handle.read(1 << 20), b""):
+                      hasher.update(chunk)
+              lines.append(f"{hasher.hexdigest()}  {path}")
+          with open(record, "w") as out:
+              out.write("\n".join(lines) + "\n")
+          print(f"recorded {len(lines)} non-editable tracked files; {len(editable)} editable path entries excluded")
+          PY
+          echo "digest=$(shasum -a 256 "${record}" | cut -d ' ' -f 1)" >> "${GITHUB_OUTPUT}"
 
       - name: Runner environment carries the box paths and the toolchain
         run: |
@@ -404,9 +462,18 @@ jobs:
         # metallib pair from ~/.cache/mlxfast-engine-build after a sha256 check
         # against the manifest the save wrote. A miss (first dispatch on a box,
         # or any source change) builds below exactly as before and saves.
+        #
+        # TRUSTED DISPATCHES ONLY (MLXFAST_BUILD_CACHE_TRUSTED, job env). A
+        # participant submission neither restores nor saves: the cache lives in
+        # the job account's home beside its MANIFEST, so a product planted
+        # there would pass the manifest check. A submission therefore builds
+        # cold every time.
         run: |
           set -euo pipefail
-          if tools/build-cache.sh restore; then
+          if [[ "${MLXFAST_BUILD_CACHE_TRUSTED}" != "1" ]]; then
+            echo "build cache skipped: ${GITHUB_REF} is not a trusted dispatch ref (main or yukon/baseline/*); building cold"
+            echo "MLXFAST_BUILD_CACHE_HIT=0" >> "${GITHUB_ENV}"
+          elif tools/build-cache.sh restore; then
             echo "MLXFAST_BUILD_CACHE_HIT=1" >> "${GITHUB_ENV}"
           else
             echo "MLXFAST_BUILD_CACHE_HIT=0" >> "${GITHUB_ENV}"
@@ -472,7 +539,8 @@ jobs:
           fi
 
       - name: Save the worker build cache
-        if: env.MLXFAST_BUILD_CACHE_HIT != '1'
+        # Trusted dispatches only; see the restore step.
+        if: env.MLXFAST_BUILD_CACHE_HIT != '1' && env.MLXFAST_BUILD_CACHE_TRUSTED == '1'
         run: tools/build-cache.sh save
 
       - name: Transform the reference checkpoint with the candidate's transform
@@ -484,6 +552,18 @@ jobs:
         # the verified reference on APFS (1 s, no extra blocks on the box), and
         # benchd seals the tree's weights_hash into the artifact, so provenance
         # needs no cache and no box-staged tree.
+        #
+        # THE TRANSFORM RUNS SANDBOXED. The two flags below arm the trusted
+        # CLI's parent-tool sandbox (Sources/MLXFastCLI/main.swift): the CLI
+        # re-executes itself under sandbox-exec before any editable code runs.
+        # The transform may then write only weights/, its staging siblings and
+        # a private TMPDIR, and it cannot read or write the evaluator-only paths
+        # the runner service exports (the goldens, the reference workspace, the
+        # calibration file, benchd-bin, the build cache, the runner
+        # registration). The CLI refuses when the sandbox cannot be applied.
+        env:
+          MLXFAST_SANDBOX_PARENT_TOOLS: "1"
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
         run: |
           set -euo pipefail
           [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
@@ -578,6 +658,38 @@ jobs:
             exit 1
           fi
           echo "ranked: starting line (load=${load} gpu_util=${util} gpu_temp=${temp}C); the fixed 40C per-phase gate inside the pinned measure-job holds every timed leg"
+
+      - name: Non-editable files are unchanged since the checkout
+        # Candidate code has run by now (the transform), and the measurement
+        # below executes scripts from this checkout. Every tracked file that
+        # is not on the editable surface must still match the record the first
+        # step wrote. The record's own digest comes from that step's output,
+        # which the runner holds, so an edit to the record fails here too.
+        # The check reads file contents only: it runs no git and no repository
+        # script, so it does not depend on a .git directory or a tool that a
+        # process in this job could have changed. Build outputs (.build/,
+        # .build-worker/, weights/, reference_weights/ contents) are untracked
+        # and are not part of the record.
+        env:
+          TRUSTED_FILES_DIGEST: ${{ steps.trusted-files.outputs.digest }}
+        run: |
+          set -euo pipefail
+          record="${RUNNER_TEMP}/trusted-files.sha256"
+          if [[ ! "${TRUSTED_FILES_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::the non-editable file record has no digest from the first step; refusing to measure" >&2
+            exit 1
+          fi
+          have="$(shasum -a 256 "${record}" 2>/dev/null | cut -d ' ' -f 1 || true)"
+          if [[ "${have}" != "${TRUSTED_FILES_DIGEST}" ]]; then
+            echo "::error::the non-editable file record at ${record} changed after the checkout (digest ${have:-missing}, expected ${TRUSTED_FILES_DIGEST}); refusing to measure" >&2
+            exit 1
+          fi
+          if ! changed="$(shasum -a 256 --check --quiet "${record}" 2>&1)"; then
+            printf '%s\n' "${changed}" >&2
+            echo "::error::a non-editable tracked file differs from the checked-out commit (listed above); refusing to measure" >&2
+            exit 1
+          fi
+          echo "non-editable files unchanged: $(wc -l < "${record}" | tr -d ' ') tracked files match the checkout"
 
       - name: Benchmark (benchd iterate --mode official, seal)
         # benchmark.json's benchmarkCommand, character for character. The

@@ -33,6 +33,10 @@
 #   14. every flag without a value, every missing required flag, and every
 #       spec/draft-length mismatch refuses BY NAME
 #
+# The stub is a Python script, and sandbox-exec would refuse the interpreter
+# exec it needs, so these cases run with RESIDENT_UP_SANDBOX=0. Case 4b proves
+# that knob is refused on a self-hosted runner, and that a bad value refuses.
+#
 # Hermetic: bash (3.2 on macOS is enough) and python3.
 #
 # Usage: tools/test-resident-up.sh
@@ -53,6 +57,9 @@ cleanup() {
   pkill -f "release/bench-worker resident" 2>/dev/null
   rm -rf "${WORK}"
 }
+
+export RESIDENT_UP_SANDBOX=0
+unset RUNNER_ENVIRONMENT
 
 fails=0
 pass() { printf 'test-resident-up: PASS -- %s\n' "$*"; }
@@ -295,6 +302,23 @@ if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (wired-limit-unpinned)"* && ! -f "$
   pass "an unpinned iogpu wired limit refuses by name before any boot"
 else
   fail "an unpinned wired limit did not refuse (rc ${rc}): ${out}"
+fi
+release_lock
+
+# --- 4b. the resident sandbox cannot be switched off on a self-hosted runner --
+hold_lock
+L4B="${WORK}/case4b"; mkdir -p "${L4B}"
+out="$(run_up "${L4B}" RUNNER_ENVIRONMENT=self-hosted --weights "${WEIGHTS}" --socket "${WORK}/case4b.sock" -- echo should-not-run)"; rc=$?
+if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (sandbox-required)"* && ! -f "${L4B}/stub-argv" ]]; then
+  pass "RESIDENT_UP_SANDBOX=0 on a self-hosted runner refuses by name before any boot"
+else
+  fail "RESIDENT_UP_SANDBOX=0 on a self-hosted runner did not refuse (rc ${rc}): ${out}"
+fi
+out="$(run_up "${L4B}" RESIDENT_UP_SANDBOX=maybe --weights "${WEIGHTS}" --socket "${WORK}/case4b.sock" -- echo should-not-run)"; rc=$?
+if [[ "${rc}" -eq 2 && "${out}" == *"RESIDENT_UP_SANDBOX must be 0 or 1"* && ! -f "${L4B}/stub-argv" ]]; then
+  pass "a RESIDENT_UP_SANDBOX value other than 0 or 1 refuses by name"
+else
+  fail "a bad RESIDENT_UP_SANDBOX value did not refuse (rc ${rc}): ${out}"
 fi
 release_lock
 
