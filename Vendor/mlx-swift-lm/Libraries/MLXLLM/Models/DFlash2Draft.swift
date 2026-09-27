@@ -438,22 +438,6 @@ public enum DFlash2SlidingMask {
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
-    private var keptKey: [Int]?
-    private var kept: MLXArray?
-
-    /// ``DFlash2TrainedBlockMask`` for one plain block forward's geometry,
-    /// shared by its layers. Left lazy: the context length moves every round,
-    /// so evaluating it here would add a wait per round.
-    func trainedBlockMask(contextLength: Int, blockLength: Int, trained: Int) -> MLXArray {
-        let requested = [contextLength, blockLength, trained]
-        if let kept, keptKey == requested { return kept }
-        let made = DFlash2TrainedBlockMask.make(
-            keyCount: contextLength + blockLength, blockStart: MLXArray(Int32(contextLength)),
-            blockLength: blockLength, trained: trained)
-        keptKey = requested
-        kept = made
-        return made
-    }
 
     func mask(
         contextLength: Int,
@@ -480,51 +464,6 @@ final class DFlash2SlidingMaskMemo {
     }
 }
 
-// MARK: - The trained block, kept inside a deeper block
-
-/// THE TRAINED BLOCK, KEPT. The drafter was trained at `dflash_config.block_size`
-/// (8: the anchor and 7 mask rows, bidirectional). A deeper declared block
-/// (depth 15 = 16 rows) is legal, but under the plain mask every row of the
-/// trained span also attends to the mask rows past it, a geometry the drafter
-/// never saw in training, and every extension row reads those perturbed rows.
-/// This mask keeps the trained span exactly as trained: block rows
-/// `i < trained` attend to the context and to block rows `j < trained` only,
-/// so their outputs are the trained-size block's outputs (the dynamic
-/// convolution is causal, so later rows never reach them). Each extension row
-/// `i >= trained` attends to the context and to block rows `j <= i`, so no row
-/// sees a mask row past what the trained geometry or its own position needs,
-/// and the draft at a position is the same for every declared depth that
-/// reaches it past the trained block. The boundary is read from the drafter's
-/// own config, never tuned. Only the DRAFT changes; the target verifies every
-/// token, so the output is the target's greedy sequence either way.
-/// `MLXFAST_DFLASH_TRAINED_BLOCK_MASK=0` restores the plain block mask; `=all`
-/// lets the extension rows attend to every block row.
-enum DFlash2TrainedBlockMask {
-    private static let setting: String = ProcessInfo.processInfo
-        .environment["MLXFAST_DFLASH_TRAINED_BLOCK_MASK"]?
-        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-    static let enabled = !["0", "false", "no", "off"].contains(setting)
-    static let causalExtension = setting != "all"
-
-    static func applies(blockLength: Int, trained: Int) -> Bool {
-        enabled && trained > 0 && blockLength > trained
-    }
-
-    /// `true` where allowed, `[blockLength, keyCount]`: key `k` is block row
-    /// `k - blockStart` (negative for a context key, always allowed here; the
-    /// caller ANDs in its own context and tail terms).
-    static func make(
-        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int
-    ) -> MLXArray {
-        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped(blockLength, 1)
-        let row = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount) - blockStart
-        if causalExtension {
-            return (row .< Int32(trained)) .|| ((query .>= Int32(trained)) .&& (row .<= query))
-        }
-        return (row .< Int32(trained)) .|| (query .>= Int32(trained))
-    }
-}
-
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -534,8 +473,6 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
-    /// `dflash_config.block_size`, the block the drafter was trained at.
-    let trainedBlock: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -565,7 +502,6 @@ private final class DFlash2Attention: Module {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
         self.isCausal = config.isCausal
-        self.trainedBlock = config.dflash.blockSize
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
@@ -727,11 +663,6 @@ private final class DFlash2Attention: Module {
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
-        if DFlash2TrainedBlockMask.applies(blockLength: L, trained: trainedBlock) {
-            let kept = masks.trainedBlockMask(
-                contextLength: cachedLength, blockLength: L, trained: trainedBlock)
-            mask = mask.map { $0 .&& kept } ?? kept
-        }
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
@@ -796,6 +727,9 @@ extension DFlash2Attention {
             .transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
+
+    /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
+    func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
 
     var speculativeCapable: Bool {
         dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
@@ -914,6 +848,9 @@ private final class DFlash2QKVStack {
     static let kvOnlyMinimumRows = 256
 
     func applies(q: Linear, k: Linear, v: Linear) -> Bool { stacked(q: q, k: k, v: v) != nil }
+
+    /// The stacked weight (built on first use), or nil when the stack does not apply.
+    func stackWeight(q: Linear, k: Linear, v: Linear) -> MLXArray? { stacked(q: q, k: k, v: v) }
 
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
@@ -1497,6 +1434,168 @@ enum DFlash2TensorMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    /// `sourceSwapped` (on after its load-time self-test; `MLXFAST_DRAFT_SWAP=0`
+    /// keeps `source`): the same product with the operands' roles swapped.
+    /// Each simdgroup loads its 32-column weight slice for one KT-wide K
+    /// step (KT = 128) into a cooperative left operand (`[32, KT]`, K
+    /// contiguous as stored) and multiplies it by the transposed 16-row input
+    /// slice, so the op is `32 x 16 x KT` into a `[32 columns, 16 rows]` FP32
+    /// accumulator. The weight read is a plain cooperative load issued ahead
+    /// of the op instead of the op's own operand fetch. Each output element is
+    /// still the FP32 sum of the same BF16 products over each simdgroup's K
+    /// partition, accumulated in K order, and the partitions (`SPLITS`, the
+    /// same `K / SPLITS` slabs) are added in the same order as `source`, so
+    /// the output is bitwise `source`'s: `prepareSwapped` compares every
+    /// weight's output bit for bit at load and keeps `source` on any
+    /// mismatch. Stored layout only (no tiled copy is read).
+    private static let sourceSwapped = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          auto tX = X.template slice<KT, 16>(k, 0);
+          lw.load(tW);
+          op.run(lw, tX, cT);
+        }
+        threadgroup float red[SPLITS - 1][16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT.is_valid_element(i)) continue;
+            float v;
+            if constexpr (SPLITS == 2) {
+              v = cT[i] + red[0][i * 32 + lane];
+            } else {
+              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            }
+            // Destination coordinates: [0] the input row, [1] the column in the block.
+            auto idx = cT.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelSwapped = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m16s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// `source32` in `sourceSwapped`'s form: one cooperative `[32, KT]`
+    /// weight slice per K step, multiplied by the input's rows 0-15 and
+    /// 16-31 (two `32 x 16 x KT` ops into two accumulators), the same K
+    /// partitions and the same partial order as `source32`, so its bits
+    /// (`prepareSwapped` compares them at load).
+    private static let sourceSwapped32 = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT0.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          lw.load(tW);
+          auto tXlo = X.template slice<KT, 16>(k, 0);
+          op.run(lw, tXlo, cT0);
+          auto tXhi = X.template slice<KT, 16>(k, 16);
+          op.run(lw, tXhi, cT1);
+        }
+        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT0.is_valid_element(i)) continue;
+            float v0, v1;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
+                  + red[2][(16 + i) * 32 + lane];
+            }
+            auto idx = cT0.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+          }
+        }
+        """
+
+    private static let kernelSwapped32 = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m32s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped32,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// Whether 17-32-row launches take `sourceSwapped32` (set by `prepareSwapped`).
+    nonisolated(unsafe) static var swapped32Active = false
+
+    /// The K step of `sourceSwapped` (`MLXFAST_DRAFT_SWAP_KT`: 64 or 128, default 128).
+    private static let swappedKT: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_KT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw == "64" ? 64 : 128
+    }()
+
+    /// `MLXFAST_DRAFT_SWAP=0` keeps `source` for the stored layout.
+    private static let swappedSetting: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// Whether stored-layout launches take `sourceSwapped`: set once by
+    /// `prepareSwapped` when every weight's output matched bit for bit.
+    nonisolated(unsafe) static var swappedActive = false
+
     // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
     // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
     // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
@@ -1641,13 +1740,7 @@ enum DFlash2TensorMatmul {
                 a = concatenated(
                     [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
             }
-            let splits = n >= 16384 ? 2 : 4
-            let threads = splits * 32
-            let y = kernel32(
-                [a, weight, dimsArray(k: k, n: n)],
-                template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
-                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
-                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
+            let y = launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
             let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
             return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
         }
@@ -1657,7 +1750,10 @@ enum DFlash2TensorMatmul {
         }
         let chosen = current
         let y: MLXArray
-        if chosen.tiled, let tiled = tiledCopy(weight) {
+        if swappedActive {
+            // The swapped kernel reads the stored weight (no copy exists while it is on).
+            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+        } else if chosen.tiled, let tiled = tiledCopy(weight) {
             y = chosen.variant(n: n)
                 ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
                 : launch(a, tiled, k: k, n: n, tiled: true, outputDType: .bfloat16)
@@ -1695,11 +1791,130 @@ enum DFlash2TensorMatmul {
         // Keep the accepted four-way route for the smaller projections.
         let splits = Kernel.stockSplits(n: n)
         let threads = splits * 32
+        if !tiled && swappedActive {
+            return launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+        }
         return kernel(
             [a, w, dimsArray(k: k, n: n)],
             template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", tiled ? 1 : 0)],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `source32` (or `sourceSwapped32` when `swapped`) over a 32-row `a`.
+    private static func launch32(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, swapped: Bool, outputDType: DType
+    ) -> MLXArray {
+        let splits = n >= 16384 ? 2 : 4
+        let threads = splits * 32
+        if swapped {
+            return kernelSwapped32(
+                [a, w, dimsArray(k: k, n: n)],
+                template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernel32(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `sourceSwapped` over a 16-row `a` and the stored `[N, K]` weight, with
+    /// the stock kernel's K split.
+    private static func launchSwapped(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, splits: Int, outputDType: DType
+    ) -> MLXArray {
+        let threads = splits * 32
+        return kernelSwapped(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Runs `sourceSwapped` and the stock kernel on every one of `weights`
+    /// (stored layout) against the same random 16-row BF16 input, FP32 and
+    /// BF16 outputs, and compares every output bit; `swappedActive` only when
+    /// all match. One stderr line either way. Nothing runs when the kernel is
+    /// off, the toolchain has no tensor operands, or `MLXFAST_DRAFT_SWAP=0`.
+    static func prepareSwapped(_ weights: [MLXArray], rows32 weights32: [MLXArray] = []) -> Bool {
+        swappedActive = false
+        swapped32Active = false
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, swappedSetting else {
+            return false
+        }
+        let eligible = weights.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        guard !eligible.isEmpty else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var inputs: [Int: MLXArray] = [:]
+        var differing: [MLXArray] = []
+        var values = 0
+        for (index, w) in eligible.enumerated() {
+            let k = w.dim(1)
+            let n = w.dim(0)
+            let splits = n >= 16384 ? 2 : 4
+            let a = inputs[k] ?? MLXRandom.normal(
+                [rowsPerTile, k], key: MLXRandom.key(UInt64(9203 + index))
+            ).asType(.bfloat16)
+            inputs[k] = a
+            for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                let stock = kernel(
+                    [a, w, dimsArray(k: k, n: n)],
+                    template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", 0)],
+                    grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+                    outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+                let swapped = launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+                differing.append(
+                    (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                values += rowsPerTile * n
+            }
+            if differing.count >= 16 {
+                let partial = stacked(differing).sum()
+                eval(partial)
+                differing = [partial]
+            }
+        }
+        let mismatches = stacked(differing).sum().item(Int.self)
+        swappedActive = mismatches == 0
+        // The 32-row form, only while the 16-row one is on.
+        var mismatches32 = 0
+        var values32 = 0
+        let eligible32 = weights32.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        if swappedActive, rows32Enabled, !eligible32.isEmpty {
+            var differing32: [MLXArray] = []
+            for (index, w) in eligible32.enumerated() {
+                let k = w.dim(1)
+                let n = w.dim(0)
+                let a = MLXRandom.normal(
+                    [2 * rowsPerTile, k], key: MLXRandom.key(UInt64(9403 + index))
+                ).asType(.bfloat16)
+                for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                    let stock = launch32(a, w, k: k, n: n, swapped: false, outputDType: outputDType)
+                    let swapped = launch32(a, w, k: k, n: n, swapped: true, outputDType: outputDType)
+                    differing32.append(
+                        (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                    values32 += 2 * rowsPerTile * n
+                }
+            }
+            mismatches32 = stacked(differing32).sum().item(Int.self)
+            swapped32Active = mismatches32 == 0
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 swapped m16 kernel: self-test \(swappedActive ? "passed" : "FAILED") "
+                    + "(\(eligible.count) weights, \(values) values bitwise, \(mismatches) mismatches); "
+                    + (swappedActive ? "on, K step \(swappedKT)" : "stock kept")
+                    + "; 32-row form \(eligible32.count) weights, \(values32) values, "
+                    + "\(mismatches32) mismatches, " + (swapped32Active ? "on" : "off")
+                    + String(format: "; %.0f ms\n", elapsed)).utf8))
+        return swappedActive
     }
 
     // MARK: Tiled weights
@@ -1882,6 +2097,70 @@ enum DFlash2TensorMatmul {
         return result ?? (false, .nan)
     }
 
+    /// The weights with a tiled copy, in the drafter's forward order (the
+    /// trial's microbench chain, `chainTimes`).
+    nonisolated(unsafe) private static var chainWeights: [MLXArray] = []
+
+    /// Each kernel's best time (ns) over `runs` passes of the drafter's tensor
+    /// launches as one dependent chain (each launch reads the previous one's
+    /// output as its input, so it waits for it as in the drafter; the values
+    /// do not change a launch's time), after one warm-up chain, the kernels in
+    /// rotated order per pass; and `kernels[0]`'s spread (its median run over
+    /// its best, minus one). nil without copies or on an MLX error.
+    static func chainTimes(_ kernels: [Kernel], runs: Int) -> (best: [Double], spread: Double, warm: Double)? {
+        let weights = chainWeights
+        guard !weights.isEmpty, !kernels.isEmpty else { return nil }
+        let saved = current
+        defer { current = saved }
+        let input = MLXRandom.normal([rowsPerTile, weights[0].dim(1)], key: MLXRandom.key(8301))
+            .asType(.bfloat16)
+        func chain(_ kernel: Kernel) -> MLXArray? {
+            current = kernel
+            var x = input
+            for (index, w) in weights.enumerated() {
+                let k = w.dim(1)
+                if index > 0 {
+                    let flat = x.reshaped([-1])
+                    x = (flat.size >= rowsPerTile * k
+                        ? flat[0 ..< rowsPerTile * k]
+                        : concatenated(
+                            [flat, MLXArray.zeros([rowsPerTile * k - flat.size], dtype: flat.dtype)]))
+                        .reshaped([rowsPerTile, k])
+                }
+                guard let y = apply(x, weight: w) else { return nil }
+                x = y
+            }
+            return x
+        }
+        var best = Array(repeating: Double.infinity, count: kernels.count)
+        var reference: [Double] = []
+        var warmNanoseconds = 0.0
+        let completed = try? withError { error -> Bool in
+            guard let warm = chain(kernels[0]) else { return false }
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            eval(warm)
+            warmNanoseconds = Double(DispatchTime.now().uptimeNanoseconds - t0)
+            try error.check()
+            for pass in 0 ..< runs {
+                let order = kernels.indices.map { (pass + $0) % kernels.count }
+                let graphs = order.map { chain(kernels[$0]) }
+                for (index, graph) in zip(order, graphs) {
+                    guard let graph else { continue }
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    eval(graph)
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0)
+                    best[index] = min(best[index], elapsed)
+                    if index == 0 { reference.append(elapsed) }
+                }
+                try error.check()
+            }
+            return true
+        }
+        guard completed == true, best[0].isFinite else { return nil }
+        let sorted = reference.sorted()
+        return (best, sorted.isEmpty ? 0 : sorted[sorted.count / 2] / best[0] - 1, warmNanoseconds)
+    }
+
     private static let tiledLock = NSLock()
     /// Each stored weight (held, so its identity is never reused) with its copy.
     nonisolated(unsafe) private static var tiledCopies:
@@ -1895,7 +2174,7 @@ enum DFlash2TensorMatmul {
     /// while `current` reads the tiled copies (`tiled` and every variant),
     /// the weight itself otherwise (`stock`, or a weight without a copy).
     static func readWeight(_ weight: MLXArray) -> MLXArray {
-        (current.tiled ? tiledCopy(weight) : nil) ?? weight
+        (current.tiled && !swappedActive ? tiledCopy(weight) : nil) ?? weight
     }
 
     /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
@@ -1912,6 +2191,7 @@ enum DFlash2TensorMatmul {
     /// self-test operands.
     static func dropTiledCopies() {
         tiledLock.withLock { tiledCopies.removeAll() }
+        chainWeights = []
         dropTestOperands()
     }
 
@@ -1933,7 +2213,9 @@ enum DFlash2TensorMatmul {
         dropTiledCopies()
         current = .stock
         passedBitwiseVariants = []
-        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false
+        // The swapped kernel reads the stored layout: no copy, no kernel trial.
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false,
+            !swappedActive
         else { return false }
         let eligible = weights.filter {
             $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
@@ -1973,6 +2255,7 @@ enum DFlash2TensorMatmul {
             tiledLock.withLock {
                 for (w, t) in copies { tiledCopies[ObjectIdentifier(w)] = (w, t) }
             }
+            chainWeights = copies.map(\.source)
             var shapes = Set<[Int]>()
             testWeights = copies.filter { shapes.insert($0.source.shape).inserted }
             testInputs = inputs
@@ -2032,53 +2315,65 @@ enum DFlash2TensorMatmul {
 }
 
 /// The drafter kernel's in-situ trial, in the load-time warm
-/// (`Qwen35DFlash2Assistant.runKernelTrial`), modelled on the verify int8
-/// kernels' `NarrowInSituTrial`: engine requests whose rounds rotate through
-/// the candidate kernels, `perCandidate` timed rounds each; per candidate the
-/// median round (outliers above 1.5x the median dropped); a candidate is
-/// adopted only when it beats the reference by more than `adoptMargin`.
+/// (`Qwen35DFlash2Assistant.runKernelTrial`), in the verify int8 kernels'
+/// two stages (`Qwen35TensorPackedMatmul.NarrowInSituTrial`).
 ///
-/// Stage 1 rotates `stock`, `tiled` and the bit-for-bit variants that passed
-/// their self-test; the fastest is kept only if it beats `stock`. Every
-/// stage-1 kernel gives the record's bits, so each round's draft ids are the
-/// record body's; they are kept, with the committed position each round
-/// proposed from, as the tape. Stage 2 (variants on, and a changed-split
-/// variant of the stage-1 pick passing its self-test) runs the same request
-/// again (same prompt, same budget: the same rounds while the drafts match),
-/// rotating the pick and its changed-split variants. A variant is adopted only
-/// if every one of its rounds proposed exactly the tape's ids from the tape's
-/// position, the pick's own rounds matched the tape as well, and it beats the
-/// pick; otherwise the pick stays. The target decides every emitted token
-/// either way; the check keeps the drafter's proposals, and so the
-/// acceptance, the record's on the trial's rounds.
+/// Stage 1 (`shortlist`), a GPU-bound microbench: the drafter's 15 tensor
+/// launches on their real weights, in the forward's order, as one dependent
+/// chain per kernel (`DFlash2TensorMatmul.chainTimes`: each launch reads the
+/// previous one's output), one warm-up chain and `chainRuns` passes, each
+/// kernel's best run kept. First `stock`, `tiled` and the bit-for-bit variants
+/// that passed their self-test; then the changed-split variants of the
+/// fastest tiled kernel that pass theirs, timed beside `stock`
+/// and that kernel. The finalist is the fastest kernel of the last pass if
+/// its gain over `stock` passes `PairedRoundTrial.admits`; else `stock` stays
+/// and no round runs.
+///
+/// Stage 2, paired rounds (`PairedRoundTrial`): one engine request whose
+/// rounds run cycles of `stock` and the finalist; the finalist is adopted only
+/// under the paired rule. A changed-split finalist reorders the FP32 sums, so
+/// it is adopted only if, in addition, every one of its rounds and of
+/// `stock`'s proposed exactly the tape's ids from the tape's position: the
+/// tape is every round's proposal of an earlier request of the same warm on
+/// the same prompt with every kernel bitwise the record's and the drafter on
+/// the stored layout (the verify or head trial's stage 2, else one request of
+/// its own, `needsTape`), so the rounds match while the drafts do.
+/// The target decides every emitted token either way; the check keeps the
+/// drafter's proposals, and so the acceptance, the record's on the trial's
+/// rounds.
 ///
 /// A round is the host time from its proposal to the next. A proposal is
 /// built with its round's kernel: set at `roundBoundary()` (the top of every
-/// proposal) and, for a block built before the previous round's readback
+/// proposal and every adopted speculative block) and, for a block built
+/// before the previous round's readback
 /// (`Qwen35DFlash2Assistant.speculateBlock`), at `aheadOfRound()`, so a
-/// round's drafter work runs the kernel the round is timed for. The first
-/// round is discarded.
+/// round's drafter work runs the kernel the round is timed for; a round whose
+/// proposal was built with another kernel is void. The first round is
+/// discarded.
 enum DFlash2KernelTrial {
     typealias Kernel = DFlash2TensorMatmul.Kernel
 
     nonisolated(unsafe) static var armed = false
     nonisolated(unsafe) static var active = false
+    /// `stock` and the finalist.
     nonisolated(unsafe) private static var candidates: [Kernel] = [.stock]
-    nonisolated(unsafe) private static var perCandidate = 12
-    nonisolated(unsafe) private static var stage = 0
+    /// Each timed round's candidate (`PairedRoundTrial.schedule`).
+    nonisolated(unsafe) private static var arms: [Int] = []
     nonisolated(unsafe) private static var roundIndex = 0
     nonisolated(unsafe) private static var lastBoundary: UInt64 = 0
     nonisolated(unsafe) private static var durations: [Int: UInt64] = [:]
     nonisolated(unsafe) private static var proposals: [Int: Proposal] = [:]
     nonisolated(unsafe) private static var tape: [Int: (position: Int, ids: [Int32])] = [:]
+    nonisolated(unsafe) private static var taping = false
+    nonisolated(unsafe) private static var tapeIndex = 0
+    nonisolated(unsafe) private static var tapeRounds = Int.max
+    /// The finalist is a changed split and no earlier request left a tape:
+    /// one request of `stock` records it first (`beginTape(rounds:onEnough:)`).
+    nonisolated(unsafe) private(set) static var needsTape = false
     nonisolated(unsafe) private static var onEnough: (() -> Void)?
-    nonisolated(unsafe) private static var pick = Kernel.stock
-    nonisolated(unsafe) private static var proposalCount = 0
     nonisolated(unsafe) private static var log = ""
-    /// Host times: stage 1 begun, its request done, stage 2's self-tests done.
+    /// Host times: stage 1 begun, stage 1 done.
     nonisolated(unsafe) private static var marks: [UInt64] = []
-    /// The rounds both requests budget for (the same budget, the same rounds).
-    nonisolated(unsafe) private(set) static var requestRounds = 0
 
     private struct Proposal {
         let tag: Int  // the candidate it was built with; -1 unknown
@@ -2086,28 +2381,42 @@ enum DFlash2KernelTrial {
         let tokens: MLXArray
     }
 
-    static let adoptMargin = 0.005
-    static let outlierFactor = 1.5
-    /// Timed rounds per candidate: stage 1 with variants (12 for the two-way
-    /// trial), stage 2.
-    static let roundsPerVariant = 8
-    static let roundsPerSplit = 6
+    /// Timed chain passes (each kernel keeps its best).
+    static let chainRuns = 5
+    /// With no round floor measured (`PairedRoundTrial.admits`), the
+    /// finalist's chain must beat `stock`'s by more than this.
+    static let chainAdmit = 0.002
 
-    /// The discarded round, the seed-side boundary, then every candidate's rounds.
-    static var roundsNeeded: Int { 2 + candidates.count * perCandidate }
+    /// The stage-2 request's budget: the discarded round, the seed-side
+    /// boundary, then every timed round.
+    static var requestRounds: Int { 2 + arms.count }
 
     @inline(__always) static func roundBoundary() {
-        guard active else { return }
-        boundary()
+        guard active || taping else { return }
+        if active {
+            boundary()
+        } else {
+            tapeIndex += 1
+            if tapeIndex == tapeRounds {
+                let enough = onEnough
+                onEnough = nil
+                enough?()
+            }
+        }
+    }
+
+    /// The candidate of the round after boundary `index` (0: `stock`).
+    private static func arm(_ index: Int) -> Int {
+        index >= 1 && index - 1 < arms.count ? arms[index - 1] : 0
     }
 
     private static func boundary() {
         let now = DispatchTime.now().uptimeNanoseconds
         if roundIndex >= 2 { durations[roundIndex - 1] = now - lastBoundary }
         lastBoundary = now
-        DFlash2TensorMatmul.current = candidates[roundIndex % candidates.count]
+        DFlash2TensorMatmul.current = candidates[arm(roundIndex)]
         roundIndex += 1
-        if roundIndex >= roundsNeeded {
+        if roundIndex >= requestRounds {
             active = false
             let enough = onEnough
             onEnough = nil
@@ -2119,7 +2428,7 @@ enum DFlash2KernelTrial {
     /// (the next boundary's) and returns its candidate; nil with no trial.
     static func aheadOfRound() -> Int? {
         guard active else { return nil }
-        let tag = roundIndex % candidates.count
+        let tag = arm(roundIndex)
         DFlash2TensorMatmul.current = candidates[tag]
         return tag
     }
@@ -2127,14 +2436,24 @@ enum DFlash2KernelTrial {
     /// The round's proposal, built at its boundary (`proposeBlock`) from
     /// `position` committed rows.
     @inline(__always) static func recordProposed(_ tokens: MLXArray, position: Int) {
-        guard active, roundIndex >= 1 else { return }
-        record(tokens, tag: (roundIndex - 1) % candidates.count, position: position)
+        guard active || taping else { return }
+        if taping {
+            if tapeIndex >= 1 { proposals[tapeIndex - 1] = Proposal(tag: 0, position: position, tokens: tokens) }
+            return
+        }
+        guard roundIndex >= 1 else { return }
+        record(tokens, tag: arm(roundIndex - 1), position: position)
     }
 
     /// The round's proposal, built ahead with `tag` (`aheadOfRound()`) and
     /// adopted at its boundary from `position` committed rows.
     @inline(__always) static func recordAdopted(_ tokens: MLXArray, tag: Int?, position: Int) {
-        guard active, roundIndex >= 1 else { return }
+        guard active || taping else { return }
+        if taping {
+            if tapeIndex >= 1 { proposals[tapeIndex - 1] = Proposal(tag: 0, position: position, tokens: tokens) }
+            return
+        }
+        guard roundIndex >= 1 else { return }
         record(tokens, tag: tag ?? -1, position: position)
     }
 
@@ -2142,22 +2461,89 @@ enum DFlash2KernelTrial {
         proposals[roundIndex - 1] = Proposal(tag: tag, position: position, tokens: tokens)
     }
 
-    /// Stage 1's candidates, and the budget both requests use.
-    static func beginFirstStage() {
-        candidates = [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
-        perCandidate = candidates.count > 2 ? roundsPerVariant : 12
-        stage = 1
-        pick = .stock
-        tape = [:]
+    /// Records every proposal of the next engine request as the tape (once;
+    /// only for a trial that can take a changed split): an earlier trial's
+    /// request (`Qwen35DFlash2Assistant.warmEngineRound`), or, with `rounds`,
+    /// a request of its own that `onEnough` ends after that many boundaries.
+    static func beginTape(rounds: Int = .max, onEnough: (() -> Void)? = nil) {
+        guard armed, !active, DFlash2TensorMatmul.variantsEnabled, tape.isEmpty else { return }
+        proposals = [:]
+        tapeIndex = 0
+        tapeRounds = rounds
+        self.onEnough = onEnough
+        taping = true
+    }
+
+    static func endTape() {
+        guard taping else { return }
+        taping = false
+        onEnough = nil
+        needsTape = false
+        for (index, p) in proposals {
+            tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
+        }
+        proposals = [:]
+    }
+
+    /// Stage 1 (see the type's notes). True when stage 2 is to run.
+    static func shortlist() -> Bool {
+        candidates = [.stock]
+        arms = []
         log = ""
-        proposalCount = 0
+        needsTape = false
         marks = [DispatchTime.now().uptimeNanoseconds]
-        requestRounds = max(
-            roundsNeeded, DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
+        guard armed else { return false }
+        func pass(_ kernels: [Kernel]) -> (kernel: Kernel, stock: Double, time: Double)? {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            guard let (best, spread, warm) = DFlash2TensorMatmul.chainTimes(kernels, runs: chainRuns) else {
+                log += (log.isEmpty ? "" : "; ") + "stage 1 chain failed"
+                return nil
+            }
+            log += (log.isEmpty ? "" : "; ") + "stage 1 chain ("
+                + String(format: "warm-up %.1f ms, best of %d, stock spread %.2f%%, %.0f ms", warm / 1e6, chainRuns, spread * 100, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+                + ") ms ["
+                + kernels.indices.map {
+                    kernels[$0].name + " " + String(format: "%.3f", best[$0] / 1e6)
+                        + ($0 == 0 ? "" : String(format: " %+.2f%%", (best[$0] / best[0] - 1) * 100))
+                }.joined(separator: " | ") + "]"
+            let fastest = (1 ..< kernels.count).min { best[$0] < best[$1] } ?? 0
+            return fastest > 0 ? (kernels[fastest], best[0], best[fastest]) : nil
+        }
+        var finalist = pass([.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants)
+        if let pick = finalist?.kernel, DFlash2TensorMatmul.variantsEnabled {
+            var passed: [Kernel] = []
+            var tested: [String] = []
+            for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
+                let test = DFlash2TensorMatmul.selfTest(kernel)
+                if test.passed { passed.append(kernel) }
+                tested.append(
+                    kernel.name
+                        + (test.passed ? String(format: " max rel %.1e", test.maxRelative) : " FAILED"))
+            }
+            log += "; split variants self-test [\(tested.joined(separator: ", "))]"
+            if !passed.isEmpty, let second = pass([.stock, pick] + passed) { finalist = second }
+        }
+        if let (kernel, stock, time) = finalist,
+            PairedRoundTrial.admits(gain: stock - time, reference: stock, fallback: chainAdmit)
+        {
+            candidates = [.stock, kernel]
+            needsTape = !kernel.bitwise && tape.isEmpty
+            log += "; finalist \(kernel.name)" + (needsTape ? " (a tape request first)" : "")
+        } else {
+            log += "; no kernel's chain gain passes the admission"
+        }
+        if PairedRoundTrial.nullRun {
+            candidates = [.stock, .stock]
+            needsTape = false
+            log += "; MLXFAST_TRIAL_NULL: the finalist is stock"
+        }
+        marks.append(DispatchTime.now().uptimeNanoseconds)
+        arms = PairedRoundTrial.schedule(challengers: candidates.count - 1)
+        return !arms.isEmpty
     }
 
     static func begin(onEnough: @escaping () -> Void) {
-        guard armed else { return }
+        guard armed, !arms.isEmpty else { return }
         roundIndex = 0
         lastBoundary = 0
         durations = [:]
@@ -2167,143 +2553,65 @@ enum DFlash2KernelTrial {
         active = true
     }
 
-    private static func median(_ values: [UInt64]) -> Double? {
-        guard !values.isEmpty else { return nil }
-        let sorted = values.sorted()
-        let mid = sorted.count / 2
-        return sorted.count % 2 == 1
-            ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
-    }
-
-    private typealias Timing = (median: Double?, kept: Int, timed: Int)
-
-    /// Per candidate. A round counts for the candidate it was scheduled for
-    /// only when its proposal was built with that candidate.
-    private static func timings() -> [Timing] {
-        var times = Array(repeating: [UInt64](), count: candidates.count)
-        for (index, duration) in durations {
-            let tag = index % candidates.count
-            guard proposals[index]?.tag == tag else { continue }
-            times[tag].append(duration)
-        }
-        return times.map { values in
-            guard let first = median(values) else { return (nil, 0, 0) }
-            let kept = values.filter { Double($0) <= outlierFactor * first }
-            return (median(kept), kept.count, values.count)
-        }
-    }
-
-    /// The fastest eligible candidate if it beats candidate 0 by more than
-    /// the margin, else candidate 0.
-    private static func choose(_ t: [Timing], eligible: [Bool]) -> Int {
-        guard let reference = t[0].median else { return 0 }
-        var best = 0
-        for c in 1 ..< t.count where eligible[c] {
-            if let m = t[c].median, m < (t[best].median ?? .infinity) { best = c }
-        }
-        return best > 0 && t[best].median! < reference * (1 - adoptMargin) ? best : 0
-    }
-
-    private static func describe(_ t: [Timing], _ note: (Int) -> String = { _ in "" }) -> String {
-        candidates.indices.map { c in
-            "\(candidates[c].name) "
-                + (t[c].median.map { String(format: "%.2f", $0 / 1e6) } ?? "-")
-                + " ms (\(t[c].kept)/\(t[c].timed)\(note(c)))"
-        }.joined(separator: ", ")
-    }
-
-    private static func change(_ t: [Timing], _ c: Int) -> String {
-        guard c > 0, let m = t[c].median, let r = t[0].median else { return "" }
-        return String(format: " (%+.2f%%)", (m / r - 1) * 100)
-    }
-
-    /// The stage-1 pick and (variants on) the tape, once.
-    private static func concludeFirstStage() {
-        guard stage == 1, log.isEmpty else { return }
-        let t = timings()
-        let best = choose(t, eligible: Array(repeating: true, count: candidates.count))
-        pick = candidates[best]
-        log = describe(t) + " -> \(pick.name)\(change(t, best))"
-        proposalCount += roundIndex
-        if DFlash2TensorMatmul.variantsEnabled {
-            for (index, p) in proposals {
-                tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
+    /// Whether every recorded proposal of `stock` and the finalist matches
+    /// the tape (see the type's notes), and the counts for the log.
+    private static func matchesTape() -> (Bool, String) {
+        var recorded = [0, 0]
+        var equal = [0, 0]
+        var firstOff = Int.max
+        var unknownDiffers = false
+        for index in proposals.keys.sorted() {
+            let p = proposals[index]!
+            if p.tag >= 0, p.tag < 2 { recorded[p.tag] += 1 }
+            guard index < firstOff, let entry = tape[index], entry.position == p.position else {
+                firstOff = min(firstOff, index)
+                continue
             }
+            let same = p.tokens.asType(.int32).asArray(Int32.self) == entry.ids
+            if p.tag < 0 || p.tag >= 2 {
+                if !same { unknownDiffers = true }
+                continue
+            }
+            if same { equal[p.tag] += 1 }
         }
-        proposals = [:]
+        let clean = (0 ..< 2).allSatisfy { recorded[$0] > 0 && equal[$0] == recorded[$0] } && !unknownDiffers
+        return (clean, "ids vs the tape: stock \(equal[0])/\(recorded[0]), \(candidates[1].name) \(equal[1])/\(recorded[1])")
     }
 
-    /// After the first request: `concludeFirstStage`, then the changed-split
-    /// variants of the pick that pass their self-test. True when the second
-    /// request is to run.
-    static func beginSecondStage() -> Bool {
-        active = false
-        onEnough = nil
-        guard armed, stage == 1 else { return false }
-        marks.append(DispatchTime.now().uptimeNanoseconds)
-        concludeFirstStage()
-        guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty else { return false }
-        var passed: [Kernel] = []
-        var tested: [String] = []
-        for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
-            let test = DFlash2TensorMatmul.selfTest(kernel)
-            if test.passed { passed.append(kernel) }
-            tested.append(
-                kernel.name
-                    + (test.passed ? String(format: " max rel %.1e", test.maxRelative) : " FAILED"))
-        }
-        log += "; split variants self-test [\(tested.joined(separator: ", "))]"
-        marks.append(DispatchTime.now().uptimeNanoseconds)
-        guard !passed.isEmpty else { return false }
-        candidates = [pick] + passed
-        perCandidate = roundsPerSplit
-        stage = 2
-        return true
-    }
-
-    /// Installs the verdict (the stage-1 pick unless a stage-2 variant
-    /// qualified; the copies are freed when the stored layout stays), logs
-    /// one line and disarms. Safe when nothing ran.
+    /// Installs the verdict (`stock` unless the finalist qualified; the
+    /// copies are freed when the stored layout stays), logs one line and
+    /// disarms. Safe when nothing ran.
     static func finish(elapsedNanoseconds: UInt64) {
         active = false
         onEnough = nil
+        taping = false
         guard armed else { return }
         armed = false
-        concludeFirstStage()
-        var adopted = pick
-        if stage == 2 {
-            proposalCount += roundIndex
-            let t = timings()
-            let n = candidates.count
-            var recorded = Array(repeating: 0, count: n)
-            var compared = recorded
-            var equal = recorded
-            var firstOff = Int.max
-            var unknownDiffers = false
-            for index in proposals.keys.sorted() {
-                let p = proposals[index]!
-                if p.tag >= 0 { recorded[p.tag] += 1 }
-                guard index < firstOff, let entry = tape[index], entry.position == p.position else {
-                    firstOff = min(firstOff, index)
-                    continue
-                }
-                let same = p.tokens.asType(.int32).asArray(Int32.self) == entry.ids
-                if p.tag < 0 {
-                    if !same { unknownDiffers = true }
-                    continue
-                }
-                compared[p.tag] += 1
-                if same { equal[p.tag] += 1 }
+        var adopted = Kernel.stock
+        var challengerWon = false
+        if candidates.count == 2, !arms.isEmpty {
+            let times: [Double?] = arms.indices.map { i in
+                guard let d = durations[i + 1], proposals[i + 1]?.tag == arms[i] else { return nil }
+                return Double(d)
             }
-            func clean(_ c: Int) -> Bool {
-                recorded[c] > 0 && compared[c] == recorded[c] && equal[c] == recorded[c]
+            let verdict = PairedRoundTrial.verdicts(arms: arms, times: times, challengers: 1).first
+                ?? PairedRoundTrial.Verdict()
+            var eligible = true
+            var ids = ""
+            if !candidates[1].bitwise {
+                (eligible, ids) = matchesTape()
+                ids = ", " + ids
             }
-            let eligible = (0 ..< n).map { c in c > 0 && clean(c) && clean(0) && !unknownDiffers }
-            let best = choose(t, eligible: eligible)
-            adopted = candidates[best]
-            log += "; " + describe(t) { c in ", ids \(equal[c])/\(recorded[c])" }
-                + " -> \(adopted.name)\(change(t, best))"
+            if verdict.adopt, eligible {
+                adopted = candidates[1]
+                challengerWon = true
+            }
+            log += "; stage 2 (\(roundIndex) proposals, "
+                + PairedRoundTrial.header(arms: arms, times: times, reference: "stock") + ") "
+                + (PairedRoundTrial.nullRun ? "null" : candidates[1].name) + " vs stock "
+                + verdict.summary + ids
         }
+        let adoptedName = challengerWon && PairedRoundTrial.nullRun ? "null (= stock)" : adopted.name
         DFlash2TensorMatmul.current = adopted
         if adopted.tiled {
             DFlash2TensorMatmul.dropTestOperands()
@@ -2314,15 +2622,14 @@ enum DFlash2KernelTrial {
         let phases = zip(marks.dropFirst(), marks).map { String(format: "%.0f", Double($0 - $1) / 1e6) }
         FileHandle.standardError.write(
             Data(
-                ("dflash2 kernel trial: \(log); adopted \(adopted.name) "
+                ("dflash2 kernel trial: \(log); adopted \(adoptedName) "
                     + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : "stored layout")); "
-                    + "\(proposalCount) proposals; "
                     + String(format: "%.0f ms", Double(elapsedNanoseconds) / 1e6)
                     + " (\(phases.joined(separator: " + ")))\n").utf8))
         proposals = [:]
         tape = [:]
         durations = [:]
-        stage = 0
+        arms = []
     }
 }
 
@@ -2463,6 +2770,12 @@ private final class DFlash2DecoderLayer: Module {
             !skipped.contains(ObjectIdentifier($0))
         }
         return (attention.read + feedForward.read + rest, replaced)
+    }
+
+    /// The two convolutions' tap projections (16-row tensor kernel too).
+    func projectionWeights() -> [MLXArray] {
+        [attentionConv.kernelProjection, mlpConv.kernelProjection]
+            .filter { $0.bias == nil }.map { $0.weight }
     }
 
     func callAsFunction(
@@ -3279,7 +3592,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// a copy only the rounds read would be one more array to make GPU-
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
-        DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
+        let layerWeights = layers.flatMap { $0.tensorWeights() }
+        _ = DFlash2TensorMatmul.prepareSwapped(
+            layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : []),
+            rows32: layers.compactMap { $0.selfAttn.stackedQKVWeight() })
+        return DFlash2TensorMatmul.prepareTiled(layerWeights)
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
@@ -3599,15 +3916,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
-        if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
-            // The block sits at row `held + c` of the keys, as in the plain
-            // path it sits right after the cached context.
-            keyMask = keyMask .&& DFlash2TrainedBlockMask.make(
-                keyCount: keys, blockStart: MLXArray(Int32(geometry.rows)) + c,
-                blockLength: blockSize, trained: config.dflash.blockSize)
-        }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         var writes: [(keys: MLXArray, values: MLXArray)] = []
         var lead: MLXArray?
