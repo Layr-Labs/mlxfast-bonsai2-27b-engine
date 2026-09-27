@@ -623,13 +623,17 @@ extension EngineLoopV2 {
                     // A fixed-depth leg plans that same depth; a smaller
                     // plan (never taken while the early gate holds) reads a
                     // prefix of the block, which is still only a proposal.
+                    // Lookup, when it fired, already replaced these ids.
                     precondition(
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
                 } else {
-                    proposal = try block.proposeBlock(
+                    let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
+                    proposal = CBv2PromptLookupDraft.override(
+                        drafted, history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -637,6 +641,9 @@ extension EngineLoopV2 {
                     // when the carry was captured).
                     block.trimBlockState(
                         requestState, toCommittedLength: carry.kvOffset)
+                    // The replacement does not depend on the drafter graph.
+                    // Keep that graph live so the cache writes are not dropped.
+                    assistantEvalTargets.append(drafted)
                 }
                 proposals.append(proposal)
                 assistantEvalTargets.append(proposal)
