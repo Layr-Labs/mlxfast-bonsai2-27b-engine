@@ -235,13 +235,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   time is shorter than the host's path from the acceptance readback to
 ///   that commit (finalize, the leading draft submission, the committed
 ///   recurrent state, the rest of the draft, then the ~3 ms verify build),
-///   the GPU idles in between. The default plan is ONE boundary after the
-///   first 8 layers (a LEADING verify submission, the verify's first ~5
-///   command buffers): the GPU gets the front of the verify as soon as it is
-///   built, and the host builds the other 48 layers while it runs. One
-///   boundary rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   the GPU idles in between. The default plan is two leading boundaries,
+///   after layers 8 and 24: the GPU gets the front of the verify as soon as
+///   it is built, and a second submission covers the host's build of the
+///   tail. Periodic slices are not the plan (slices every 2 layers lengthened
+///   the window on the ranked box). `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
+///   restores the single boundary after layer 8. `MLXFAST_VERIFY_SLICE_LAYERS`
 ///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
 ///   again. Both trunk paths honour it: the plain per-layer loop and the
@@ -300,11 +299,18 @@ enum Qwen35TrunkSubmission {
         let kill = env["DARKBLOOM_QWEN35_VERIFY_SLICES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(kill ?? "") { return .off }
-        // One leading submission after layer 8 (pochita0's `11cb04a`; see the type's comment);
-        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
-        return Plan.parse(
-            env["MLXFAST_VERIFY_SLICE_LAYERS"],
-            default: Plan(stride: 0, offset: 0, explicit: [8]))
+        // Two leading submissions, after layers 8 and 24. The first is
+        // pochita0's `11cb04a`. The second covers the host build of layers
+        // 24..63 (~4 ms) with the GPU work of layers 8..23, so the GPU does
+        // not sit idle after the first slice. Same kernels, same order; only
+        // the asyncEval points move. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
+        // restores the single boundary. `MLXFAST_VERIFY_SLICE_LAYERS` sets
+        // another plan; `0` turns slicing off.
+        let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let counts = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let fallback = Plan(stride: 0, offset: 0, explicit: counts)
+        return Plan.parse(env["MLXFAST_VERIFY_SLICE_LAYERS"], default: fallback)
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -2166,6 +2172,136 @@ enum Qwen35GatedDeltaChunked {
         outputNames: ["y", "state_out"],
         source: scanFreshSource)
 
+    /// `scanFreshSource` with the next chunk's K, Q, T' and P loaded into
+    /// registers immediately after the staging barrier, while the current
+    /// chunk's products run. The following iteration writes those registers
+    /// to the same threadgroup addresses the device stage would have. The
+    /// products, the epilogue and the state update are the stock text.
+    /// Launched only when each thread owns exactly two K/Q float4s
+    /// (`KQ4 == 2*NT`, the C=8, Dk=128, 4-simdgroup prompt geometry).
+    /// `BONSAI_GDN_SCAN_PREFETCH=0` keeps the fresh kernel.
+    private static let scanFreshPrefetchSource: String = {
+        let anchor = """
+            for (int n = 0; n < NC; ++n) {
+              const int t0 = n * C;
+              const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              device float* y_ = y + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              const device float* gf_ = gf + ((size_t)bh * NC + n) * 2 * C;
+              // stage this chunk's K, Q, T', P (the previous chunk's readers are done)
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int e = tid; e < KQ4; e += NT) {
+                const int row = e / (Dk / 4);
+                const int c4 = (e % (Dk / 4)) * 4;
+                const size_t src = (size_t)(t0 + row) * ks + c4;
+                *(threadgroup float4*)(Ksh + row * LK + c4) = *(const device float4*)(kbase + src);
+                *(threadgroup float4*)(Qsh + row * LK + c4) = *(const device float4*)(qbase + src);
+              }
+              for (int e = tid; e < 2 * TP4; e += NT) {
+                const int which = e / TP4;
+                const int f = e % TP4;
+                const int row = f / (C / 4);
+                const int c4 = (f % (C / 4)) * 4;
+                const device float* src = (which == 0 ? tbase : pbase) + (size_t)n * C * C;
+                *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = *(const device float4*)(src + f * 4);
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        """
+        precondition(
+            scanFreshSource.components(separatedBy: anchor).count == 2,
+            "Qwen35 chunked GDN: the prefetch scan source no longer matches the fresh kernel")
+        let staged = """
+            // Next-chunk K/Q/T'/P, loaded while this chunk's products run.
+            // Each thread owns exactly two K/Q float4s and at most one T'/P
+            // float4 when KQ4 == 2*NT and 2*TP4 <= NT. The stores below use
+            // the same addresses and the same values as the device stage.
+            float4 pk0 = float4(0), pk1 = float4(0), pq0 = float4(0), pq1 = float4(0), ptp = float4(0);
+            int prow0 = 0, pc40 = 0, prow1 = 0, pc41 = 0;
+            int pwhich = 0, pf = 0, ptp_row = 0, ptp_c4 = 0;
+            bool have_pref = false;
+            bool have_tp = false;
+            for (int n = 0; n < NC; ++n) {
+              const int t0 = n * C;
+              const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              device float* y_ = y + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;
+              const device float* gf_ = gf + ((size_t)bh * NC + n) * 2 * C;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (!have_pref) {
+                for (int e = tid; e < KQ4; e += NT) {
+                  const int row = e / (Dk / 4);
+                  const int c4 = (e % (Dk / 4)) * 4;
+                  const size_t src = (size_t)(t0 + row) * ks + c4;
+                  *(threadgroup float4*)(Ksh + row * LK + c4) = *(const device float4*)(kbase + src);
+                  *(threadgroup float4*)(Qsh + row * LK + c4) = *(const device float4*)(qbase + src);
+                }
+                for (int e = tid; e < 2 * TP4; e += NT) {
+                  const int which = e / TP4;
+                  const int f = e % TP4;
+                  const int row = f / (C / 4);
+                  const int c4 = (f % (C / 4)) * 4;
+                  const device float* src = (which == 0 ? tbase : pbase) + (size_t)n * C * C;
+                  *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = *(const device float4*)(src + f * 4);
+                }
+              } else {
+                *(threadgroup float4*)(Ksh + prow0 * LK + pc40) = pk0;
+                *(threadgroup float4*)(Qsh + prow0 * LK + pc40) = pq0;
+                *(threadgroup float4*)(Ksh + prow1 * LK + pc41) = pk1;
+                *(threadgroup float4*)(Qsh + prow1 * LK + pc41) = pq1;
+                if (have_tp) {
+                  *(threadgroup float4*)(TPsh + pwhich * C * LC + ptp_row * LC + ptp_c4) = ptp;
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              // Issue the next chunk's device loads before this chunk's math.
+              // They are consumed only after the next barrier, which is after
+              // the last read of this chunk's staged tile.
+              if (n + 1 < NC && KQ4 == 2 * NT && 2 * TP4 <= NT) {
+                const int t1 = (n + 1) * C;
+                {
+                  const int e = tid;
+                  const int row = e / (Dk / 4);
+                  const int c4 = (e % (Dk / 4)) * 4;
+                  const size_t src = (size_t)(t1 + row) * ks + c4;
+                  pk0 = *(const device float4*)(kbase + src);
+                  pq0 = *(const device float4*)(qbase + src);
+                  prow0 = row;
+                  pc40 = c4;
+                }
+                {
+                  const int e = tid + NT;
+                  const int row = e / (Dk / 4);
+                  const int c4 = (e % (Dk / 4)) * 4;
+                  const size_t src = (size_t)(t1 + row) * ks + c4;
+                  pk1 = *(const device float4*)(kbase + src);
+                  pq1 = *(const device float4*)(qbase + src);
+                  prow1 = row;
+                  pc41 = c4;
+                }
+                have_tp = tid < 2 * TP4;
+                if (have_tp) {
+                  const int e = tid;
+                  pwhich = e / TP4;
+                  pf = e % TP4;
+                  ptp_row = pf / (C / 4);
+                  ptp_c4 = (pf % (C / 4)) * 4;
+                  const device float* src = (pwhich == 0 ? tbase : pbase) + (size_t)(n + 1) * C * C;
+                  ptp = *(const device float4*)(src + pf * 4);
+                }
+                have_pref = true;
+              } else {
+                have_pref = false;
+              }
+
+        """
+        return scanFreshSource.replacingOccurrences(of: anchor, with: staged)
+    }()
+
+    private static let scanFreshPrefetchKernel = MLXFast.metalKernel(
+        name: "bonsai_gated_delta_chunk_scan_fresh_pf",
+        inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+        outputNames: ["y", "state_out"],
+        source: scanFreshPrefetchSource)
+
     /// `run` from an all-zero FP32 state of `stateShape`, which is not passed,
     /// for a window of whole chunks (a remainder's sequential tail reads the
     /// state array, so such a window stays on `run`); nil when this does not
@@ -2210,7 +2346,9 @@ enum Qwen35GatedDeltaChunked {
             threadGroup: (32, 1, 1),
             outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
             outputDTypes: [.float32, .float32, .float32])
-        let outputs = scanFreshKernel(
+        let kernel = prefetchAdopted(hk: Hk, dk: Dk, hv: Hv, dv: Dv)
+            ? scanFreshPrefetchKernel : scanFreshKernel
+        let outputs = kernel(
             [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
@@ -2283,6 +2421,166 @@ enum Qwen35GatedDeltaChunked {
         }
         return true
     }
+
+    /// Prompt-width fresh scan that stages the next chunk's K, Q, T' and P
+    /// while the current chunk computes. Off unless the load-time check finds
+    /// every FP32 bit equal to the fresh kernel and the scoring GPU finds the
+    /// production 512-row shape faster. A miss keeps the fresh kernel.
+    static let prefetchEnabled: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        let value = (env["BONSAI_GDN_SCAN_PREFETCH"] ?? env["DARKBLOOM_GDN_SCAN_PREFETCH"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// C=8, Dk=128, four simdgroups: each of the 128 threads owns exactly two
+    /// K/Q float4s and at most one T'/P float4. Other geometries keep the
+    /// fresh kernel (the prefetch stores are specialized to that ownership).
+    static func prefetchGeometry(dk: Int) -> Bool {
+        let ns = scanSimdgroups
+        let nt = 32 * ns
+        let kq4 = chunk * (dk / 4)
+        let tp4 = chunk * (chunk / 4)
+        return chunk == 8 && dk == 128 && ns == 4 && kq4 == 2 * nt && 2 * tp4 <= nt
+    }
+
+    private static let prefetchLock = NSLock()
+    nonisolated(unsafe) private static var prefetchVerdicts: [[Int]: Bool] = [:]
+
+    private static func prefetchAdopted(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        guard prefetchEnabled, prefetchGeometry(dk: dk) else { return false }
+        return prefetchLock.withLock { prefetchVerdicts[[hk, dk, hv, dv, chunk]] ?? false }
+    }
+
+    /// Bit-identical to the fresh scan, and faster on this device's 512-row
+    /// prompt shape, or the fresh kernel stays. Once per geometry, at load.
+    static func preparePrefetch(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard enabled, freshEnabled, prefetchEnabled, prefetchGeometry(dk: dk),
+            hk > 0, dv % 8 == 0, hv % hk == 0,
+            freshVerified(hk: hk, dk: dk, hv: hv, dv: dv)
+        else { return }
+        let key = [hk, dk, hv, dv, chunk]
+        if prefetchLock.withLock({ prefetchVerdicts[key] != nil }) { return }
+        let verdict = prefetchSelfCheck(hk: hk, dk: dk, hv: hv, dv: dv)
+        let recorded = prefetchLock.withLock { () -> Bool in
+            guard prefetchVerdicts[key] == nil else { return false }
+            prefetchVerdicts[key] = verdict
+            return true
+        }
+        if recorded {
+            let line = verdict
+                ? "qwen35 gdn scan prefetch: adopted (bitwise match, faster on the 512-row prompt shape)\n"
+                : "qwen35 gdn scan prefetch: kept the fresh kernel\n"
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
+    }
+
+    private static func prefetchChunks(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int]
+    ) -> (MLXArray, MLXArray) {
+        let B = k.dim(0)
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let C = chunk
+        let NC = T / C
+        let rowCount = MLXArray(Int32(T))
+        let prepared = prepKernel(
+            [q, k, g, beta, rowCount],
+            template: [("C", C), ("Dk", Dk), ("Hk", Hk), ("Hv", Hv)],
+            grid: (32, NC, B * Hk),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
+            outputDTypes: [.float32, .float32, .float32])
+        let outputs = scanFreshPrefetchKernel(
+            [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
+            template: [
+                ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("NS", scanSimdgroups),
+            ],
+            grid: (32, Dv / 8, B * Hv),
+            threadGroup: (32, scanSimdgroups, 1),
+            outputShapes: [[B, T, Hv, Dv], stateShape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    private static func prefetchSelfCheck(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7066_7363), into: 8)
+        func spread(_ shape: [Int], _ i: Int) -> MLXArray {
+            MLXRandom.normal(shape, key: keys[i]) * exp(MLXRandom.normal(shape, key: keys[i + 3]))
+        }
+        // Bits at the short window and at the scored 512-row prompt, including
+        // the prep's zero and subnormal gate rows.
+        for T in [minRows, 512] where T % chunk == 0 {
+            let q = spread([1, T, hk, dk], 0) * 0.1
+            let k = spread([1, T, hk, dk], 1) * 0.1
+            let v = spread([1, T, hv, dv], 2)
+            let rowIndex = MLXArray.arange(T).reshaped(1, T, 1)
+            let g0 = MLXRandom.uniform(0.5 ..< 1.0, [1, T, hv], key: keys[6])
+            let g = which(
+                (rowIndex .>= 8) .&& (rowIndex .< 16), Float(0),
+                which((rowIndex .>= 16) .&& (rowIndex .< 24), Float(1e-39), g0))
+            let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[7])
+            let stateShape = [1, hv, dv, dk]
+            let (yRef, sRef) = freshChunks(
+                q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+            let (yNew, sNew) = prefetchChunks(
+                q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+            let same = all(yRef.view(dtype: .uint32) .== yNew.view(dtype: .uint32))
+                .&& all(sRef.view(dtype: .uint32) .== sNew.view(dtype: .uint32))
+            eval(same)
+            if !same.item(Bool.self) { return false }
+        }
+        // Speed: the production shape, chained calls, alternating so a thermal
+        // drift hits both. Adopt only on a clear win. The fresh kernel stays
+        // otherwise, including when the two are tied inside the noise.
+        let q = spread([1, 512, hk, dk], 0) * 0.1
+        let k = spread([1, 512, hk, dk], 1) * 0.1
+        let v = spread([1, 512, hv, dv], 2)
+        let g = MLXRandom.uniform(0.5 ..< 1.0, [1, 512, hv], key: keys[6])
+        let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, 512, hv], key: keys[7])
+        let stateShape = [1, hv, dv, dk]
+        func batch(_ prefetch: Bool, _ iters: Int) {
+            for _ in 0 ..< iters {
+                let pair = prefetch
+                    ? prefetchChunks(q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+                    : freshChunks(q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape)
+                eval(pair.0, pair.1)
+            }
+        }
+        // Warm both kernels (compile + caches), then time batches large enough
+        // that the GPU work is not hidden by graph construction. Adopt unless
+        // the prefetch is clearly slower: a tie keeps the measured M5 form,
+        // a loss keeps the fresh kernel.
+        batch(false, 6)
+        batch(true, 6)
+        var freshTimes: [Double] = []
+        var prefTimes: [Double] = []
+        for _ in 0 ..< 5 {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            batch(false, 24)
+            freshTimes.append(CFAbsoluteTimeGetCurrent() - t0)
+            let t1 = CFAbsoluteTimeGetCurrent()
+            batch(true, 24)
+            prefTimes.append(CFAbsoluteTimeGetCurrent() - t1)
+        }
+        freshTimes.sort()
+        prefTimes.sort()
+        let freshMed = freshTimes[2]
+        let prefMed = prefTimes[2]
+        let adopt = prefMed <= freshMed * 1.005
+        let decision = adopt ? "adopt" : "keep fresh"
+        let line = String(
+            format: "qwen35 gdn scan prefetch trial: fresh %.3f ms, prefetch %.3f ms, ",
+            freshMed * 1e3, prefMed * 1e3) + decision + "\n"
+        FileHandle.standardError.write(line.data(using: .utf8)!)
+        return adopt
+    }
+
+
 }
 
 /// Wide-window (prefill) variant of the unmasked gated-delta kernel.
@@ -2714,6 +3012,8 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GatedDeltaChunked.prepareFresh(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35GatedDeltaChunked.preparePrefetch(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
 
