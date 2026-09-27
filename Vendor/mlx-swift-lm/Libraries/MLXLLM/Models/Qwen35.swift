@@ -312,25 +312,18 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        // A first boundary after layer 2 as well: in a round whose ids came
+        // from the prompt no drafter block is queued ahead of the verify, so
+        // the GPU waits for the host's first submission; after two layers it
+        // starts ~0.4 ms sooner (M4: readback to first submission 0.85 to
+        // 0.48 ms). `MLXFAST_VERIFY_FIRST_SLICE=0` keeps [8, 24].
+        let first = env["MLXFAST_VERIFY_FIRST_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let early = ["0", "false", "no", "off"].contains(first ?? "") ? [] : [2]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? early + [8] : early + [8, 24]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
-    }()
-
-    /// The verify plan when nothing is queued ahead of the verify on the GPU
-    /// (`CBv2VerifyQueueHint`: a prompt-lookup round, whose drafter only
-    /// absorbed its context rows). The default plan's first boundary after 8
-    /// layers is sized to hide behind a drafter block; with none, the GPU
-    /// would wait for the host's ~0.8 ms on those 8 layers, so it starts after
-    /// the first 2. `DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES` sets another plan
-    /// (same syntax); `0` keeps the default one.
-    static let verifyUnqueued: Plan = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
-        let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
-        let plan = Plan.parse(raw, default: fallback)
-        return plan.isOff ? verify : plan
     }()
 
     static let prompt: Plan = Plan.parse(
@@ -367,7 +360,7 @@ enum Qwen35TrunkSubmission {
     ) -> Plan? {
         let plan: Plan
         if captureRecurrentWindow {
-            plan = CBv2VerifyQueueHint.takeNothingAhead() ? verifyUnqueued : verify
+            plan = verify
         } else if rows >= promptMinimumRows {
             plan = prompt
         } else {
@@ -2887,6 +2880,9 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
+        Qwen35PreworkSplit.prepare(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
+            hidden: hiddenSize)
         Qwen35SplitKFold.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
@@ -6059,7 +6055,7 @@ enum Qwen35GDNPrework {
         return text
     }()
 
-    private static let freshStridedKernel = MLXFast.metalKernel(
+    static let freshStridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
@@ -6100,6 +6096,14 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        if strided,
+            let split = freshSplit(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
+                normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim)
+        {
+            return split
+        }
         if strided, B == 1, S % rowTile == 0,
             rowTileVerified(
                 keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,

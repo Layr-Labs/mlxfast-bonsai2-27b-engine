@@ -2159,6 +2159,148 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8q_sum", inputNames: ["part", "ksz"],
         outputNames: ["out"], source: sourceNarrowXTGSum, ensureRowContiguous: true)
 
+    // Zoo 4 (`NarrowVariant.derived`): the zoo body's text (and the R-pair
+    // body's, `pair`) with one or both of two changes that leave the zoo's
+    // rule (a)-(c) as written, so every body is bitwise that of
+    // `sourceNarrowInt8` (self-tested at load against `original`):
+    // - I4: the staged right operand as `int4b_format` nibbles (`int8 x
+    //   int4b -> int32` is in the tensor op's type table; the codes 0..3 are
+    //   exact signed nibbles) in the int8 staging's permuted K order (position
+    //   p of a 16-block holds code 4 (p % 4) + p / 4 of the word): half the
+    //   threadgroup bytes staged and read per group (2 KB per simdgroup and 32
+    //   columns at K 128). A is read from device memory (AM = 0).
+    // - CS: each quarter's activation constants (the rows' scales and scaled
+    //   sums) staged in threadgroup memory 8 groups at a time, 4 lines a load
+    //   (the next 8 groups' loaded into registers 8 groups ahead), instead of
+    //   four loads over 16 rows per group and lane; a group then reads its
+    //   four values as one float4 (the R-pair body: its owners only). The same
+    //   FP32 values reach the same FMAs.
+    // Nil when an anchor moved (the variants on it are then not offered).
+    static func narrowDerivedSource(_ text: String, i4: Bool, cs: Bool, pair: Bool = false) -> String? {
+        var edits: [(String, String)] = []
+        if i4 {
+            let sws = pair
+                ? "constexpr int SWS = 32 * KH / 4;      // staging words per simdgroup"
+                : "constexpr int SWS = NH * 32 * KH / 4; // staging words per simdgroup"
+            let putw = pair
+                ? "auto putw = [&](thread const uint32_t (&v)[8], int p) {"
+                : "// stages K step p of v (words p * KW .. p * KW + KW - 1): one uint4 store per word"
+            let dst = pair
+                ? "threadgroup uint32_t* dst = sb + int(lane) * (KH / 4);"
+                : "threadgroup uint32_t* dst = sb + h * (32 * KH / 4) + int(lane) * (KH / 4);"
+            edits += [
+                (sws, sws.replacingOccurrences(of: "KH / 4;", with: "KH / 8;")
+                    + (pair ? "" : " (I4: nibbles)\n        static_assert(AM == 0, \"the int4 staging reads A from device memory\");")),
+                ("tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)sb, ",
+                 "tensor<threadgroup int4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)sb, "),
+                (putw,
+                 """
+                 // I4: a word's 16 codes as the nibbles of two words in the int8
+                         // staging's order: v holds (code 4 b, code 4 b + 1) in byte b's nibbles;
+                         // two delta swaps order them (4 b first, then 4 b + 1, b = 0..3).
+                         auto i4n = [](uint32_t v) -> uint32_t {
+                           uint32_t t = (v ^ (v >> 4)) & 0x00F000F0u; v ^= t ^ (t << 4);
+                           t = (v ^ (v >> 8)) & 0x0000FF00u; v ^= t ^ (t << 8);
+                           return v;
+                         };
+
+                 """ + "        " + putw.replacingOccurrences(of: "one uint4 store", with: "one uint2 store")),
+                (dst, dst.replacingOccurrences(of: "KH / 4)", with: "KH / 8)")),
+                ("*(threadgroup uint4*)(dst + 4 * jj) = uint4(", "*(threadgroup uint2*)(dst + 2 * jj) = uint2("),
+                ("wv & 0x03030303u, (wv >> 2) & 0x03030303u,",
+                 "i4n((wv & 0x03030303u) | ((wv << 2) & 0x30303030u)),"),
+                ("(wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);",
+                 "i4n(((wv >> 4) & 0x03030303u) | ((wv >> 2) & 0x30303030u)));"),
+            ]
+            if !pair {
+                edits.append(
+                    ("tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)(sb + (NH - 1) * (32 * KH / 4)), ",
+                     "tensor<threadgroup int4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)(sb + (NH - 1) * (32 * KH / 8)), "))
+            }
+        }
+        if cs {
+            let anchor = pair
+                ? "// The owner's constants ring: step t's R groups in slot t % CDD, loaded CDD - 1"
+                : "// epilogue constants of one group, kept in their stored types until use"
+            let (c01, c23, get) = pair
+                ? ("cr[s][e][0] = ascale[(size_t)fm * Kg + g]; cr[s][e][1] = ascale[(size_t)(fm + 8) * Kg + g];",
+                   "cr[s][e][2] = rowsum[(size_t)fm * Kg + g]; cr[s][e][3] = rowsum[(size_t)(fm + 8) * Kg + g];",
+                   "csget(g, cr[s][e]);")
+                : ("c[0] = ascale[(size_t)fm * Kg + g]; c[1] = ascale[(size_t)(fm + 8) * Kg + g];",
+                   "c[2] = rowsum[(size_t)fm * Kg + g]; c[3] = rowsum[(size_t)(fm + 8) * Kg + g];",
+                   "csget(g, c);")
+            edits += [
+                (anchor,
+                 """
+                 // CS: this quarter's activation constants in threadgroup memory, 8
+                         // groups at a time: (array a, row r, group j of the chunk) at float
+                         // (8 j + r % 8) * 4 + 2 a + r / 8 of this quarter's slot, so group j's
+                         // four values of row fm (the scale and scaled sum of rows fm, fm + 8) are
+                         // one float4. Load k of a chunk: rows 4 (k % 4) + lane / 8 of array k / 4
+                         // (ascale, rowsum) at group gc + lane % 8, 4 lines a load.
+                         threadgroup float4 csb[4][8][8];
+                         threadgroup float* csf = (threadgroup float*)&csb[CSQ][0][0];
+                         float cspre[8];
+                         auto csload = [&](int gc) {
+                           #pragma clang loop unroll(full)
+                           for (int k = 0; k < 8; k++) {
+                             const int r = 4 * (k & 3) + int(lane >> 3);
+                             const int g = gc + int(lane & 7);
+                             const device float* src = k < 4 ? ascale : rowsum;
+                             cspre[k] = g < g1 ? src[(size_t)r * Kg + g] : 0.0f;
+                           }
+                         };
+                         auto csput = [&]() {
+                           #pragma clang loop unroll(full)
+                           for (int k = 0; k < 8; k++) {
+                             const int r = 4 * (k & 3) + int(lane >> 3);
+                             csf[(int(lane & 7) * 8 + (r & 7)) * 4 + 2 * (k >> 2) + (r >> 3)] = cspre[k];
+                           }
+                         };
+                         // group g's four constants (called for g0 .. g1 - 1 in order, once each):
+                         // at a chunk's first group the chunk is stored and the next one loaded
+                         auto csget = [&](int g, thread float (&c)[4]) {
+                           const int j = (g - g0) & 7;
+                           if (j == 0) {
+                             if (g == g0) { csload(g0); }
+                             simdgroup_barrier(mem_flags::mem_threadgroup);
+                             csput();
+                             simdgroup_barrier(mem_flags::mem_threadgroup);
+                             if (g + 8 < g1) { csload(g + 8); }
+                           }
+                           const float4 cv = csb[CSQ][j][fm];
+                           c[0] = cv.x; c[1] = cv.y; c[2] = cv.z; c[3] = cv.w;
+                         };
+
+                 """.replacingOccurrences(of: "CSQ", with: pair ? "qd" : "sg") + "        " + anchor),
+                (c01, get),
+                (c23, ""),
+            ]
+        }
+        var t = text
+        for (from, to) in edits {
+            guard t.components(separatedBy: from).count == 2 else { return nil }
+            t = t.replacingOccurrences(of: from, with: to)
+        }
+        return t
+    }
+
+    /// Zoo 4's bodies (`NarrowVariant.derived`): from the zoo text CS, I4 and
+    /// I4 + CS, from the R-pair text CS and I4.
+    private static let kernelNarrowDerived: [MLXFast.MLXFastKernel?] = [
+        (false, true, false), (true, false, false), (true, true, false), (false, true, true), (true, false, true),
+    ].map { form in
+        narrowDerivedSource(
+            form.2 ? sourceNarrowInt8PairR : sourceNarrowInt8Zoo, i4: form.0, cs: form.1, pair: form.2
+        ).map {
+            MLXFast.metalKernel(
+                name: "bonsai_tensor_packed_matmul_m16_i8" + (form.2 ? "r_" : "z_") + (form.0 ? "i4" : "")
+                    + (form.1 ? "cs" : ""),
+                inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+                outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+        }
+    }
+
     private static let kernelNarrowInt8Pipelined = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8p",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -2736,15 +2878,29 @@ enum Qwen35TensorPackedMatmul {
         case x4p2k32pd2 = 44
         case x4p4k16pd1 = 45
         case x2p2k32pd2 = 46
+        // Zoo 4 (`narrowDerivedSource`, N = 5120 sets): on the zoo body `cs`
+        // the activation constants staged (KH 32), `csa` the same at KH 128 with
+        // A one group ahead, `i4` the int4 right operand (KH 128), `i4cs` both;
+        // on the R-pair body (4 simdgroups a quarter) `csp` (KH 16, two
+        // exchange slots: 28 KB of threadgroup memory with the constants) and
+        // `i4p` (KH 32: the int4 operand takes K steps of 32).
+        case csk32pd2 = 50
+        case csa128pd2 = 51
+        case i4k128pd2 = 52
+        case i4csk128pd2 = 53
+        case csp4k16x2 = 54
+        case i4p4k32pd1 = 55
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
-                .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1:
+                .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
+                .i4p4k32pd1:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
-                .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2:
+                .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
+                .i4k128pd2, .i4csk128pd2:
                 return 2
             case .pd3, .k64pd3: return 3
             case .pd4, .k64pd4, .k32pd4, .k16pd4, .x4k16pd4: return 4
@@ -2760,9 +2916,10 @@ enum Qwen35TensorPackedMatmul {
         var kh: Int {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
-            case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1:
+            case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
+                .csk32pd2, .i4p4k32pd1:
                 return 32
-            case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return 16
+            case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
             }
         }
@@ -2774,6 +2931,12 @@ enum Qwen35TensorPackedMatmul {
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
             case .g2k32pd1: return "dual"
+            case .csk32pd2: return "cs"
+            case .csa128pd2: return "csa"
+            case .i4k128pd2: return "i4"
+            case .i4csk128pd2: return "i4cs"
+            case .csp4k16x2: return "csp"
+            case .i4p4k32pd1: return "i4p"
             default: return xtg.map { $0.body == 2 ? "xtgp" : "xtg" }
             }
         }
@@ -2793,14 +2956,26 @@ enum Qwen35TensorPackedMatmul {
             default: return nil
             }
         }
-        var am: Int { [.a128pd2, .a64pd2, .aw64pd1].contains(self) ? 2 : 0 }
+        var am: Int { [.a128pd2, .a64pd2, .aw64pd1, .csa128pd2].contains(self) ? 2 : 0 }
+        /// Zoo 4: the zoo text's changes (`narrowDerivedSource`) and the body's
+        /// kernel (`kernelNarrowDerived`); nil for every other body.
+        var derived: (i4: Bool, cs: Bool, index: Int)? {
+            switch self {
+            case .csk32pd2, .csa128pd2: return (false, true, 0)
+            case .i4k128pd2: return (true, false, 1)
+            case .i4csk128pd2: return (true, true, 2)
+            case .csp4k16x2: return (false, true, 3)
+            case .i4p4k32pd1: return (true, false, 4)
+            default: return nil
+            }
+        }
 
         /// Zoo 2 bodies: `sourceNarrowInt8PairR` (true) or `sourceNarrowInt8Zoo2`
         /// (false); nil for every other body.
         var zoo2Pair: Bool? {
             switch self {
             case .k16pd2, .k16pd4, .w128k32pd1, .g2k32pd1: return false
-            case .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return true
+            case .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2, .i4p4k32pd1: return true
             default: return nil
             }
         }
@@ -2818,6 +2993,8 @@ enum Qwen35TensorPackedMatmul {
             case .g2k32pd1: return [("PD", 1), ("TN", 32), ("KH", 32), ("CD", 1), ("GS", 2), ("RC", 0)]
             case .pk16pd2: return [("PD", 2), ("KH", 16), ("R", 2), ("XS", 0), ("CD", 0)]
             case .p4k16pd1: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 0), ("CD", 1)]
+            case .csp4k16x2: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 2), ("CD", 1)]
+            case .i4p4k32pd1: return [("PD", 1), ("KH", 32), ("R", 4), ("XS", 0), ("CD", 1)]
             case .p4k16x1: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 1), ("CD", 1)]
             case .p5k16pd1: return [("PD", 1), ("KH", 16), ("R", 5), ("XS", 2), ("CD", 1)]
             default: return []
@@ -2828,7 +3005,7 @@ enum Qwen35TensorPackedMatmul {
         var threads: Int {
             switch self {
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2: return 256
-            case .p4k16pd1, .p4k16x1: return 512
+            case .p4k16pd1, .p4k16x1, .csp4k16x2, .i4p4k32pd1: return 512
             case .p5k16pd1: return 640
             default: return 128
             }
@@ -2838,7 +3015,7 @@ enum Qwen35TensorPackedMatmul {
         var zooClasses: Set<Int> {
             switch self {
             case .k16pd4, .g2k32pd1, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p2k32pd2, .x4p4k16pd1,
-                .x2p2k32pd2:
+                .x2p2k32pd2, .csk32pd2, .csa128pd2, .i4k128pd2, .i4csk128pd2, .csp4k16x2, .i4p4k32pd1:
                 return [1]
             default: return [1, 2]
             }
@@ -3627,7 +3804,8 @@ enum Qwen35TensorPackedMatmul {
             if let pairR = v.zoo2Pair {
                 let t = zooTemplate + v.zoo2Template.map { ($0.0, $0.1 as any KernelTemplateArg) }
                 if pairR {
-                    return kernelNarrowInt8PairR(
+                    let pairKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8PairR
+                    return pairKernel(
                         inputs, template: t, grid: (n / 32 * v.threads, 1, 1),
                         threadGroup: (v.threads, 1, 1),
                         outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
@@ -3642,7 +3820,10 @@ enum Qwen35TensorPackedMatmul {
                     grid: (n / 32 * 256, 1, 1), threadGroup: (256, 1, 1),
                     outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
             }
-            return kernelNarrowInt8Zoo(
+            // Zoo 4: the derived text's kernel (its variants are offered only
+            // where it built, `narrowDerivedVariants`), same templates and grid.
+            let zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            return zooKernel(
                 inputs, template: zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)],
                 grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
@@ -3773,6 +3954,25 @@ enum Qwen35TensorPackedMatmul {
             .filter { kernelNarrowXTG[$0.xtg!.body] != nil }
     }()
     static let narrowXTGShapes = Set((narrowTunedShapes + [narrowZooShapes[0]]).map { [$0.0, $0.1] })
+
+    /// Zoo 4's bodies (`NarrowVariant.derived`), self-tested after zoo 3a's
+    /// with 4 s of their own, one body per family (`cs`, `csa`, `i4`, `i4cs`,
+    /// `csp`, `i4p`: N = 5120 sets). `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_CS=0`
+    /// drops the bodies with the staged constants, `..._TZOO_I4=0` those with
+    /// the int4 operand.
+    static let narrowDerivedVariants: [NarrowVariant] = {
+        func on(_ name: String) -> Bool {
+            let value = ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }
+        let cs = on("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_CS")
+        let i4 = on("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_I4")
+        return [NarrowVariant.i4k128pd2, .csa128pd2, .csk32pd2, .i4csk128pd2, .csp4k16x2, .i4p4k32pd1].filter {
+            guard let d = $0.derived, kernelNarrowDerived[d.index] != nil else { return false }
+            return (cs || !d.cs) && (i4 || !d.i4)
+        }
+    }()
 
     /// Chooses the verify int8 kernels once, at load, on the running GPU.
     ///
@@ -3959,7 +4159,8 @@ enum Qwen35TensorPackedMatmul {
                 }
                 if narrowZoo, let name = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE"),
                     let variant = NarrowVariant(name: name), variant.family != nil,
-                    variant.xtg == nil || narrowXTGVariants.contains(variant)
+                    variant.xtg == nil || narrowXTGVariants.contains(variant),
+                    variant.derived == nil || narrowDerivedVariants.contains(variant)
                 {
                     let forced = NarrowKernel(variant: variant, form: zooForm)
                     if zooExact(forced, .float16), zooExact(forced, .float32) {
@@ -3984,7 +4185,8 @@ enum Qwen35TensorPackedMatmul {
                         let part = entry.split(separator: "=").map { $0.trimmingCharacters(in: .whitespaces) }
                         guard part.count == 2, let index = names.firstIndex(of: part[0]),
                             let variant = NarrowVariant(name: part[1]), variant.family != nil,
-                            variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5)
+                            variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5),
+                            variant.derived == nil || narrowDerivedVariants.contains(variant)
                         else { ok = false; break }
                         let kernel = NarrowKernel(variant: variant, form: zooForm)
                         if !exact16.contains(kernel) {
@@ -4085,9 +4287,10 @@ enum Qwen35TensorPackedMatmul {
     /// on the shapes of its classes), then per family the record's pick with
     /// the family's fastest body on each N = 5120 shape (scope 1), and with
     /// the family's fastest body over the wide shapes (launches per round
-    /// times time) on all of them and the head (scope 2; not for pair, dual
-    /// and xtgp, which target the N = 5120 shapes; xtg leaves the head's pick).
-    /// Zoo 3a (`narrowXTGVariants`) has 4 s more. Every zoo body in a scope-2
+    /// times time) on all of them and the head (scope 2; not for pair, dual,
+    /// xtgp and zoo 4's, which target the N = 5120 shapes; xtg leaves the
+    /// head's pick). Zoo 3a (`narrowXTGVariants`) has 4 s more, zoo 4
+    /// (`narrowDerivedVariants`) 4 s more still. Every zoo body in a scope-2
     /// set also passes the FP32 self-test (qkv|z, attention qkv and the head
     /// take FP32 outputs); a body failing it leaves the sets.
     private static func zooSets(
@@ -4096,9 +4299,9 @@ enum Qwen35TensorPackedMatmul {
     ) -> [(NarrowChoice, String, Int)] {
         let start = DispatchTime.now().uptimeNanoseconds
         var passed: [NarrowKernel] = [], failed: [NarrowKernel] = [], skipped: [NarrowKernel] = []
-        for variant in narrowZooVariants + narrowXTGVariants {
+        for variant in narrowZooVariants + narrowXTGVariants + narrowDerivedVariants {
             let kernel = NarrowKernel(variant: variant, form: form)
-            let budget: Double = variant.xtg == nil ? 9000 : 13000
+            let budget: Double = variant.derived != nil ? 17000 : (variant.xtg == nil ? 9000 : 13000)
             if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 > budget {
                 skipped.append(kernel)
             } else if exact(kernel, .float16) {
@@ -4159,7 +4362,7 @@ enum Qwen35TensorPackedMatmul {
         let perRound: [Double] = [48, 64, 64, 16, 64]
         func build(_ usable: [NarrowKernel]) -> [(NarrowChoice, String, Int)] {
             var choices: [(NarrowChoice, String, Int)] = []
-            for family in ["k32", "wide", "acoop", "pair", "dual", "xtg", "xtgp"] {
+            for family in ["k32", "wide", "acoop", "pair", "dual", "xtg", "xtgp", "cs", "csa", "i4", "i4cs", "csp", "i4p"] {
                 let members = usable.filter { $0.variant.family == family }
                 var map = byShape
                 var changed = false
@@ -4937,7 +5140,8 @@ extension Qwen35TensorPackedMatmul {
         ]
         let v = kernel.variant
         let columns = v == .v0 ? 32 : v.tn
-        guard n % columns == 0, v.xtg == nil else { return nil }
+        // zoo 3a and zoo 4 have no fused form (zoo 4 never takes the head)
+        guard n % columns == 0, v.xtg == nil, v.derived == nil else { return nil }
         let shapes = [[m, n / columns, 2], [m, n / columns, 2]]
         let dtypes: [DType] = [.int32, .float32]
         let partial: [MLXArray]

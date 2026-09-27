@@ -277,22 +277,3 @@ enum CBv2PromptLookupDraft {
         return nil
     }
 }
-
-/// Whether the next verify forward has no drafter block queued ahead of it on
-/// the GPU (a round whose ids came from the prompt with the drafter skipped).
-/// The verify's early-submission plan assumes a ~6 ms block ahead to hide the
-/// host's first layers; without it the GPU waits for them, so that verify
-/// submits sooner (`Qwen35TrunkSubmission.verifyUnqueued`). Set and taken on
-/// the engine thread, which builds the verify right after the finalize that
-/// sets it.
-public enum CBv2VerifyQueueHint {
-    nonisolated(unsafe) private static var nothingAhead = false
-
-    public static func markNothingAhead() { nothingAhead = true }
-
-    /// The hint for the verify being built now, cleared as it is read.
-    public static func takeNothingAhead() -> Bool {
-        defer { nothingAhead = false }
-        return nothingAhead
-    }
-}
