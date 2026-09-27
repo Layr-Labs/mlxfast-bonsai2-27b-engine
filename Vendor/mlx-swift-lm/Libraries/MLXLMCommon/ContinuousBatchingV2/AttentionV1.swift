@@ -1070,11 +1070,13 @@ package enum CBv2PromptCausalAttention {
                     : Limits<float>::min;
               }
             }
-            if (simd_group_id == 0) {
+            // Only initialize unused slots. Active SIMD groups write their
+            // own slots below, so these stores are disjoint and need no barrier.
+            const uint groups = uint((axis_size + 127) / 128);
+            if (simd_group_id == 0 && simd_lane_id >= groups) {
               local_max[simd_lane_id] = Limits<float>::min;
               local_normalizer[simd_lane_id] = 0;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Get the max
             float maxval = Limits<float>::finite_min;
@@ -1086,14 +1088,9 @@ package enum CBv2PromptCausalAttention {
               local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-              maxval = simd_max(local_max[simd_lane_id]);
-              if (simd_lane_id == 0) {
-                local_max[0] = maxval;
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
+            // Every SIMD group reduces the same 32 ordered partials. This
+            // preserves the reduction tree and avoids a group-zero broadcast.
+            maxval = simd_max(local_max[simd_lane_id]);
 
             // Compute exp(x_i - maxval) and store the partial sums in local_normalizer
             float normalizer = 0;
@@ -1107,14 +1104,7 @@ package enum CBv2PromptCausalAttention {
               local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-              normalizer = simd_sum(local_normalizer[simd_lane_id]);
-              if (simd_lane_id == 0) {
-                local_normalizer[0] = normalizer;
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
+            normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
 
             // Normalize and write to the output
             device float* o = out + gid * size_t(axis_size) + lid * N_READS;
