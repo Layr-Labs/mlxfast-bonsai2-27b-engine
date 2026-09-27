@@ -139,8 +139,10 @@ enum CBv2PromptLookupDraft {
     ///
     /// Everything is lazy device work beside the drafter's own graph: the
     /// drafter's ids are never read on the host, so the early block still
-    /// overlaps the host's finalize. The candidate table is built from the
-    /// request's own prompt, every round, and is not kept.
+    /// overlaps the host's finalize. The candidate table is the prompt's own
+    /// tokens. `CBv2PromptSpliceReuse` keeps that table, the depth-only index
+    /// arrays, and the scalar int32s; the committed-suffix runs are rebuilt
+    /// because they follow the generated text.
     static func splice(
         _ drafted: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray? {
@@ -167,47 +169,27 @@ enum CBv2PromptLookupDraft {
             runs[c] = Int32(length)
         }
 
-        // The prompt continuation of every alignment, [candidates, depth].
-        var table = [Int32]()
-        table.reserveCapacity(candidates * depth)
-        for c in 0 ..< candidates {
-            for t in 0 ..< depth { table.append(Int32(history[c + 1 + t])) }
-        }
-        // The drafter's block read from position j, [depth, depth], with -1
-        // (never a token) past its end, and the first row's run bonus.
-        var shift = [Int32]()
-        var inside = [Bool]()
-        shift.reserveCapacity(depth * depth)
-        inside.reserveCapacity(depth * depth)
-        for j in 0 ..< depth {
-            for t in 0 ..< depth {
-                shift.append(Int32(min(j + t, depth - 1)))
-                inside.append(j + t < depth)
-            }
-        }
-        var firstRow = [Int32](repeating: 0, count: depth)
-        firstRow[0] = 1
-
+        let geom = CBv2PromptSpliceReuse.geometry(depth: depth)
+        let scalars = CBv2PromptSpliceReuse.scalars(minimum: minimum)
+        let kept = CBv2PromptSpliceReuse.table(
+            history: history, prompt: prompt, depth: depth, candidates: candidates)
         let block = drafted.reshaped([depth]).asType(.int32)
-        let continuation = MLXArray(table, [1, candidates, depth])
         let shifted = which(
-            MLXArray(inside, [depth, 1, depth]),
-            take(block, MLXArray(shift, [depth, 1, depth]), axis: 0),
-            MLXArray(Int32(-1)))
+            geom.inside,
+            take(block, geom.shift, axis: 0),
+            scalars.negOne)
         // Leading agreement of each (j, c): [depth, candidates].
-        let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
+        let agree = cumprod((shifted .== kept.continuation).asType(.int32), axis: 2).sum(axis: 2)
         let score =
-            agree + MLXArray(firstRow, [depth, 1]) * MLXArray(runs, [1, candidates])
-        let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
-        let ranked = which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
+            agree + geom.firstRow * MLXArray(runs, [1, candidates])
+        let eligible = (agree .>= scalars.one) .&& (score .>= scalars.minimum)
+        let ranked = which(eligible, score, scalars.zero).reshaped([depth * candidates])
         let best = argMax(ranked, axis: 0).asType(.int32)
-        let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(minimum))
-        let j = floorDivide(best, MLXArray(Int32(candidates)))
-        let c = best - j * MLXArray(Int32(candidates))
-        let steps = MLXArray((0 ..< depth).map { Int32($0) })
-        let source = maximum(c + MLXArray(Int32(1)) + steps - j, MLXArray(Int32(0)))
-        let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
-        let spliced = which(steps .< j, block, take(promptIDs, source, axis: 0))
+        let fire = take(ranked, best, axis: 0) .>= scalars.minimum
+        let j = floorDivide(best, kept.candidates)
+        let c = best - j * kept.candidates
+        let source = maximum(c + scalars.one + geom.steps - j, scalars.zero)
+        let spliced = which(geom.steps .< j, block, take(kept.promptIDs, source, axis: 0))
         let proposal = which(fire, spliced, block).reshaped([1, depth]).asType(drafted.dtype)
         if spliceTrace {
             eval(best, fire)
@@ -220,6 +202,155 @@ enum CBv2PromptLookupDraft {
         }
         return proposal
     }
+
+
+/// Depth-only indexes, scalar int32s, and the prompt continuation table the
+/// splice reads. Each is the same values the splice used to build every
+/// round. The runs along the committed suffix are not here: they change
+/// when a token is accepted.
+enum CBv2PromptSpliceReuse {
+    private static func flag(_ name: String) -> Bool {
+        let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }
+
+    /// `DARKBLOOM_DFLASH_SPLICE_GEOM=0` rebuilds the depth-only indexes.
+    private static let reuseGeometry = flag("DARKBLOOM_DFLASH_SPLICE_GEOM")
+    /// `DARKBLOOM_DFLASH_SPLICE_SCALARS=0` rebuilds the scalar int32s.
+    private static let reuseScalars = flag("DARKBLOOM_DFLASH_SPLICE_SCALARS")
+    /// `DARKBLOOM_DFLASH_SPLICE_TABLE=0` rebuilds the prompt continuation.
+    private static let reuseTable = flag("DARKBLOOM_DFLASH_SPLICE_TABLE")
+
+    private static let lock = NSLock()
+    private struct Geometry {
+        let depth: Int
+        let shift: MLXArray
+        let inside: MLXArray
+        let firstRow: MLXArray
+        let steps: MLXArray
+    }
+    private struct Scalars {
+        let minimum: Int
+        let negOne: MLXArray
+        let zero: MLXArray
+        let one: MLXArray
+        let minimumArray: MLXArray
+    }
+    private struct Table {
+        let prompt: Int
+        let depth: Int
+        let candidates: Int
+        let tokens: [Int]
+        let continuation: MLXArray
+        let promptIDs: MLXArray
+        let candidatesArray: MLXArray
+    }
+    nonisolated(unsafe) private static var geometryCache: Geometry?
+    nonisolated(unsafe) private static var scalarCache: Scalars?
+    nonisolated(unsafe) private static var tableCache: Table?
+
+    struct Indexes {
+        let shift: MLXArray
+        let inside: MLXArray
+        let firstRow: MLXArray
+        let steps: MLXArray
+    }
+
+    struct Constants {
+        let negOne: MLXArray
+        let zero: MLXArray
+        let one: MLXArray
+        let minimum: MLXArray
+    }
+
+    struct Kept {
+        let continuation: MLXArray
+        let promptIDs: MLXArray
+        let candidates: MLXArray
+    }
+
+    /// `shift`, `inside`, `firstRow`, and `steps` for this depth.
+    static func geometry(depth: Int) -> Indexes {
+        if reuseGeometry, let hit = lock.withLock({ geometryCache }), hit.depth == depth {
+            return Indexes(shift: hit.shift, inside: hit.inside, firstRow: hit.firstRow, steps: hit.steps)
+        }
+        var shift = [Int32]()
+        var inside = [Bool]()
+        shift.reserveCapacity(depth * depth)
+        inside.reserveCapacity(depth * depth)
+        for j in 0 ..< depth {
+            for t in 0 ..< depth {
+                shift.append(Int32(min(j + t, depth - 1)))
+                inside.append(j + t < depth)
+            }
+        }
+        var firstRow = [Int32](repeating: 0, count: depth)
+        firstRow[0] = 1
+        let made = Geometry(
+            depth: depth,
+            shift: MLXArray(shift, [depth, 1, depth]),
+            inside: MLXArray(inside, [depth, 1, depth]),
+            firstRow: MLXArray(firstRow, [depth, 1]),
+            steps: MLXArray((0 ..< depth).map { Int32($0) }))
+        if reuseGeometry {
+            lock.withLock { geometryCache = made }
+        }
+        return Indexes(
+            shift: made.shift, inside: made.inside, firstRow: made.firstRow, steps: made.steps)
+    }
+
+    /// The int32 scalars `-1`, `0`, `1`, and `minimum`.
+    static func scalars(minimum: Int) -> Constants {
+        if reuseScalars, let hit = lock.withLock({ scalarCache }), hit.minimum == minimum {
+            return Constants(
+                negOne: hit.negOne, zero: hit.zero, one: hit.one, minimum: hit.minimumArray)
+        }
+        let made = Scalars(
+            minimum: minimum,
+            negOne: MLXArray(Int32(-1)),
+            zero: MLXArray(Int32(0)),
+            one: MLXArray(Int32(1)),
+            minimumArray: MLXArray(Int32(minimum)))
+        if reuseScalars {
+            lock.withLock { scalarCache = made }
+        }
+        return Constants(
+            negOne: made.negOne, zero: made.zero, one: made.one, minimum: made.minimumArray)
+    }
+
+    /// The prompt continuation `[1, candidates, depth]`, the prompt ids, and
+    /// the candidate count. A miss rebuilds them from `history[0..<prompt]`.
+    static func table(history: [Int], prompt: Int, depth: Int, candidates: Int) -> Kept {
+        if reuseTable, let hit = lock.withLock({ tableCache }),
+            hit.prompt == prompt, hit.depth == depth, hit.candidates == candidates,
+            hit.tokens.count == prompt, hit.tokens.elementsEqual(history.prefix(prompt))
+        {
+            return Kept(
+                continuation: hit.continuation, promptIDs: hit.promptIDs,
+                candidates: hit.candidatesArray)
+        }
+        var rows = [Int32]()
+        rows.reserveCapacity(candidates * depth)
+        for c in 0 ..< candidates {
+            for t in 0 ..< depth { rows.append(Int32(history[c + 1 + t])) }
+        }
+        let made = Table(
+            prompt: prompt,
+            depth: depth,
+            candidates: candidates,
+            tokens: Array(history.prefix(prompt)),
+            continuation: MLXArray(rows, [1, candidates, depth]),
+            promptIDs: MLXArray(history[0 ..< prompt].map { Int32($0) }),
+            candidatesArray: MLXArray(Int32(candidates)))
+        if reuseTable {
+            lock.withLock { tableCache = made }
+        }
+        return Kept(
+            continuation: made.continuation, promptIDs: made.promptIDs,
+            candidates: made.candidatesArray)
+    }
+}
 
     struct Hit {
         let match: Int
