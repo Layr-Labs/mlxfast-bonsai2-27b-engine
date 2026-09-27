@@ -2,7 +2,46 @@
 //
 // Target-authoritative scoring strategies for one known MTP draft chain.
 
+import Foundation
 import MLX
+
+/// The verify window's token row as two copies (the seed column and the block
+/// proposal, which already holds the draft ids as `[B, k]` in column order)
+/// instead of one copy per column: 16 launches of one element each become
+/// two. The same int32 values in the same order. Checked once, on first use,
+/// bit for bit against the per-column concatenation;
+/// `MLXFAST_VERIFY_TOKEN_STACK=0` concatenates the columns.
+enum CBv2VerifyTokenStack {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_TOKEN_STACK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    private static let verified: Bool = {
+        let seed = MLXArray([Int32(7), Int32(248_319)]).reshaped([2, 1])
+        let block = MLXRandom.randInt(Int32(0) ..< Int32(248_320), [2, 15], key: MLXRandom.key(23))
+            .asType(.int32)
+        let columns = [seed] + (0 ..< 15).map { block[0..., $0].reshaped([2, 1]) }
+        let same = all(concatenated([seed, block], axis: 1) .== concatenated(columns, axis: 1))
+            .item(Bool.self)
+        FileHandle.standardError.write(
+            (same
+                ? "mlxfast verify token stack: self-test passed (2 x 16 ids bitwise); two copies\n"
+                : "mlxfast verify token stack: mismatch; per-column concatenation kept\n")
+                .data(using: .utf8)!)
+        return same
+    }()
+
+    /// `[seed | block]`, or nil (the caller concatenates `columns`).
+    static func tokens(seed: MLXArray, block: MLXArray?, columns: [MLXArray]) -> MLXArray? {
+        guard enabled, let block, block.ndim == 2, seed.ndim == 2, seed.dim(1) == 1,
+            block.dim(0) == seed.dim(0), columns.count == block.dim(1) + 1,
+            block.dtype == seed.dtype, verified
+        else { return nil }
+        return concatenated([seed, block], axis: 1)
+    }
+}
 
 extension EngineLoopV2 {
 
@@ -28,7 +67,8 @@ extension EngineLoopV2 {
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        stackedTokens: MLXArray? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -240,7 +280,7 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularAttention = false
                 }
             }
-            let tokens = concatenated(columns, axis: 1)
+            let tokens = stackedTokens ?? concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
