@@ -818,7 +818,7 @@ private final class DFlash2QKVStack {
         guard rows.ndim == 3, blockRows <= rows.dim(1),
             let weight = stacked(q: q, k: k, v: v)
         else { return nil }
-        let y = matmul(rows, weight.T)
+        let y = DFlash2TensorMatmul.apply(rows, weight: weight) ?? matmul(rows, weight.T)
         let n = rows.dim(1)
         return (
             y[0..., (n - blockRows)..., ..<qEnd],
@@ -829,6 +829,15 @@ private final class DFlash2QKVStack {
 }
 
 /// Kill switch for the one-projection context+block K/V (default on).
+/// The grouped convolutions' `kernel_projection` (5120 -> 1280 on the
+/// 16-row block) through the drafter's tensor kernel instead of MLX's GEMM.
+/// `DARKBLOOM_DFLASH2_TENSOR_KPROJ=0` keeps the GEMM.
+private let dflash2KernelProjectionTensor: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_TENSOR_KPROJ"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let dflash2KVConcatEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
     else { return true }
@@ -950,7 +959,8 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic-tap
     /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let projection = kernelProjection(hidden)
+        let projection = dflash2KernelProjectionTensor
+            ? DFlash2TensorMatmul.linear(kernelProjection, hidden) : kernelProjection(hidden)
         if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
             return (fused, projection)
         }
@@ -1147,6 +1157,84 @@ enum DFlash2TensorMatmul {
         }
         """
 
+    // Two 16-row tiles over the same weight tile: x bfloat [32, K]; every
+    // K step runs the 16 x 32 x 256 op on rows 0-15 and on rows 16-31
+    // against one B slice, so a context-plus-block forward of up to 32 rows
+    // reads the weights once. Same K partitions and reduction as the m16
+    // kernel, per row tile.
+    private static let source32 = """
+        const int K = ksz[0]; const int M = 32; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 256, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> A((device bfloat*)x, dextents<int, 2>(K, M));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> B((device bfloat*)w, dextents<int, 2>(K, N));
+        auto tA0 = A.template slice<256, 16>(0, 0);
+        auto tB0 = B.template slice<256, 32>(0, n0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += 256) {
+          auto tB = B.template slice<256, 32>(k, n0);
+          auto tAlo = A.template slice<256, 16>(k, 0);
+          auto tAhi = A.template slice<256, 16>(k, 16);
+          op.run(tAlo, tB, cT0);
+          op.run(tAhi, tB, cT1);
+        }
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 16; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 16; i++) {
+            float v0, v1;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
+                  + red[2][(16 + i) * 32 + lane];
+            }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v0);
+            out[(size_t)(16 + fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v1);
+          }
+        }
+        """
+
+    private static let kernel32 = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m32",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: source32,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// `DARKBLOOM_DFLASH2_TENSOR_M32=0` keeps MLX's GEMM for 17-32 rows.
+    private static let rows32Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_TENSOR_M32"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let kernel = MLXFast.metalKernel(
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
@@ -1175,8 +1263,25 @@ enum DFlash2TensorMatmul {
         let k = x.dim(-1)
         let rows = x.size / k
         let n = weight.dim(0)
-        guard rows >= 1, rows <= rowsPerTile, weight.dim(1) == k, k % 1024 == 0, n % 32 == 0
+        guard rows >= 1, rows <= 2 * rowsPerTile, weight.dim(1) == k, k % 1024 == 0, n % 32 == 0
         else { return nil }
+        if rows > rowsPerTile {
+            guard rows32Enabled else { return nil }
+            var a = x.reshaped(rows, k)
+            if rows < 2 * rowsPerTile {
+                a = concatenated(
+                    [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
+            }
+            let splits = n >= 16384 ? 2 : 4
+            let threads = splits * 32
+            let y = kernel32(
+                [a, weight, dimsArray(k: k, n: n)],
+                template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
+                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
+            let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
+            return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
+        }
         var a = x.reshaped(rows, k)
         if rows < rowsPerTile {
             a = concatenated(
