@@ -2585,15 +2585,18 @@ enum Qwen35SmallNMatmul {
 
     static let chunk = 128
 
-    // grid (N / 32 * 128, K / KC, 1), threadgroup (128, 1, 1). Thread t:
-    // column nb + (t & 31), rows 4 * (t >> 5) .. + 3 (rows >= M skipped).
+    static let promptRows = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["BONSAI_SPLITK_BA_PROMPT"]?.lowercased() ?? "")
+
+    // grid (N / 32 * 128, K / KC, ceil(M / 16)), threadgroup (128, 1, 1). Thread t:
+    // column nb + (t & 31), rows 16 * z + 4 * (t >> 5) .. + 3 (rows >= M skipped).
     private static let partialSource = """
         const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
         const int nb = int(threadgroup_position_in_grid.x) * 32;
         const int kc = int(threadgroup_position_in_grid.y);
         const uint t = thread_position_in_threadgroup.x;
         const int c = int(t & 31);
-        const int r0 = int(t >> 5) * 4;
+        const int r0 = int(threadgroup_position_in_grid.z) * 16 + int(t >> 5) * 4;
         const int k0 = kc * KC;
         const device float* wr = w + (size_t)(nb + c) * K + k0;
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -2631,18 +2634,21 @@ enum Qwen35SmallNMatmul {
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: true)
 
-    static func apply(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
+    static func apply(_ x: MLXArray, _ w: MLXArray, maxRows: Int? = nil) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
         let rows = x.size / k
-        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else {
-            return nil
-        }
+        // Prompt width (`BONSAI_SPLITK_BA_PROMPT=0` keeps MLX's GEMM there; see
+        // `promptVerdict`): the grid's z axis walks 16-row blocks, one at <= 16.
+        let limit = maxRows ?? (promptRows && promptVerdict ? 1024 : 16)
+        guard rows >= 1, rows <= limit, w.dim(1) == k, n % 32 == 0,
+            k % chunk == 0
+        else { return nil }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
-            grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+            grid: (n / 32 * 128, k / chunk, (rows + 15) / 16), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         let y = reduceKernel(
             [part, dims], template: [("KC", chunk)],

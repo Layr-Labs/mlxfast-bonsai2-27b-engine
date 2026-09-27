@@ -1194,6 +1194,12 @@ package enum CBv2PromptCausalAttention {
                 outputDTypes: [.float32])[0]
             probabilities = softmax(masked, axis: -1, precise: true)
         }
+        if verify,
+            let out = CBv2VerifyValueProduct.apply(
+                probabilities, values: values, queryHeads: H, rows: L)
+        {
+            return out
+        }
         var out = matmul(probabilities, v)
         if repeats > 1 {
             out = out.reshaped([B, H, L, out.dim(-1)])

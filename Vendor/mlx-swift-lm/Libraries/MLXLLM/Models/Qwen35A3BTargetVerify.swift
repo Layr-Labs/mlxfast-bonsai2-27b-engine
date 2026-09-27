@@ -1166,3 +1166,27 @@ extension Qwen35GDNPrework {
         return true
     }
 }
+
+extension Qwen35SmallNMatmul {
+    /// The a|b split-K pair at prompt width (`BONSAI_SPLITK_BA_PROMPT`), checked
+    /// once, at the load-time prompt warm (the first prompt-width call), against
+    /// a CPU FP32 product of the a|b shape at 40 rows: two whole 16-row blocks of
+    /// the grid's z axis and a partial one. An error above 1e-4 of the output
+    /// range keeps MLX's GEMM at prompt width; at most 16 rows never reads this.
+    static let promptVerdict: Bool = {
+        let rows = 40, k = 5120, n = 96
+        let xs = (0 ..< rows * k).map { Float(sin(Double($0) * 0.6113)) }
+        let ws = (0 ..< n * k).map { Float(cos(Double($0) * 0.3719) * 0.02) }
+        let x = MLXArray(xs, [rows, k])
+        let w = MLXArray(ws, [n, k])
+        guard let y = apply(x, w, maxRows: rows) else { return false }
+        let reference = matmul(x, w.T, stream: .cpu)
+        let range = abs(reference, stream: .cpu).max(stream: .cpu).item(Float.self)
+        let error = abs(y - reference, stream: .cpu).max(stream: .cpu).item(Float.self)
+        let passed = error.isFinite && error <= 1e-4 * max(range, 1e-3)
+        FileHandle.standardError.write(
+            ("bonsai split-K a|b at prompt width: max abs error \(error) (output range \(range))"
+                + " against CPU FP32" + (passed ? "; split-K\n" : "; GEMM kept\n")).data(using: .utf8)!)
+        return passed
+    }()
+}

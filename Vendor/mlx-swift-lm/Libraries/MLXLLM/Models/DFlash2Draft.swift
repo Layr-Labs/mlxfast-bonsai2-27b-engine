@@ -950,7 +950,9 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic-tap
     /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let projection = kernelProjection(hidden)
+        let projection =
+            dflash2NarrowTensorEnabled
+            ? DFlash2TensorMatmul.linear(kernelProjection, hidden) : kernelProjection(hidden)
         if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
             return (fused, projection)
         }
@@ -982,6 +984,44 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                 base: baseKernel[1], groupSize: groupSize)
     }
 }
+
+/// The block's narrow BF16 projections (each layer's two tap projections, N =
+/// 1280, and the candidate selector's, N = 256) on `DFlash2TensorMatmul`
+/// instead of the core's GEMM. At 16 rows MLX gives the N = 1280 projection
+/// the NAX split-K GEMM with 128-wide tiles: 10 column tiles x 2 K partitions,
+/// 20 threadgroups that each stream 128 x 2560 weights, half an M5 Max's
+/// cores idle (the shape Subflatus3's split-K a|b kernel replaced in the
+/// target); the selector's gets 8. The tensor kernel gives them N / 32
+/// threadgroups over K quarters. The same FP32-accumulated product in a
+/// different summation order, rounded to BF16; the drafter only proposes.
+/// `DARKBLOOM_DFLASH2_NARROW_TENSOR=0` keeps the core's GEMM. Checked once, at
+/// the load-time drafter warm, on the tap projection's shape against a CPU FP32
+/// product: an error above 1/64 of the output range (BF16 output rounding is
+/// 1/256) keeps the core's GEMM.
+let dflash2NarrowTensorEnabled: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_NARROW_TENSOR"],
+        ["0", "false", "no", "off"].contains(raw.lowercased())
+    {
+        return false
+    }
+    let rows = 16, k = 5120, n = 1280
+    let x = MLXArray((0 ..< rows * k).map { Float(sin(Double($0) * 0.6113)) }, [1, rows, k])
+        .asType(.bfloat16)
+    let w = MLXArray((0 ..< n * k).map { Float(cos(Double($0) * 0.3719) * 0.02) }, [n, k])
+        .asType(.bfloat16)
+    guard let y = DFlash2TensorMatmul.apply(x, weight: w) else { return false }
+    let reference = matmul(
+        x.asType(.float32, stream: .cpu), w.asType(.float32, stream: .cpu).T, stream: .cpu)
+    let range = abs(reference, stream: .cpu).max(stream: .cpu).item(Float.self)
+    let error = abs(y.asType(.float32) - reference, stream: .cpu).max(stream: .cpu)
+        .item(Float.self)
+    let passed = error.isFinite && error <= max(range, 1e-3) / 64
+    FileHandle.standardError.write(
+        ("bonsai drafter narrow projections on the tensor kernel: max abs error \(error)"
+            + " (output range \(range)) against CPU FP32"
+            + (passed ? "; tensor kernel\n" : "; core GEMM kept\n")).data(using: .utf8)!)
+    return passed
+}()
 
 /// Kill switch for the one-launch grouped convolution (default on).
 private let dflash2FusedConvEnabled: Bool = {
@@ -1370,7 +1410,9 @@ final class DFlash2CandidateSelector: Module {
                 0..., 0..., (vocabularySize - topK)...]
             unary = takeAlong(logits, candidates, axis: -1)
         }
-        let projected = hiddenProjection(hidden)
+        let projected =
+            dflash2NarrowTensorEnabled
+            ? DFlash2TensorMatmul.linear(hiddenProjection, hidden) : hiddenProjection(hidden)
 
         if let path = DFlash2GreedyWalk.select(
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
