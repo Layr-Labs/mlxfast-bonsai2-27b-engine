@@ -1937,6 +1937,38 @@ enum DFlash2GreedyWalk {
 
 // MARK: - The drafter
 
+/// Immutable zero rows for the speculative context tail, outside the Module
+/// parameter tree. Prepared once at bind; current context and block values
+/// still enter every forward dynamically. No request-derived arrays are held.
+private final class DFlash2SpeculativeZeroPad {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_ZERO_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private let zeros: MLXArray
+
+    private init(width: Int, dtype: DType) {
+        zeros = MLXArray.zeros([1, 32, width], dtype: dtype)
+    }
+
+    static func prepare(width: Int, dtype: DType) -> DFlash2SpeculativeZeroPad? {
+        guard enabled, width > 0, [.float16, .bfloat16, .float32].contains(dtype)
+        else { return nil }
+        return try? withError { _ in
+            let pad = DFlash2SpeculativeZeroPad(width: width, dtype: dtype)
+            eval(pad.zeros)
+            return pad
+        }
+    }
+
+    func rows(_ count: Int, width: Int, dtype: DType) -> MLXArray? {
+        guard count > 0, count <= zeros.dim(1), width == zeros.dim(2), dtype == zeros.dtype
+        else { return nil }
+        return zeros[0..., ..<count, 0...]
+    }
+}
+
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
     public let config: DFlash2Configuration
 
@@ -1957,6 +1989,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// block shape `[1, blockSize-1, hidden]`. Rebuilding that broadcast every
     /// propose round repeats an identical geometry graph.
     private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
+    private var speculativeZeroPad: DFlash2SpeculativeZeroPad?
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -1999,6 +2032,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             MLXArray([Int32(config.maskTokenId)], [1, 1]))
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
+        speculativeZeroPad = DFlash2SpeculativeZeroPad.prepare(width: config.hiddenSize, dtype: dtype)
     }
 
     /// Builds and self-tests the tiled copies of the weights the block
@@ -2289,8 +2323,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
+        let padding = speculativeZeroPad?.rows(
+            n - contextRows, width: config.hiddenSize, dtype: context.dtype)
+            ?? MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)
         let base = concatenated(
-            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
+            [context, padding],
             axis: 1)
         let c = confirmed.reshaped([]).asType(.int32)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
