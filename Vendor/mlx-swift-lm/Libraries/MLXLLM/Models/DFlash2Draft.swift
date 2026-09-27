@@ -482,22 +482,6 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
     private let qkv = DFlash2QKVStack()
 
-    /// The weights a block forward reads here in place of stored ones (the
-    /// q|k|v stack once built, o_proj as `DFlash2TensorMatmul` reads it), and
-    /// the stored weights they stand in for (`DFlash2ResidencyPrefetch`).
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        var read: [MLXArray] = []
-        var replaced: [MLXArray] = []
-        if let stacked = qkv.residentWeight {
-            read.append(stacked)
-            replaced += [qProj.weight, kProj.weight, vProj.weight]
-        }
-        let o = DFlash2TensorMatmul.readWeight(oProj.weight)
-        read.append(o)
-        if o !== oProj.weight { replaced.append(oProj.weight) }
-        return (read, replaced)
-    }
-
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
@@ -534,8 +518,8 @@ private final class DFlash2Attention: Module {
     ///     or nil when this round brings no new context rows (the cache already
     ///     holds every committed row; see `absorbContext`).
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
-        masks: DFlash2SlidingMaskMemo
+        _ x: MLXArray, context: MLXArray?, joined: MLXArray? = nil, rope: RoPELayer,
+        cache: KVCache, masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -573,22 +557,33 @@ private final class DFlash2Attention: Module {
             // One K and one V projection over [context; block]. The block's
             // positions continue the context's, so one rope at the context's
             // offset rotates every row where the two separate ropes did.
-            let rows = context.map { concatenated([$0, x], axis: 1) } ?? x
+            let rows = joined ?? context.map { DFlash2Concat.concatenate([$0, x], axis: 1) } ?? x
             let n = contextLength + L
             let projectedQ: MLXArray
             let projectedK: MLXArray
             let projectedV: MLXArray
+            var product: MLXArray?
             if let stacked = qkv.apply(rows, blockRows: L, q: qProj, k: kProj, v: vProj) {
-                (projectedQ, projectedK, projectedV) = stacked
+                (projectedQ, projectedK, projectedV, product) = stacked
             } else {
                 (projectedQ, projectedK, projectedV) = (qProj(x), kProj(rows), vProj(rows))
             }
-            queries = rope(
-                qNorm(projectedQ.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
-                offset: blockOffset)
-            let allKeys = rope(
-                kNorm(projectedK.reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
-                offset: cache.offset)
+            let allKeys: MLXArray
+            if let product, let (q, k) = DFlash2QKPrework.apply(
+                product, blockRows: L, heads: heads, qNorm: qNorm, kNorm: kNorm,
+                offsets: [blockOffset, cache.offset])
+            {
+                (queries, allKeys) = (q, k)
+            } else {
+                queries = rope(
+                    DFlash2StridedRMSNorm.apply(qNorm, projectedQ.reshaped(B, L, heads, -1))
+                        .transposed(0, 2, 1, 3),
+                    offset: blockOffset)
+                allKeys = rope(
+                    DFlash2StridedRMSNorm.apply(kNorm, projectedK.reshaped(B, n, kvHeads, -1))
+                        .transposed(0, 2, 1, 3),
+                    offset: cache.offset)
+            }
             let allValues = projectedV.reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
             if let block = cache as? DFlash2BlockKVCache,
                 let held = block.updateBlock(
@@ -660,6 +655,16 @@ private final class DFlash2Attention: Module {
 }
 
 extension DFlash2Attention {
+    /// Whether a block forward prepends `context` unchanged (one projection
+    /// over `[context; block]`, no row skipped), so the caller may hand it
+    /// those rows already joined.
+    func joins(_ context: MLXArray?) -> Bool {
+        guard dflash2KVConcatEnabled, let context else { return false }
+        return slidingWindow.map {
+            DFlash2SlidingMask.contextSkip(contextLength: context.dim(1), slidingWindow: $0) == 0
+        } ?? true
+    }
+
     /// Write the keys and values of `context` (`[B, contextLength, hidden]`,
     /// the projected target hidden state of committed positions) into this
     /// layer's cache, exactly as a block forward over the same context would,
@@ -698,7 +703,8 @@ extension DFlash2Attention {
             qkv.applyContext(context, q: qProj, k: kProj, v: vProj)
             ?? (kProj(context), vProj(context))
         let keys = rope(
-            kNorm(projectedK.reshaped(B, contextLength, kvHeads, -1))
+            DFlash2StridedRMSNorm.apply(
+                kNorm, projectedK.reshaped(B, contextLength, kvHeads, -1))
                 .transposed(0, 2, 1, 3),
             offset: cache.offset)
         let values = projectedV.reshaped(B, contextLength, kvHeads, -1)
@@ -770,9 +776,6 @@ private final class DFlash2QKVStack {
         kEnd = 0
     }
 
-    /// The stacked weight once built (nil before its first use).
-    var residentWeight: MLXArray? { weight }
-
     /// The stacked weight, concatenated on first use, or nil when the stack
     /// does not apply to these projections.
     private func stacked(q: Linear, k: Linear, v: Linear) -> MLXArray? {
@@ -833,11 +836,11 @@ private final class DFlash2QKVStack {
         return (DFlash2TensorMatmul.apply(rows, weight: weight) ?? matmul(rows, weight.T), qEnd, kEnd)
     }
 
-    /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
+    /// `(q(rows[-blockRows...]), k(rows), v(rows), product)` from one matmul, or nil
     /// when the stack does not apply.
     func apply(
         _ rows: MLXArray, blockRows: Int, q: Linear, k: Linear, v: Linear
-    ) -> (MLXArray, MLXArray, MLXArray)? {
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         guard rows.ndim == 3, blockRows <= rows.dim(1),
             let weight = stacked(q: q, k: k, v: v)
         else { return nil }
@@ -846,7 +849,8 @@ private final class DFlash2QKVStack {
         return (
             y[0..., (n - blockRows)..., ..<qEnd],
             y[.ellipsis, qEnd ..< kEnd],
-            y[.ellipsis, kEnd...]
+            y[.ellipsis, kEnd...],
+            y
         )
     }
 }
@@ -948,7 +952,8 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// it, and contraction off. The residual sum is the layer's own
     /// `x + conv`. Bit-identical to the chain it replaces.
     private func fusedConvolve(
-        _ hidden: MLXArray, projection: MLXArray, tap: Int, residual: MLXArray?
+        _ hidden: MLXArray, projection: MLXArray, tap: Int, residual: MLXArray?,
+        context: MLXArray? = nil
     ) -> MLXArray? {
         guard dflash2FusedConvEnabled, hidden.ndim == 3 else { return nil }
         let batch = hidden.dim(0)
@@ -961,11 +966,22 @@ final class DFlash2GroupedDynamicCausalConv: Module {
             projection.shape == [batch, length, 2 * kernelSize * groups],
             projection.dtype == dtype,
             baseKernel.shape == [2, kernelSize, hiddenSize], baseKernel.dtype == dtype,
-            residual.map({ $0.shape == hidden.shape && $0.dtype == dtype }) ?? true
+            residual.map({ $0.shape == hidden.shape && $0.dtype == dtype }) ?? true,
+            context.map({
+                $0.ndim == 3 && $0.dim(0) == batch && $0.dim(2) == hiddenSize && $0.dtype == dtype
+                    && Self.joinVerified(dtype, kernelSize, groupSize, hiddenSize)
+            }) ?? true
         else { return nil }
         let template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("KS", kernelSize), ("GS", groupSize), ("TAP", tap),
         ]
+        if let context {
+            let rows = context.dim(1) + length
+            return dflash2GroupedConvJoinKernel(
+                [hidden, projection, baseKernel, context],
+                template: template, grid: (hiddenSize, rows, batch), threadGroup: (256, 1, 1),
+                outputShapes: [[batch, rows, hiddenSize]], outputDTypes: [dtype])[0]
+        }
         let grid = (hiddenSize, length, batch)
         if let residual {
             return dflash2GroupedConvResidualKernel(
@@ -999,6 +1015,84 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         )
     }
 
+    /// ``prepare(_:)`` with `context`'s rows ahead of the convolved block in
+    /// the SAME launch: `(block, taps, [context; block])`, the rows the
+    /// attention's one-launch concatenation joins from the two, or nil. The
+    /// context rows are copied; the block rows are the tap-0 kernel's.
+    func prepare(_ hidden: MLXArray, joining context: MLXArray) -> (MLXArray, MLXArray, MLXArray)? {
+        // The same projection as `prepare(_:)` (the tensor kernel when
+        // `DARKBLOOM_DFLASH2_TENSOR_KPROJ` is on), so the taps keep its bits.
+        let projection = dflash2KernelProjectionTensor
+            ? DFlash2TensorMatmul.linear(kernelProjection, hidden) : kernelProjection(hidden)
+        guard
+            let joined = fusedConvolve(
+                hidden, projection: projection, tap: 0, residual: nil, context: context)
+        else { return nil }
+        return (joined[0..., context.dim(1)..., 0...], projection, joined)
+    }
+
+    private static let joinLock = NSLock()
+    nonisolated(unsafe) private static var joinVerdicts: [String: Bool] = [:]
+
+    /// The joined launch's self-test (at bind), bit for bit against the
+    /// tap-0 kernel's rows after the context rows by `DFlash2Concat`.
+    /// `MLXFAST_DFLASH_CONV_JOIN=0` keeps the two launches.
+    static func joinVerified(_ dtype: DType, _ ks: Int, _ gs: Int, _ hs: Int) -> Bool {
+        guard dflash2ConvJoinEnabled, dflash2FusedConvEnabled, hs % gs == 0,
+            [DType.bfloat16, .float16].contains(dtype)
+        else { return false }
+        return joinLock.withLock {
+            let key = "\(dtype) \(ks) \(gs) \(hs)"
+            if let verdict = joinVerdicts[key] { return verdict }
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    for (seed, c) in [(61, 1), (62, 7)] {
+                        let l = 16
+                        func draw(_ shape: [Int], _ salt: Int) -> MLXArray {
+                            (MLXRandom.normal(shape, key: MLXRandom.key(UInt64(seed * 8 + salt)))
+                                * exp(MLXRandom.uniform(
+                                    Float(-7) ..< Float(8), [shape[0], shape[1], 1],
+                                    key: MLXRandom.key(UInt64(seed * 8 + salt + 4))))
+                            ).asType(dtype)
+                        }
+                        let h = draw([1, l, hs], 0)
+                        let dyn = draw([1, l, 2 * ks * (hs / gs)], 1)
+                        let base = draw([2, ks, hs], 2)
+                        let context = draw([1, c, hs], 3)
+                        let template: [(String, any KernelTemplateArg)] = [
+                            ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0),
+                        ]
+                        let fused = dflash2GroupedConvJoinKernel(
+                            [h, dyn, base, context], template: template, grid: (hs, c + l, 1),
+                            threadGroup: (256, 1, 1), outputShapes: [[1, c + l, hs]],
+                            outputDTypes: [dtype])[0]
+                        let conv = dflash2GroupedConvKernel(
+                            [h, dyn, base], template: template, grid: (hs, l, 1),
+                            threadGroup: (256, 1, 1), outputShapes: [h.shape],
+                            outputDTypes: [dtype])[0]
+                        let reference = DFlash2Concat.concatenate([context, conv], axis: 1)
+                        same = same && fused.shape == reference.shape
+                            && all(fused.view(dtype: .uint16) .== reference.view(dtype: .uint16))
+                                .item(Bool.self)
+                        compared += reference.size
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            joinVerdicts[key] = same
+            FileHandle.standardError.write(
+                ("dflash2 conv+concat join (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        : "self-test failed; two launches kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+
     /// The second tap, over the sub-layer's output, added to the layer's
     /// residual stream: `residual + conv(hidden)`.
     func finish(_ hidden: MLXArray, projection: MLXArray, residual: MLXArray) -> MLXArray {
@@ -1015,6 +1109,13 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                 base: baseKernel[1], groupSize: groupSize)
     }
 }
+
+/// Kill switch for the tap-0 convolution joined to its context rows (default on).
+private let dflash2ConvJoinEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_JOIN"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// Kill switch for the one-launch grouped convolution (default on).
 private let dflash2FusedConvEnabled: Bool = {
@@ -1076,6 +1177,28 @@ private let dflash2GroupedConvResidualSource = """
     out[i] = res[i] + conv;
     """
 
+/// `[ctx; conv(h)]`: rows below `ctx`'s count are its rows, the rest the
+/// tap's convolution of the block.
+private let dflash2GroupedConvJoinSource = """
+    const uint c = thread_position_in_grid.x;
+    const uint r = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint H = threads_per_grid.x;
+    const uint R = threads_per_grid.y;
+    const uint C = uint(ctx_shape[1]);
+    out[(size_t(b) * R + r) * H + c] = r < C
+        ? ctx[(size_t(b) * C + r) * H + c]
+        : dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, r - C, c, R - C, H);
+    """
+
+private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_conv_join",
+    inputNames: ["h", "dyn", "base", "ctx"],
+    outputNames: ["out"],
+    source: dflash2GroupedConvJoinSource,
+    header: dflash2GroupedConvHeader,
+    ensureRowContiguous: true)
+
 private let dflash2GroupedConvKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv",
     inputNames: ["h", "dyn", "base"],
@@ -1119,7 +1242,14 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 /// a row stride apart. The tensor op, its operands' values, the K order and
 /// the reduction are unchanged; only the slice's base and row stride move,
 /// so the output is bitwise the stored layout's (self-tested at load on
-/// every copy; the in-situ trial then decides, see `DFlash2TiledTrial`).
+/// every copy; the in-situ trial then decides, see `DFlash2KernelTrial`).
+///
+/// Kernel variants on the tiled copies (`Kernel`, `variantSource`): a K split
+/// of 2, 4 or 8 simdgroups and 32 or 64 columns per threadgroup per class
+/// (the wide stacked gate|up, the narrow o_proj and down_proj), and a
+/// one-step prefetch of the next K step's weight tile. With the record's K
+/// split they are bit for bit the record's; a changed split reorders the FP32
+/// sum. Each is self-tested at load, and the in-situ trial picks one.
 enum DFlash2TensorMatmul {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_TENSOR_MATMUL"]
@@ -1279,6 +1409,113 @@ enum DFlash2TensorMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
+    // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
+    // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
+    // contiguous parts when SPLITS divides the step count) and runs the
+    // record's 16 x 32 x 256 op on each of its TN / 32 column blocks per
+    // step; the parts are added in simdgroup order, as the record adds them.
+    // PF = 1 loads four 128-byte lines per lane of the next step's tiles
+    // before the op and folds them into a never-stored word after it (a
+    // prefetch; the arithmetic is unchanged).
+    private static let variantSource = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        constexpr int NH = TN / 32;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int steps = K / 256;
+        const int KS = steps * 32;
+        const int s0 = int(sg) * steps / SPLITS;
+        const int s1 = (int(sg) + 1) * steps / SPLITS;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 256, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> A((device bfloat*)x, dextents<int, 2>(K, M));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> B((device bfloat*)w, dextents<int, 2>(256, (N / 32) * KS));
+        const int tb = (n0 / 32) * KS;
+        auto tA0 = A.template slice<256, 16>(0, 0);
+        auto tB0 = B.template slice<256, 32>(0, tb);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; i++) {
+          cT0[i] = 0.0f;
+          if constexpr (NH == 2) { cT1[i] = 0.0f; }
+        }
+        const device uint* wl = (const device uint*)w + (size_t)lane * 32;
+        uint touched = 0;
+        for (int s = s0; s < s1; s++) {
+          uint p[NH][4];
+          const bool ahead = PF != 0 && s + 1 < s1;
+          if (ahead) {
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              const device uint* nx = wl + (size_t)(tb + h * KS + (s + 1) * 32) * 128;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 4; j++) { p[h][j] = nx[j * 1024]; }
+            }
+          }
+          auto tA = A.template slice<256, 16>(s * 256, 0);
+          auto tB = B.template slice<256, 32>(0, tb + s * 32);
+          op.run(tA, tB, cT0);
+          if constexpr (NH == 2) {
+            auto tB1 = B.template slice<256, 32>(0, tb + KS + s * 32);
+            op.run(tA, tB1, cT1);
+          }
+          if (ahead) {
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 4; j++) { touched ^= p[h][j]; }
+            }
+          }
+        }
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        threadgroup float red[SPLITS - 1][NH][16 * 32];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 16; i++) {
+            red[sg - 1][0][i * 32 + lane] = cT0[i];
+            if constexpr (NH == 2) { red[sg - 1][NH - 1][i * 32 + lane] = cT1[i]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NH; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 16; i++) {
+              float v = h == 0 ? cT0[i] : cT1[i];
+              if constexpr (SPLITS == 2) {
+                v = v + red[0][h][i * 32 + lane];
+              } else if constexpr (SPLITS == 4) {
+                v = v + red[0][h][i * 32 + lane] + red[1][h][i * 32 + lane] + red[2][h][i * 32 + lane];
+              } else {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < SPLITS - 1; j++) { v = v + red[j][h][i * 32 + lane]; }
+              }
+              const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nh] = OutT(v);
+            }
+          }
+        }
+        // Never taken (ksz[1] is 16): keeps the prefetch loads.
+        if (PF != 0 && touched == 0x7fbfffffu && ksz[1] == 0) { out[0] = OutT(0.0f); }
+        """
+
+    private static let variantKernel = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m16_kvar",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: variantSource,
+        header: header,
+        ensureRowContiguous: true)
+
     private static let dimsLock = NSLock()
     nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
     private static func dimsArray(k: Int, n: Int) -> MLXArray {
@@ -1328,13 +1565,37 @@ enum DFlash2TensorMatmul {
         }
         var a = x.reshaped(rows, k)
         if rows < rowsPerTile {
-            a = concatenated(
-                [a, MLXArray.zeros([rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
+            a = DFlash2Concat.padRows(a, to: rowsPerTile)
         }
-        let tiled = tiledActive ? tiledCopy(weight) : nil
-        let y = launch(a, tiled ?? weight, k: k, n: n, tiled: tiled != nil, outputDType: .bfloat16)
+        let chosen = current
+        let y: MLXArray
+        if chosen.tiled, let tiled = tiledCopy(weight) {
+            y = chosen.variant(n: n)
+                ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
+                : launch(a, tiled, k: k, n: n, tiled: true, outputDType: .bfloat16)
+        } else {
+            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+        }
         let rowsOut = rows < rowsPerTile ? y[0 ..< rows] : y
         return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+
+    /// The variant kernel over a 16-row `a` and the tiled copy `t` of an
+    /// `[N, K]` weight, with `kernel`'s split, width and prefetch for N.
+    private static func launchVariant(
+        _ a: MLXArray, _ t: MLXArray, k: Int, n: Int, kernel: Kernel, outputDType: DType
+    ) -> MLXArray {
+        var (splits, tn) = kernel.split(n: n)
+        if n % tn != 0 { tn = 32 }
+        if k / 256 < splits { splits = Kernel.stockSplits(n: n) }
+        let threads = splits * 32
+        return variantKernel(
+            [a, t, dimsArray(k: k, n: n)],
+            template: [
+                ("OutT", outputDType), ("SPLITS", splits), ("TN", tn), ("PF", kernel.prefetch),
+            ],
+            grid: (n / tn * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
     }
 
     /// The kernel over a 16-row `a` and `w` (the stored `[N, K]` weight, or
@@ -1344,7 +1605,7 @@ enum DFlash2TensorMatmul {
     ) -> MLXArray {
         // Wide projections expose enough output tiles to use fewer K partitions.
         // Keep the accepted four-way route for the smaller projections.
-        let splits = n >= 16384 ? 2 : 4
+        let splits = Kernel.stockSplits(n: n)
         let threads = splits * 32
         return kernel(
             [a, w, dimsArray(k: k, n: n)],
@@ -1365,10 +1626,173 @@ enum DFlash2TensorMatmul {
         return nil
     }()
 
-    /// Whether `apply` reads the tiled copies. Set at load (forced), by the
-    /// in-situ trial's round boundaries, and once by its verdict; read when a
-    /// drafter graph is built.
-    nonisolated(unsafe) static var tiledActive = false
+    /// The kernel `apply` runs. Set at load (forced), by the in-situ trial's
+    /// round boundaries, and once by its verdict; read when a drafter graph
+    /// is built.
+    nonisolated(unsafe) static var current = Kernel.stock
+
+    /// Which kernel reads the weights that have a tiled copy (`fc` has none:
+    /// it always runs the record's kernel on its stored weight). `stock`: the
+    /// record's kernel on the stored weights; `tiled`: the record's kernel on
+    /// the tiled copies; otherwise the variant kernel on the tiled copies with
+    /// a K split and a width per class (wide: N >= 16384, the stacked
+    /// gate|up; narrow: o_proj and down_proj) and the prefetch. A class that
+    /// keeps the record's split, 32 columns and no prefetch runs the record's
+    /// kernel on its tiled copy.
+    struct Kernel: Equatable {
+        var tiled: Bool
+        var wideSplits = 2, wideTN = 32, narrowSplits = 4, narrowTN = 32, prefetch = 0
+
+        static let stock = Kernel(tiled: false)
+        static let tiledStock = Kernel(tiled: true)
+
+        /// The record's K split (`launch`).
+        static func stockSplits(n: Int) -> Int { n >= 16384 ? 2 : 4 }
+
+        func split(n: Int) -> (splits: Int, tn: Int) {
+            n >= 16384 ? (wideSplits, wideTN) : (narrowSplits, narrowTN)
+        }
+
+        /// Whether a weight of `n` rows runs the variant kernel.
+        func variant(n: Int) -> Bool {
+            let (splits, tn) = split(n: n)
+            return tiled && (splits != Self.stockSplits(n: n) || tn != 32 || prefetch != 0)
+        }
+
+        /// The record's split on both classes: the same partial sums, added in
+        /// the same order, so the record's bits (self-tested). A changed split
+        /// reorders the FP32 sum.
+        var bitwise: Bool { wideSplits == 2 && narrowSplits == 4 }
+
+        var name: String {
+            !tiled
+                ? "stock"
+                : self == .tiledStock
+                    ? "tiled" : "w\(wideSplits)x\(wideTN)n\(narrowSplits)x\(narrowTN)p\(prefetch)"
+        }
+
+        init(
+            tiled: Bool, wideSplits: Int = 2, wideTN: Int = 32, narrowSplits: Int = 4,
+            narrowTN: Int = 32, prefetch: Int = 0
+        ) {
+            (self.tiled, self.wideSplits, self.wideTN) = (tiled, wideSplits, wideTN)
+            (self.narrowSplits, self.narrowTN, self.prefetch) = (narrowSplits, narrowTN, prefetch)
+        }
+
+        /// `stock`, `tiled`, or `w<S>x<TN>n<S>x<TN>p<PF>` (wide then narrow
+        /// class; S 2/4/8, TN 32/64, PF 0/1), e.g. `w2x64n4x32p1`.
+        init?(name: String) {
+            if name == "stock" { self = .stock; return }
+            if name == "tiled" { self = .tiledStock; return }
+            let v = name.split(whereSeparator: { "wxnp".contains($0) }).compactMap { Int($0) }
+            guard v.count == 5, [2, 4, 8].contains(v[0]), [32, 64].contains(v[1]),
+                [2, 4, 8].contains(v[2]), [32, 64].contains(v[3]), [0, 1].contains(v[4])
+            else { return nil }
+            self.init(
+                tiled: true, wideSplits: v[0], wideTN: v[1], narrowSplits: v[2], narrowTN: v[3],
+                prefetch: v[4])
+            guard self.name == name || self == .tiledStock else { return nil }
+        }
+    }
+
+    /// `MLXFAST_DRAFT_KVAR=0`: no kernel variants (the trial is the record's
+    /// stored against tiled one).
+    static let variantsEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_KVAR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// `MLXFAST_DRAFT_KVAR_FORCE=<name>` (`Kernel(name:)`): that kernel, no
+    /// trial, once it passes its self-test (the stored layout otherwise). A
+    /// variant is not forced with the variants off.
+    static let forcedKernel: Kernel? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_KVAR_FORCE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty,
+            let kernel = Kernel(name: raw), variantsEnabled || kernel == .stock || kernel == .tiledStock
+        else { return nil }
+        return kernel
+    }()
+
+    /// The in-situ trial chooses (nothing forces a kernel).
+    static var trialWanted: Bool { tiledSetting == nil && forcedKernel == nil }
+
+    /// The bit-for-bit variants the trial's first request times beside
+    /// `stock` and `tiled`: 64 columns on the wide class, the prefetch, both.
+    static let bitwiseVariants: [Kernel] = [
+        Kernel(tiled: true, wideTN: 64), Kernel(tiled: true, prefetch: 1),
+        Kernel(tiled: true, wideTN: 64, prefetch: 1),
+    ]
+
+    /// The changed-split variants of `base` (its widths and prefetch, on the
+    /// tiled copies): the wide class split 4, the narrow class split 8, both.
+    static func splitVariants(of base: Kernel) -> [Kernel] {
+        var b = base
+        b.tiled = true
+        var w = b, n = b, wn = b
+        w.wideSplits = 4
+        n.narrowSplits = 8
+        (wn.wideSplits, wn.narrowSplits) = (4, 8)
+        return [w, n, wn]
+    }
+
+    /// The stage-1 variants that passed their self-test at load.
+    nonisolated(unsafe) static var passedBitwiseVariants: [Kernel] = []
+
+    /// A changed split's FP32 outputs must lie within this fraction of each
+    /// output row's largest magnitude of the record's (2^-15; locally the
+    /// reordering moves them by at most 2.5e-6).
+    static let splitTolerance: Float = 1.0 / 32768
+
+    /// One stored weight and its tiled copy per production shape, and one
+    /// random 16-row input per K, for the variants' self-tests.
+    nonisolated(unsafe) private static var testWeights: [(source: MLXArray, tiled: MLXArray)] = []
+    nonisolated(unsafe) private static var testInputs: [Int: MLXArray] = [:]
+
+    /// `kernel` against the record's kernel on the stored weights, on every
+    /// production shape it runs the variant kernel on, one fixed random
+    /// 16-row input per K: where a class keeps the record's split, its BF16
+    /// outputs (the form the drafter reads) bit for bit; where it changes the
+    /// split, its FP32 outputs within `splitTolerance`, the same argmax in
+    /// every row, and its BF16 form built and run. Each kernel runs in its own
+    /// error scope: a form that fails to compile or run fails the test, never
+    /// the process. Returns the verdict and the largest relative difference.
+    static func selfTest(_ kernel: Kernel) -> (passed: Bool, maxRelative: Float) {
+        let result = try? withError { scoped -> (Bool, Float) in
+            var passed = true
+            var worst: Float = 0
+            for (w, t) in testWeights where kernel.variant(n: w.dim(0)) {
+                let (n, k) = (w.dim(0), w.dim(1))
+                guard let a = testInputs[k] else { return (false, worst) }
+                if kernel.split(n: n).splits == Kernel.stockSplits(n: n) {
+                    let reference = launch(a, w, k: k, n: n, tiled: false, outputDType: .bfloat16)
+                    let y = launchVariant(a, t, k: k, n: n, kernel: kernel, outputDType: .bfloat16)
+                    let differing = (reference.view(dtype: .uint16) .!= y.view(dtype: .uint16))
+                        .asType(.int32).sum()
+                    eval(differing)
+                    try scoped.check()
+                    if differing.item(Int32.self) != 0 { passed = false }
+                } else {
+                    let reference = launch(a, w, k: k, n: n, tiled: false, outputDType: .float32)
+                    let y = launchVariant(a, t, k: k, n: n, kernel: kernel, outputDType: .float32)
+                    let scale = maximum(
+                        abs(reference).max(axis: -1, keepDims: true), MLXArray(Float(1e-30)))
+                    let relative = (abs(y - reference) / scale).max()
+                    let sameArgmax = all(
+                        argMax(reference, axis: -1) .== argMax(y, axis: -1))
+                    let production = launchVariant(
+                        a, t, k: k, n: n, kernel: kernel, outputDType: .bfloat16)
+                    eval(relative, sameArgmax, production)
+                    try scoped.check()
+                    let r = relative.item(Float.self)
+                    worst = max(worst, r)
+                    if !(r <= splitTolerance) || !sameArgmax.item(Bool.self) { passed = false }
+                }
+            }
+            return (passed, worst)
+        }
+        return result ?? (false, .nan)
+    }
 
     private static let tiledLock = NSLock()
     /// Each stored weight (held, so its identity is never reused) with its copy.
@@ -1377,12 +1801,6 @@ enum DFlash2TensorMatmul {
 
     private static func tiledCopy(_ weight: MLXArray) -> MLXArray? {
         tiledLock.withLock { tiledCopies[ObjectIdentifier(weight)]?.tiled }
-    }
-
-    /// The array `apply` reads for `weight` at block width: its tiled copy
-    /// while that layout is active, the weight itself otherwise.
-    static func readWeight(_ weight: MLXArray) -> MLXArray {
-        (tiledActive ? tiledCopy(weight) : nil) ?? weight
     }
 
     /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
@@ -1395,20 +1813,31 @@ enum DFlash2TensorMatmul {
             .reshaped([n, k])
     }
 
-    /// Frees the copies (the trial kept the stored layout).
+    /// Frees the copies (the trial kept the stored layout) and the variants'
+    /// self-test operands.
     static func dropTiledCopies() {
         tiledLock.withLock { tiledCopies.removeAll() }
+        dropTestOperands()
+    }
+
+    /// Frees the variants' self-test operands (the copies stay registered).
+    static func dropTestOperands() {
+        testWeights = []
+        testInputs = [:]
     }
 
     /// Builds the tiled copy of each of `weights` the kernel serves, then
     /// runs the kernel on every copy (TILED) and on its stored weight against
     /// the same random 16-row BF16 input, FP32 and BF16 outputs, and compares
     /// every output bit. Registers the copies and returns true only when all
-    /// match; one stderr line either way. Nothing runs when the kernel is off,
-    /// the toolchain has no tensor operands, or `MLXFAST_DRAFT_TILED=0`.
+    /// match; then self-tests the forced kernel or the bit-for-bit variants
+    /// (`bitwiseVariants`). One stderr line either way. Nothing runs when the
+    /// kernel is off, the toolchain has no tensor operands, or
+    /// `MLXFAST_DRAFT_TILED=0`.
     static func prepareTiled(_ weights: [MLXArray]) -> Bool {
         dropTiledCopies()
-        tiledActive = false
+        current = .stock
+        passedBitwiseVariants = []
         guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false
         else { return false }
         let eligible = weights.filter {
@@ -1444,17 +1873,49 @@ enum DFlash2TensorMatmul {
         }
         let mismatches = stacked(differing).sum().item(Int.self)
         let passed = mismatches == 0
+        var verdict = "stored layout kept"
         if passed {
             tiledLock.withLock {
                 for (w, t) in copies { tiledCopies[ObjectIdentifier(w)] = (w, t) }
             }
-            tiledActive = tiledSetting == true
+            var shapes = Set<[Int]>()
+            testWeights = copies.filter { shapes.insert($0.source.shape).inserted }
+            testInputs = inputs
+            let variantStart = DispatchTime.now().uptimeNanoseconds
+            if let forced = forcedKernel {
+                var test = (passed: true, maxRelative: Float(0))
+                if forced.tiled, forced != .tiledStock { test = selfTest(forced) }
+                current = test.passed ? forced : .stock
+                verdict = "\(forced.name) forced by MLXFAST_DRAFT_KVAR_FORCE"
+                    + (forced.tiled && forced != .tiledStock
+                        ? ", self-test \(test.passed ? "passed" : "FAILED, stored layout kept")"
+                            + (forced.bitwise ? " (bitwise)" : String(format: " (max rel %.1e)", test.maxRelative))
+                        : "")
+                dropTestOperands()
+                if !current.tiled { dropTiledCopies() }
+            } else if tiledSetting == true {
+                current = .tiledStock
+                verdict = "tiled forced on by MLXFAST_DRAFT_TILED=1"
+                dropTestOperands()
+            } else {
+                verdict = "the in-situ trial decides"
+                if variantsEnabled {
+                    var failed: [Kernel] = []
+                    for kernel in bitwiseVariants {
+                        if selfTest(kernel).passed {
+                            passedBitwiseVariants.append(kernel)
+                        } else {
+                            failed.append(kernel)
+                        }
+                    }
+                    verdict += "; variants bitwise [\(passedBitwiseVariants.map(\.name).joined(separator: " "))]"
+                        + (failed.isEmpty ? "" : " FAILED [\(failed.map(\.name).joined(separator: " "))]")
+                        + String(format: " in %.0f ms", Double(DispatchTime.now().uptimeNanoseconds - variantStart) / 1e6)
+                } else {
+                    verdict += "; variants off (MLXFAST_DRAFT_KVAR=0)"
+                }
+            }
         }
-        let verdict =
-            !passed
-            ? "stored layout kept"
-            : tiledSetting == true
-                ? "tiled forced on by MLXFAST_DRAFT_TILED=1" : "the in-situ trial decides"
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
         FileHandle.standardError.write(
             Data(
@@ -1475,30 +1936,70 @@ enum DFlash2TensorMatmul {
     }
 }
 
-/// The tiled drafter weights' in-situ trial, in the load-time warm
-/// (`Qwen35DFlash2Assistant`), modelled on the verify int8 kernels'
-/// `NarrowInSituTrial`: one engine request whose rounds alternate the stored
-/// and the tiled layout, `roundsPerSetting` timed rounds each; the tiled
-/// layout is adopted only when its median round (outliers above 1.5x the
-/// median dropped) beats the stored one's by more than `adoptMargin`. Both
-/// layouts give the same bits (self-tested), so the rounds and their tokens
-/// do not depend on the choice. `roundBoundary()` runs at the top of every
-/// block proposal: a round's time is the host time from its proposal to the
-/// next, and the layout set at a boundary is what that proposal's graph
-/// reads. The first round is discarded.
-enum DFlash2TiledTrial {
+/// The drafter kernel's in-situ trial, in the load-time warm
+/// (`Qwen35DFlash2Assistant.runKernelTrial`), modelled on the verify int8
+/// kernels' `NarrowInSituTrial`: engine requests whose rounds rotate through
+/// the candidate kernels, `perCandidate` timed rounds each; per candidate the
+/// median round (outliers above 1.5x the median dropped); a candidate is
+/// adopted only when it beats the reference by more than `adoptMargin`.
+///
+/// Stage 1 rotates `stock`, `tiled` and the bit-for-bit variants that passed
+/// their self-test; the fastest is kept only if it beats `stock`. Every
+/// stage-1 kernel gives the record's bits, so each round's draft ids are the
+/// record body's; they are kept, with the committed position each round
+/// proposed from, as the tape. Stage 2 (variants on, and a changed-split
+/// variant of the stage-1 pick passing its self-test) runs the same request
+/// again (same prompt, same budget: the same rounds while the drafts match),
+/// rotating the pick and its changed-split variants. A variant is adopted only
+/// if every one of its rounds proposed exactly the tape's ids from the tape's
+/// position, the pick's own rounds matched the tape as well, and it beats the
+/// pick; otherwise the pick stays. The target decides every emitted token
+/// either way; the check keeps the drafter's proposals, and so the
+/// acceptance, the record's on the trial's rounds.
+///
+/// A round is the host time from its proposal to the next. A proposal is
+/// built with its round's kernel: set at `roundBoundary()` (the top of every
+/// proposal) and, for a block built before the previous round's readback
+/// (`Qwen35DFlash2Assistant.speculateBlock`), at `aheadOfRound()`, so a
+/// round's drafter work runs the kernel the round is timed for. The first
+/// round is discarded.
+enum DFlash2KernelTrial {
+    typealias Kernel = DFlash2TensorMatmul.Kernel
+
     nonisolated(unsafe) static var armed = false
     nonisolated(unsafe) static var active = false
-    nonisolated(unsafe) private static var roundTimes: [[UInt64]] = [[], []]
+    nonisolated(unsafe) private static var candidates: [Kernel] = [.stock]
+    nonisolated(unsafe) private static var perCandidate = 12
+    nonisolated(unsafe) private static var stage = 0
     nonisolated(unsafe) private static var roundIndex = 0
     nonisolated(unsafe) private static var lastBoundary: UInt64 = 0
+    nonisolated(unsafe) private static var durations: [Int: UInt64] = [:]
+    nonisolated(unsafe) private static var proposals: [Int: Proposal] = [:]
+    nonisolated(unsafe) private static var tape: [Int: (position: Int, ids: [Int32])] = [:]
     nonisolated(unsafe) private static var onEnough: (() -> Void)?
+    nonisolated(unsafe) private static var pick = Kernel.stock
+    nonisolated(unsafe) private static var proposalCount = 0
+    nonisolated(unsafe) private static var log = ""
+    /// Host times: stage 1 begun, its request done, stage 2's self-tests done.
+    nonisolated(unsafe) private static var marks: [UInt64] = []
+    /// The rounds both requests budget for (the same budget, the same rounds).
+    nonisolated(unsafe) private(set) static var requestRounds = 0
 
-    static let roundsPerSetting = 12
+    private struct Proposal {
+        let tag: Int  // the candidate it was built with; -1 unknown
+        let position: Int
+        let tokens: MLXArray
+    }
+
     static let adoptMargin = 0.005
     static let outlierFactor = 1.5
-    /// The discarded round, the seed-side boundary, then both settings' rounds.
-    static var roundsNeeded: Int { 2 + 2 * roundsPerSetting }
+    /// Timed rounds per candidate: stage 1 with variants (12 for the two-way
+    /// trial), stage 2.
+    static let roundsPerVariant = 8
+    static let roundsPerSplit = 6
+
+    /// The discarded round, the seed-side boundary, then every candidate's rounds.
+    static var roundsNeeded: Int { 2 + candidates.count * perCandidate }
 
     @inline(__always) static func roundBoundary() {
         guard active else { return }
@@ -1507,9 +2008,9 @@ enum DFlash2TiledTrial {
 
     private static func boundary() {
         let now = DispatchTime.now().uptimeNanoseconds
-        if roundIndex >= 2 { roundTimes[(roundIndex - 1) % 2].append(now - lastBoundary) }
+        if roundIndex >= 2 { durations[roundIndex - 1] = now - lastBoundary }
         lastBoundary = now
-        DFlash2TensorMatmul.tiledActive = roundIndex % 2 == 1
+        DFlash2TensorMatmul.current = candidates[roundIndex % candidates.count]
         roundIndex += 1
         if roundIndex >= roundsNeeded {
             active = false
@@ -1519,12 +2020,55 @@ enum DFlash2TiledTrial {
         }
     }
 
+    /// Before a block is built ahead of its round: sets that round's kernel
+    /// (the next boundary's) and returns its candidate; nil with no trial.
+    static func aheadOfRound() -> Int? {
+        guard active else { return nil }
+        let tag = roundIndex % candidates.count
+        DFlash2TensorMatmul.current = candidates[tag]
+        return tag
+    }
+
+    /// The round's proposal, built at its boundary (`proposeBlock`) from
+    /// `position` committed rows.
+    @inline(__always) static func recordProposed(_ tokens: MLXArray, position: Int) {
+        guard active, roundIndex >= 1 else { return }
+        record(tokens, tag: (roundIndex - 1) % candidates.count, position: position)
+    }
+
+    /// The round's proposal, built ahead with `tag` (`aheadOfRound()`) and
+    /// adopted at its boundary from `position` committed rows.
+    @inline(__always) static func recordAdopted(_ tokens: MLXArray, tag: Int?, position: Int) {
+        guard active, roundIndex >= 1 else { return }
+        record(tokens, tag: tag ?? -1, position: position)
+    }
+
+    private static func record(_ tokens: MLXArray, tag: Int, position: Int) {
+        proposals[roundIndex - 1] = Proposal(tag: tag, position: position, tokens: tokens)
+    }
+
+    /// Stage 1's candidates, and the budget both requests use.
+    static func beginFirstStage() {
+        candidates = [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
+        perCandidate = candidates.count > 2 ? roundsPerVariant : 12
+        stage = 1
+        pick = .stock
+        tape = [:]
+        log = ""
+        proposalCount = 0
+        marks = [DispatchTime.now().uptimeNanoseconds]
+        requestRounds = max(
+            roundsNeeded, DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
+    }
+
     static func begin(onEnough: @escaping () -> Void) {
         guard armed else { return }
-        roundTimes = [[], []]
         roundIndex = 0
         lastBoundary = 0
+        durations = [:]
+        proposals = [:]
         self.onEnough = onEnough
+        DFlash2TensorMatmul.current = candidates[0]
         active = true
     }
 
@@ -1536,34 +2080,154 @@ enum DFlash2TiledTrial {
             ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
     }
 
-    /// Installs the verdict (the stored layout unless the tiled one won, whose
-    /// copies are then freed), logs one line and disarms. Safe when nothing ran.
+    private typealias Timing = (median: Double?, kept: Int, timed: Int)
+
+    /// Per candidate. A round counts for the candidate it was scheduled for
+    /// only when its proposal was built with that candidate.
+    private static func timings() -> [Timing] {
+        var times = Array(repeating: [UInt64](), count: candidates.count)
+        for (index, duration) in durations {
+            let tag = index % candidates.count
+            guard proposals[index]?.tag == tag else { continue }
+            times[tag].append(duration)
+        }
+        return times.map { values in
+            guard let first = median(values) else { return (nil, 0, 0) }
+            let kept = values.filter { Double($0) <= outlierFactor * first }
+            return (median(kept), kept.count, values.count)
+        }
+    }
+
+    /// The fastest eligible candidate if it beats candidate 0 by more than
+    /// the margin, else candidate 0.
+    private static func choose(_ t: [Timing], eligible: [Bool]) -> Int {
+        guard let reference = t[0].median else { return 0 }
+        var best = 0
+        for c in 1 ..< t.count where eligible[c] {
+            if let m = t[c].median, m < (t[best].median ?? .infinity) { best = c }
+        }
+        return best > 0 && t[best].median! < reference * (1 - adoptMargin) ? best : 0
+    }
+
+    private static func describe(_ t: [Timing], _ note: (Int) -> String = { _ in "" }) -> String {
+        candidates.indices.map { c in
+            "\(candidates[c].name) "
+                + (t[c].median.map { String(format: "%.2f", $0 / 1e6) } ?? "-")
+                + " ms (\(t[c].kept)/\(t[c].timed)\(note(c)))"
+        }.joined(separator: ", ")
+    }
+
+    private static func change(_ t: [Timing], _ c: Int) -> String {
+        guard c > 0, let m = t[c].median, let r = t[0].median else { return "" }
+        return String(format: " (%+.2f%%)", (m / r - 1) * 100)
+    }
+
+    /// The stage-1 pick and (variants on) the tape, once.
+    private static func concludeFirstStage() {
+        guard stage == 1, log.isEmpty else { return }
+        let t = timings()
+        let best = choose(t, eligible: Array(repeating: true, count: candidates.count))
+        pick = candidates[best]
+        log = describe(t) + " -> \(pick.name)\(change(t, best))"
+        proposalCount += roundIndex
+        if DFlash2TensorMatmul.variantsEnabled {
+            for (index, p) in proposals {
+                tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
+            }
+        }
+        proposals = [:]
+    }
+
+    /// After the first request: `concludeFirstStage`, then the changed-split
+    /// variants of the pick that pass their self-test. True when the second
+    /// request is to run.
+    static func beginSecondStage() -> Bool {
+        active = false
+        onEnough = nil
+        guard armed, stage == 1 else { return false }
+        marks.append(DispatchTime.now().uptimeNanoseconds)
+        concludeFirstStage()
+        guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty else { return false }
+        var passed: [Kernel] = []
+        var tested: [String] = []
+        for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
+            let test = DFlash2TensorMatmul.selfTest(kernel)
+            if test.passed { passed.append(kernel) }
+            tested.append(
+                kernel.name
+                    + (test.passed ? String(format: " max rel %.1e", test.maxRelative) : " FAILED"))
+        }
+        log += "; split variants self-test [\(tested.joined(separator: ", "))]"
+        marks.append(DispatchTime.now().uptimeNanoseconds)
+        guard !passed.isEmpty else { return false }
+        candidates = [pick] + passed
+        perCandidate = roundsPerSplit
+        stage = 2
+        return true
+    }
+
+    /// Installs the verdict (the stage-1 pick unless a stage-2 variant
+    /// qualified; the copies are freed when the stored layout stays), logs
+    /// one line and disarms. Safe when nothing ran.
     static func finish(elapsedNanoseconds: UInt64) {
         active = false
         onEnough = nil
         guard armed else { return }
         armed = false
-        let medians: [(Double?, Int, Int)] = roundTimes.map { times in
-            guard let first = median(times) else { return (nil, 0, 0) }
-            let kept = times.filter { Double($0) <= outlierFactor * first }
-            return (median(kept), kept.count, times.count)
+        concludeFirstStage()
+        var adopted = pick
+        if stage == 2 {
+            proposalCount += roundIndex
+            let t = timings()
+            let n = candidates.count
+            var recorded = Array(repeating: 0, count: n)
+            var compared = recorded
+            var equal = recorded
+            var firstOff = Int.max
+            var unknownDiffers = false
+            for index in proposals.keys.sorted() {
+                let p = proposals[index]!
+                if p.tag >= 0 { recorded[p.tag] += 1 }
+                guard index < firstOff, let entry = tape[index], entry.position == p.position else {
+                    firstOff = min(firstOff, index)
+                    continue
+                }
+                let same = p.tokens.asType(.int32).asArray(Int32.self) == entry.ids
+                if p.tag < 0 {
+                    if !same { unknownDiffers = true }
+                    continue
+                }
+                compared[p.tag] += 1
+                if same { equal[p.tag] += 1 }
+            }
+            func clean(_ c: Int) -> Bool {
+                recorded[c] > 0 && compared[c] == recorded[c] && equal[c] == recorded[c]
+            }
+            let eligible = (0 ..< n).map { c in c > 0 && clean(c) && clean(0) && !unknownDiffers }
+            let best = choose(t, eligible: eligible)
+            adopted = candidates[best]
+            log += "; " + describe(t) { c in ", ids \(equal[c])/\(recorded[c])" }
+                + " -> \(adopted.name)\(change(t, best))"
         }
-        var adopt = false
-        if let off = medians[0].0, let on = medians[1].0 { adopt = on < off * (1 - adoptMargin) }
-        DFlash2TensorMatmul.tiledActive = adopt
-        if !adopt { DFlash2TensorMatmul.dropTiledCopies() }
-        func ms(_ entry: (Double?, Int, Int)) -> String {
-            (entry.0.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " ms (\(entry.1)/\(entry.2))"
+        DFlash2TensorMatmul.current = adopted
+        if adopted.tiled {
+            DFlash2TensorMatmul.dropTestOperands()
+        } else {
+            DFlash2TensorMatmul.dropTiledCopies()
         }
-        var log = "dflash2 tiled weights trial: off \(ms(medians[0])), on \(ms(medians[1])), adopted "
-            + (adopt ? "on" : "off")
-        if let off = medians[0].0, let on = medians[1].0 {
-            log += String(format: " (%+.2f%%)", (on / off - 1) * 100)
-        }
-        log += "; \(roundIndex) proposals; "
-            + String(format: "%.0f ms\n", Double(elapsedNanoseconds) / 1e6)
-        FileHandle.standardError.write(Data(log.utf8))
-        roundTimes = [[], []]
+        marks.append(DispatchTime.now().uptimeNanoseconds)
+        let phases = zip(marks.dropFirst(), marks).map { String(format: "%.0f", Double($0 - $1) / 1e6) }
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 kernel trial: \(log); adopted \(adopted.name) "
+                    + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : "stored layout")); "
+                    + "\(proposalCount) proposals; "
+                    + String(format: "%.0f ms", Double(elapsedNanoseconds) / 1e6)
+                    + " (\(phases.joined(separator: " + ")))\n").utf8))
+        proposals = [:]
+        tape = [:]
+        durations = [:]
+        stage = 0
     }
 }
 
@@ -1580,9 +2244,6 @@ private final class DFlash2GateUpStack {
         weight = nil
         boundary = 0
     }
-
-    /// The stacked weight once built (nil before its first use).
-    var residentWeight: MLXArray? { weight }
 
     /// The stacked weight, concatenated on first use, or nil when the stack
     /// does not apply.
@@ -1612,21 +2273,6 @@ private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "up_proj") var up: Linear
     private let gateUp = DFlash2GateUpStack()
 
-    /// As `DFlash2Attention.residencyWeights`: the gate|up stack and
-    /// down_proj as `DFlash2TensorMatmul` reads them.
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        var read: [MLXArray] = []
-        var replaced: [MLXArray] = []
-        if let stacked = gateUp.residentWeight {
-            read.append(DFlash2TensorMatmul.readWeight(stacked))
-            replaced += [gate.weight, up.weight]
-        }
-        let d = DFlash2TensorMatmul.readWeight(down.weight)
-        read.append(d)
-        if d !== down.weight { replaced.append(down.weight) }
-        return (read, replaced)
-    }
-
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
         _down.wrappedValue = Linear(intermediateSize, hiddenSize, bias: false)
@@ -1651,7 +2297,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
-            return DFlash2TensorMatmul.linear(down, silu(g) * u)
+            return DFlash2TensorMatmul.linear(down, DFlash2SwiGLU.apply(g, u))
         }
         return DFlash2TensorMatmul.linear(down, silu(gate(x)) * up(x))
     }
@@ -1692,28 +2338,18 @@ private final class DFlash2DecoderLayer: Module {
         (selfAttn.oProj.bias == nil ? [selfAttn.oProj.weight] : []) + mlp.tensorWeights()
     }
 
-    /// Every array of this layer a block forward reads, in forward order
-    /// (the attention's, then the MLP's, then every other parameter), and
-    /// the stored weights a stack or a tiled copy stands in for.
-    func residencyWeights() -> (read: [MLXArray], replaced: [MLXArray]) {
-        let attention = selfAttn.residencyWeights()
-        let feedForward = mlp.residencyWeights()
-        let replaced = attention.replaced + feedForward.replaced
-        let skipped = Set(replaced.map { ObjectIdentifier($0) })
-        let rest = parameters().flattened().map(\.1).filter {
-            !skipped.contains(ObjectIdentifier($0))
-        }
-        return (attention.read + feedForward.read + rest, replaced)
-    }
-
     func callAsFunction(
         _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
         masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
-        let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
+        let normed = inputLayerNorm(x)
+        let joined = selfAttn.joins(context)
+            ? context.flatMap { attentionConv.prepare(normed, joining: $0) } : nil
+        let (attentionInput, attentionTaps) =
+            joined.map { ($0.0, $0.1) } ?? attentionConv.prepare(normed)
         let attended = attentionConv.finish(
             selfAttn(
-                attentionInput, context: context, rope: rope, cache: cache,
+                attentionInput, context: context, joined: joined?.2, rope: rope, cache: cache,
                 masks: masks),
             projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
@@ -2040,6 +2676,31 @@ enum DFlash2GreedyWalk {
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
         guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        if narrowOperands, unary.ndim == 3, unary.dim(0) == 1, projected.ndim == 3,
+            projected.dim(0) == 1, predecessorCodebook.dtype == successorCodebook.dtype,
+            [DType.bfloat16, .float16, .float32].contains(predecessorCodebook.dtype),
+            [DType.bfloat16, .float16, .float32].contains(projected.dtype),
+            narrowVerified(
+                codebook: predecessorCodebook.dtype, projected: projected.dtype,
+                unary: unary.dtype)
+        {
+            return selectNarrow(
+                candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+                predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        }
+        return selectWide(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+    }
+
+    /// The walk over operands widened to FP32 first (as recorded).
+    private static func selectWide(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray? {
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(-1)
         let c = candidates[0]
         // Gather only the codebook rows the candidate lists can visit. The
         // fused kernel scores each edge and advances the greedy walk in one
@@ -2064,6 +2725,125 @@ enum DFlash2GreedyWalk {
             outputDTypes: [.int32])[0]
         return path.reshaped([1, length])
     }
+
+    /// The walk reading its operands as they are: the batch axis squeezed
+    /// (a view) where `[0]` gathered a copy of candidates, scores and
+    /// projections, and the codebook rows and projections in their own dtype,
+    /// widened to FP32 in the kernel (exact) where four launches widened them
+    /// first. Same FP32 values, same arithmetic, same order: seven launches
+    /// fewer per proposal. Self-tested once per operand dtypes (at bind for
+    /// the ones in use) against the widened walk on random operands, every
+    /// path id compared; `MLXFAST_DFLASH_WALK_NARROW=0` widens first.
+    static let narrowOperands: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_NARROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static func selectNarrow(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray {
+        let length = candidates.dim(1)
+        let c = candidates.squeezed(axis: 0)
+        let path = narrowKernel(
+            [
+                take(predecessorCodebook, anchor, axis: 0).reshaped([-1]),
+                take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0).reshaped([-1]),
+                take(successorCodebook, c, axis: 0).reshaped([-1]),
+                projected.squeezed(axis: 0).reshaped([-1]),
+                unary.squeezed(axis: 0).reshaped([-1]),
+                c.asType(.uint32).reshaped([-1]),
+            ],
+            template: [("L", length), ("K", candidates.dim(2)), ("R", projected.dim(-1))],
+            grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[length]], outputDTypes: [.int32])[0]
+        return path.reshaped([1, length])
+    }
+
+    private static let narrowLock = NSLock()
+    nonisolated(unsafe) private static var narrowVerdicts: [String: Bool] = [:]
+
+    /// Runs the narrow walk's self-test for these dtypes now (load time).
+    static func prepare(codebook: DType, projected: DType, unary: DType) {
+        guard enabled, narrowOperands else { return }
+        _ = narrowVerified(codebook: codebook, projected: projected, unary: unary)
+    }
+
+    private static func narrowVerified(codebook: DType, projected: DType, unary: DType) -> Bool {
+        narrowLock.withLock {
+            let key = "\(codebook) \(projected) \(unary)"
+            if let verdict = narrowVerdicts[key] { return verdict }
+            var same = true
+            var walks = 0
+            do {
+                try withError { error in
+                    let (vocab, length, k, rank) = (4096, 15, 16, 256)
+                    for seed in 0 ..< 16 {
+                        func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(seed * 8 + salt)) }
+                        let pred = MLXRandom.normal([vocab, rank], key: key(0)).asType(codebook)
+                        let succ = MLXRandom.normal([vocab, rank], key: key(1)).asType(codebook)
+                        let proj = MLXRandom.normal([1, length, rank], key: key(2)).asType(projected)
+                        let una = (MLXRandom.normal([1, length, k], key: key(3)) * 4).asType(unary)
+                        let cand = MLXRandom.randInt(Int32(0) ..< Int32(vocab), [1, length, k], key: key(4))
+                            .asType(.uint32)
+                        let anchor = MLXArray([Int32(seed * 97 % vocab)])
+                        guard
+                            let wide = selectWide(
+                                candidates: cand, unary: una, projected: proj, anchor: anchor,
+                                predecessorCodebook: pred, successorCodebook: succ)
+                        else { same = false; return }
+                        let narrow = selectNarrow(
+                            candidates: cand, unary: una, projected: proj, anchor: anchor,
+                            predecessorCodebook: pred, successorCodebook: succ)
+                        same = same && all(wide .== narrow).item(Bool.self)
+                        walks += 1
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            narrowVerdicts[key] = same
+            FileHandle.standardError.write(
+                ("dflash2 greedy walk narrow operands (\(key)): "
+                    + (same
+                        ? "self-test passed: \(walks) walks of 15 ids identical; narrow\n"
+                        : "self-test failed; widened operands kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+
+    private static let narrowKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_fused_greedy_walk_narrow",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            uint previous_slot = 0;
+            for (uint i = 0; i < L; i++) {
+                float score = -INFINITY;
+                if (c < K) {
+                    const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
+                    const uint succ_base = (i * K + c) * R;
+                    auto pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+                    auto proj_ptr = projected + i * R;
+                    auto succ_ptr = next + succ_base;
+                    float edge = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (uint d = 0; d < R; d++) {
+                        edge += (float(pred_ptr[d]) * float(proj_ptr[d])) * float(succ_ptr[d]);
+                    }
+                    score = float(unary[i * K + c]) + edge;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                previous_slot = sel;
+                if (c == 0) path[i] = int(cand[i * K + sel]);
+            }
+            """)
 
     private static let kernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_fused_greedy_walk",
@@ -2107,140 +2887,6 @@ enum DFlash2GreedyWalk {
                 if (c == 0) path[i] = int(cand[i * K + sel]);
             }
             """)
-}
-
-// MARK: - Residency prefetch
-
-/// One command buffer that binds a group of arrays: a single thread reads the
-/// first element of each input. It exists for the buffers it binds, not for
-/// its output (see `DFlash2ResidencyPrefetch`).
-private enum DFlash2ResidencyTouch {
-    /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
-    static let maximumInputs = 24
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-
-    private static func kernel(inputs count: Int) -> MLXFast.MLXFastKernel {
-        lock.withLock {
-            if let kernel = kernels[count] { return kernel }
-            let names = (0 ..< count).map { "w\($0)" }
-            let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }
-                .joined(separator: "\n")
-            let kernel = MLXFast.metalKernel(
-                name: "dflash2_residency_touch_\(count)", inputNames: names,
-                outputNames: ["out"],
-                source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
-                ensureRowContiguous: false)
-            kernels[count] = kernel
-            return kernel
-        }
-    }
-
-    /// One touch per `maximumInputs` arrays of `arrays`.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
-        stride(from: 0, to: arrays.count, by: maximumInputs).map { start in
-            let chunk = Array(arrays[start ..< min(start + maximumInputs, arrays.count)])
-            return kernel(inputs: chunk.count)(
-                chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
-                outputShapes: [[1]], outputDTypes: [.float32])[0]
-        }
-    }
-}
-
-/// Makes the drafter's weights GPU-resident again inside the prompt forward
-/// of a request that will draft with it, behind that forward's own work.
-///
-/// Nothing reads the drafter between one request's last round and the next
-/// request's first: the target's prompt forwards and the benchmark's idle
-/// gates leave its weights unwired, and the first block forward of the next
-/// decode pays to make them resident again. Command-buffer timestamps show
-/// it: the round's buffers are committed within half a millisecond, but the
-/// GPU idles before each one in proportion to the drafter bytes it binds,
-/// about 0.1 ms per 10 MB, ~37 ms over the ~3.8 GB the forward reads. Later
-/// rounds show no such gaps.
-///
-/// Making a buffer resident is done as its command buffer is submitted, while
-/// the GPU keeps running the buffers queued ahead of it: a standalone probe
-/// (eight 512 MB arrays unwired by a 30 s idle, each bound by a one-thread
-/// kernel queued behind a 9.4 ms matmul chain) ran in 89.2 ms against 89.4 ms
-/// for the chains alone, while the same binds with nothing queued ahead cost
-/// ~5.5 ms each. A decode's prompt forward keeps up to MLX's ten buffers
-/// (~20-45 ms of prompt layers) queued ahead of the host. So an engine build
-/// that drafts arms this prefetch, and its prompt forward binds the drafter's
-/// arrays (`DFlash2DraftModel.residencyArrays`, in forward order) in four
-/// groups of about equal bytes, each right after the forward's early
-/// submission at layer 8, 16, 32 and 48 (`Qwen35TrunkSubmission.promptFused`).
-/// Any group still due at the end of the forward is bound there.
-///
-/// Each group costs one single-thread kernel per 24 arrays on the GPU. No
-/// value of either model is read into any result, and nothing about the
-/// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
-public enum DFlash2ResidencyPrefetch {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// The prompt layers after which one group each is due.
-    static let dueAfterLayers = [8, 16, 32, 48]
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var groups: [[MLXArray]] = []
-    nonisolated(unsafe) private static var nextGroup = 0
-
-    /// Arms the prefetch for the next prompt forward: called when an engine
-    /// that drafts with `drafter` is built.
-    static func arm(_ drafter: DFlash2DraftModel) {
-        guard enabled else { return }
-        let arrays = drafter.residencyArrays()
-        let total = arrays.reduce(0) { $0 + $1.nbytes }
-        let share = max(1, total / dueAfterLayers.count)
-        var built: [[MLXArray]] = []
-        var group: [MLXArray] = []
-        var bytes = 0
-        for array in arrays {
-            group.append(array)
-            bytes += array.nbytes
-            if bytes >= share * (built.count + 1), built.count < dueAfterLayers.count - 1 {
-                built.append(group)
-                group = []
-            }
-        }
-        if !group.isEmpty { built.append(group) }
-        lock.withLock {
-            groups = built
-            nextGroup = 0
-        }
-    }
-
-    /// Submits every group due once the prompt forward has submitted its
-    /// first `completedLayers` layers. A no-op unless armed.
-    static func submitDue(completedLayers: Int) {
-        let due: [[MLXArray]] = lock.withLock {
-            var due: [[MLXArray]] = []
-            while nextGroup < groups.count,
-                nextGroup >= dueAfterLayers.count
-                    || dueAfterLayers[nextGroup] <= completedLayers
-            {
-                due.append(groups[nextGroup])
-                nextGroup += 1
-            }
-            if nextGroup >= groups.count {
-                groups = []
-                nextGroup = 0
-            }
-            return due
-        }
-        guard !due.isEmpty else { return }
-        asyncEval(due.flatMap { DFlash2ResidencyTouch.touch($0) })
-    }
-
-    /// Submits whatever is still due: the end of a prompt forward.
-    static func submitRemaining() {
-        submitDue(completedLayers: .max)
-    }
 }
 
 // MARK: - The drafter
@@ -2304,9 +2950,24 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         self.target = target
         let maskEmbedding = target.embedTokensForDFlash2(
-            MLXArray([Int32(config.maskTokenId)], [1, 1]))
+            MLXArray([Int32(config.maskTokenId)], [1, 1])).asType(dtype)
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
+        // The one-launch concatenations' self-tests, before any timed forward:
+        // each layer's [context; block] rows and the target's tapped states.
+        DFlash2Concat.prepare(inputs: 2, dtype: dtype)
+        DFlash2Concat.prepare(inputs: 2, dtype: .float16)
+        DFlash2SwiGLU.prepare(dtype: dtype, width: config.intermediateSize)
+        DFlash2StridedRMSNorm.prepare(dtype: dtype, headDim: config.headDim, eps: config.rmsNormEps)
+        _ = DFlash2GroupedDynamicCausalConv.joinVerified(
+            dtype, config.dflash.convKernelSize, config.dflash.convGroupSize, config.hiddenSize)
+        DFlash2QKPrework.prepare(
+            rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
+            kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
+        DFlash2GreedyWalk.prepare(
+            codebook: candidateSelector.predecessorCodebook.dtype,
+            projected: candidateSelector.hiddenProjection.weight.dtype, unary: .float32)
+        DFlash2Concat.prepare(inputs: config.targetLayerIds.count, dtype: .float16)
     }
 
     /// Builds and self-tests the tiled copies of the weights the block
@@ -2317,33 +2978,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
         DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
-    }
-
-    /// Every array a block forward reads that this drafter owns, in forward
-    /// order: each layer's (`DFlash2DecoderLayer.residencyWeights`), then
-    /// every other parameter (`fc`, the norms, the candidate selector's
-    /// projection and codebooks). A stored weight that a stack or a tiled
-    /// copy stands in for is left out; the block forward does not read it.
-    /// The target's embedding and head are the target's, read by its own
-    /// forwards.
-    func residencyArrays() -> [MLXArray] {
-        var arrays: [MLXArray] = []
-        var seen = Set<ObjectIdentifier>()
-        var replaced = Set<ObjectIdentifier>()
-        for layer in layers {
-            let weights = layer.residencyWeights()
-            for array in weights.replaced { replaced.insert(ObjectIdentifier(array)) }
-            for array in weights.read where seen.insert(ObjectIdentifier(array)).inserted {
-                arrays.append(array)
-            }
-        }
-        for (_, array) in parameters().flattened()
-        where !replaced.contains(ObjectIdentifier(array))
-            && seen.insert(ObjectIdentifier(array)).inserted
-        {
-            arrays.append(array)
-        }
-        return arrays
     }
 
     // MARK: The cache
@@ -2436,9 +3070,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             embeddedInputs = try blockEmbedding(
                 anchorIDs: inputs[0..., ..<1], maskColumns: inputs.dim(1) - 1)
         } else {
-            embeddedInputs = target.embedTokensForDFlash2(inputs)
+            embeddedInputs = target.embedTokensForDFlash2(inputs).asType(dtype)
         }
-        var h = embeddedInputs.asType(dtype)
+        var h = embeddedInputs
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
@@ -2469,9 +3103,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         guard let target, let maskEmbedding = maskTokenEmbedding else {
             throw DFlash2Error.notBound
         }
-        let anchorEmbedding = target.embedTokensForDFlash2(anchorIDs)
+        let anchorEmbedding = target.embedTokensForDFlash2(anchorIDs).asType(dtype)
         let batch = anchorIDs.dim(0)
-        let repeatedMasks: MLXArray
+        var repeatedMasks: MLXArray
         if batch == 1,
             let cached = cachedMaskEmbeddingBlock,
             cached.cols == cols
@@ -2481,11 +3115,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             repeatedMasks = broadcast(
                 maskEmbedding, to: [batch, cols, config.hiddenSize])
             if batch == 1 {
+                // Retained row-contiguous (the same values) where the
+                // one-launch concatenation reads it: a broadcast view
+                // would be copied into place by every launch.
+                if DFlash2Concat.enabled {
+                    repeatedMasks = contiguous(repeatedMasks)
+                }
                 eval(repeatedMasks)
                 cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
             }
         }
-        return concatenated([anchorEmbedding, repeatedMasks], axis: 1)
+        return DFlash2Concat.concatenate([anchorEmbedding, repeatedMasks], axis: 1)
     }
 
     /// `hiddenNorm(fc(rows))`. `BONSAI_DRAFT_CONTEXT_PAD16=1` (validation aid)
@@ -2766,4 +3406,639 @@ enum DFlash2DraftSubmission {
             Int($0.trimmingCharacters(in: .whitespaces))
         }.filter { $0 > 0 }
     }()
+}
+
+// MARK: - One-launch concatenation
+
+/// A concatenation of arrays of one dtype as ONE launch that copies every
+/// element to its place, where MLX's `Concatenate` runs one copy launch per
+/// input: the target's tapped hidden states (five launches per verify window
+/// of the 27B) and each drafter layer's `[context; block]` rows (two per
+/// layer). A copy: the output holds the inputs' bits in concatenation order.
+/// Self-tested once per input count and dtype (at bind for the two in use),
+/// bit for bit against `concatenated` on odd shapes along both a middle and
+/// the last axis; a mismatch or an MLX error keeps `concatenated`.
+/// `MLXFAST_ONE_LAUNCH_CONCAT=0` keeps `concatenated`.
+enum DFlash2Concat {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ONE_LAUNCH_CONCAT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernelLock = NSLock()
+    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+
+    /// Input `i` is `[outer, inner_i]` row-major, the output `[outer, total]`;
+    /// `dims` = `[outer, total, inner_0, ...]` at run time, so one pipeline per
+    /// input count and dtype serves every shape (a timed round never builds one).
+    private static func kernel(_ n: Int) -> MLXFast.MLXFastKernel {
+        kernelLock.withLock {
+            if let kernel = kernels[n] { return kernel }
+            var source = """
+                const uint idx = thread_position_in_grid.x;
+                const uint total = uint(dims[1]);
+                if (idx >= uint(dims[0]) * total) { return; }
+                const uint o = idx / total;
+                uint j = idx - o * total;
+
+                """
+            for i in 0 ..< n {
+                source += "{ const uint w = uint(dims[\(i + 2)]);\n"
+                source += "if (j < w) { out[idx] = x\(i)[o * w + j]; return; }\n"
+                source += "j -= w; }\n"
+            }
+            let kernel = MLXFast.metalKernel(
+                name: "dflash2_concat\(n)", inputNames: (0 ..< n).map { "x\($0)" } + ["dims"],
+                outputNames: ["out"], source: source, ensureRowContiguous: true)
+            kernels[n] = kernel
+            return kernel
+        }
+    }
+
+    private static func launch(_ parts: [MLXArray], axis: Int) -> MLXArray {
+        var shape = parts[0].shape
+        let outer = shape[..<axis].reduce(1, *)
+        let inners = parts.map { $0.shape[axis...].reduce(1, *) }
+        let total = inners.reduce(0, +)
+        shape[axis] = parts.reduce(0) { $0 + $1.dim(axis) }
+        let dims = MLXArray(([outer, total] + inners).map { Int32($0) })
+        let threads = outer * total
+        return kernel(parts.count)(
+            parts + [dims], grid: (threads, 1, 1),
+            threadGroup: (min(256, threads), 1, 1), outputShapes: [shape],
+            outputDTypes: [parts[0].dtype])[0]
+    }
+
+    /// `concatenated(parts, axis: axis)`, in one launch where it applies.
+    static func concatenate(_ parts: [MLXArray], axis: Int) -> MLXArray {
+        guard enabled, parts.count >= 2, parts.count <= 8 else {
+            return concatenated(parts, axis: axis)
+        }
+        let first = parts[0]
+        let ax = axis < 0 ? axis + first.ndim : axis
+        guard ax >= 0, ax < first.ndim,
+            [DType.float16, .bfloat16, .float32].contains(first.dtype),
+            parts.allSatisfy({ part in
+                part.dtype == first.dtype && part.ndim == first.ndim
+                    && (0 ..< first.ndim).allSatisfy { $0 == ax || part.dim($0) == first.dim($0) }
+            }),
+            parts.reduce(0, { $0 + $1.size }) < Int(Int32.max),
+            verified(parts.count, first.dtype)
+        else { return concatenated(parts, axis: axis) }
+        return launch(parts, axis: ax)
+    }
+
+    private static let zerosLock = NSLock()
+    nonisolated(unsafe) private static var zeros: [[Int]: MLXArray] = [:]
+
+    /// `concatenated([x, zeros([rows - x.dim(0), k])], axis: 0)` for a 2-D
+    /// `x`: the zero rows are a view of one retained, never-written zeros
+    /// array per width and dtype (materialized by its first use), so the pad
+    /// is one launch instead of a fill and two copies.
+    static func padRows(_ x: MLXArray, to rows: Int) -> MLXArray {
+        let (have, k) = (x.dim(0), x.dim(1))
+        guard enabled, x.ndim == 2, have < rows else {
+            return concatenated(
+                [x, MLXArray.zeros([rows - have, k], dtype: x.dtype)], axis: 0)
+        }
+        let block: MLXArray = zerosLock.withLock {
+            let key = [rows - 1, k, x.dtype == .bfloat16 ? 1 : x.dtype == .float16 ? 2 : 3]
+            if let hit = zeros[key] { return hit }
+            let made = MLXArray.zeros([rows - 1, k], dtype: x.dtype)
+            zeros[key] = made
+            return made
+        }
+        return concatenate([x, block[0 ..< (rows - have)]], axis: 0)
+    }
+
+    /// Runs the self-test for `inputs` inputs of `dtype` now (load time).
+    static func prepare(inputs: Int, dtype: DType) {
+        guard enabled else { return }
+        _ = verified(inputs, dtype)
+    }
+
+    private static func verified(_ n: Int, _ dtype: DType) -> Bool {
+        lock.withLock {
+            let key = "\(n) \(dtype)"
+            if let verdict = verdicts[key] { return verdict }
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    let bits: DType = dtype == .float32 ? .uint32 : .uint16
+                    for (seed, axis) in [(71, 1), (72, 2)] {
+                        let parts = (0 ..< n).map { i -> MLXArray in
+                            var shape = [2, 3, 40]
+                            shape[axis] = [1, 5, 24, 16, 3, 7, 40, 2][i]
+                            return (MLXRandom.normal(shape, key: MLXRandom.key(UInt64(seed * 16 + i)))
+                                * 1000).asType(dtype)
+                        }
+                        let fused = launch(parts, axis: axis)
+                        let reference = concatenated(parts, axis: axis)
+                        same = same && fused.shape == reference.shape
+                            && all(fused.view(dtype: bits) .== reference.view(dtype: bits))
+                                .item(Bool.self)
+                        compared += reference.size
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            verdicts[key] = same
+            FileHandle.standardError.write(
+                ("dflash2 one-launch concat (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        : "self-test failed; concatenated kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+}
+
+// MARK: - Head RMSNorm over a strided view
+
+/// The drafter's q and k head norms read the stacked q|k|v product through
+/// its strides. `RMSNorm` first copies a view that is not row-contiguous (a
+/// column slice of the stacked product), one launch per norm; this is MLX's
+/// `rms_single_row` body (one simdgroup per row of `D` <= 128, four reads per
+/// lane, the same FP32 sum, `simd_sum`s, `precise::rsqrt` and the two
+/// roundings of the output) reading the view in place and writing the same
+/// contiguous output. Self-tested once per dtype and head size (at bind) on
+/// column slices of a stacked product with rows of very different
+/// magnitudes (and a zero row), bit for bit against `RMSNorm`; a mismatch or
+/// an MLX error keeps `RMSNorm`. `MLXFAST_DFLASH_STRIDED_NORM=0` keeps it.
+enum DFlash2StridedRMSNorm {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_STRIDED_NORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_strided_rms_single_row",
+        inputNames: ["x", "w", "eps"],
+        outputNames: ["out"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint axis_size = uint(D);
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+
+            const uint H = uint(x_shape[2]);
+            const uint T = uint(x_shape[1]);
+            const uint h = gid % H;
+            const uint t = (gid / H) % T;
+            const uint b = gid / (H * T);
+            const device auto* xr = x + int64_t(b) * x_strides[0] + int64_t(t) * x_strides[1]
+                + int64_t(h) * x_strides[2] + lid * N_READS;
+            const device auto* wr = w + lid * N_READS;
+
+            float acc = 0;
+            float thread_x[N_READS];
+            if (lid * N_READS + N_READS <= axis_size) {
+              for (int i = 0; i < N_READS; i++) {
+                thread_x[i] = xr[i];
+                acc += thread_x[i] * thread_x[i];
+              }
+            } else {
+              for (int i = 0; i < N_READS; i++) {
+                thread_x[i] = (lid * N_READS + i < axis_size) ? (float)xr[i] : 0;
+                acc += thread_x[i] * thread_x[i];
+              }
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+              local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+              local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              acc = simd_sum(local_sums[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            device auto* o = out + size_t(gid) * axis_size + lid * N_READS;
+            if (lid * N_READS + N_READS <= axis_size) {
+              for (int i = 0; i < N_READS; i++) {
+                o[i] = wr[i] * static_cast<OutT>(thread_x[i] * local_inv_mean[0]);
+              }
+            } else {
+              for (int i = 0; i < N_READS; i++) {
+                if ((lid * N_READS + i) < axis_size) {
+                  o[i] = wr[i] * static_cast<OutT>(thread_x[i] * local_inv_mean[0]);
+                }
+              }
+            }
+            """,
+        ensureRowContiguous: false)
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+    nonisolated(unsafe) private static var epsArrays: [Float: MLXArray] = [:]
+
+    private static func epsArray(_ eps: Float) -> MLXArray {
+        if let hit = epsArrays[eps] { return hit }
+        let made = MLXArray([eps])
+        epsArrays[eps] = made
+        return made
+    }
+
+    private static func launch(_ x: MLXArray, weight: MLXArray, eps: MLXArray) -> MLXArray {
+        let (b, t, h, d) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
+        return kernel(
+            [x, weight, eps],
+            template: [("OutT", x.dtype), ("D", d)],
+            grid: (32 * b * t * h, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+    }
+
+    /// `norm(x)` for a `[B, T, H, D]` view whose rows of `D` are contiguous.
+    static func apply(_ norm: RMSNorm, _ x: MLXArray) -> MLXArray {
+        let weight = norm.weight
+        guard enabled, x.ndim == 4, x.dim(3) <= 128, x.dim(3) % 4 == 0,
+            weight.ndim == 1, weight.dim(0) == x.dim(3), weight.dtype == x.dtype,
+            [DType.bfloat16, .float16].contains(x.dtype),
+            x.size < Int(Int32.max),
+            verified(x.dtype, headDim: x.dim(3), eps: norm.eps)
+        else { return norm(x) }
+        let eps: MLXArray = lock.withLock { epsArray(norm.eps) }
+        return launch(x, weight: weight, eps: eps)
+    }
+
+    /// Runs the self-test for this dtype and head size now (load time).
+    static func prepare(dtype: DType, headDim: Int, eps: Float) {
+        guard enabled, [DType.bfloat16, .float16].contains(dtype), headDim <= 128,
+            headDim % 4 == 0
+        else { return }
+        _ = verified(dtype, headDim: headDim, eps: eps)
+    }
+
+    private static func verified(_ dtype: DType, headDim d: Int, eps: Float) -> Bool {
+        lock.withLock {
+            let key = "\(dtype) \(d) \(eps)"
+            if let verdict = verdicts[key] { return verdict }
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    let epsA = epsArray(eps)
+                    for seed in [81, 82] {
+                        let rows = 17
+                        // Row scales from 1e-3 to 3e3 and one zero row.
+                        let scale = exp(MLXRandom.uniform(
+                            Float(-7) ..< Float(8), [rows, 1], key: MLXRandom.key(UInt64(seed))))
+                            * (MLXArray(0 ..< rows) .!= MLXArray(Int32(5))).asType(.float32)
+                                .reshaped(rows, 1)
+                        let stacked = (MLXRandom.normal(
+                            [rows, 48 * d], key: MLXRandom.key(UInt64(seed + 100))) * scale)
+                            .asType(dtype)
+                        let weight = (1 + 0.3 * MLXRandom.normal(
+                            [d], key: MLXRandom.key(UInt64(seed + 200)))).asType(dtype)
+                        let views = [
+                            stacked[1..., ..<(32 * d)].reshaped(1, rows - 1, 32, d),
+                            stacked[0..., (32 * d) ..< (40 * d)].reshaped(1, rows, 8, d),
+                        ]
+                        for view in views {
+                            let fused = launch(view, weight: weight, eps: epsA)
+                            let reference = MLXFast.rmsNorm(view, weight: weight, eps: eps)
+                            same = same && fused.shape == reference.shape
+                                && all(fused.view(dtype: .uint16) .== reference.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            compared += reference.size
+                        }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            verdicts[key] = same
+            FileHandle.standardError.write(
+                ("dflash2 strided head norm (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; strided\n"
+                        : "self-test failed; RMSNorm kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+}
+
+// MARK: - Head norms and ropes in one launch
+
+/// The q and k head norms and their ropes (four launches per layer) as ONE
+/// launch over the stacked q|k|v product. Each simdgroup takes one head row
+/// through `DFlash2StridedRMSNorm`'s body verbatim (reads, FP32 sum,
+/// `simd_sum`s, `precise::rsqrt`, both roundings), then MLX's `rope` body on
+/// the rounded row (`exp2(-d * log2(base))`, `fast::cos`/`fast::sin`, the
+/// same FP32 products, one rounding), the other half of each pair taken from
+/// lane `^ 16`; the outputs are `rope`'s contiguous `[B, H, T, D]`.
+/// Self-tested at bind against `rmsNorm` + the drafter's own rope, bit for
+/// bit, on rows from 1e-3 to 3e3 with zero rows at three offsets; a mismatch
+/// or an MLX error keeps the four launches. `MLXFAST_DFLASH_QK_PREWORK=0`
+/// keeps them.
+enum DFlash2QKPrework {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_QK_PREWORK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_qk_prework",
+        inputNames: ["y", "qw", "kw", "p", "pos"],
+        outputNames: ["q", "k"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint axis_size = uint(D);
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+
+            const uint n = uint(y_shape[1]);
+            const uint BL = uint(pos[2]);
+            const uint qRows = uint(y_shape[0]) * BL * HQ;
+            const bool isQ = gid < qRows;
+            const uint r = isQ ? gid : gid - qRows;
+            const uint H = isQ ? HQ : HK;
+            const uint NT = isQ ? BL : n;
+            const uint h = r % H;
+            const uint t = (r / H) % NT;
+            const uint b = r / (H * NT);
+            const device auto* xr = y + (size_t(b) * n + (isQ ? n - BL + t : t)) * uint(y_shape[2])
+                + (isQ ? 0 : HQ * D) + h * D + lid * N_READS;
+            const device auto* wr = (isQ ? qw : kw) + lid * N_READS;
+
+            float acc = 0;
+            float thread_x[N_READS];
+            for (int i = 0; i < N_READS; i++) {
+              thread_x[i] = xr[i];
+              acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+              local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+              local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              acc = simd_sum(local_sums[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + p[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const bool lo = lid < 16;
+            float Lp = p[2] * static_cast<float>(t + uint(pos[isQ ? 0 : 1]));
+            device T* o = (isQ ? q : k) + ((size_t(b) * H + h) * NT + t) * D + lid * N_READS;
+            for (int i = 0; i < N_READS; i++) {
+              const T v = wr[i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+              const float xv = static_cast<float>(v);
+              const float other = simd_shuffle_xor(xv, ushort(16));
+              float d = static_cast<float>((lid & 15) * N_READS + i) / static_cast<float>(D / 2);
+              float inv_freq = metal::exp2(-d * p[1]);
+              float theta = Lp * inv_freq;
+              float costheta = metal::fast::cos(theta);
+              float sintheta = metal::fast::sin(theta);
+              float x1 = lo ? xv : other;
+              float x2 = lo ? other : xv;
+              float rx1 = x1 * costheta - x2 * sintheta;
+              float rx2 = x1 * sintheta + x2 * costheta;
+              o[i] = static_cast<T>(lo ? rx1 : rx2);
+            }
+            """,
+        ensureRowContiguous: true)
+
+    private static let lock = NSLock()
+    /// `[eps, log2(base), scale]` per self-tested geometry.
+    nonisolated(unsafe) private static var ready: [String: MLXArray] = [:]
+
+    private static func launch(
+        _ y: MLXArray, _ l: Int, _ hq: Int, _ hk: Int, _ qw: MLXArray, _ kw: MLXArray,
+        _ p: MLXArray, _ offsets: [Int]
+    ) -> (MLXArray, MLXArray) {
+        let (b, n, d) = (y.dim(0), y.dim(1), qw.dim(0))
+        let out = kernel(
+            [y, qw, kw, p, MLXArray(offsets.map { Int32($0) } + [Int32(l)])],
+            template: [("T", y.dtype), ("D", d), ("HQ", hq), ("HK", hk)],
+            grid: (32 * b * (l * hq + n * hk), 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[b, hq, l, d], [b, hk, n, d]], outputDTypes: [y.dtype, y.dtype])
+        return (out[0], out[1])
+    }
+
+    /// `(rope(qNorm(q)), rope(kNorm(k)))` from the stacked product `y`
+    /// (`[B, n, (heads + 2 kvHeads) * D]`, the q rows its last `l`), rotated
+    /// at `offsets` = [q, k], or nil when the launch does not apply.
+    static func apply(
+        _ y: MLXArray, blockRows l: Int, heads hq: Int, qNorm: RMSNorm, kNorm: RMSNorm,
+        offsets: [Int]
+    ) -> (MLXArray, MLXArray)? {
+        let d = qNorm.weight.dim(0)
+        let hk = (y.dim(-1) / d - hq) / 2
+        guard enabled, y.ndim == 3, d == 128, y.dim(2) == (hq + 2 * hk) * d, hk > 0,
+            l >= 1, l <= y.dim(1), qNorm.eps == kNorm.eps, kNorm.weight.shape == [d],
+            qNorm.weight.dtype == y.dtype, kNorm.weight.dtype == y.dtype,
+            y.size < Int(Int32.max), offsets.allSatisfy({ $0 >= 0 }),
+            let p = lock.withLock({ ready["\(y.dtype) \(hq) \(hk) \(qNorm.eps)"] })
+        else { return nil }
+        return launch(y, l, hq, hk, qNorm.weight, kNorm.weight, p, offsets)
+    }
+
+    /// The self-test for the drafter's geometry and rope, at bind.
+    static func prepare(
+        rope: RoPELayer, base: Float, dtype: DType, heads hq: Int, kvHeads hk: Int,
+        headDim d: Int, eps: Float
+    ) {
+        guard enabled, d == 128, hk > 0, [DType.bfloat16, .float16].contains(dtype) else { return }
+        lock.withLock {
+            let key = "\(dtype) \(hq) \(hk) \(eps)"
+            guard ready[key] == nil else { return }
+            let p = MLXArray([eps, log2(base), 1])
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    for (seed, n, off) in [(71, 24, 37), (72, 16, 4077), (73, 40, 65514)] {
+                        let (l, w) = (16, hq + 2 * hk)
+                        let index = MLXArray(0 ..< n * w).reshaped(n, w, 1)
+                        // Head rows from 1e-3 to 3e3, a zero q row and a zero k row.
+                        let scale = exp(MLXRandom.uniform(
+                            Float(-7) ..< Float(8), [n, w, 1], key: MLXRandom.key(UInt64(seed))))
+                            * ((index .!= MLXArray(Int32((n - 1) * w + 3)))
+                                .&& (index .!= MLXArray(Int32(hq + 1)))).asType(.float32)
+                        let y = (MLXRandom.normal(
+                            [n, w, d], key: MLXRandom.key(UInt64(seed + 100))) * scale)
+                            .asType(dtype).reshaped(1, n, w * d)
+                        let qw = (1 + 0.3 * MLXRandom.normal(
+                            [d], key: MLXRandom.key(UInt64(seed + 200)))).asType(dtype)
+                        let kw = (1 + 0.3 * MLXRandom.normal(
+                            [d], key: MLXRandom.key(UInt64(seed + 300)))).asType(dtype)
+                        let (fq, fk) = launch(y, l, hq, hk, qw, kw, p, [off + n - l, off])
+                        let rq = rope(
+                            MLXFast.rmsNorm(
+                                y[0..., (n - l)..., ..<(hq * d)].reshaped(1, l, hq, d),
+                                weight: qw, eps: eps
+                            ).transposed(0, 2, 1, 3), offset: off + n - l)
+                        let rk = rope(
+                            MLXFast.rmsNorm(
+                                y[0..., 0..., (hq * d) ..< ((hq + hk) * d)].reshaped(1, n, hk, d),
+                                weight: kw, eps: eps
+                            ).transposed(0, 2, 1, 3), offset: off)
+                        for (f, r) in [(fq, rq), (fk, rk)] {
+                            same = same && f.shape == r.shape
+                                && all(f.view(dtype: .uint16) .== r.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            compared += r.size
+                        }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            if same { ready[key] = p }
+            FileHandle.standardError.write(
+                ("dflash2 q/k norm+rope prework (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        : "self-test failed; norms and ropes kept\n")).data(using: .utf8)!)
+        }
+    }
+}
+
+// MARK: - SwiGLU in one launch
+
+/// `silu(g) * u` for the drafter's MLP as ONE launch over the stacked
+/// gate|up product's two column halves, where the compiled SiLU and the
+/// product ran as two: the compiled kernel's own ops in its own order and
+/// dtype (MLX's `Sigmoid` body on the BF16 gate, `x * sigmoid(x)` rounded to
+/// BF16, then the product with `u` rounded to BF16). Self-tested once per
+/// dtype and width (at bind), bit for bit against `silu(g) * u` on halves of
+/// a stacked product with rows from 1e-3 to 3e3 (both saturations) and a
+/// zero row; a mismatch or an MLX error keeps the two launches.
+/// `MLXFAST_DFLASH_SWIGLU=0` keeps them.
+enum DFlash2SwiGLU {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SWIGLU"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_swiglu_strided",
+        inputNames: ["g", "u"],
+        outputNames: ["out"],
+        source: """
+            const uint idx = thread_position_in_grid.x;
+            const uint N = uint(g_shape[2]);
+            if (idx >= uint(g_shape[1]) * N) { return; }
+            const uint r = idx / N;
+            const uint c = idx - r * N;
+            const OutT gv = g[int64_t(r) * g_strides[1] + int64_t(c) * g_strides[2]];
+            const OutT uv = u[int64_t(r) * u_strides[1] + int64_t(c) * u_strides[2]];
+            const OutT sg = SigmoidMLX()(gv);
+            const OutT act = MultiplyMLX()(gv, sg);
+            out[idx] = MultiplyMLX()(act, uv);
+            """,
+        header: """
+            struct SigmoidMLX {
+              template <typename T>
+              T operator()(T x) thread {
+                auto y = 1 / (1 + metal::exp(metal::abs(x)));
+                return (x < 0) ? y : 1 - y;
+              }
+            };
+            struct MultiplyMLX {
+              template <typename T>
+              T operator()(T x, T y) { return x * y; }
+            };
+            """,
+        ensureRowContiguous: false)
+
+    private static func launch(_ g: MLXArray, _ u: MLXArray) -> MLXArray {
+        let (r, n) = (g.dim(1), g.dim(2))
+        return kernel(
+            [g, u], template: [("OutT", g.dtype)],
+            grid: (r * n, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [g.shape], outputDTypes: [g.dtype])[0]
+    }
+
+    static func apply(_ g: MLXArray, _ u: MLXArray) -> MLXArray {
+        guard enabled, g.ndim == 3, g.dim(0) == 1, g.shape == u.shape, g.dtype == u.dtype,
+            [DType.bfloat16, .float16].contains(g.dtype), g.size < Int(Int32.max),
+            verified(g.dtype, width: g.dim(2))
+        else { return silu(g) * u }
+        return launch(g, u)
+    }
+
+    static func prepare(dtype: DType, width: Int) {
+        guard enabled, [DType.bfloat16, .float16].contains(dtype) else { return }
+        _ = verified(dtype, width: width)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+
+    private static func verified(_ dtype: DType, width: Int) -> Bool {
+        lock.withLock {
+            let key = "\(dtype) \(width)"
+            if let verdict = verdicts[key] { return verdict }
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    for seed in [91, 92] {
+                        let rows = 16
+                        let scale = exp(MLXRandom.uniform(
+                            Float(-7) ..< Float(8), [rows, 1], key: MLXRandom.key(UInt64(seed))))
+                            * (MLXArray(0 ..< rows) .!= MLXArray(Int32(3))).asType(.float32)
+                                .reshaped(rows, 1)
+                        let stacked = (MLXRandom.normal(
+                            [rows, 2 * width], key: MLXRandom.key(UInt64(seed + 100))) * scale)
+                            .asType(dtype).reshaped(1, rows, 2 * width)
+                        let g = stacked[.ellipsis, ..<width]
+                        let u = stacked[.ellipsis, width...]
+                        let fused = launch(g, u)
+                        let reference = silu(g) * u
+                        same = same && fused.shape == reference.shape
+                            && all(fused.view(dtype: .uint16) .== reference.view(dtype: .uint16))
+                                .item(Bool.self)
+                        compared += reference.size
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            verdicts[key] = same
+            FileHandle.standardError.write(
+                ("dflash2 one-launch SwiGLU (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        : "self-test failed; silu(g) * u kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
 }
