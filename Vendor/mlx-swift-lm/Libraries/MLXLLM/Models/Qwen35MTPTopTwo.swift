@@ -1561,6 +1561,464 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
+    // Zoo 2: more bodies under the zoo's rule (a)-(c) above, so every one is
+    // bitwise that of `sourceNarrowInt8` (self-tested at load against
+    // `original` on the stored words, one error scope per body):
+    // - `sourceNarrowInt8Zoo2`: the zoo body over "units" of GS consecutive
+    //   groups of a quarter. A K step runs E = GS x TN / 32 ops (group
+    //   GS u + e / NH, 32-column half e % NH), each into its own int32 tile;
+    //   the epilogue then folds the unit's groups in ascending order, each over
+    //   its halves, with the two FMAs of `sourceNarrowInt8`. KH 16 / 32 / 64 /
+    //   128, TN 32 / 64 / 128, GS 1 / 2 / 4 (E <= 4), a PD-deep ring of whole
+    //   units' words, a CD-deep ring of their constants (CD = 1: loaded at the
+    //   unit's start, NP K steps before the epilogue reads them), and the
+    //   reduction in passes of RC halves (the same sums in the same order, less
+    //   threadgroup memory at TN 128).
+    //   Templates: OutT, NEG, F32S, PD, TN, KH, CD, GS, RC.
+    //   grid (N / TN * 128), (128).
+    // - `sourceNarrowInt8PairR`: the pair body with R simdgroups per K quarter
+    //   (R = 2 .. 5): simdgroup q + 4 r takes groups g0 + r + R t; at step t
+    //   the helpers hand their int32 tiles over through XS slots per quarter
+    //   (ceil((R - 1) / XS) rounds of two barriers) and the owner folds the
+    //   step's groups g0 + R t, g0 + R t + 1, .. in ascending order, so the
+    //   owner's sequence is (b) exactly with R loads in flight per column block.
+    //   The reduction reuses the exchange. Templates: OutT, NEG, F32S, PD, KH,
+    //   R, XS, CD. grid (N / 32 * 128 R), (128 R).
+    // Both read the tiled copy only. The zoo 2 reduction keeps one `if (sg ==
+    // 0)` block and one store, so the fused head top two (`headTop2Source`)
+    // applies to it as to the others (its running state at `HT2 STATE`).
+    private static let sourceNarrowInt8Zoo2 = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int gper = Kg / 4;
+        const int g0 = int(sg) * gper;
+        const int g1 = g0 + gper;
+        const int nu = (gper + GS - 1) / GS;   // units: GS consecutive groups of this quarter
+        constexpr int NH = TN / 32;
+        constexpr int E = GS * NH;             // ops per K step: op e takes group GS u + e / NH, half e % NH
+        constexpr int NP = 128 / KH;           // K steps per 128-group
+        constexpr int KW = KH / 16;            // 2-bit words per column per step
+        constexpr int CDD = CD > 0 ? CD : (PD < 2 ? 2 : PD);  // constants ring depth (units)
+        constexpr int UR = CDD % PD == 0 ? CDD : (PD % CDD == 0 ? PD : PD * CDD);  // unit-loop unroll
+        constexpr int CAP = 32 / 2;
+        constexpr int STW = 32 * KH / 4;       // staging words per op
+        constexpr int SWS = E * STW;           // staging words per simdgroup
+        constexpr int RH = RC > 0 ? RC : NH;   // 32-column halves per reduction pass
+        constexpr int RDW = 3 * RH * CAP * 32; // reduction words
+        static_assert(E <= 4 && NH % RH == 0, "at most four ops per step");
+        // staging, reused by the reduction: sized for whichever is larger
+        threadgroup uint32_t bs[4 * SWS > RDW ? 4 * SWS : RDW];
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, KH, false, true, false, NP > 1 ? mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate : mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
+        threadgroup uint32_t* sb = bs + int(sg) * SWS;
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)sb, dextents<int, 2>(KH, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)(sb + (E > 1 ? 1 : 0) * STW), dextents<int, 2>(KH, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B2((threadgroup int8_t*)(sb + (E > 2 ? 2 : 0) * STW), dextents<int, 2>(KH, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B3((threadgroup int8_t*)(sb + (E > 3 ? 3 : 0) * STW), dextents<int, 2>(KH, 32));
+        auto tA0 = A.template slice<KH, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cT2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        auto cT3 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[NH][CAP];
+        #pragma clang loop unroll(full)
+        for (int h = 0; h < NH; h++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[h][i] = 0.0f; }
+        }
+        // Tiled copy: block n0 / 32 + h, group gg, column lane: 8 contiguous words.
+        const device uint32_t* wrow = w + (size_t)(n0 / 32) * (size_t)Kg * 256 + (size_t)int(lane) * 8;
+        const size_t hstride = (size_t)Kg * 256;
+        // all 8 words of every op of unit u (a missing last group is skipped)
+        auto getw = [&](int u, thread uint32_t (&v)[E][8]) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < E; e++) {
+            const int g = g0 + GS * u + e / NH;
+            if (GS > 1 && g >= g1) { continue; }
+            const device uint4* src = (const device uint4*)(wrow + (e % NH) * hstride + (size_t)g * 256);
+            const uint4 u0 = src[0];
+            const uint4 u1 = src[1];
+            v[e][0] = u0.x; v[e][1] = u0.y; v[e][2] = u0.z; v[e][3] = u0.w;
+            v[e][4] = u1.x; v[e][5] = u1.y; v[e][6] = u1.z; v[e][7] = u1.w;
+          }
+        };
+        // stages K step p of unit u's words (words p * KW .. p * KW + KW - 1): one uint4 store per word
+        auto putw = [&](thread const uint32_t (&v)[E][8], int u, int p) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < E; e++) {
+            if (GS > 1 && g0 + GS * u + e / NH >= g1) { continue; }
+            threadgroup uint32_t* dst = sb + e * STW + int(lane) * (KH / 4);
+            #pragma clang loop unroll(full)
+            for (int jj = 0; jj < KW; jj++) {
+              const uint32_t wv = v[e][p * KW + jj];
+              *(threadgroup uint4*)(dst + 4 * jj) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        // Word ring: unit i sits in slot i % PD from its load until its last K step is
+        // staged; the slot is then refilled with unit i + PD. Constants ring: slot
+        // (u % CDD) holds unit u's groups' constants, loaded CDD - 1 units ahead, kept
+        // in their stored types until use.
+        uint32_t wr[PD][E][8];
+        half4 shr[CDD][GS][NH][2], bhr[CDD][GS][NH][2];
+        float4 sfr[CDD][GS][NH][2];
+        float cr[CDD][GS][4];
+        auto getc = [&](int u, int s) {
+          #pragma clang loop unroll(full)
+          for (int ge = 0; ge < GS; ge++) {
+            const int g = g0 + GS * u + ge;
+            if (GS > 1 && g >= g1) { continue; }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 2; q++) {
+                const size_t o = (size_t)g * N + n0 + 32 * h + fn + 16 * q;
+                if constexpr (F32S) { sfr[s][ge][h][q] = *(const device float4*)(scalesT + o); }
+                else { shr[s][ge][h][q] = *(const device half4*)(scalesT + o); }
+                if constexpr (!NEG) { bhr[s][ge][h][q] = *(const device half4*)(biasesT + o); }
+              }
+            }
+            cr[s][ge][0] = ascale[(size_t)fm * Kg + g]; cr[s][ge][1] = ascale[(size_t)(fm + 8) * Kg + g];
+            cr[s][ge][2] = rowsum[(size_t)fm * Kg + g]; cr[s][ge][3] = rowsum[(size_t)(fm + 8) * Kg + g];
+          }
+        };
+        // K step p of unit u: every op's staged KH x 32 codes
+        auto mm = [&](int u, int p) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < E; e++) {
+            const int g = g0 + GS * u + e / NH;
+            if (GS > 1 && g >= g1) { continue; }
+            auto tA = A.template slice<KH, 16>(g * 128 + p * KH, 0);
+            if (e == 0) { op.run(tA, B0, cT0); }
+            else if (e == 1) { op.run(tA, B1, cT1); }
+            else if (e == 2) { op.run(tA, B2, cT2); }
+            else { op.run(tA, B3, cT3); }
+          }
+        };
+        // unit u at unrolled position j (a constant): ring slots are static
+        auto body = [&](int u, int j) {
+          const int cs = j % CDD;
+          const int ws = j % PD;
+          if (u + CDD - 1 < nu) { getc(u + CDD - 1, (j + CDD - 1) % CDD); }
+          if constexpr (NP > 1) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { cT0[i] = 0; cT1[i] = 0; cT2[i] = 0; cT3[i] = 0; }
+          }
+          #pragma clang loop unroll(full)
+          for (int p = 0; p < NP; p++) {
+            if (p > 0) {
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              putw(wr[ws], u, p);
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              if (p == NP - 1 && u + PD < nu) { getw(u + PD, wr[ws]); }
+            }
+            mm(u, p);
+          }
+          // the unit's groups in ascending order, each over its halves: every output
+          // still folds its quarter's groups one by one in ascending order
+          #pragma clang loop unroll(full)
+          for (int ge = 0; ge < GS; ge++) {
+            if (GS > 1 && g0 + GS * u + ge >= g1) { continue; }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < NH; h++) {
+              const int e = ge * NH + h;
+              float4 sv[2], bv[2];
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 2; q++) {
+                if constexpr (F32S) { sv[q] = sfr[cs][ge][h][q]; } else { sv[q] = float4(shr[cs][ge][h][q]); }
+                if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhr[cs][ge][h][q]); }
+              }
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) {
+                const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+                const int32_t ci = e == 0 ? cT0[i] : (e == 1 ? cT1[i] : (e == 2 ? cT2[i] : cT3[i]));
+                acc[h][i] = fma(mh ? cr[cs][ge][1] : cr[cs][ge][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][ge][3] : cr[cs][ge][2], acc[h][i]));
+              }
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (u + 1 < nu) {
+            const int wn = (j + 1) % PD;       // slot holding unit u + 1
+            putw(wr[wn], u + 1, 0);
+            if (NP == 1 && u + 1 + PD < nu) { getw(u + 1 + PD, wr[wn]); }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        };
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < PD; i++) {
+          if (i < nu) { getw(i, wr[i]); }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CDD - 1; i++) {
+          if (i < nu) { getc(i, i); }
+        }
+        putw(wr[0], 0, 0);
+        if (NP == 1 && PD < nu) { getw(PD, wr[0]); }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int u = 0; u < nu; u += UR) {
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < UR; j++) {
+            if (u + j < nu) { body(u + j, j); }
+          }
+        }
+        // the reduction reuses the staging buffers, in simdgroup order, RH halves a pass
+        threadgroup float* red = (threadgroup float*)bs;
+        /* HT2 STATE */
+        #pragma clang loop unroll(full)
+        for (int rp = 0; rp < NH / RH; rp++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg > 0) {
+            #pragma clang loop unroll(full)
+            for (int hh = 0; hh < RH; hh++) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * RH + hh) * (CAP * 32) + i * 32 + int(lane)] = acc[rp * RH + hh][i]; }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg == 0) {
+            #pragma clang loop unroll(full)
+            for (int hh = 0; hh < RH; hh++) {
+              const int h = rp * RH + hh;
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i += 4) {
+                const int mh = (i >> 2) & 1;
+                const int nq = i >> 3;
+                float v0 = acc[h][i];
+                float v1 = acc[h][i + 1];
+                float v2 = acc[h][i + 2];
+                float v3 = acc[h][i + 3];
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < 4 - 1; q++) {
+                  v0 += red[(q * RH + hh) * (CAP * 32) + i * 32 + int(lane)];
+                  v1 += red[(q * RH + hh) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                  v2 += red[(q * RH + hh) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                  v3 += red[(q * RH + hh) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+                }
+                const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nq;
+                if constexpr (sizeof(OutT) == sizeof(float)) {
+                  *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+                } else {
+                  *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+                }
+              }
+            }
+          }
+        }
+        """
+
+    private static let sourceNarrowInt8PairR = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int qd = int(sg) & 3;           // K quarter, as in `sourceNarrowInt8`
+        const int role = int(sg) >> 2;        // 0: owner (the FP32 sum), 1 .. R - 1: helpers
+        const int gper = Kg / 4;
+        const int g0 = qd * gper;
+        const int g1 = g0 + gper;
+        const int ns = (gper + R - 1) / R;    // steps: step t holds groups g0 + R t .. g0 + R t + R - 1
+        constexpr int NP = 128 / KH;          // K steps per 128-group
+        constexpr int KW = KH / 16;           // 2-bit words per column per step
+        constexpr int CAP = 32 / 2;
+        constexpr int SWS = 32 * KH / 4;      // staging words per simdgroup
+        constexpr int XN = XS > 0 ? XS : R - 1;  // exchange slots per quarter
+        constexpr int XR = (R - 2) / XN + 1;     // exchange rounds per step
+        constexpr int CDD = CD > 0 ? CD : 2;     // the owner's constants ring depth (steps)
+        constexpr int UT = PD > CDD ? PD : CDD;  // step-loop unroll
+        static_assert(R >= 2 && R <= 5 && XN <= R - 1 && UT % PD == 0 && UT % CDD == 0, "two to five simdgroups per quarter");
+        threadgroup uint32_t bs[4 * R * SWS];
+        // each quarter's helper tiles, XN at a time; the reduction reuses it
+        threadgroup int32_t xch[XN * 4 * CAP * 32];
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, KH, false, true, false, NP > 1 ? mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate : mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)x, dextents<int, 2>(K, M));  // SIGNED codes only
+        threadgroup uint32_t* sb = bs + int(sg) * SWS;
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)sb, dextents<int, 2>(KH, 32));
+        auto tA0 = A.template slice<KH, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        // Tiled copy: block n0 / 32, group gg, column lane: 8 contiguous words.
+        const device uint32_t* wrow = w + (size_t)(n0 / 32) * (size_t)Kg * 256 + (size_t)int(lane) * 8;
+        auto getw = [&](int gg, thread uint32_t (&v)[8]) {
+          const device uint4* src = (const device uint4*)(wrow + (size_t)gg * 256);
+          const uint4 u0 = src[0];
+          const uint4 u1 = src[1];
+          v[0] = u0.x; v[1] = u0.y; v[2] = u0.z; v[3] = u0.w;
+          v[4] = u1.x; v[5] = u1.y; v[6] = u1.z; v[7] = u1.w;
+        };
+        auto putw = [&](thread const uint32_t (&v)[8], int p) {
+          threadgroup uint32_t* dst = sb + int(lane) * (KH / 4);
+          #pragma clang loop unroll(full)
+          for (int jj = 0; jj < KW; jj++) {
+            const uint32_t wv = v[p * KW + jj];
+            *(threadgroup uint4*)(dst + 4 * jj) = uint4(
+                wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+          }
+        };
+        // The owner's constants ring: step t's R groups in slot t % CDD, loaded CDD - 1
+        // steps ahead, kept in their stored types until use.
+        half4 shr[CDD][R][2], bhr[CDD][R][2];
+        float4 sfr[CDD][R][2];
+        float cr[CDD][R][4];
+        auto stepc = [&](int t, int s) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < R; e++) {
+            const int g = g0 + R * t + e;
+            if (g >= g1) { continue; }
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              const size_t o = (size_t)g * N + n0 + fn + 16 * q;
+              if constexpr (F32S) { sfr[s][e][q] = *(const device float4*)(scalesT + o); }
+              else { shr[s][e][q] = *(const device half4*)(scalesT + o); }
+              if constexpr (!NEG) { bhr[s][e][q] = *(const device half4*)(biasesT + o); }
+            }
+            cr[s][e][0] = ascale[(size_t)fm * Kg + g]; cr[s][e][1] = ascale[(size_t)(fm + 8) * Kg + g];
+            cr[s][e][2] = rowsum[(size_t)fm * Kg + g]; cr[s][e][3] = rowsum[(size_t)(fm + 8) * Kg + g];
+          }
+        };
+        // one group's epilogue, the FP32 sequence of `sourceNarrowInt8`
+        auto epi = [&](int s, int e, thread const int32_t (&ci)[CAP]) {
+          float4 sv[2], bv[2];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 2; q++) {
+            if constexpr (F32S) { sv[q] = sfr[s][e][q]; } else { sv[q] = float4(shr[s][e][q]); }
+            if constexpr (NEG) { bv[q] = -sv[q]; } else { bv[q] = float4(bhr[s][e][q]); }
+          }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int cc = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            acc[i] = fma(mh ? cr[s][e][1] : cr[s][e][0], sv[nq][cc] * float(ci[i]), fma(bv[nq][cc], mh ? cr[s][e][3] : cr[s][e][2], acc[i]));
+          }
+        };
+        // This simdgroup's groups: g0 + role + R t (when < g1). Word ring: its group of
+        // step t in slot t % PD until the last K step is staged, then that of step t + PD.
+        uint32_t wr[PD][8];
+        // step t at unrolled position u (a constant)
+        auto step = [&](int t, int u) {
+          const int gm = g0 + role + R * t;
+          const int ws = u % PD;
+          const int cs = u % CDD;
+          if (role == 0 && t + CDD - 1 < ns) { stepc(t + CDD - 1, (u + CDD - 1) % CDD); }
+          if (gm < g1) {
+            if constexpr (NP > 1) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { cT0[i] = 0; }
+            }
+            #pragma clang loop unroll(full)
+            for (int p = 0; p < NP; p++) {
+              if (p > 0) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                putw(wr[ws], p);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                if (p == NP - 1 && gm + R * PD < g1) { getw(gm + R * PD, wr[ws]); }
+              }
+              auto tA = A.template slice<KH, 16>(gm * 128 + p * KH, 0);
+              op.run(tA, B0, cT0);
+            }
+          }
+          // XR rounds: helpers 1 + XN x .. XN + XN x hand their tiles over in round x,
+          // and the owner folds the step's groups in ascending order: its own first,
+          // then the helpers'
+          #pragma clang loop unroll(full)
+          for (int xr = 0; xr < XR; xr++) {
+            if (role > 0 && (role - 1) / XN == xr && gm < g1) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < CAP; i++) { xch[((((role - 1) % XN) * 4 + qd) * CAP + i) * 32 + int(lane)] = cT0[i]; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (role == 0) {
+              int32_t ci[CAP];
+              if (xr == 0) {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) { ci[i] = cT0[i]; }
+                epi(cs, 0, ci);
+              }
+              #pragma clang loop unroll(full)
+              for (int x = 0; x < XN; x++) {
+                const int e = 1 + xr * XN + x;
+                if (e < R && gm + e < g1) {
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) { ci[i] = xch[((x * 4 + qd) * CAP + i) * 32 + int(lane)]; }
+                  epi(cs, e, ci);
+                }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (gm + R < g1) {
+            const int wn = (u + 1) % PD;       // slot holding this simdgroup's group of step t + 1
+            putw(wr[wn], 0);
+            if (NP == 1 && gm + R + R * PD < g1) { getw(gm + R + R * PD, wr[wn]); }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        };
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < PD; i++) {
+          if (g0 + role + R * i < g1) { getw(g0 + role + R * i, wr[i]); }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CDD - 1; i++) {
+          if (role == 0 && i < ns) { stepc(i, i); }
+        }
+        if (g0 + role < g1) {
+          putw(wr[0], 0);
+          if (NP == 1 && g0 + role + R * PD < g1) { getw(g0 + role + R * PD, wr[0]); }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int t = 0; t < ns; t += UT) {
+          #pragma clang loop unroll(full)
+          for (int u = 0; u < UT; u++) {
+            if (t + u < ns) { step(t + u, u); }
+          }
+        }
+        // the owners' partials, reduced as in `sourceNarrowInt8` (the exchange is free)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)xch;
+        if (role == 0 && qd > 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { red[(qd - 1) * (CAP * 32) + i * 32 + int(lane)] = acc[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q * (CAP * 32) + i * 32 + int(lane)];
+              v1 += red[q * (CAP * 32) + (i + 1) * 32 + int(lane)];
+              v2 += red[q * (CAP * 32) + (i + 2) * 32 + int(lane)];
+              v3 += red[q * (CAP * 32) + (i + 3) * 32 + int(lane)];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
+          }
+        }
+        """
+
     private static let kernelNarrowInt8Zoo = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8z",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -1574,6 +2032,22 @@ enum Qwen35TensorPackedMatmul {
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
         source: sourceNarrowInt8Pair,
+        header: header,
+        ensureRowContiguous: true)
+
+    private static let kernelNarrowInt8Zoo2 = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_i8z2",
+        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowInt8Zoo2,
+        header: header,
+        ensureRowContiguous: true)
+
+    private static let kernelNarrowInt8PairR = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_i8r",
+        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowInt8PairR,
         header: header,
         ensureRowContiguous: true)
 
@@ -1822,11 +2296,24 @@ enum Qwen35TensorPackedMatmul {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Groups of four consecutive i share mm and nh with c=0..3, so the
+        // four outputs are consecutive columns at nb + 32*nh. Same values as
+        // the scalar loop; float4/half4 stores match OutT. Hot path:
+        // support==staged8 (signed + FACTORED). Alignment under tip N/nb guards.
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const float v0 = acc[i];
+          const float v1 = acc[i + 1];
+          const float v2 = acc[i + 2];
+          const float v3 = acc[i + 3];
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+          } else {
+            *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+          }
         }
         """
 
@@ -1837,6 +2324,324 @@ enum Qwen35TensorPackedMatmul {
         source: sourceStaged8,
         header: header,
         ensureRowContiguous: true)
+
+    // Prompt-width int8 kernel forms on the tiled words (`sourceStaged8`,
+    // TILED = 1, reshaped along its bitwise-safe axes). The stock reduction:
+    // each 64 x 64 x 128 op sums one 128-group of a 64 x 64 output tile in
+    // int32 (exact, so the op's internal order is free); every output element
+    // then folds the groups in ascending order from 0.0f, one FP32 update per
+    // group (`acc = fma(s, fma(as, C, -rb), acc)` factored, `fma(b, rb,
+    // fma(as, s * C, acc))` otherwise), and converts once at its store. No sum
+    // crosses elements or threads. So which threadgroup or op computes an
+    // element's group sums, how far ahead and where its operands are staged,
+    // the tile shape, the raster order and the store width are all free as
+    // long as each element keeps that fold. Every form keeps the stock op per
+    // 64 x 64 sub-tile and group (same descriptor, operand types, four
+    // simdgroups and destination lane layout) and the stock epilogue
+    // expression per element in ascending group order. Axes: TM x TN tile
+    // (MT x NT ops per group sharing the staged weights / the A slice); PF = 1:
+    // the words (and AS's codes) loaded one group ahead into registers, each
+    // group's constants loaded before its ops; LG = 1: group g - 1's epilogue
+    // after group g's op, from the other int32 destination (ping-pong), the
+    // same fold one op later; AS = 1: the 64 x 128 A slice staged in
+    // threadgroup memory too; ksz[3] = 1: row tiles first in the raster;
+    // four-wide stores of the same values. Kg must be even (K % 512 == 0).
+    // Grid (N / TN * 128, M / TM, 1), or (M / TM * 128, N / TN, 1) with ksz[3]
+    // = 1; threadgroup (128, 1, 1). Inputs as `sourceStaged8` on the tiled
+    // words, ksz = [K, M, N, raster]. Every form is checked bit for bit
+    // against `sourceStaged8` at load (`PromptZooTrial`).
+    private static let sourceStaged8Zoo = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        constexpr int MT = TM / 64;
+        constexpr int NT = TN / 64;
+        constexpr int CAP = 32;
+        static_assert(LG == 0 || MT * NT == 1, "LG: one op per group");
+        static_assert(AS == 0 || MT == 1, "AS: one 64-row A slice");
+        // ksz[3] != 0: row tiles along the grid's x, so consecutive threadgroups
+        // share one weight tile; column tiles along y.
+        const bool rs = ksz[3] != 0;
+        const int n0 = int(rs ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x) * TN;
+        const int m0 = int(rs ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y) * TM;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        typedef tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> TgT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        // staged B per buffer: TN columns x 128 codes as int8 bytes, k inner (the
+        // stock staging), column half h at word 2048 * h; AS: the 64 x 128 A slice
+        // staged the same way (row r at word 32 * r).
+        threadgroup uint32_t bs[2][TN * 32];
+        threadgroup uint32_t xs[2][AS ? 2048 : 4];
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        TgT B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        typedef typename metal::conditional<AS != 0, TgT, decltype(tA0)>::type AOpT;
+        // cT0 / cT1: the ops of sub-tiles 0 / 1, or (LG) of even / odd groups
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<AOpT>, metal::remove_addrspace_t<TgT>, int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<AOpT>, metal::remove_addrspace_t<TgT>, int32_t>();
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[MT * NT][CAP];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
+        }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const device float4* up0 = (const device float4*)(uT + nb);
+        const device float4* up1 = (const device float4*)(uT + nb + 32);
+        const int NQ = N / 4;
+        const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        float4 s0[NT], s1[NT], b0[NT], b1[NT], u0[NT], u1[NT];
+        float as[MT][4], rb[MT][4];
+        // group g's constants, the stock loads (sub-tile rows r, column half h)
+        auto consts = [&](const int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            s0[h] = float4(sp0[g * NQ + 16 * h]); s1[h] = float4(sp1[g * NQ + 16 * h]);
+            if constexpr (NEGATIVE_SCALE_BIAS) {
+              b0[h] = -s0[h]; b1[h] = -s1[h];
+            } else {
+              b0[h] = float4(bp0[g * NQ + 16 * h]); b1[h] = float4(bp1[g * NQ + 16 * h]);
+            }
+            u0[h] = 0.0f; u1[h] = 0.0f;
+            if (!SIGNED) { u0[h] = up0[g * NQ + 16 * h]; u1[h] = up1[g * NQ + 16 * h]; }
+          }
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < MT; r++) {
+            if (MPERM) {
+              const size_t tb = tbase + (size_t)r * (size_t)Kg * 64 + (size_t)g * 64;
+              const float4 as4 = *(const device float4*)(ascale + tb);
+              const float4 rb4 = *(const device float4*)(rsb + tb);
+              as[r][0] = as4.x; as[r][1] = as4.y; as[r][2] = as4.z; as[r][3] = as4.w;
+              rb[r][0] = rb4.x; rb[r][1] = rb4.y; rb[r][2] = rb4.z; rb[r][3] = rb4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 4; q++) {
+                as[r][q] = ascale[(mrow[q] + 64 * r) * Kg + g]; rb[r][q] = rsb[(mrow[q] + 64 * r) * Kg + g];
+              }
+            }
+          }
+        };
+        // the stock per-group epilogue of sub-tile t on cT0 (which 0) or cT1
+        auto apply = [&](const int t, const int which) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const int ci = which == 0 ? cT0[i] : cT1[i];
+            const float s = nh ? s1[h][c] : s0[h][c];
+            const float b = nh ? b1[h][c] : b0[h][c];
+            const float u = nh ? u1[h][c] : u0[h][c];
+            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+              acc[t][i] = fma(s, fma(as[r][mh], float(ci), -rb[r][mh]), acc[t][i]);
+            } else {
+              const float tv = SIGNED ? s * float(ci) : fma(s, float(ci), u);
+              acc[t][i] = fma(b, rb[r][mh], fma(as[r][mh], tv, acc[t][i]));
+            }
+          }
+        };
+        // staging (tiled words): thread t -> column t >> 1 of each column half,
+        // K half t & 1; column half h is two 32-column blocks further on.
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)((n0 + sc) >> 5) * (size_t)Kg * 256 + (size_t)((n0 + sc) & 31) * 8 + sh * 4;
+        const size_t hstep = (size_t)Kg * 512;
+        uint4 wq[NT];
+        auto fetch = [&](const int g) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) { wq[h] = *(const device uint4*)(wrow + h * hstep + (size_t)g * 256); }
+        };
+        auto put = [&](const int buf) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < NT; h++) {
+            threadgroup uint32_t* dst = bs[buf] + 2048 * h + sc * 32 + sh * 16;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const uint32_t wv = wq[h][j];
+              *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                  wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                  (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+            }
+          }
+        };
+        // AS: thread t -> row t >> 1 of the 64-row tile, 64-code half t & 1
+        const device uint4* xrow = (const device uint4*)(xq + (size_t)(m0 + int(tid >> 1)) * K) + (tid & 1) * 4;
+        uint4 xv[AS ? 4 : 1];
+        auto xfetch = [&](const int g) {
+          if constexpr (AS != 0) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) { xv[j] = xrow[g * 8 + j]; }
+          }
+        };
+        auto xput = [&](const int buf) {
+          if constexpr (AS != 0) {
+            threadgroup uint4* dst = (threadgroup uint4*)(xs[buf] + (tid >> 1) * 32 + (tid & 1) * 16);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) { dst[j] = xv[j]; }
+          }
+        };
+        // group g: stage g + 1 into buffer par ^ 1 (PF: from the registers loaded
+        // one group earlier, then load g + 2), the ops over buffer par, the
+        // epilogue (LG: of group g - 1, from the other destination), one barrier.
+        // LG unrolls the loop by two (Kg is even) so each step's destination
+        // is static; the others keep the stock loop (runtime buffer parity).
+        auto step = [&](const int g, const int par) {
+          if (g + 1 < Kg) {
+            if (PF) {
+              put(par ^ 1); xput(par ^ 1);
+              if (g + 2 < Kg) { fetch(g + 2); xfetch(g + 2); }
+            } else {
+              fetch(g + 1); xfetch(g + 1); put(par ^ 1); xput(par ^ 1);
+            }
+          }
+          if (LG) {
+            if (g > 0) { consts(g - 1); }
+          } else if (PF) {
+            consts(g);
+          }
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < MT * NT; t++) {
+            const int r = t / NT; const int h = t % NT;
+            TgT Bt((threadgroup CodeT*)(bs[par] + 2048 * h), dextents<int, 2>(128, 64));
+            const bool first = LG ? par == 0 : t == 0;
+            if constexpr (AS != 0) {
+              TgT At((threadgroup CodeT*)xs[par], dextents<int, 2>(128, 64));
+              if (first) { op.run(At, Bt, cT0); } else { op.run(At, Bt, cT1); }
+            } else {
+              auto At = A.template slice<128, 64>(g * 128, m0 + 64 * r);
+              if (first) { op.run(At, Bt, cT0); } else { op.run(At, Bt, cT1); }
+            }
+          }
+          if (LG) {
+            if (g > 0) { apply(0, par ^ 1); }
+          } else {
+            if (!PF) { consts(g); }
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < MT * NT; t++) { apply(t, t); }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        };
+        fetch(0); xfetch(0);
+        put(0); xput(0);
+        if (PF) { fetch(1); xfetch(1); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (LG != 0) {
+          for (int g = 0; g < Kg; g += 2) {
+            step(g, 0);
+            step(g + 1, 1);
+          }
+        } else {
+          for (int g = 0; g < Kg; g++) { step(g, g & 1); }
+        }
+        if (LG) {
+          consts(Kg - 1);
+          apply(0, 1);
+        }
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < MT * NT; t++) {
+          const int r = t / NT; const int h = t % NT;
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 8; q++) {
+            const int i = 4 * q;
+            const int mm = mb + 64 * r + 8 * (q & 1) + 32 * ((q >> 2) & 1);
+            const size_t base = (size_t)mm * N + nb + 64 * h + 32 * ((q >> 1) & 1);
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(acc[t][i], acc[t][i + 1], acc[t][i + 2], acc[t][i + 3]);
+            } else {
+              *(device half4*)(out + base) = half4(half(acc[t][i]), half(acc[t][i + 1]), half(acc[t][i + 2]), half(acc[t][i + 3]));
+            }
+          }
+        }
+        """
+
+    private static let kernelStaged8Zoo = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_u8_zoo",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Zoo,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// A prompt int8 kernel form: the `sourceStaged8Zoo` body `[tm, tn, pf,
+    /// lg, sa]` (`sa` is AS) and the raster flag `rs` (a launch argument).
+    struct PromptZooForm: Hashable, CustomStringConvertible {
+        let name: String
+        let tm: Int, tn: Int, pf: Int, lg: Int, sa: Int, rs: Int
+        var description: String { name }
+        var body: [Int] { [tm, tn, pf, lg, sa] }
+        func takes(m: Int, n: Int) -> Bool { m % tm == 0 && n % tn == 0 }
+    }
+
+    /// The forms in self-test order: the stock staging (b; r with the
+    /// row-first raster), then prefetch (p), prefetch + lagged epilogue (lp),
+    /// prefetch + staged A (ap) and prefetch + 128 columns (n2p), each in the
+    /// stock raster and the row-first one (suffix r).
+    static let promptZooForms: [PromptZooForm] = {
+        let bodies: [(String, Int, Int, Int, Int, Int, [Int])] = [
+            ("b", 64, 64, 0, 0, 0, [0, 1]), ("p", 64, 64, 1, 0, 0, [0, 1]), ("lp", 64, 64, 1, 1, 0, [0, 1]),
+            ("ap", 64, 64, 1, 0, 1, [0, 1]), ("n2p", 64, 128, 1, 0, 0, [0, 1]),
+        ]
+        return bodies.flatMap { b in
+            b.6.map {
+                PromptZooForm(
+                    name: $0 == 1 ? (b.0 == "b" ? "r" : b.0 + "r") : b.0, tm: b.1, tn: b.2, pf: b.3,
+                    lg: b.4, sa: b.5, rs: $0)
+            }
+        }
+    }()
+
+    /// The installed prompt form (nil: the stock kernel) and the combos it
+    /// passed; read at every prompt launch's graph build.
+    nonisolated(unsafe) static var promptZooInstalled: PromptZooForm?
+    nonisolated(unsafe) static var promptZooCombos = Set<Int>()
+    /// The combos the prompt route launched before the trial, one bit each
+    /// (combo = 2 for FP32 output, + 1 for negated offsets).
+    nonisolated(unsafe) static var promptZooSeen = 0
+
+    static func promptZooCombo(_ outputDType: DType, _ negative: Bool) -> Int {
+        (outputDType == .float32 ? 2 : 0) | (negative ? 1 : 0)
+    }
+
+    /// The form for one prompt launch (tiled words), nil for the stock kernel.
+    static func promptZoo(m: Int, n: Int, outputDType: DType, negative: Bool) -> PromptZooForm? {
+        let combo = promptZooCombo(outputDType, negative)
+        if !PromptZooTrial.done, promptZooSeen & (1 << combo) == 0 {
+            dimsLock.withLock { promptZooSeen |= 1 << combo }
+        }
+        guard let form = promptZooInstalled, form.takes(m: m, n: n), promptZooCombos.contains(combo)
+        else { return nil }
+        return form
+    }
+
+    /// One launch of `form`; `inputs` are `sourceStaged8`'s without ksz,
+    /// `template` its OutT, MPERM, SIGNED, NEGATIVE_SCALE_BIAS and FACTORED.
+    static func launchStaged8Zoo(
+        _ inputs: [MLXArray], template: [(String, any KernelTemplateArg)], form: PromptZooForm,
+        k: Int, m: Int, n: Int, outputDType: DType
+    ) -> MLXArray {
+        let ksz = dimsLock.withLock { () -> MLXArray in
+            if let cached = dims[[k, m, n, form.rs]] { return cached }
+            let array = MLXArray([Int32(k), Int32(m), Int32(n), Int32(form.rs)])
+            dims[[k, m, n, form.rs]] = array
+            return array
+        }
+        return kernelStaged8Zoo(
+            inputs + [ksz],
+            template: template + [
+                ("TM", form.tm), ("TN", form.tn), ("PF", form.pf), ("LG", form.lg), ("AS", form.sa),
+            ],
+            grid: form.rs == 1 ? (m / form.tm * 128, n / form.tn, 1) : (n / form.tn * 128, m / form.tm, 1),
+            threadGroup: (128, 1, 1), outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+    }
 
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
@@ -2013,35 +2818,107 @@ enum Qwen35TensorPackedMatmul {
         case pk32pd1 = 28
         case pk32pd2 = 29
         case pk64pd2 = 30
+        // Zoo 2 (`sourceNarrowInt8Zoo2` / `sourceNarrowInt8PairR`): k16 (K 16
+        // per op), a four-group ring over K 16 steps, TN 128, dual (two
+        // consecutive groups per step, folded in order), pair with 16 (one
+        // helper), 32 (three helpers; `x1`: one exchange slot, three rounds)
+        // or 40 simdgroups (four helpers, two slots).
+        case k16pd2 = 31
+        case k16pd4 = 32
+        case w128k32pd1 = 33
+        case g2k32pd1 = 34
+        case pk16pd2 = 35
+        case p4k16pd1 = 36
+        case p4k16x1 = 37
+        case p5k16pd1 = 38
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
-            case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1: return 1
-            case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2: return 2
+            case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
+                .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1:
+                return 1
+            case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2:
+                return 2
             case .pd3, .k64pd3: return 3
-            case .pd4, .k64pd4, .k32pd4: return 4
+            case .pd4, .k64pd4, .k32pd4, .k16pd4: return 4
             }
         }
-        var tn: Int { [.tn64, .w64k64pd1, .w64k32pd1, .aw64pd1].contains(self) ? 64 : 32 }
+        var tn: Int {
+            switch self {
+            case .tn64, .w64k64pd1, .w64k32pd1, .aw64pd1: return 64
+            case .w128k32pd1: return 128
+            default: return 32
+            }
+        }
         var kh: Int {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
-            case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2: return 32
+            case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1:
+                return 32
+            case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return 16
             default: return 128
             }
         }
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4: return "k32"
-            case .w64k64pd1, .w64k32pd1: return "wide"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4: return "k32"
+            case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
-            case .pk32pd1, .pk32pd2, .pk64pd2: return "pair"
+            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
+            case .g2k32pd1: return "dual"
             default: return nil
             }
         }
         var am: Int { [.a128pd2, .a64pd2, .aw64pd1].contains(self) ? 2 : 0 }
+
+        /// Zoo 2 bodies: `sourceNarrowInt8PairR` (true) or `sourceNarrowInt8Zoo2`
+        /// (false); nil for every other body.
+        var zoo2Pair: Bool? {
+            switch self {
+            case .k16pd2, .k16pd4, .w128k32pd1, .g2k32pd1: return false
+            case .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return true
+            default: return nil
+            }
+        }
+        /// A zoo 2 body's templates after OutT / NEG / F32S: PD, TN, KH, CD
+        /// (constants ring depth, 0: the words ring's), GS (groups per unit),
+        /// RC (halves per reduction pass, 0: all) for `sourceNarrowInt8Zoo2`;
+        /// PD, KH, R (simdgroups per quarter), XS (exchange slots, 0: R - 1),
+        /// CD for `sourceNarrowInt8PairR`.
+        var zoo2Template: [(String, Int)] {
+            switch self {
+            case .k16pd2: return [("PD", 2), ("TN", 32), ("KH", 16), ("CD", 0), ("GS", 1), ("RC", 0)]
+            case .k16pd4: return [("PD", 4), ("TN", 32), ("KH", 16), ("CD", 1), ("GS", 1), ("RC", 0)]
+            case .w128k32pd1:
+                return [("PD", 1), ("TN", 128), ("KH", 32), ("CD", 1), ("GS", 1), ("RC", 2)]
+            case .g2k32pd1: return [("PD", 1), ("TN", 32), ("KH", 32), ("CD", 1), ("GS", 2), ("RC", 0)]
+            case .pk16pd2: return [("PD", 2), ("KH", 16), ("R", 2), ("XS", 0), ("CD", 0)]
+            case .p4k16pd1: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 0), ("CD", 1)]
+            case .p4k16x1: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 1), ("CD", 1)]
+            case .p5k16pd1: return [("PD", 1), ("KH", 16), ("R", 5), ("XS", 2), ("CD", 1)]
+            default: return []
+            }
+        }
+        /// Threads per threadgroup: 32 per simdgroup; a pair body runs R
+        /// simdgroups per K quarter (the zoo's pair bodies two).
+        var threads: Int {
+            switch self {
+            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2: return 256
+            case .p4k16pd1, .p4k16x1: return 512
+            case .p5k16pd1: return 640
+            default: return 128
+            }
+        }
+        /// Shape classes a zoo body is tried on (`narrowShapeClass`): the new
+        /// pair, dual and deep-ring bodies target the N = 5120 shapes only.
+        var zooClasses: Set<Int> {
+            switch self {
+            case .k16pd4, .g2k32pd1, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return [1]
+            default: return [1, 2]
+            }
+        }
 
         init?(name: String) {
             guard let v = Self.allCases.first(where: { "\($0)" == name }) else { return nil }
@@ -2079,38 +2956,78 @@ enum Qwen35TensorPackedMatmul {
         narrowNeedsF32 = all.contains { $0.form == .negativeBiasF32Scales }
     }
 
-    /// The in-situ choice of the verify int8 kernels: a few candidate choices
+    /// The in-situ choice of the verify int8 kernels: candidate choices
     /// (shortlisted by the synthetic self-test and timing at load) run in turn
     /// on real speculative rounds of the load-time engine warm, and a
     /// candidate replaces the record's pick only when its median round beats
     /// the record's pick's by more than 0.5 %. The synthetic timing streams
     /// each kernel for 0.5-0.7 ms bursts in which the GPU never reaches the
     /// clock state of the decode window, so it mispicks; a whole round does
-    /// reach it. Every candidate passed the bitwise self-test (FP16 and FP32
-    /// outputs), so the rounds and their tokens are the same whichever runs.
+    /// reach it. Every candidate passed the bitwise self-test at the output
+    /// types its shapes take, so the rounds and their tokens are the same
+    /// whichever runs.
     ///
-    /// `roundBoundary()` runs at the top of every block proposal (one static
-    /// bool check when no trial is active): round r's time is the host time
-    /// from its proposal to the next one, and the choice installed at a
-    /// boundary is what the next verify graph build reads. The first round
-    /// after the seed is discarded. Runs only inside the deferred load warm
-    /// (`Qwen35DFlash2Assistant`), never in a served request.
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps the record's
-    /// pick without a trial.
+    /// Up to `singleStageMax` sets (the base's trial, e.g. without the zoo):
+    /// `roundsPerSet` rounds each, interleaved. More sets (the zoo's family
+    /// sets): two stages in one request. Stage 1 runs every set for
+    /// `stage1Rounds` rounds, interleaved. Stage 2 then takes up to
+    /// `stage2Sets` candidates by their stage-1 median, where a set combining
+    /// the best N = 5120-class set's bodies with the best wide-class set's is
+    /// estimated as the sum of their gains, and runs them and the record's pick
+    /// for `roundsPerSet` rounds each, interleaved; only stage 2's rounds
+    /// decide. A candidate whose stage-1 estimate is more than `stage2Slack`
+    /// slower than the record's pick is not taken; with none left, the
+    /// record's pick is kept after stage 1.
+    ///
+    /// `roundBoundary()` runs at the top of every block proposal and of every
+    /// adopted speculative block (one static bool check when no trial is
+    /// active): round r's time is the host time from its boundary to the next
+    /// one, and the choice installed at a boundary is what the next verify
+    /// graph build reads. The first round after the seed is discarded. Runs
+    /// only inside the deferred load warm (`Qwen35DFlash2Assistant`), never in
+    /// a served request. One stderr line names every set's medians and the
+    /// set installed. `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off` keeps
+    /// the record's pick without a trial.
     enum NarrowInSituTrial {
         nonisolated(unsafe) static var active = false
+        /// The candidate sets (the first is the record's pick), their names,
+        /// and their scopes (0: any shape, 1: the zoo's bodies on the N = 5120
+        /// class only, 2: on the wide class only; `narrowShapeClass`).
         nonisolated(unsafe) static var sets: [NarrowChoice] = []
-        nonisolated(unsafe) static var roundTimes: [[UInt64]] = []
+        nonisolated(unsafe) static var labels: [String] = []
+        nonisolated(unsafe) static var scopes: [Int] = []
         nonisolated(unsafe) static var roundIndex = 0
         nonisolated(unsafe) static var lastBoundary: UInt64 = 0
         nonisolated(unsafe) static var onEnough: (() -> Void)?
+        // The running trial: `pool` holds the sets, then stage 2's combined
+        // sets; a timing slot is one set in one stage; `schedule` holds the
+        // slot of each timed round (round 1 on).
+        nonisolated(unsafe) private static var pool: [NarrowChoice] = []
+        nonisolated(unsafe) private static var poolLabels: [String] = []
+        nonisolated(unsafe) private static var slotSet: [Int] = []
+        nonisolated(unsafe) private static var slotTimes: [[UInt64]] = []
+        nonisolated(unsafe) private static var schedule: [Int] = []
+        nonisolated(unsafe) private static var stage1Slots = 0
+        nonisolated(unsafe) private static var stage2Built = false
+        nonisolated(unsafe) private static var current = -1
 
-        /// Timed rounds per candidate.
+        /// Timed rounds per candidate (one stage, and stage 2).
         static let roundsPerSet = 8
+        /// Timed rounds per set in stage 1.
+        static let stage1Rounds = 3
+        /// Candidates stage 2 runs beside the record's pick.
+        static let stage2Sets = 3
+        /// Up to this many sets the trial is one stage (the base's).
+        static let singleStageMax = 4
         /// A candidate must beat the record's pick by more than this.
         static let adoptMargin = 0.005
+        /// Stage 2 takes a candidate only if its stage-1 estimate is at most
+        /// this much slower than the record's pick's median.
+        static let stage2Slack = 0.02
         /// Rounds above this multiple of their candidate's median are dropped.
         static let outlierFactor = 1.5
+        /// A candidate is adopted only with at least this many kept rounds.
+        static let minimumRounds = 4
 
         static let enabled: Bool = {
             let value = ProcessInfo.processInfo.environment[
@@ -2122,40 +3039,72 @@ enum Qwen35TensorPackedMatmul {
         /// Whether a trial is set up (two or more distinct candidates; the
         /// first is the record's pick).
         static var armed: Bool { enabled && sets.count >= 2 }
+        static var twoStage: Bool { sets.count > singleStageMax }
 
-        /// Proposals the trial needs: the discarded round, the seed-side
-        /// boundary, then `roundsPerSet` per candidate.
-        static var roundsNeeded: Int { 2 + roundsPerSet * sets.count }
+        /// Proposals the trial can need (the warm request's budget): the
+        /// discarded round, the seed-side boundary, then every timed round.
+        static var roundsNeeded: Int {
+            twoStage
+                ? 2 + stage1Rounds * sets.count + roundsPerSet * (1 + stage2Sets)
+                : 2 + roundsPerSet * sets.count
+        }
 
         @inline(__always) static func roundBoundary() {
             guard active else { return }
             boundary()
         }
 
-        private static func boundary() {
-            let now = DispatchTime.now().uptimeNanoseconds
-            let count = sets.count
-            if roundIndex >= 2 {
-                roundTimes[(roundIndex - 1) % count].append(now - lastBoundary)
-            }
-            lastBoundary = now
-            let set = sets[roundIndex % count]
+        private static func install(_ set: NarrowChoice) {
             narrowDefault = set.0
             narrowByShape = set.1
-            roundIndex += 1
-            if roundIndex >= roundsNeeded {
+        }
+
+        /// New timing slots for these pool sets, `rounds` each, interleaved
+        /// (the first set's rounds last, as the base's rotation).
+        private static func appendRounds(_ poolIndices: [Int], rounds: Int) {
+            let first = slotSet.count
+            for index in poolIndices {
+                slotSet.append(index)
+                slotTimes.append([])
+            }
+            let count = poolIndices.count
+            schedule += (1 ... rounds * count).map { first + $0 % count }
+        }
+
+        private static func boundary() {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if roundIndex >= 2, current >= 0 { slotTimes[current].append(now - lastBoundary) }
+            lastBoundary = now
+            if roundIndex >= 1, roundIndex - 1 >= schedule.count, twoStage, !stage2Built {
+                buildStage2()
+            }
+            if roundIndex >= 1, roundIndex - 1 >= schedule.count {
+                // every scheduled round is timed
+                roundIndex += 1
                 active = false
                 let enough = onEnough
                 onEnough = nil
                 enough?()
+                return
             }
+            current = roundIndex == 0 ? -1 : schedule[roundIndex - 1]
+            install(pool[current < 0 ? 0 : slotSet[current]])
+            roundIndex += 1
         }
 
         /// Arms the round hook. `onEnough` runs (on the engine's thread) once
         /// every candidate has its rounds.
         static func begin(onEnough: @escaping () -> Void) {
             guard armed else { return }
-            roundTimes = Array(repeating: [], count: sets.count)
+            pool = sets
+            poolLabels = sets.indices.map { $0 < labels.count ? labels[$0] : "set \($0)" }
+            slotSet = []
+            slotTimes = []
+            schedule = []
+            appendRounds(Array(sets.indices), rounds: twoStage ? stage1Rounds : roundsPerSet)
+            stage1Slots = sets.count
+            stage2Built = false
+            current = -1
             roundIndex = 0
             lastBoundary = 0
             self.onEnough = onEnough
@@ -2170,14 +3119,70 @@ enum Qwen35TensorPackedMatmul {
                 ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
         }
 
+        /// A slot's median over its rounds within `outlierFactor` of the raw
+        /// median, the rounds kept and the rounds run.
+        private static func summary(_ slot: Int) -> (Double?, Int, Int) {
+            let times = slot < slotTimes.count ? slotTimes[slot] : []
+            guard let first = median(times) else { return (nil, 0, times.count) }
+            let kept = times.filter { Double($0) <= outlierFactor * first }
+            return (median(kept), kept.count, times.count)
+        }
+
+        /// The kernel each production shape and the head resolve to.
+        static func effective(_ choice: NarrowChoice) -> [NarrowKernel] {
+            [choice.0] + (narrowTunedShapes + narrowZooShapes).map { choice.1[[$0.0, $0.1]] ?? choice.0 }
+        }
+
+        /// Stage 2's candidates from stage 1's medians (see the type's notes).
+        private static func buildStage2() {
+            stage2Built = true
+            let medians = (0 ..< stage1Slots).map { summary($0).0 }
+            guard let record = medians[0] else { return }
+            var candidates: [(Int, Double)] = []
+            for index in 1 ..< stage1Slots {
+                if let m = medians[index] { candidates.append((index, m)) }
+            }
+            func best(_ scope: Int) -> [(Int, Double)] {
+                Array(
+                    candidates.filter { $0.0 < scopes.count && scopes[$0.0] == scope }
+                        .sorted { $0.1 < $1.1 }.prefix(2))
+            }
+            let narrow = best(1)
+            let wide = best(2)
+            for a in narrow {
+                for b in wide {
+                    var map = pool[a.0].1
+                    for (key, kernel) in pool[b.0].1 where narrowShapeClass(key) == 2 { map[key] = kernel }
+                    pool.append((pool[a.0].0, map))
+                    poolLabels.append(poolLabels[a.0] + "+" + poolLabels[b.0])
+                    candidates.append((pool.count - 1, a.1 + b.1 - record))
+                }
+            }
+            candidates.sort { $0.1 < $1.1 }
+            var chosen: [Int] = []
+            let recordKernels = effective(pool[0])
+            for (index, estimate) in candidates
+            where chosen.count < stage2Sets && estimate < record * (1 + stage2Slack) {
+                let kernels = effective(pool[index])
+                if kernels != recordKernels, !chosen.contains(where: { effective(pool[$0]) == kernels }) {
+                    chosen.append(index)
+                }
+            }
+            guard !chosen.isEmpty else { return }
+            appendRounds([0] + chosen, rounds: roundsPerSet)
+        }
+
         static func describe(_ set: NarrowChoice) -> String {
-            guard !set.1.isEmpty else { return "\(set.0)" }
+            func name(_ kernel: NarrowKernel) -> String {
+                kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
+            }
+            guard !set.1.isEmpty else { return name(set.0) }
             // the zoo's extra keys (o/out, head), named, when a set has them
             let extra = narrowZooShapes.compactMap { shape in
-                set.1[[shape.0, shape.1]].map { "\(shape.0)x\(shape.1)=\($0)" }
+                set.1[[shape.0, shape.1]].map { "\(shape.0)x\(shape.1)=\(name($0))" }
             }
-            return "\(set.0){"
-                + (narrowTunedShapes.map { "\(set.1[[$0.0, $0.1]] ?? set.0)" } + extra)
+            return "\(name(set.0)){"
+                + (narrowTunedShapes.map { name(set.1[[$0.0, $0.1]] ?? set.0) } + extra)
                 .joined(separator: ",") + "}"
         }
 
@@ -2187,56 +3192,383 @@ enum Qwen35TensorPackedMatmul {
             active = false
             onEnough = nil
             guard armed else { return }
-            if roundTimes.count != sets.count {
-                roundTimes = Array(repeating: [], count: sets.count)
+            if pool.isEmpty {
+                pool = sets
+                poolLabels = sets.indices.map { $0 < labels.count ? labels[$0] : "set \($0)" }
             }
-            let medians: [(Double?, Int, Int)] = roundTimes.map { times in
-                guard let first = median(times) else { return (nil, 0, 0) }
-                let kept = times.filter { Double($0) <= outlierFactor * first }
-                return (median(kept), kept.count, times.count)
-            }
+            // The deciding slots: stage 2's (the record's pick first) when the
+            // trial has two stages, else the single stage's.
+            let deciding: [Int] = twoStage
+                ? (stage1Slots < slotSet.count ? Array(stage1Slots ..< slotSet.count) : [])
+                : Array(0 ..< min(stage1Slots, slotSet.count))
             var chosen = 0
-            if let record = medians[0].0 {
+            if let first = deciding.first, let record = summary(first).0 {
                 var best = record
-                for (index, entry) in medians.enumerated().dropFirst() {
-                    if let m = entry.0, m < best { best = m; chosen = index }
+                for slot in deciding.dropFirst() {
+                    let (m, kept, _) = summary(slot)
+                    if let m, kept >= minimumRounds, m < best { best = m; chosen = slotSet[slot] }
                 }
                 if chosen != 0, !(best < record * (1 - adoptMargin)) { chosen = 0 }
             }
-            let set = sets[chosen]
-            narrowDefault = set.0
-            narrowByShape = set.1
+            let set = pool[chosen]
+            install(set)
             setNarrowOperandNeeds([set])
-            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; median ms/round"
-            for (index, candidate) in sets.enumerated() {
-                let (m, kept, total) = medians[index]
-                log += (index == 0 ? " [record " : " | ") + describe(candidate) + " "
-                    + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
+            func line(_ slots: Range<Int>) -> String {
+                slots.map { slot in
+                    let (m, kept, total) = summary(slot)
+                    return poolLabels[slotSet[slot]] + " "
+                        + (m.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " (\(kept)/\(total))"
+                }.joined(separator: " | ")
             }
-            log += "]; "
+            var log = "bonsai verify int8 in-situ: \(roundIndex) proposals; "
+            if twoStage {
+                log += "stage 1 (\(stage1Slots) sets x \(stage1Rounds)) median ms/round ["
+                    + line(0 ..< min(stage1Slots, slotSet.count)) + "]; stage 2 ("
+                    + (deciding.isEmpty
+                        ? "none within \(Int(stage2Slack * 100)) % of the record's pick)"
+                        : "\(deciding.count) sets x \(roundsPerSet)) [" + line(stage1Slots ..< slotSet.count) + "]")
+            } else {
+                log += "median ms/round [" + line(0 ..< min(stage1Slots, slotSet.count)) + "]"
+            }
+            log += "; "
             if chosen == 0 {
-                log += "keeping the record's pick"
-            } else if let record = medians[0].0, let m = medians[chosen].0 {
-                log += "adopted " + describe(set)
+                log += "keeping the record's pick " + describe(set)
+            } else if let first = deciding.first, let record = summary(first).0,
+                let slot = deciding.first(where: { slotSet[$0] == chosen }), let m = summary(slot).0
+            {
+                log += "adopted \(poolLabels[chosen]) = " + describe(set)
                     + String(format: " (%+.2f%%)", (m / record - 1) * 100)
             }
             log += String(format: "; %.0f ms\n", Double(elapsedNanoseconds) / 1e6)
             FileHandle.standardError.write(log.data(using: .utf8)!)
             sets = []
-            roundTimes = []
+            labels = []
+            scopes = []
+            pool = []
+            poolLabels = []
+            slotSet = []
+            slotTimes = []
+            schedule = []
         }
     }
 
+    /// The in-situ choice of the prompt int8 kernel form (`sourceStaged8Zoo`),
+    /// run once from the load-time prompt warm
+    /// (`Qwen35DFlash2Assistant.warmTargetPrefill`), after its first engine
+    /// prompt forward (which records the combos the route launches) and
+    /// before any timed phase.
+    ///
+    /// Self-test: every form against the production `sourceStaged8` launch
+    /// (TILED = 1) on synthetic operands (three shapes, 4 to 24 groups, an odd
+    /// row-tile count) in this process's template (MPERM, SIGNED, FACTORED)
+    /// and the main recorded combo (output dtype, offset form): every output
+    /// bit must match. Each body is compiled and run in its own error scope,
+    /// so a body the toolchain rejects (or any MLX error) drops that body
+    /// alone; bodies not started within `selfTestBudgetMs` are skipped.
+    /// Shortlist: the stock kernel and the passing forms on the five
+    /// production shapes at 512 rows (best of two), weighted by launches per
+    /// forward; the fastest form, and the fastest of another body, each only
+    /// within `shortlistSlack` of the stock kernel (the synthetic timing only
+    /// shortlists) and only after the same self-test in every other recorded
+    /// combo; a form runs only in the combos it passed. Trial: the stock
+    /// kernel and the shortlist installed in turn for one whole engine prompt
+    /// forward on fresh throwaway state, `timedRuns` passes in serpentine
+    /// order (A B C C B A, so a clock drift over the trial cancels in each
+    /// mean), each
+    /// forward timed on the host from its graph build (after a stream
+    /// synchronize) to the end of its evaluation. No run is discarded: the
+    /// warm's forward just ran, the self-test and shortlist built every
+    /// pipeline, and the buffer cache still holds the forward's buffers. A
+    /// form is adopted only when its mean beats the stock kernel's by more
+    /// than `adoptMargin`. No engine round runs here, so the round hooks
+    /// (`proposeBlock`, `adoptSpeculativeBlock`) play no part. Every form is
+    /// the same arithmetic bit for bit, so the forwards and every served
+    /// result are the same whichever wins. One stderr line.
+    ///
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO=0` keeps the stock kernel (no
+    /// self-test, no trial). `DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO_FORCE=<form>`
+    /// installs that form after its self-test (every recorded combo), without
+    /// a trial.
+    enum PromptZooTrial {
+        static let timedRuns = 2
+        static let adoptMargin = 0.005
+        static let selfTestBudgetMs = 700.0
+        static let shortlistSlack = 0.03
+        /// The production shapes (k, n) and their launches per 512-row warm
+        /// forward: qkv|z, attention qkv, o, gate|up, down.
+        static let shapes: [(Int, Int, Double)] = [
+            (5120, 16384, 48), (5120, 14336, 16), (6144, 5120, 63), (5120, 34816, 63),
+            (17408, 5120, 63),
+        ]
+
+        private static func knob(_ name: String) -> String {
+            ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        }
+        static let forced = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO_FORCE")
+        /// `..._PZOO=trial`: shortlist without the synthetic slack (validation).
+        static let trialAll = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO") == "trial"
+        static var armed: Bool {
+            !["0", "off", "false", "no"].contains(knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_PZOO"))
+                && installed && support == .staged8 && narrowTiled
+        }
+        nonisolated(unsafe) static var done = false
+
+        /// Synthetic operands: codes in the route's form, random words (read
+        /// as the tiled layout by both kernels), FP16 scales of both signs
+        /// with zeros and signed zeros, offsets that are their FP16 negations
+        /// bit for bit (NEGATIVE_SCALE_BIAS = 1) or independent, folded sums,
+        /// FP32 activation scales and scaled sums.
+        fileprivate struct Operands {
+            let m: Int, k: Int, n: Int
+            let codes: MLXArray, words: MLXArray, scalesT: MLXArray, negatedT: MLXArray
+            let biasesT: MLXArray, folded: MLXArray, ascale: MLXArray, rsb: MLXArray
+
+            init(m: Int, k: Int, n: Int, seed: UInt64) {
+                self.m = m
+                self.k = k
+                self.n = n
+                let kg = k / 128
+                func key(_ i: UInt64) -> MLXArray { MLXRandom.key(seed &* 16 &+ i) }
+                codes = signedCodes
+                    ? MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: key(0)).asType(.int8)
+                    : MLXRandom.randInt(Int32(0) ..< Int32(256), [m, k], key: key(0)).asType(.uint8)
+                words = MLXRandom.randInt(Int32(0) ..< Int32(65536), [n, k / 8], key: key(1))
+                    .asType(.uint16).view(dtype: .uint32)
+                var s = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(2))
+                let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [kg, n], key: key(3))
+                s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+                s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+                scalesT = s.asType(.float16)
+                negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                biasesT = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: key(4))
+                    .asType(.float16)
+                folded = MLXRandom.normal([kg, n], key: key(5)) * Float(100)
+                ascale = MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: key(6))
+                rsb = MLXRandom.normal([m, kg], key: key(7)) * Float(50)
+                eval(codes, words, scalesT, negatedT, biasesT, folded, ascale, rsb)
+            }
+
+            /// `form`, or the stock launch (nil), in this process's template.
+            func run(_ form: PromptZooForm?, _ combo: Int) -> MLXArray {
+                let outputDType: DType = combo & 2 != 0 ? .float32 : .float16
+                let template: [(String, any KernelTemplateArg)] = [
+                    ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                    ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", combo & 1),
+                    ("FACTORED", factoredPromptEpilogue ? 1 : 0),
+                ]
+                let inputs = [codes, words, scalesT, combo & 1 != 0 ? negatedT : biasesT, folded, ascale, rsb]
+                if let form {
+                    return launchStaged8Zoo(
+                        inputs, template: template, form: form, k: k, m: m, n: n, outputDType: outputDType)
+                }
+                return kernelStaged8(
+                    inputs + [dimsArray(k: k, m: m, n: n)], template: template + [("TILED", 1)],
+                    grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+            }
+        }
+
+        /// True when `form` matches the stock launch bit for bit on every
+        /// operand set in every combo; false on a mismatch or on any MLX
+        /// error inside (a failed compile included), scoped to this call.
+        private static func exact(_ form: PromptZooForm, _ combos: [Int], _ operands: [Operands]) -> Bool {
+            let same = try? withError { scoped -> Bool in
+                for combo in combos {
+                    let bits: DType = combo & 2 != 0 ? .uint32 : .uint16
+                    for ops in operands where form.takes(m: ops.m, n: ops.n) {
+                        let reference = ops.run(nil, combo)
+                        let y = ops.run(form, combo)
+                        let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try scoped.check()
+                        if differ.item(Int32.self) != 0 { return false }
+                    }
+                }
+                return true
+            }
+            return same ?? false
+        }
+
+        private static func install(_ form: PromptZooForm?, _ combos: [Int]) {
+            promptZooInstalled = form
+            promptZooCombos = form == nil ? [] : Set(combos)
+        }
+
+        /// Runs the self-test, the shortlist and the trial once. `forward`
+        /// runs one whole engine prompt forward on fresh throwaway state and
+        /// returns its host nanoseconds (nil when it could not run, which
+        /// keeps the stock kernel). Leaves the choice installed.
+        static func run(forward: () -> UInt64?) {
+            guard armed, !done else { return }
+            done = true
+            let start = DispatchTime.now().uptimeNanoseconds
+            func elapsedMs() -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 }
+            let combos = (0 ..< 4).filter { promptZooSeen & (1 << $0) != 0 }
+            install(nil, combos)
+            var log = "bonsai prompt int8 in-situ: combos ["
+                + combos.map { ($0 & 2 != 0 ? "f32" : "f16") + ($0 & 1 != 0 ? "/neg" : "/off") }
+                .joined(separator: " ") + "]"
+            defer {
+                log += String(format: "; %.0f ms\n", elapsedMs())
+                FileHandle.standardError.write(log.data(using: .utf8)!)
+                Memory.clearCache()
+            }
+            guard !combos.isEmpty else { log += "; no prompt launch seen, stock kernel"; return }
+            let testOps = [(256, 1536, 512), (128, 512, 256), (192, 3072, 128)].enumerated().map {
+                Operands(m: $0.element.0, k: $0.element.1, n: $0.element.2, seed: 91 + UInt64($0.offset))
+            }
+            if !forced.isEmpty {
+                guard let form = promptZooForms.first(where: { $0.name == forced }) else {
+                    log += "; unknown forced form \(forced), stock kernel"
+                    return
+                }
+                if exact(form, combos, testOps) {
+                    install(form, combos)
+                    log += "; forced \(form) (self-test passed), no trial"
+                } else {
+                    log += "; forced \(form) FAILED its self-test, stock kernel"
+                }
+                return
+            }
+            // Self-test in the main combo (negated offsets, FP16 first); the
+            // shortlisted forms take the other recorded combos below.
+            let main = [1, 3, 0, 2].first { combos.contains($0) }!
+            let others = combos.filter { $0 != main }
+            var passed: [PromptZooForm] = [], failed: [PromptZooForm] = [], skipped: [PromptZooForm] = []
+            var started = Set<[Int]>()
+            for form in promptZooForms {
+                if !started.contains(form.body) {
+                    if elapsedMs() > selfTestBudgetMs { skipped.append(form); continue }
+                    started.insert(form.body)
+                }
+                if exact(form, [main], testOps) { passed.append(form) } else { failed.append(form) }
+            }
+            log += "; self-test passed [" + passed.map(\.name).joined(separator: " ") + "]"
+            if !failed.isEmpty { log += " failed [" + failed.map(\.name).joined(separator: " ") + "]" }
+            if !skipped.isEmpty { log += " skipped [" + skipped.map(\.name).joined(separator: " ") + "]" }
+            log += String(format: " (%.0f ms)", elapsedMs())
+            guard !passed.isEmpty else { log += "; stock kernel"; return }
+
+            // Shortlist: synthetic time per forward on the production shapes.
+            let kernels: [PromptZooForm?] = [nil] + passed
+            var estimate = [Double](repeating: 0, count: kernels.count)
+            let timed = try? withError { scoped -> Bool in
+                let timingOps = shapes.enumerated().map {
+                    Operands(m: 512, k: $0.element.0, n: $0.element.1, seed: 100 + UInt64($0.offset))
+                }
+                for kernel in kernels { eval(timingOps.map { $0.run(kernel, main) }) }
+                try scoped.check()
+                var best = [[Double]](
+                    repeating: [Double](repeating: .infinity, count: shapes.count), count: kernels.count)
+                for _ in 0 ..< 2 {
+                    for (s, ops) in timingOps.enumerated() {
+                        for (index, kernel) in kernels.enumerated() {
+                            let outs = (0 ..< 2).map { _ in ops.run(kernel, main) }
+                            let t0 = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            let us = Double(DispatchTime.now().uptimeNanoseconds - t0) / 2000
+                            best[index][s] = min(best[index][s], us)
+                        }
+                    }
+                }
+                try scoped.check()
+                for index in kernels.indices {
+                    estimate[index] = zip(best[index], shapes).reduce(0) { $0 + $1.0 * $1.1.2 } / 1000
+                }
+                return true
+            }
+            guard timed == true else { log += "; shortlist timing failed, stock kernel"; return }
+            log += "; synthetic ms/forward [stock " + String(format: "%.1f", estimate[0])
+                + passed.indices.map { " \(passed[$0])=" + String(format: "%.1f", estimate[$0 + 1]) }.joined()
+                + "]"
+            // The fastest form, then the fastest of another body, each within
+            // `shortlistSlack` of the stock kernel and exact in every other
+            // recorded combo too.
+            var shortlist: [PromptZooForm] = [], failedOthers: [PromptZooForm] = []
+            for index in passed.indices.sorted(by: { estimate[$0 + 1] < estimate[$1 + 1] })
+            where shortlist.count < 2 && !shortlist.contains(where: { $0.body == passed[index].body })
+                && (trialAll || estimate[index + 1] < estimate[0] * (1 + shortlistSlack))
+            {
+                if others.isEmpty || exact(passed[index], others, testOps) {
+                    shortlist.append(passed[index])
+                } else {
+                    failedOthers.append(passed[index])
+                }
+            }
+            if !failedOthers.isEmpty {
+                log += "; failed other combos [" + failedOthers.map(\.name).joined(separator: " ") + "]"
+            }
+            guard !shortlist.isEmpty else { log += "; no form shortlisted, stock kernel"; return }
+
+            // Trial: whole prompt forwards, serpentine.
+            let sets: [PromptZooForm?] = [nil] + shortlist
+            var times = [[UInt64]](repeating: [], count: sets.count)
+            var complete = true
+            let trialStart = elapsedMs()
+            trial: for rep in 0 ..< timedRuns {
+                for index in (rep % 2 == 0 ? Array(sets.indices) : Array(sets.indices.reversed())) {
+                    install(sets[index], combos)
+                    guard let ns = forward() else { complete = false; break trial }
+                    times[index].append(ns)
+                }
+            }
+            install(nil, combos)
+            let means = times.map { $0.isEmpty ? nil : Double($0.reduce(0, +)) / Double($0.count) }
+            log += "; mean ms/forward (512 rows, \(timedRuns) serpentine runs"
+                + String(format: ", %.0f ms)", elapsedMs() - trialStart)
+            for (index, set) in sets.enumerated() {
+                log += (index == 0 ? " [stock " : " | \(set!) ")
+                    + (means[index].map { String(format: "%.2f", $0 / 1e6) } ?? "-")
+            }
+            log += "]"
+            guard complete, let stock = means[0] else {
+                log += "; a forward did not run, stock kernel"
+                return
+            }
+            var chosen = 0
+            for index in sets.indices.dropFirst() {
+                if let m = means[index], m < (means[chosen] ?? .infinity) { chosen = index }
+            }
+            if chosen != 0, let m = means[chosen], m < stock * (1 - adoptMargin) {
+                install(sets[chosen], combos)
+                log += "; adopted \(sets[chosen]!)" + String(format: " (%+.2f%%)", (m / stock - 1) * 100)
+            } else {
+                log += "; keeping the stock kernel"
+            }
+        }
+    }
+
+    /// Zoo bodies that passed the bitwise self-test with FP16 / FP32 output.
+    /// A zoo body runs only at an output type it passed at (`narrowKernel`).
+    nonisolated(unsafe) static var zooExact16 = Set<NarrowKernel>()
+    nonisolated(unsafe) static var zooExact32 = Set<NarrowKernel>()
+    nonisolated(unsafe) private static var zooDeclineAnnounced = false
+
     /// The kernel for this projection: the chosen one for its shape when its
-    /// constants pass the proof (or it needs none), else `original`.
+    /// constants pass the proof (or it needs none) and, for a zoo body, when
+    /// it passed the self-test at this output type, else `original`.
     /// `materialize` evaluates the FP32 scales now (the prompt route's
     /// load-time call); the verify route leaves them lazy.
     static func narrowKernel(
         _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
-        k: Int, n: Int, materialize: Bool
+        k: Int, n: Int, outputDType: DType, materialize: Bool
     ) -> NarrowKernel {
         let choice = narrowByShape[[k, n]] ?? narrowDefault
         if n % choice.variant.tn != 0 { return .original }
+        if choice.variant.family != nil,
+            !(outputDType == .float32 ? zooExact32 : zooExact16).contains(choice)
+        {
+            if !zooDeclineAnnounced {
+                zooDeclineAnnounced = true
+                FileHandle.standardError.write(
+                    Data(
+                        ("bonsai verify int8: \(choice.variant) is not self-tested at \(outputDType) "
+                            + "(k \(k), n \(n)); original used there\n").utf8))
+            }
+            return .original
+        }
         guard choice.form != .base else { return choice }
         guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
         if choice.form == .negativeBiasF32Scales {
@@ -2366,6 +3698,18 @@ enum Qwen35TensorPackedMatmul {
         // The zoo bodies read the tiled copy only (`original` otherwise).
         if let family = v.family, tiled {
             let zooTemplate = Array(template.prefix(3))
+            if let pairR = v.zoo2Pair {
+                let t = zooTemplate + v.zoo2Template.map { ($0.0, $0.1 as any KernelTemplateArg) }
+                if pairR {
+                    return kernelNarrowInt8PairR(
+                        inputs, template: t, grid: (n / 32 * v.threads, 1, 1),
+                        threadGroup: (v.threads, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                }
+                return kernelNarrowInt8Zoo2(
+                    inputs, template: t, grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+            }
             if family == "pair" {
                 return kernelNarrowInt8Pair(
                     inputs, template: zooTemplate + [("PD", v.pd), ("KH", v.kh)],
@@ -2448,34 +3792,43 @@ enum Qwen35TensorPackedMatmul {
     /// and attention qkv, 16 rows each.
     static let narrowTunedShapes = [(5120, 16384), (5120, 34816), (17408, 5120), (5120, 14336)]
     /// The shapes the zoo sets also key: o/out (timed with the tuned four) and
-    /// the head (named in logs only: the zoo sets keep the head on the
-    /// record's kernel, whose fused top two (`Qwen35HeadTopTwo`) the zoo
-    /// bodies do not have).
+    /// the head (untimed at load: a wide-class zoo set puts its gate|up body on
+    /// it; the fused head top two (`Qwen35HeadTopTwo`) has a form for every
+    /// zoo body, self-tested on the head's final kernel after the trial).
     static let narrowZooShapes = [(6144, 5120), (5120, 248320)]
+
+    /// A production shape's class: 1 for the N = 5120 shapes (down, o/out: 160
+    /// threadgroups at TN = 32, FP16 outputs on the verify route), 2 for the
+    /// wide ones (qkv|z and attention qkv with FP32 outputs, gate|up with FP16,
+    /// the head with FP32).
+    static func narrowShapeClass(_ key: [Int]) -> Int { key.count == 2 && key[1] == 5120 ? 1 : 2 }
 
     /// The tiled zoo (`NarrowVariant.family != nil`): its own self-test (one
     /// error scope per body, so a body the toolchain cannot compile is dropped
-    /// alone), timing on the tuned shapes and o/out against the record's picks,
-    /// and trial sets: per family, the record's pick with that family's fastest
-    /// body on each shape of its class (N = 5120 for k32 / acoop / pair, the
-    /// wide-N shapes for wide) and on any other shape where it beat the
-    /// record's pick by more than 2 % (the head keeps the record's kernel),
-    /// and one set of the fastest body per shape. The trial keeps four sets
-    /// at most: the record's pick, `v0`, the fastest-per-shape set, then the
-    /// family sets by estimated per-round saving and the K3 bodies.
+    /// alone), timing on the tuned shapes and o/out against the record's picks
+    /// (each body on the shapes of its classes), and trial sets: per family,
+    /// the record's pick with the family's fastest body on each N = 5120 shape
+    /// (k32, wide, acoop, pair, dual), and the record's pick with the family's
+    /// fastest body over the wide shapes on all of them and the head (k32,
+    /// wide, acoop). Every body on a wide shape passes the FP32 self-test too.
+    /// With the record's own candidates that is more than four sets, so the
+    /// in-situ trial runs in two stages (`NarrowInSituTrial`).
     /// Only with the tiled copy. `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO=0` leaves
-    /// the record's candidates alone; `..._TZOO_FORCE=<body>` (e.g. `k32pd2`)
-    /// installs that body on every shape, without a trial, once it passes.
+    /// the record's candidates alone (and the trial one stage);
+    /// `..._TZOO_FORCE=<body>` (e.g. `k32pd2`, `p4k16pd1`) installs that body
+    /// on every shape, without a trial, once it passes.
     static let narrowZoo: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "") && narrowTiled
     }()
 
-    /// Zoo bodies in self-test order (the deadline cuts the last).
+    /// Zoo bodies in self-test order (the deadline cuts the last): the zoo's
+    /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
         .k32pd2, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
         .aw64pd1, .k32pd1, .pk32pd1,
+        .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
     ]
 
     /// Chooses the verify int8 kernels once, at load, on the running GPU.
@@ -2493,9 +3846,10 @@ enum Qwen35TensorPackedMatmul {
     /// keeps its fastest kernel and every other shape takes the fastest in
     /// total. That is what is installed; the timing only shortlists the
     /// in-situ candidates (`NarrowInSituTrial`): the record's pick, `v0` with
-    /// the negated offset, and the two fastest K3 bodies in total, each after
-    /// its FP32 self-test, and every candidate kernel is then launched once
-    /// per production shape with FP16 and FP32 outputs. A candidate not
+    /// the negated offset, the tiled zoo's family sets (`zooSets`), and the
+    /// two fastest K3 bodies in total, each after its FP32 self-test (a zoo
+    /// body where its shapes take FP32), and every candidate kernel is then
+    /// launched once per production shape at each output type it may run at. A candidate not
     /// started within 4 s of the self-test is skipped (load time is not
     /// timed). Runs at model init, before any timed phase, and builds every
     /// candidate's pipelines, so no verify round (nor any trial round)
@@ -2505,7 +3859,7 @@ enum Qwen35TensorPackedMatmul {
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_PIPELINE=off` keeps the recorded
     /// body (`v0`); a comma-separated list of variant names (`pd1` .. `pd4`,
     /// `tn64`, `k64pd1` .. `k64pd4`) limits the pipelined candidates to those.
-    private static func chooseNarrowKernels() -> (NarrowChoice, [NarrowChoice]) {
+    private static func chooseNarrowKernels() -> (NarrowChoice, [(NarrowChoice, String, Int)]) {
         let environment = ProcessInfo.processInfo.environment
         func knob(_ name: String) -> String? {
             environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -2544,7 +3898,7 @@ enum Qwen35TensorPackedMatmul {
         var timings: [NarrowKernel: [Double]] = [:]
         var byShape: [[Int]: NarrowKernel] = [:]
         var fallback = NarrowKernel.original
-        var trial: [NarrowChoice] = []
+        var trial: [(NarrowChoice, String, Int)] = []
         do {
             try withError { error in
                 let testShapes = [
@@ -2660,6 +4014,8 @@ enum Qwen35TensorPackedMatmul {
                 {
                     let forced = NarrowKernel(variant: variant, form: zooForm)
                     if zooExact(forced, .float16), zooExact(forced, .float32) {
+                        zooExact16 = [forced]
+                        zooExact32 = [forced]
                         fallback = forced
                         byShape = [:]
                         log += "; tzoo forced \(forced) on every shape"
@@ -2669,42 +4025,40 @@ enum Qwen35TensorPackedMatmul {
                 }
 
                 // The in-situ candidates: the record's pick, v0 with the
-                // negated offset, and the two fastest K3 bodies in total, each
-                // exact at FP32 as well. Choices equal on every shape collapse.
+                // negated offset, the zoo's family sets, and the two fastest
+                // K3 bodies in total, each exact at FP32 as well (a zoo body at
+                // the output types of its shapes). Choices equal on every
+                // shape collapse.
                 guard NarrowInSituTrial.enabled else { return }
-                var shortlist: [NarrowChoice] = [(fallback, byShape)]
+                var shortlist: [(NarrowChoice, String, Int)] = [((fallback, byShape), "record", 0)]
                 let v0Negative = NarrowKernel(variant: .v0, form: .negativeBias)
                 if passed.contains(v0Negative), try exactF32(v0Negative) {
-                    shortlist.append((v0Negative, [:]))
+                    shortlist.append(((v0Negative, [:]), "v0neg", 0))
                 }
                 let k3 = passed.filter { !narrowRecordVariants.contains($0.variant) }
                     .sorted { timings[$0]!.reduce(0, +) < timings[$1]!.reduce(0, +) }
-                var k3Sets: [NarrowChoice] = []
+                var k3Sets: [(NarrowChoice, String, Int)] = []
                 for kernel in k3 where k3Sets.count < 2 {
-                    if try exactF32(kernel) { k3Sets.append((kernel, [:])) }
+                    if try exactF32(kernel) { k3Sets.append(((kernel, [:]), "k3 \(kernel)", 0)) }
                 }
-                func effective(_ choice: NarrowChoice) -> [NarrowKernel] {
-                    [choice.0] + (narrowTunedShapes + narrowZooShapes).map {
-                        choice.1[[$0.0, $0.1]] ?? choice.0
-                    }
-                }
-                // With the zoo the trial keeps the base's four sets at most (its
-                // duration): after v0, the zoo's fastest-per-shape set and its
-                // family sets by estimated saving, then the K3 bodies.
                 if narrowZoo { shortlist += zooSets(fallback, byShape, sets, zooForm, zooExact, &log) }
                 shortlist += k3Sets
-                for choice in shortlist
-                where !(narrowZoo && trial.count >= 4)
-                    && !trial.contains(where: { effective($0) == effective(choice) })
-                {
-                    trial.append(choice)
+                for candidate in shortlist
+                where !trial.contains(where: {
+                    NarrowInSituTrial.effective($0.0) == NarrowInSituTrial.effective(candidate.0)
+                }) {
+                    trial.append(candidate)
                 }
                 guard trial.count >= 2 else { trial = []; return }
-                // Every candidate kernel once per production shape, FP16 and
-                // FP32 outputs, so no pipeline compiles inside a trial round.
-                let trialKernels = Set(trial.flatMap { [$0.0] + Array($0.1.values) })
+                // Every candidate kernel once per production shape at each
+                // output type it may run at (a zoo body at FP32 only where it
+                // passed it), so no pipeline compiles inside a trial round.
+                let trialKernels = Set(trial.flatMap { [$0.0.0] + Array($0.0.1.values) })
                 for kernel in trialKernels {
-                    for outputDType in [DType.float16, .float32] {
+                    for outputDType in [DType.float16, .float32]
+                    where kernel.variant.family == nil
+                        || (outputDType == .float16 ? zooExact16 : zooExact32).contains(kernel)
+                    {
                         eval(sets.map { $0[0].run(kernel, outputDType) })
                     }
                 }
@@ -2733,7 +4087,7 @@ enum Qwen35TensorPackedMatmul {
             .joined(separator: " ") + "]"
         if !trial.isEmpty {
             log += "; in-situ candidates [record" + trial.dropFirst().map {
-                " " + NarrowInSituTrial.describe($0)
+                " \($0.1)=" + NarrowInSituTrial.describe($0.0)
             }.joined() + "]"
         }
         log += "; \(String(format: "%.0f", elapsedMs())) ms\n"
@@ -2742,21 +4096,25 @@ enum Qwen35TensorPackedMatmul {
     }
 
     /// The tiled zoo's trial sets (see `narrowZoo`): the zoo bodies' FP16
-    /// self-test (6 s budget), their timing against the record's picks on the
-    /// tuned shapes and o/out (same method as the record's), then per family
-    /// the record's pick with the family's fastest body on its class and
-    /// wherever it is more than 2 % faster than the record's pick, and the
-    /// fastest body per shape; every zoo body in a set also passes the FP32
-    /// self-test.
+    /// self-test (9 s budget: a cold toolchain compiles each body at
+    /// 0.2-0.9 s), their timing against the record's picks on the
+    /// tuned shapes and o/out (the record's method, best of three, each body
+    /// on the shapes of its classes), then per family the record's pick with
+    /// the family's fastest body on each N = 5120 shape (scope 1), and with
+    /// the family's fastest body over the wide shapes (launches per round
+    /// times time) on all of them and the head (scope 2; not for pair and
+    /// dual, which target the N = 5120 shapes). Every zoo body in a scope-2
+    /// set also passes the FP32 self-test (qkv|z, attention qkv and the head
+    /// take FP32 outputs); a body failing it leaves the sets.
     private static func zooSets(
         _ fallback: NarrowKernel, _ byShape: [[Int]: NarrowKernel], _ sets: [[NarrowOperands]],
         _ form: NarrowEpilogue, _ exact: (NarrowKernel, DType) -> Bool, _ log: inout String
-    ) -> [NarrowChoice] {
+    ) -> [(NarrowChoice, String, Int)] {
         let start = DispatchTime.now().uptimeNanoseconds
         var passed: [NarrowKernel] = [], failed: [NarrowKernel] = [], skipped: [NarrowKernel] = []
         for variant in narrowZooVariants {
             let kernel = NarrowKernel(variant: variant, form: form)
-            if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 > 6000 {
+            if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 > 9000 {
                 skipped.append(kernel)
             } else if exact(kernel, .float16) {
                 passed.append(kernel)
@@ -2764,6 +4122,7 @@ enum Qwen35TensorPackedMatmul {
                 failed.append(kernel)
             }
         }
+        zooExact16 = Set(passed)
         func names(_ kernels: [NarrowKernel]) -> String { kernels.map { "\($0.variant)" }.joined(separator: " ") }
         log += "; tzoo self-test passed [\(names(passed))]"
         if !failed.isEmpty { log += " failed [\(names(failed))]" }
@@ -2771,6 +4130,9 @@ enum Qwen35TensorPackedMatmul {
         guard !passed.isEmpty, sets.count == narrowTunedShapes.count else { return [] }
 
         let shapes = narrowTunedShapes + [narrowZooShapes[0]]
+        let keys = shapes.map { [$0.0, $0.1] }
+        let classes = keys.map { narrowShapeClass($0) }
+        let head = [narrowZooShapes[1].0, narrowZooShapes[1].1]
         let o = narrowZooShapes[0]
         let oSets = (0 ..< min(6, max(2, (96 << 20) / (o.0 * o.1 / 4) + 1))).map {
             NarrowOperands(k: o.0, n: o.1, seed: 200 + UInt64($0))
@@ -2782,12 +4144,17 @@ enum Qwen35TensorPackedMatmul {
             record.append(kernel)
         }
         let kernels = record + passed
-        for kernel in kernels { eval(allSets.flatMap { $0.map { $0.run(kernel, .float16) } }) }
+        func timed(_ kernel: NarrowKernel, _ index: Int) -> Bool {
+            kernel.variant.family == nil || kernel.variant.zooClasses.contains(classes[index])
+        }
+        for kernel in kernels {
+            eval(allSets.indices.filter { timed(kernel, $0) }.flatMap { allSets[$0].map { $0.run(kernel, .float16) } })
+        }
         var t: [NarrowKernel: [Double]] = [:]
         for kernel in kernels { t[kernel] = Array(repeating: .infinity, count: shapes.count) }
-        for _ in 0 ..< 5 {
+        for _ in 0 ..< 3 {
             for (index, shapeSets) in allSets.enumerated() {
-                for kernel in kernels {
+                for kernel in kernels where timed(kernel, index) {
                     let outs = shapeSets.map { $0.run(kernel, .float16) }
                     let t0 = DispatchTime.now().uptimeNanoseconds
                     eval(outs)
@@ -2799,64 +4166,58 @@ enum Qwen35TensorPackedMatmul {
         log += "; tzoo us/launch (qkv|z gate|up down attn o):"
         for kernel in kernels {
             let name = kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
-            log += " \(name)=" + t[kernel]!.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            log += " \(name)=" + t[kernel]!.map { $0.isFinite ? String(format: "%.1f", $0) : "-" }
+                .joined(separator: ",")
         }
 
-        func recordPick(_ index: Int) -> NarrowKernel {
-            index < narrowTunedShapes.count
-                ? (byShape[[shapes[index].0, shapes[index].1]] ?? fallback) : fallback
-        }
-        func build(_ usable: [NarrowKernel]) -> [NarrowChoice] {
-            var choices: [NarrowChoice] = []
-            // target class: the N = 5120 shapes (160 threadgroups at TN = 32)
-            // for k32 / acoop / pair, the wide-N shapes for wide
-            for family in ["k32", "wide", "acoop", "pair"] {
+        // launches per round: qkv|z 48, gate|up 64, down 64, attn 16, o/out 64
+        let perRound: [Double] = [48, 64, 64, 16, 64]
+        func build(_ usable: [NarrowKernel]) -> [(NarrowChoice, String, Int)] {
+            var choices: [(NarrowChoice, String, Int)] = []
+            for family in ["k32", "wide", "acoop", "pair", "dual"] {
                 let members = usable.filter { $0.variant.family == family }
                 var map = byShape
                 var changed = false
-                for (index, shape) in shapes.enumerated() {
-                    guard let best = members.min(by: { t[$0]![index] < t[$1]![index] }) else { continue }
-                    if (shape.1 == 5120) == (family != "wide")
-                        || t[best]![index] < t[recordPick(index)]![index] * 0.98
-                    {
-                        map[[shape.0, shape.1]] = best
+                for index in shapes.indices where classes[index] == 1 {
+                    let fit = members.filter { t[$0]![index].isFinite }
+                    if let best = fit.min(by: { t[$0]![index] < t[$1]![index] }) {
+                        map[keys[index]] = best
                         changed = true
                     }
                 }
-                if changed { choices.append((fallback, map)) }
+                if changed { choices.append(((fallback, map), "\(family)/5120", 1)) }
             }
-            // launches per round: qkv|z 48, gate|up 64, down 64, attn 16, o/out 64
-            let perRound: [Double] = [48, 64, 64, 16, 64]
-            func saving(_ choice: NarrowChoice) -> Double {
-                shapes.indices.reduce(0) { total, index in
-                    let body = choice.1[[shapes[index].0, shapes[index].1]] ?? choice.0
-                    return total + perRound[index] * (t[recordPick(index)]![index] - t[body]![index])
+            for family in ["k32", "wide", "acoop"] {
+                func cost(_ kernel: NarrowKernel) -> Double {
+                    shapes.indices.filter { classes[$0] == 2 }.reduce(0) { $0 + perRound[$1] * t[kernel]![$1] }
                 }
+                let fit = usable.filter { $0.variant.family == family && cost($0).isFinite }
+                guard let best = fit.min(by: { cost($0) < cost($1) }) else { continue }
+                var map = byShape
+                for index in shapes.indices where classes[index] == 2 { map[keys[index]] = best }
+                map[head] = best
+                choices.append(((fallback, map), "\(family)/wide", 2))
             }
-            choices.sort { saving($0) > saving($1) }
-            var map = byShape
-            for (index, shape) in shapes.enumerated() {
-                if let best = (record + usable).min(by: { t[$0]![index] < t[$1]![index] }) {
-                    map[[shape.0, shape.1]] = best
-                }
-            }
-            return [(fallback, map)] + choices
+            return choices
         }
         var usable = passed
         var checked = Set<NarrowKernel>()
         var failedF32: [NarrowKernel] = []
-        var choices: [NarrowChoice] = []
+        var choices: [(NarrowChoice, String, Int)] = []
         while true {
-            // at most three sets can join the trial (after the record's pick)
-            choices = Array(build(usable).prefix(3))
+            choices = build(usable)
             var clean = true
-            for kernel in choices.flatMap({ Array($0.1.values) })
-            where kernel.variant.family != nil && !checked.contains(kernel) {
-                checked.insert(kernel)
-                if !exact(kernel, .float32) {
-                    usable.removeAll { $0 == kernel }
-                    failedF32.append(kernel)
-                    clean = false
+            for choice in choices where choice.2 == 2 {
+                for kernel in Set(choice.0.1.values)
+                where kernel.variant.family != nil && !checked.contains(kernel) {
+                    checked.insert(kernel)
+                    if exact(kernel, .float32) {
+                        zooExact32.insert(kernel)
+                    } else {
+                        usable.removeAll { $0 == kernel }
+                        failedF32.append(kernel)
+                        clean = false
+                    }
                 }
             }
             if clean { break }
@@ -2872,8 +4233,10 @@ enum Qwen35TensorPackedMatmul {
         let (choice, trial) = chooseNarrowKernels()
         narrowDefault = choice.0
         narrowByShape = choice.1
-        NarrowInSituTrial.sets = trial
-        setNarrowOperandNeeds([choice] + trial)
+        NarrowInSituTrial.sets = trial.map(\.0)
+        NarrowInSituTrial.labels = trial.map(\.1)
+        NarrowInSituTrial.scopes = trial.map(\.2)
+        setNarrowOperandNeeds([choice] + trial.map(\.0))
     }
 
     nonisolated(unsafe) private static var installed = false
@@ -2929,7 +4292,8 @@ enum Qwen35TensorPackedMatmul {
                     activation.scaledSums.shape == [m, k / 128],
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
-                let choice = narrowKernel(cache, scales, biases, k: k, n: n, materialize: false)
+                let choice = narrowKernel(
+                    cache, scales, biases, k: k, n: n, outputDType: outputDType, materialize: false)
                 let scalesT: MLXArray
                 let biasesT: MLXArray
                 switch choice.form {
@@ -2953,7 +4317,9 @@ enum Qwen35TensorPackedMatmul {
                 if Qwen35HeadTopTwo.capturing, outputDType == .float32 {
                     if headTop2Site == nil {
                         headTop2Site = (k, n, {
-                            narrowKernel(cache, scales, biases, k: k, n: n, materialize: false)
+                            narrowKernel(
+                                cache, scales, biases, k: k, n: n, outputDType: .float32,
+                                materialize: false)
                         })
                     }
                     if Qwen35HeadTopTwo.on, headTop2Applies(k: k, n: n, kernel: choice) {
@@ -3034,12 +4400,13 @@ enum Qwen35TensorPackedMatmul {
                 ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
                 ("SIGNED", signedCodes ? 1 : 0),
             ]
+            var negative = false
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
                 packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                negative = cache.biasesAreNegativeScales(scales, biases)
+                template.append(("NEGATIVE_SCALE_BIAS", negative ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
             default: packedKernel = kernelStaged
@@ -3049,6 +4416,17 @@ enum Qwen35TensorPackedMatmul {
             // read could lose its GPU residency between windows).
             let words = support == .staged8 && narrowTiled
                 ? narrowTiledWeight(cache, weight, materialize: true) : weight
+            // The prompt form the in-situ trial adopted (`PromptZooTrial`), on
+            // the tiled words only; the stock launch everywhere else.
+            if support == .staged8, narrowTiled,
+                let form = promptZoo(m: m, n: n, outputDType: outputDType, negative: negative)
+            {
+                return launchStaged8Zoo(
+                    [codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                     activation.scaledSums],
+                    template: Array(template.prefix(5)), form: form, k: k, m: m, n: n,
+                    outputDType: outputDType)
+            }
             return packedKernel(
                 [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
@@ -3384,15 +4762,20 @@ extension Qwen35TensorPackedMatmul {
     /// merge and store appended (`headTop2Tail`). Everything up to the
     /// summed values is the stock text, so each candidate is the value the
     /// stock kernel stores. Nil if the text no longer has the anchors.
+    /// A body whose `if (sg == 0)` block sits in a loop (the zoo 2 reduction
+    /// passes) marks where the running state is declared, outside it, with
+    /// `/* HT2 STATE */`; the others declare it just before the block.
     static func headTop2Source(_ text: String, columns: String) -> String? {
         let open = "if (sg == 0) {"
+        let marker = "/* HT2 STATE */"
         guard text.components(separatedBy: open).count == 2, !text.contains("ht2"),
+            text.components(separatedBy: marker).count <= 2,
             let regex = try? NSRegularExpression(pattern: headTop2StorePattern)
         else { return nil }
-        var t = text.replacingOccurrences(
-            of: open,
-            with: "bonsai_head_top2 ht2[2] = {bonsai_head_top2_empty(), bonsai_head_top2_empty()};\n        "
-                + open)
+        let state = "bonsai_head_top2 ht2[2] = {bonsai_head_top2_empty(), bonsai_head_top2_empty()};\n        "
+        var t = text.contains(marker)
+            ? text.replacingOccurrences(of: marker, with: state)
+            : text.replacingOccurrences(of: open, with: state + open)
         let range = NSRange(t.startIndex..., in: t)
         guard regex.numberOfMatches(in: t, range: range) == 1,
             let match = regex.firstMatch(in: t, range: range),
@@ -3421,6 +4804,15 @@ extension Qwen35TensorPackedMatmul {
         "bonsai_tensor_packed_matmul_m16_i8_top2", sourceNarrowInt8, columns: "32")
     private static let kernelNarrowInt8PipelinedTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8p_top2", sourceNarrowInt8Pipelined, columns: "TN")
+    // The zoo bodies' fused forms (the head on a zoo body, zoo 2).
+    private static let kernelNarrowInt8ZooTop2 = headTop2Kernel(
+        "bonsai_tensor_packed_matmul_m16_i8z_top2", sourceNarrowInt8Zoo, columns: "TN")
+    private static let kernelNarrowInt8PairTop2 = headTop2Kernel(
+        "bonsai_tensor_packed_matmul_m16_i8x_top2", sourceNarrowInt8Pair, columns: "32")
+    private static let kernelNarrowInt8Zoo2Top2 = headTop2Kernel(
+        "bonsai_tensor_packed_matmul_m16_i8z2_top2", sourceNarrowInt8Zoo2, columns: "TN")
+    private static let kernelNarrowInt8PairRTop2 = headTop2Kernel(
+        "bonsai_tensor_packed_matmul_m16_i8r_top2", sourceNarrowInt8PairR, columns: "32")
 
     /// One simdgroup per row merges the blocks' pairs (`DFlash2TopK`'s merge
     /// pattern): each lane takes every 32nd block, then five butterfly steps.
@@ -3470,26 +4862,51 @@ extension Qwen35TensorPackedMatmul {
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
         ]
         let v = kernel.variant
-        // The zoo bodies have no fused form: their head launch stays stock.
-        guard v.family == nil else { return nil }
         let columns = v == .v0 ? 32 : v.tn
         guard n % columns == 0 else { return nil }
         let shapes = [[m, n / columns, 2], [m, n / columns, 2]]
         let dtypes: [DType] = [.int32, .float32]
         let partial: [MLXArray]
-        switch v {
-        case .v0:
-            guard let launch = kernelNarrowInt8Top2 else { return nil }
+        if let family = v.family {
+            // A zoo body's fused form: the same body text, template and grid
+            // as its stock launch (`launchNarrowInt8`), on the tiled copy only.
+            guard tiled else { return nil }
+            let zooTemplate = Array(template.prefix(3))
+            let launch: MLXFast.MLXFastKernel?
+            let t: [(String, any KernelTemplateArg)]
+            var grid = (n / v.tn * 128, 1, 1)
+            var threads = 128
+            if let pairR = v.zoo2Pair {
+                launch = pairR ? kernelNarrowInt8PairRTop2 : kernelNarrowInt8Zoo2Top2
+                t = zooTemplate + v.zoo2Template.map { ($0.0, $0.1 as any KernelTemplateArg) }
+                if pairR { (grid, threads) = ((n / 32 * v.threads, 1, 1), v.threads) }
+            } else if family == "pair" {
+                launch = kernelNarrowInt8PairTop2
+                t = zooTemplate + [("PD", v.pd), ("KH", v.kh)]
+                (grid, threads) = ((n / 32 * 256, 1, 1), 256)
+            } else {
+                launch = kernelNarrowInt8ZooTop2
+                t = zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)]
+            }
+            guard let launch else { return nil }
             partial = launch(
-                inputs, template: template,
-                grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                inputs, template: t, grid: grid, threadGroup: (threads, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
-        default:
-            guard let launch = kernelNarrowInt8PipelinedTop2 else { return nil }
-            partial = launch(
-                inputs, template: template + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
-                grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
-                outputShapes: shapes, outputDTypes: dtypes)
+        } else {
+            switch v {
+            case .v0:
+                guard let launch = kernelNarrowInt8Top2 else { return nil }
+                partial = launch(
+                    inputs, template: template,
+                    grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: shapes, outputDTypes: dtypes)
+            default:
+                guard let launch = kernelNarrowInt8PipelinedTop2 else { return nil }
+                partial = launch(
+                    inputs, template: template + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
+                    grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: shapes, outputDTypes: dtypes)
+            }
         }
         let merged = headTop2MergeKernel(
             partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
