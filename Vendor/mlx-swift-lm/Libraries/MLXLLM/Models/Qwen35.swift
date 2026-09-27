@@ -311,7 +311,13 @@ enum Qwen35TrunkSubmission {
         // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        // Keep the two leading boundaries and submit the remaining tail after
+        // layer 40, while the host constructs layers 40..63. Tail off keeps
+        // the accepted [8,24] plan; second-slice off keeps [8].
+        let tail = env["MLXFAST_VERIFY_TAIL_SLICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let leading = ["0", "false", "no", "off"].contains(second ?? "")
+            ? [8] : (["0", "false", "no", "off"].contains(tail ?? "") ? [8, 24] : [8, 24, 40])
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))

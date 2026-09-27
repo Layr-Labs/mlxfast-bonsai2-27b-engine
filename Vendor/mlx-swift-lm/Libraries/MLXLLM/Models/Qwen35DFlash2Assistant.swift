@@ -570,6 +570,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     private func warmDrafter() {
         let block = Self.warmBlockSize
+        DFlash2SpeculativePad.warm(
+            block: block, hidden: drafter.config.hiddenSize, dtype: drafter.dtype)
         guard let caches = try? drafter.makeCache() else { return }
         let width = drafter.config.targetHiddenSize
         var offset = 0
