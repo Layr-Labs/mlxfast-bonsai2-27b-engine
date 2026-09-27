@@ -161,9 +161,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
-                self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
+                self.warmLookupAbsorb()
+                Stream().synchronize()
+                Memory.clearCache()
             }
         }
         Stream().synchronize()
@@ -195,20 +197,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
     /// `=0` no self-test either). Nothing runs where the head is not on the
     /// int8 verify route or its fused form fails the self-test.
-    /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
-    /// after the verify kernels' trial, the same way: one engine request,
-    /// cancelled once both arms have their rounds, the choice, one stderr
-    /// line, the buffer cache drained.
-    private func runNarrowProducerTrial(serving: any LanguageModel) {
-        typealias Trial = Qwen35NarrowProducerTrial
-        guard Trial.armed else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded, producerTrial: true)
-        Stream().synchronize()
-        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
-        Memory.clearCache()
-    }
-
     private func runHeadTopTwoTrial(serving: any LanguageModel) {
         typealias Head = Qwen35HeadTopTwo
         guard Head.forced != false, Qwen35TensorPackedMatmul.prepareHeadTop2() else { return }
@@ -287,7 +275,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false, producerTrial: Bool = false
+        kernelTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -356,9 +344,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     guard let engine else { return }
                     DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
                 }
-                if producerTrial {
-                    Qwen35NarrowProducerTrial.begin(onEnough: cancel)
-                } else if headTrial {
+                if headTrial {
                     Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
                 } else if kernelTrial {
                     DFlash2KernelTrial.begin(onEnough: cancel)
@@ -377,7 +363,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             done.wait()
             if trialRounds > 0 {
                 Qwen35TensorPackedMatmul.NarrowInSituTrial.active = false
-                Qwen35NarrowProducerTrial.active = false
                 Qwen35HeadTopTwo.Trial.active = false
                 DFlash2KernelTrial.active = false
             }
@@ -601,6 +586,27 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 anchor: [0], targetHidden: nil, cache: caches, blockSize: block)
         else { return }
         eval([tokens] + caches.flatMap { $0.innerState() })
+        warmLookupAbsorb()
+    }
+
+    /// A lookup round's absorb (`absorbLookupRound`) for every confirmed count,
+    /// on fresh throwaway caches behind a prompt's prefetch, so no timed round
+    /// compiles its kernels. Run again after the kernel trial has chosen.
+    private func warmLookupAbsorb() {
+        guard Self.lookupAbsorbEnabled, Self.contextPrefetchEnabled,
+            let caches = try? drafter.makeCache()
+        else { return }
+        let width = drafter.config.targetHiddenSize
+        let prompt = MLXArray.zeros([1, Self.warmPromptRows, width], dtype: drafter.dtype)
+        guard (try? drafter.absorbContext(targetHidden: prompt, cache: caches)) == true
+        else { return }
+        eval(caches.flatMap { $0.innerState() })
+        for rows in 1 ... Self.warmBlockSize {
+            let context = MLXArray.zeros([1, rows, width], dtype: drafter.dtype)
+            guard (try? drafter.absorbBlockContext(targetHidden: context, cache: caches)) == true
+            else { return }
+            eval(caches.flatMap { $0.innerState() })
+        }
     }
 
     private static func qwen35TextTarget(
@@ -655,6 +661,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         var isReleased = false
         /// Columns the last round confirmed (the speculative block's row class guess).
         var lastConfirmed: Int?
+        /// The round just planned drafts from a prompt-span lookup.
+        var lookupRound = false
 
         init(caches: [any KVCache]) { self.caches = caches }
 
@@ -766,7 +774,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
-        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         let state = self.state(requestState)
@@ -787,6 +794,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         DFlash2KernelTrial.recordProposed(tokens, position: state.observedRows)
         state.absorbPending()
         state.contextPrefetched = false
+        state.lookupRound = false
         state.roots.append(tokens)
         return tokens
     }
@@ -849,6 +857,45 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int
     ) {
         drafter.trimCache(state(requestState).caches, toCommittedLength: committed)
+    }
+
+    // MARK: - Lookup rounds
+
+    /// Kill switch for skipping the block forward of a lookup round (default
+    /// on): `DARKBLOOM_DFLASH2_LOOKUP_ABSORB=0` proposes and replaces as before.
+    static let lookupAbsorbEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_LOOKUP_ABSORB"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// A lookup round's drafter work: the confirmed rows enter the caches
+    /// through the block path's own projection and tensor kernel
+    /// (`absorbBlockContext`), and no block is built. The next proposal then
+    /// reads the caches alone, as after a prompt's prefetch.
+    public func absorbLookupRound(requestState: any CBv2MTPRequestState) -> [MLXArray]? {
+        guard Self.lookupAbsorbEnabled else { return nil }
+        let state = self.state(requestState)
+        guard !state.isReleased, state.cacheSeeded, !state.pending.isEmpty,
+            state.pendingRows <= Self.warmBlockSize
+        else { return nil }
+        let context =
+            state.pending.count == 1
+            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        guard (try? drafter.absorbBlockContext(targetHidden: context, cache: state.caches)) == true
+        else { return nil }
+        // The top of this round's drafter work, as `proposeBlock`'s.
+        Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
+        Qwen35HeadTopTwo.Trial.roundBoundary()
+        DFlash2KernelTrial.roundBoundary()
+        state.absorbPending()
+        state.contextPrefetched = true
+        state.lookupRound = true
+        return state.caches.flatMap { $0.innerState() }
+    }
+
+    public func noteLookupRound(_ hit: Bool, requestState: any CBv2MTPRequestState) {
+        state(requestState).lookupRound = hit
     }
 
     // MARK: - Round lifecycle
@@ -918,6 +965,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let state = self.state(requestState)
         guard let plan = speculationPlan, k + 2 == plan.classes.count, !state.isReleased,
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
+            !(state.lookupRound && Self.lookupAbsorbEnabled),
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
         let targets = packet[k ..< (2 * k + 1)]
@@ -946,7 +994,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             plan.classes[confirmed] == s.block.contextRows
         else { return nil }
         Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
-        Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
         drafter.adoptSpeculative(s.block, confirmed: confirmed, cache: state.caches)
@@ -956,6 +1003,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         state.lastConfirmed = confirmed
         state.observedRows += confirmed
         state.contextPrefetched = false
+        state.lookupRound = false
         DFlash2KernelTrial.recordAdopted(s.block.tokens, tag: s.kernelTag, position: state.observedRows)
         return s.block.tokens
     }

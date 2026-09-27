@@ -456,12 +456,30 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// submission (a prompt's worth of rows). Returns the lazy arrays to
     /// evaluate, or nothing when the rows stay pending for the next block.
     func prefetchCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
+
+    /// A round whose ids a prompt-span lookup supplies
+    /// (`CBv2PromptLookupDraft`): absorb the committed context rows the state
+    /// holds without a block forward, whose ids would be replaced anyway.
+    /// Returns the lazy arrays to evaluate, or nil (nothing changed) when the
+    /// drafter proposes as before.
+    func absorbLookupRound(requestState: any CBv2MTPRequestState) -> [MLXArray]?
+
+    /// Whether the round just planned drafts from a lookup. While it does, a
+    /// drafter that builds its next block before the readback does not build
+    /// it: the next round most likely looks up again.
+    func noteLookupRound(_ hit: Bool, requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPBlockDrafter {
     public func prefetchCommittedContext(
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] { [] }
+
+    public func absorbLookupRound(requestState: any CBv2MTPRequestState) -> [MLXArray]? {
+        nil
+    }
+
+    public func noteLookupRound(_ hit: Bool, requestState: any CBv2MTPRequestState) {}
 
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
