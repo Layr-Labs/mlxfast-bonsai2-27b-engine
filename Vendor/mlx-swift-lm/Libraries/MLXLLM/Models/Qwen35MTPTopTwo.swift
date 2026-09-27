@@ -646,6 +646,31 @@ enum Qwen35TensorPackedMatmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The prompt int8 kernel loads this group's epilogue constants before
+    /// the tensor op. `DARKBLOOM_QWEN35_PROMPT_PREFETCH=0` loads them after.
+    static let promptPrefetch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The next group's constants are loaded in the same window, and the
+    /// following iteration uses those registers.
+    /// `DARKBLOOM_QWEN35_PROMPT_PREFETCH_NEXT=0` does not.
+    static let promptPrefetchNext: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_PREFETCH_NEXT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The factored epilogue's four consecutive outputs are one float4 fma.
+    /// `DARKBLOOM_QWEN35_PROMPT_EPI4=0` keeps the scalar fmas.
+    static let promptEpilogueWide: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_PROMPT_EPI4"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -1779,45 +1804,91 @@ enum Qwen35TensorPackedMatmul {
             *(threadgroup uint4*)(dst + 4 * j) = codes;
           }
         };
+        // Epilogue constants are not produced by the tensor op.
+        // PFP loads this group's before the op (they overlap it). PFN also
+        // loads the next group's then, and the next iteration consumes those
+        // registers, so its op does not wait on them. Both off is the
+        // recorded load-after-op order. Same addresses, same values.
+        float4 s0, s1, b0, b1;
+        float4 u0 = 0.0f, u1 = 0.0f;
+        float as[4], rb[4];
+        float4 s0n, s1n, b0n, b1n;
+        float4 u0n = 0.0f, u1n = 0.0f;
+        float asn[4], rbn[4];
+        auto load_epi = [&](int gg, thread float4 &os0, thread float4 &os1,
+                            thread float4 &ob0, thread float4 &ob1,
+                            thread float4 &ou0, thread float4 &ou1,
+                            thread float (&oas)[4], thread float (&orb)[4]) {
+          os0 = float4(sp0[gg * NQ]); os1 = float4(sp1[gg * NQ]);
+          if constexpr (NEGATIVE_SCALE_BIAS) { ob0 = -os0; ob1 = -os1; }
+          else { ob0 = float4(bp0[gg * NQ]); ob1 = float4(bp1[gg * NQ]); }
+          if (!SIGNED) { ou0 = up0[gg * NQ]; ou1 = up1[gg * NQ]; }
+          else { ou0 = 0.0f; ou1 = 0.0f; }
+          if (MPERM) {
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)gg * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)gg * 64);
+            oas[0] = as4.x; oas[1] = as4.y; oas[2] = as4.z; oas[3] = as4.w;
+            orb[0] = rb4.x; orb[1] = rb4.y; orb[2] = rb4.z; orb[3] = rb4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) {
+              oas[q] = ascale[mrow[q] * Kg + gg]; orb[q] = rsb[mrow[q] * Kg + gg];
+            }
+          }
+        };
         stage(0, 0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (PFN != 0 || PFP != 0) {
+          load_epi(0, s0, s1, b0, b1, u0, u1, as, rb);
+        }
         for (int g = 0; g < Kg; g++) {
           const int cur = g & 1;
           if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          if constexpr (PFN != 0) {
+            if (g + 1 < Kg) { load_epi(g + 1, s0n, s1n, b0n, b1n, u0n, u1n, asn, rbn); }
+          } else if constexpr (PFP != 0) {
+            if (g > 0) { load_epi(g, s0, s1, b0, b1, u0, u1, as, rb); }
+          }
           auto tA = A.template slice<128, 64>(g * 128, m0);
           if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          float4 b0, b1;
-          if constexpr (NEGATIVE_SCALE_BIAS) {
-            b0 = -s0; b1 = -s1;
-          } else {
-            b0 = float4(bp0[g * NQ]); b1 = float4(bp1[g * NQ]);
+          if constexpr (PFN == 0 && PFP == 0) {
+            load_epi(g, s0, s1, b0, b1, u0, u1, as, rb);
           }
-          float4 u0 = 0.0f, u1 = 0.0f;
-          if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
-          float as[4], rb[4];
-          if (MPERM) {
-            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
-            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
-            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
-            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          if constexpr (EPI4 != 0 && FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+            // Four consecutive outputs share nh and mh. One float4 fma per
+            // component is the scalar factored fma, element 0 then 1 then 2
+            // then 3, each on its own accumulator.
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i += 4) {
+              const int nh = (i >> 3) & 1;
+              const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+              const float4 sv = nh ? s1 : s0;
+              const float4 ct = float4(
+                  float(cT[i]), float(cT[i + 1]), float(cT[i + 2]), float(cT[i + 3]));
+              const float4 a4 = fma(sv, fma(float4(as[mh]), ct, float4(-rb[mh])),
+                  float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]));
+              acc[i] = a4.x; acc[i + 1] = a4.y; acc[i + 2] = a4.z; acc[i + 3] = a4.w;
+            }
           } else {
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+            for (int i = 0; i < CAP; i++) {
+              const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+              const float s = nh ? s1[c] : s0[c];
+              const float b = nh ? b1[c] : b0[c];
+              const float u = nh ? u1[c] : u0[c];
+              if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
+                acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
+              } else {
+                const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
+                acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+              }
+            }
           }
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float u = nh ? u1[c] : u0[c];
-            if constexpr (FACTORED != 0 && NEGATIVE_SCALE_BIAS != 0 && SIGNED != 0) {
-              // offset = -scale: as*(s*C) + (-s)*rb == s*(as*C - rb), one
-              // FMA fewer per element and group.
-              acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
-            } else {
-              const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
-              acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          if constexpr (PFN != 0) {
+            if (g + 1 < Kg) {
+              s0 = s0n; s1 = s1n; b0 = b0n; b1 = b1n; u0 = u0n; u1 = u1n;
+              as[0] = asn[0]; as[1] = asn[1]; as[2] = asn[2]; as[3] = asn[3];
+              rb[0] = rbn[0]; rb[1] = rbn[1]; rb[2] = rbn[2]; rb[3] = rbn[3];
             }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2305,6 +2376,8 @@ enum Qwen35TensorPackedMatmul {
                     ("OutT", DType.float32), ("MPERM", rowTiledConstants ? 1 : 0),
                     ("SIGNED", signedCodes ? 1 : 0), ("NEGATIVE_SCALE_BIAS", 1),
                     ("FACTORED", factoredPromptEpilogue ? 1 : 0), ("TILED", tiledFlag),
+                    ("PFP", promptPrefetch ? 1 : 0), ("PFN", promptPrefetchNext ? 1 : 0),
+                    ("EPI4", promptEpilogueWide ? 1 : 0),
                 ],
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -3042,6 +3115,9 @@ enum Qwen35TensorPackedMatmul {
                     cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
+                template.append(("PFP", promptPrefetch ? 1 : 0))
+                template.append(("PFN", promptPrefetchNext ? 1 : 0))
+                template.append(("EPI4", promptEpilogueWide ? 1 : 0))
             default: packedKernel = kernelStaged
             }
             // The prompt route reads the verify route's tiled copy too, so the
