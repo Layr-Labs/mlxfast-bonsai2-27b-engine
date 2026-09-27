@@ -567,15 +567,18 @@ enum Qwen35GatedDeltaV3 {
         return value != "v1" && !["0", "off", "false", "no"].contains(value ?? "")
     }()
 
-    /// Dv rows per lane (template `DVPL`): 2 by default; `BONSAI_GDN_V3_DVPL=4`
-    /// selects the four-row layout (samfenwick `41a687f6`, carried in
-    /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
-    /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
-    static let rowsPerLane: Int = {
+    /// Dv rows per lane (template `DVPL`). `BONSAI_GDN_V3_DVPL=4` or `=2`
+    /// forces a layout (the four-row one is samfenwick `41a687f6`, carried
+    /// in terrapinelf `2e0f5f12`); unset, the load-time timed choice owns it
+    /// (`Qwen35GDNKernelTunes.choose`, 2 unless the four-row layout measured
+    /// faster on the running GPU). Rows never mix, so the values are the
+    /// same bit for bit either way. A threadgroup covers `16 * DVPL` dv rows.
+    static let forcedRowsPerLane: Int? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "4" ? 4 : 2
+        return value == "4" ? 4 : value == "2" ? 2 : nil
     }()
+    static var rowsPerLane: Int { forcedRowsPerLane ?? Qwen35GDNKernelTunes.dvpl }
 
     fileprivate static let source = """
         constexpr int R = 16;
@@ -887,33 +890,30 @@ enum Qwen35GatedDeltaV3 {
 ///
 /// A partially accepted verify commits each GDN layer by replaying the
 /// accepted prefix from the pre-verify state (`replayedPrefixState`): per
-/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3` with
-/// `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows. That is
+/// layer the gate kernel over the prefix's `a`/`b`, `Qwen35GatedDeltaV3`
+/// with `OUTPUT_NEEDED = 0`, and the copy detaching the boundary conv rows —
 /// three small dependent launches per layer, 144 per round on the 48 GDN
-/// layers, each built, encoded and dispatched on its own; the replay's bytes
-/// (each layer's state read once and written once) are the same either way,
-/// so what batching removes is that per-launch cost. Here one launch serves
-/// `layersPerLaunch` layers: every threadgroup of the stock V3 grid gains a
-/// layer index (the V3 kernel's batch index, the batch now being the
-/// layers), computes its step's gates in registers with MLX's own functors in
-/// the gate kernel's order, runs the V3 recurrence text unchanged (derived
-/// from `Qwen35GatedDeltaV3.source`), and copies its share of the layer's
-/// boundary conv rows. Layers never mix, and each layer's values go through
-/// the same operations in the same order as its own replay (the gates are
-/// the same FP32 expression, held in a register instead of stored and
-/// reloaded), so every committed bit is the per-layer replay's.
+/// layers, while the replay's bytes (state read once, written once) are the
+/// same either way; batching removes the per-launch cost. Here one launch
+/// serves `layersPerLaunch` layers: every threadgroup of the stock V3 grid
+/// gains a layer index (the V3 batch index, now the layers), computes its
+/// step's gates in registers with MLX's own functors in the gate kernel's
+/// order, runs the V3 recurrence text unchanged, and copies its share of
+/// the boundary conv rows. Layers never mix and each layer's values go
+/// through the same operations in the same order as its own replay, so every
+/// committed bit is the per-layer replay's.
 ///
-/// Metal binds at most 31 buffers per launch. A layer binds six (k, v, a, b,
-/// the pre-verify state and the conv input, all read in place); a launch adds
-/// six (the group's stacked A_log and dt_bias, the a/b row strides, the row
-/// count and the two pooled outputs): 6 * 4 + 6 = 30. The committed state and
-/// conv rows of the group's layers are views into those pooled outputs.
+/// Metal binds at most 31 buffers per launch: a layer binds six (k, v, a,
+/// b, pre-verify state, conv input, read in place) and a launch adds six
+/// (stacked A_log and dt_bias, a/b row strides, row count, two pooled
+/// outputs): 6 * 4 + 6 = 30. The group's committed states and conv rows are
+/// views into those pooled outputs.
 ///
 /// At model construction a self-test on the running GPU replays synthetic
-/// tapes (four layers, every committed row count of a 16-row window, extreme
-/// gate inputs included) both ways and compares every bit; a mismatch or any
-/// MLX error keeps the per-layer replay. A group that does not fit the
-/// kernel's shape, dtype and stride assumptions replays per layer too.
+/// tapes (four layers, every committed row count of a 16-row window,
+/// extreme gate inputs included) both ways and compares every bit; a
+/// mismatch or any MLX error keeps the per-layer replay, as does a group
+/// that does not fit the kernel's shape, dtype and stride assumptions.
 enum Qwen35GDNReplayBatch {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_REPLAY_BATCH"]?
@@ -2702,6 +2702,10 @@ final class Qwen35GatedDeltaNet: Module {
 
         super.init()
 
+        // Before any V3-templated prepare: the tuned DVPL must be settled
+        // first so every compiled pipeline uses the chosen layout.
+        Qwen35GDNKernelTunes.choose(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GDNPrefillKernel.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
         Qwen35GatedDeltaChunked.prepare(
