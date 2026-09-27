@@ -51,15 +51,6 @@ enum Qwen35SmallNMatmul {
 
     static let chunk = 128
 
-    /// The reduce takes the qkv|z product as an unread input (`after`), so MLX
-    /// encodes it after that product and the partial runs beside the product
-    /// instead of alone. `DARKBLOOM_QWEN35_SPLITK_BA_OVERLAP=0` drops it.
-    static let overlap: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SPLITK_BA_OVERLAP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     // grid (N / 32 * 128, K / 128, 1), threadgroup (128, 1, 1). The chunk's
     // x rows [M x 128] are staged in threadgroup memory; thread t takes column
     // nb + (t & 31) and k sub-range 32 * (t >> 5) .. + 31 for every row (eight
@@ -125,24 +116,24 @@ enum Qwen35SmallNMatmul {
         name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
         source: partialSource, ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
-        name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
-        source: reduceSource, ensureRowContiguous: false)
+        name: "qwen35_splitk_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
+        source: reduceSource, ensureRowContiguous: true)
 
-    static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
+    static func apply(_ x: MLXArray, _ w: MLXArray) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
         let rows = x.size / k
-        guard rows >= 1, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
-        // Prompt width: the 64-row simdgroup-matrix split-K (`Qwen35WideNMatmul`).
-        if rows > 16 { return Qwen35WideNMatmul.apply(x, w, rows: rows, k: k, n: n) }
+        guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else {
+            return nil
+        }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         let y = reduceKernel(
-            [part, dims, (overlap ? after : nil) ?? dims], template: [("KS", k / chunk)],
+            [part, dims], template: [("KS", k / chunk)],
             grid: ((rows * n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])

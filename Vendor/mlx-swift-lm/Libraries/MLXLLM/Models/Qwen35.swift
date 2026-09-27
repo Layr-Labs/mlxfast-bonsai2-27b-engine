@@ -2551,7 +2551,7 @@ final class Qwen35DenseSiblingStack {
 
     /// `(b(x), a(x))` from one matmul, or nil when the stack does not apply
     /// (only plain, unquantized, bias-free `Linear` siblings of one dtype).
-    func apply(_ x: MLXArray, b: Linear, a: Linear, after: MLXArray? = nil) -> (MLXArray, MLXArray)? {
+    func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
         guard Self.enabled,
             ObjectIdentifier(type(of: b)) == ObjectIdentifier(Linear.self),
             ObjectIdentifier(type(of: a)) == ObjectIdentifier(Linear.self),
@@ -2563,7 +2563,7 @@ final class Qwen35DenseSiblingStack {
             weight = concatenated([b.weight, a.weight], axis: 0)
             boundary = b.weight.dim(0)
         }
-        let y = Qwen35SmallNMatmul.apply(x, weight!, after: after) ?? matmul(x, weight!.T)
+        let y = Qwen35SmallNMatmul.apply(x, weight!) ?? matmul(x, weight!.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
     }
 }
@@ -2710,8 +2710,6 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GDNVerifyStateSkip.prepare(layer: self)
         Qwen35GDNReplayFused.prepare(layer: self)
         Qwen35GDNPrework.prepare(
-            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
-        Qwen35GDNPrework.prepareVerify(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
@@ -2962,7 +2960,7 @@ final class Qwen35GatedDeltaNet: Module {
                 ?? sharedHadamardProjections(
                     inputs, [inProjQKV, inProjZ], widenOutput: !narrowStack)
             {
-                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA, after: shared[0]) {
+                if let (bOut, aOut) = baStack.apply(inputs, b: inProjB, a: inProjA) {
                     return (shared[0], shared[1].reshaped(B, S, numVHeads, headVDim), bOut, aOut)
                 }
                 return (
@@ -5451,15 +5449,6 @@ enum Qwen35GDNPrework {
             S > 0, S < 65536
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
-        // The verify window's launch reads first when verified (TV file).
-        if stridedReads, writeConvInput,
-            let lf = verifyLoadsFirst(
-                qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
-                aDecay: aDecay, dtb: dtb, normScales: normScales, keyHeads: keyHeads,
-                valueHeads: valueHeads, headKDim: headKDim, headVDim: headVDim)
-        {
-            return lf
-        }
         // One shape and dtype per output name: six, or seven with `ci`.
         var outputShapes: [[Int]] = [
             [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
@@ -6680,7 +6669,7 @@ enum Qwen35FusedHadamard {
             ]
             let outShape = [rows, width]
             let groupShape = [rows, width / 128]
-            let outputs = producerKernel(rows: rows)(
+            let outputs = kernelInt8Producer(
                 [aView, bView, w, eps, signs], template: template,
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [outShape, groupShape, groupShape],
@@ -6688,349 +6677,6 @@ enum Qwen35FusedHadamard {
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
         }
-    }
-}
-
-// MARK: - Vector operand reads for the prompt-width producer rotation
-
-/// `bonsai_signed_hadamard_1024_q8p` with each thread's four consecutive
-/// columns of an operand read as one vector load where the operand's
-/// innermost stride is 1. The stock read computes a 64-bit strided offset
-/// (`bonsai_q8p_col`) and issues one scalar load per element and operand
-/// (the SwiGLU gate and up halves, the head-transposed attention output and
-/// its gate, the GDN output read twice with its z, the norm weight and the
-/// signs). At prompt width that address arithmetic is a large part of the
-/// launch (M4, 512 rows, in the model, with the fold below: SwiGLU 132 -> 121
-/// us, attention gate 97 -> 88 us, GDN gated norm 95 -> 70 us per launch).
-///
-/// Thread i still owns columns `256 j + 4 i + r` of its block (r = 0..3):
-/// the four share one head (the head width is a multiple of 4), so the
-/// grouped layout maps them to four consecutive source columns, and the
-/// vector load returns exactly the four elements the scalar reads return,
-/// widened to FP32 the same way. The gated norm's per-head RMS pass (a second
-/// read of the GDN output, a threadgroup array and a barrier) folds into the
-/// column loop: at step j simdgroup i / 32 holds exactly head 2 j + i / 32 of
-/// the block with lane l on its elements 4 l .. 4 l + 3, the stock pass's
-/// lanes and elements, so the sum of squares (r = 0..3 order), `simd_sum`
-/// and `rsqrt` are the same operations on the same values. Every other FP32
-/// expression (the gated tail, the signs), the threadgroup layout, the
-/// butterflies, `* 0.03125f`, the quantization and every store are the stock
-/// text, so every output has the same bits. The source is cut from the stock
-/// one by three checked replacements.
-///
-/// Prompt width only (the producer rotation has no verify-width caller).
-/// Before first use a self-test runs the stock and this kernel through the
-/// production closure on operands in the production layouts (FP16 gate|up
-/// column halves; the head-transposed FP32 attention output with the gate
-/// half of each q|gate head; the FP32 GDN output with the FP16 z slice of a
-/// qkv|z stack in the 16-key-head x 3 grouped layout; wide magnitude spreads,
-/// an all-zero row; also operands whose base is not vector-aligned) at 128
-/// and 512 rows and compares codes, scales and scaled sums bit for bit; a
-/// mismatch or an MLX error keeps the stock kernel.
-/// `BONSAI_ROT_VEC=0` keeps the stock kernel.
-extension Qwen35FusedHadamard {
-    static let producerVecEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_ROT_VEC"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let producerVecHeader = """
-        // Four consecutive elements in one load (FP32 and FP16; any other
-        // element type reads one element at a time), widened to FP32.
-        inline float4 bonsai_ld4(const device float* p) {
-          return *(const device float4*)p;
-        }
-        inline float4 bonsai_ld4(const device half* p) {
-          return float4(*(const device half4*)p);
-        }
-        template <typename T>
-        inline float4 bonsai_ld4(const device T* p) {
-          return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
-        }
-        // Elements c .. c + 3 of a producer operand: one load when its
-        // innermost stride is 1 (`vec`), else the stock scalar strided reads.
-        template <int HD, typename T>
-        inline float4 bonsai_q8p_ld4(
-            const device T* p, int64_t rowoff, const constant int64_t* st, uint c, bool vec) {
-          if (vec) {
-            return bonsai_ld4(p + rowoff + bonsai_q8p_col<HD>(st, c));
-          }
-          float4 v;
-          #pragma clang loop unroll(full)
-          for (int r = 0; r < 4; r++) {
-            v[r] = float(p[rowoff + bonsai_q8p_col<HD>(st, c + uint(r))]);
-          }
-          return v;
-        }
-
-        """
-
-    private static let producerVecSource: String = {
-        func replacing(_ text: String, _ target: String, _ replacement: String) -> String {
-            precondition(
-                text.components(separatedBy: target).count == 2,
-                "Qwen35 vector producer rotation: the stock source no longer matches")
-            return text.replacingOccurrences(of: target, with: replacement)
-        }
-        var text = sourceInt8Producer
-        let brow = "const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
-        text = replacing(
-            text, brow,
-            brow + """
-                const bool AV = (AHD == 0 ? a_strides[1] : a_strides[3]) == 1;
-                const bool BV = (BHD == 0 ? b_strides[1] : b_strides[3]) == 1;
-
-                """)
-        text = replacing(
-            text,
-            """
-            threadgroup float inv_rms[8];
-            if (PROD == 3) {
-              // Per-head RMS as rms_single_row: lane l sums elements 4l..4l+3 of
-              // the head in order, then simd_sum; heads of this block in output
-              // order, read from their source head.
-              const uint lane = uint(i) & 31u;
-              const uint sgi = uint(i) >> 5;
-              for (uint hh = sgi; hh < 8u; hh += 2u) {
-                const uint p0 = bcol + hh * uint(GD);
-                const uint kh = p0 / uint(GR * GD);
-                const uint rep = (p0 % uint(GR * GD)) / uint(GD);
-                const uint src_head = rep * uint(GKH) + kh;
-                const uint c0 = src_head * uint(GD) + lane * 4;
-                float acc = 0.0f;
-                #pragma clang loop unroll(full)
-                for (int r = 0; r < 4; r++) {
-                  const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
-                  acc += tx * tx;
-                }
-                acc = simd_sum(acc);
-                if (lane == 0) {
-                  inv_rms[hh] = metal::precise::rsqrt(acc / float(GD) + eps[0]);
-                }
-              }
-              threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            """,
-            "")
-        text = replacing(
-            text,
-            """
-            #pragma clang loop unroll(full)
-            for (short j = 0; j < 4; j++) {
-              const short index = j * 4 * NT + i * 4;
-              #pragma clang loop unroll(full)
-              for (short r = 0; r < 4; r++) {
-                const uint col = bcol + uint(index + r);
-                uint src = col;
-                if (GR > 1) {
-                  const uint d = col % uint(GD);
-                  const uint hr = col / uint(GD);
-                  const uint h = hr / uint(GR);
-                  const uint rr = hr % uint(GR);
-                  src = (rr * uint(GKH) + h) * uint(GD) + d;
-                }
-                const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
-                const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
-                float v;
-                if (PROD == 1) {
-                  v = (av * bonsai_sigmoid(av)) * bv;
-                } else if (PROD == 2) {
-                  v = av * bonsai_sigmoid(bv);
-                } else {
-                  const float xn = w[src % uint(GD)] * (av * inv_rms[(index + r) / GD]);
-                  v = (bv * bonsai_sigmoid(bv)) * xn;
-                }
-                buf[index + r] = v * signs[col];
-              }
-            }
-            """,
-            """
-            // Columns col .. col + 3 share one head (GD % 4 == 0), so their
-            // sources are src .. src + 3. For the gated norm the 128 columns of
-            // simdgroup i / 32 at step j are head 2 j + i / 32 of the block, lane
-            // l holding its elements 4 l .. 4 l + 3: the stock RMS pass's lanes
-            // and elements, so the head's sum of squares, `simd_sum` and `rsqrt`
-            // are formed here from the values already loaded, in that order.
-            static_assert(GR == 1 || GD % 4 == 0, "four-column runs share a head");
-            static_assert(PROD != 3 || (GD == 128 && NT == 64), "one head per simdgroup and step");
-            #pragma clang loop unroll(full)
-            for (short j = 0; j < 4; j++) {
-              const short index = j * 4 * NT + i * 4;
-              const uint col = bcol + uint(index);
-              uint src = col;
-              if (GR > 1) {
-                const uint d = col % uint(GD);
-                const uint hr = col / uint(GD);
-                const uint h = hr / uint(GR);
-                const uint rr = hr % uint(GR);
-                src = (rr * uint(GKH) + h) * uint(GD) + d;
-              }
-              const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
-              const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
-              const float4 s4 = bonsai_ld4(signs + col);
-              float inv = 0.0f;
-              if (PROD == 3) {
-                float acc = 0.0f;
-                #pragma clang loop unroll(full)
-                for (int r = 0; r < 4; r++) {
-                  const float tx = a4[r];
-                  acc += tx * tx;
-                }
-                acc = simd_sum(acc);
-                inv = metal::precise::rsqrt(acc / float(GD) + eps[0]);
-              }
-              #pragma clang loop unroll(full)
-              for (short r = 0; r < 4; r++) {
-                const float av = a4[r];
-                const float bv = b4[r];
-                float v;
-                if (PROD == 1) {
-                  v = (av * bonsai_sigmoid(av)) * bv;
-                } else if (PROD == 2) {
-                  v = av * bonsai_sigmoid(bv);
-                } else {
-                  const float xn = w[src % uint(GD) + uint(r)] * (av * inv);
-                  v = (bv * bonsai_sigmoid(bv)) * xn;
-                }
-                buf[index + r] = v * s4[r];
-              }
-            }
-            """)
-        return text
-    }()
-
-    private static let producerVecKernel = MLXFast.metalKernel(
-        name: "bonsai_signed_hadamard_1024_q8pv",
-        inputNames: ["a", "b", "w", "eps", "signs"],
-        outputNames: ["out", "qscale", "qsum"],
-        source: producerVecSource,
-        header: headerProducer + producerVecHeader,
-        ensureRowContiguous: false)
-
-    /// Self-test override: 1 forces the stock kernel, 2 the vector one.
-    nonisolated(unsafe) private static var producerVecForce = 0
-    private static let producerVecLock = NSLock()
-    nonisolated(unsafe) private static var producerVecVerdict: Bool?
-
-    /// The producer rotation's kernel at `rows` rows.
-    static func producerKernel(rows: Int) -> MLXFast.MLXFastKernel {
-        if producerVecForce != 0 {
-            return producerVecForce == 2 ? producerVecKernel : kernelInt8Producer
-        }
-        guard producerVecEnabled, rows >= BonsaiPromptWidth.minimumRows else {
-            return kernelInt8Producer
-        }
-        let passed = producerVecLock.withLock { () -> Bool in
-            if let producerVecVerdict { return producerVecVerdict }
-            let (passed, summary) = producerVecSelfTest()
-            producerVecVerdict = passed
-            FileHandle.standardError.write(
-                ("bonsai vector producer rotation: " + summary
-                    + (passed ? "; vector reads\n" : "; stock kernel kept\n")).data(using: .utf8)!)
-            return passed
-        }
-        return passed ? producerVecKernel : kernelInt8Producer
-    }
-
-    private static func producerVecSelfTest() -> (Bool, String) {
-        guard let fused = SignedBlockHadamard.fusedTransformInt8Producer else {
-            return (false, "self-test error: the producer rotation is not installed")
-        }
-        var cases = 0
-        var values = 0
-        var mismatches = 0
-        var failure: String? = nil
-        do {
-            try withError { error in
-                let keys = MLXRandom.split(key: MLXRandom.key(0x7176_6563), into: 16)
-                // A wide magnitude spread per element.
-                func spread(_ shape: [Int], _ i: Int) -> MLXArray {
-                    MLXRandom.normal(shape, key: keys[i])
-                        * exp(MLXRandom.normal(shape, key: keys[i + 1]))
-                }
-                func signs(_ n: Int, _ i: Int) -> MLXArray {
-                    which(
-                        MLXRandom.uniform(Float(0) ..< Float(1), [n], key: keys[i]) .< Float(0.5),
-                        Float(-1), Float(1))
-                }
-                func compare(_ a: MLXArray, _ b: MLXArray) throws {
-                    guard a.dtype == b.dtype, a.shape == b.shape else {
-                        failure = "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
-                        return
-                    }
-                    let bits: DType =
-                        a.dtype.size == 4 ? .uint32 : a.dtype.size == 2 ? .uint16 : .uint8
-                    let differ = (a.view(dtype: bits) .!= b.view(dtype: bits))
-                        .asType(.int32).sum()
-                    eval(differ)
-                    try error.check()
-                    values += a.size
-                    mismatches += Int(differ.item(Int32.self))
-                }
-                let layout = try HadamardGDNLayout(width: 6144, keyHeads: 16, valueHeads: 48)
-                for rows in [128, 512] {
-                    // One all-zero row (all-zero groups: scale 1, codes 0).
-                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows / 3)))
-                        .reshaped(1, rows, 1)
-                    var tests: [(SignedBlockHadamard.Int8Producer, MLXArray, HadamardGDNLayout?)] = []
-                    // `skew` 1 starts every operand one element past a vector
-                    // boundary (views the model does not build).
-                    for skew in [0, 1] {
-                        let flat = which(
-                            zeroRow.reshaped(1, rows, 1), Float(0), spread([1, rows, 6144], 2)
-                        ).reshaped(-1)
-                        let out = concatenated([MLXArray.zeros([skew]), flat])[skew...]
-                            .reshaped(1, rows, 48, 128)
-                        let qkvz = spread([1, rows, 16384 + skew], 4).asType(.float16)
-                        let z = qkvz[.ellipsis, (10240 + skew)...].reshaped(1, rows, 48, 128)
-                        tests.append((
-                            .gatedRMSNorm(
-                                x: out, gate: z, weight: MLXRandom.normal([128], key: keys[6]),
-                                eps: 1e-6),
-                            signs(6144, 7), layout))
-                        let gateUp = which(
-                            zeroRow, Float(0), spread([1, rows, 2 * 17408 + skew], 8)
-                        ).asType(.float16)
-                        tests.append((
-                            .swiglu(
-                                gate: gateUp[.ellipsis, skew ..< (17408 + skew)],
-                                up: gateUp[.ellipsis, (17408 + skew)...]),
-                            signs(17408, 10), nil))
-                        let attended = spread([1, 24, rows, 256], 11).transposed(0, 2, 1, 3)
-                        let qGate = spread([1, rows, 24, 512 + skew], 13)
-                        tests.append((
-                            .sigmoidGate(x: attended, gate: qGate[.ellipsis, (256 + skew)...]),
-                            signs(6144, 15), nil))
-                    }
-                    for (producer, signVector, gdn) in tests {
-                        producerVecForce = 1
-                        let reference = fused(producer, signVector, 1024, gdn, 128)
-                        producerVecForce = 2
-                        let candidate = fused(producer, signVector, 1024, gdn, 128)
-                        producerVecForce = 0
-                        guard let reference, let candidate else {
-                            failure = "the producer rotation declined a test case"
-                            return
-                        }
-                        cases += 1
-                        try compare(reference.codes, candidate.codes)
-                        try compare(reference.scales, candidate.scales)
-                        try compare(reference.scaledSums, candidate.scaledSums)
-                    }
-                }
-            }
-        } catch {
-            failure = "\(error)"
-        }
-        producerVecForce = 0
-        if let failure { return (false, "self-test error: \(failure)") }
-        let passed = mismatches == 0 && cases == 12
-        return (
-            passed,
-            "self-test \(passed ? "passed" : "FAILED"): \(cases) cases, \(values) values "
-                + "compared bitwise, \(mismatches) mismatches")
     }
 }
 

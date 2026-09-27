@@ -1781,6 +1781,14 @@ enum DFlash2TopK {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Exact SIMD-local lower bound: discard only keys strictly below the
+    /// K-th largest of the lanes' maxima. Set to 0 to keep the original scan.
+    static let thresholdPrune: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_PREFILTER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let chunks = 8
     private static let threads = 128
 
@@ -1799,6 +1807,8 @@ enum DFlash2TopK {
             ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
             ("VEC", vector ? 1 : 0),
             ("HALF", logits.dtype == .float16 ? 1 : 0),
+            ("PREFILTER", thresholdPrune && k >= 8 && k <= 16
+                && vocabularySize >= 32768 ? 1 : 0),
         ]
         let parts = chunkKernel(
             [flat], template: template,
@@ -1826,8 +1836,8 @@ enum DFlash2TopK {
             // order, so an equal key keeps the higher index.
             template <int KK>
             inline void mlxfast_topk_consider(thread uint (&k)[KK], thread uint (&id)[KK],
-                                               uint kx, uint ix) {
-                if (kx >= k[KK - 1]) {
+                                               uint kx, uint ix, uint cutoff) {
+                if (kx >= cutoff && kx >= k[KK - 1]) {
                     for (int j = 0; j < KK; j++) {
                         bool sw = kx >= k[j];
                         uint tk = k[j], ti = id[j];
@@ -1874,6 +1884,39 @@ enum DFlash2TopK {
             // `logits` is float or half (the drafter's FP16 head read); the
             // key and the gathered value are the float the half widens to.
             auto x = logits + size_t(row) * NV;
+            // Each lane's maximum names a distinct element. The K-th of
+            // these maxima cannot exceed the K-th key of their full union.
+            // Keep equality: tied values still rank by the original index.
+            uint cutoff = 0u;
+            if (PREFILTER) {
+                uint lane_max = 0u;
+                if (VEC && (CH % 4u) == 0u) {
+                    for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                        if (HALF) {
+                            const half4 q = *(const device half4*)(x + v);
+                            for (int j = 0; j < 4; j++) {
+                                lane_max = max(lane_max, mlxfast_topk_key(float(q[j])));
+                            }
+                        } else {
+                            const float4 q = *(const device float4*)(x + v);
+                            for (int j = 0; j < 4; j++) {
+                                lane_max = max(lane_max, mlxfast_topk_key(q[j]));
+                            }
+                        }
+                    }
+                } else {
+                    for (uint v = lo + t; v < hi; v += TPG) {
+                        lane_max = max(lane_max, mlxfast_topk_key(float(x[v])));
+                    }
+                }
+                // Pop exactly one lane per round, including ties. An empty
+                // lane has sentinel key zero, below every representable logit.
+                for (int r = 0; r < KK; r++) {
+                    cutoff = simd_max(lane_max);
+                    uint winner = simd_min(lane_max == cutoff ? lane : 0xffffffffu);
+                    if (lane == winner) lane_max = 0u;
+                }
+            }
             uint k[KK], id[KK];
             for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
             if (VEC && (CH % 4u) == 0u) {
@@ -1881,21 +1924,21 @@ enum DFlash2TopK {
                 for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
                     if (HALF) {
                         const half4 q = *(const device half4*)(x + v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u, cutoff);
                     } else {
                         const float4 q = *(const device float4*)(x + v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u);
-                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u, cutoff);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u, cutoff);
                     }
                 }
             } else {
                 for (uint v = lo + t; v < hi; v += TPG) {
-                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v);
+                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v, cutoff);
                 }
             }
             uint ok = 0u, oi = 0u;

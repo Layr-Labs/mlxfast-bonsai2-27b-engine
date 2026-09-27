@@ -151,12 +151,8 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        // Squeezed (a view): mlx-swift's slice assignment reshapes away a
-        // leading 1, which copies a strided update (the verify's V view).
-        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] =
-            newKeys.dim(0) == 1 ? newKeys.squeezed(axis: 0) : newKeys
-        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] =
-            newValues.dim(0) == 1 ? newValues.squeezed(axis: 0) : newValues
+        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
+        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         absoluteOffset += n
 
         return (
