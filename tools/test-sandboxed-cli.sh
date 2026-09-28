@@ -56,7 +56,9 @@ else
     grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" <<< "${profile}" \
       || fail "generator: no read and write deny for ${path}"
   done
-  grep -qF '(allow process-exec (literal "/bin/bash"))' <<< "${profile}" \
+  # The generator resolves the program path, and /bin is a symlink on Linux.
+  bash_path="$(python3 -c 'import os; print(os.path.realpath("/bin/bash"))')"
+  grep -qF "(allow process-exec (literal \"${bash_path}\"))" <<< "${profile}" \
     || fail "generator: the named program is not the one exec allowed"
   grep -qF "(allow file-write* (subpath \"${WORK}/out\"))" <<< "${profile}" \
     || fail "generator: the output tree is not writable"
