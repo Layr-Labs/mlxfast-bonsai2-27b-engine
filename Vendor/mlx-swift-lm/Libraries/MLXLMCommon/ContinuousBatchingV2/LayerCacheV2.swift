@@ -45,9 +45,6 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private var cachedPositionOffsets: MLXArray
-    /// Host copy of `cachedPositionOffsets`: set where it is rebuilt,
-    /// advanced by the same `+ L` (see `CBv2HostPositionOffsets`).
-    private var hostPositionOffsets: [Int32] = []
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -83,7 +80,6 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
-        self.hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
     }
 
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
@@ -156,30 +152,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             keepMask: keepMask, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
-        advancePositionOffsets(by: queries.dim(2))
+        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return output
-    }
-
-    /// `updateAndAttend(queries:keys:values:scale:sinks:)` (no keep mask) for
-    /// a one-row chunk on the query-block path, returning the blocks'
-    /// outputs in query order (see the protocol). Declines, before any state
-    /// changes, when an observation is armed, a span overlay is bound, the
-    /// layer borrows its K/V, or the chunk would not attend in query blocks.
-    public func updateAndAttendQueryBlocks(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?
-    ) -> [MLXArray]? {
-        guard kind.sharesKVWithLayer == nil, attentionMetadata == nil, attentionPacket == nil,
-            rows.count == 1, boundSpanContexts?.contains(where: { $0 != nil }) != true,
-            let blocks = CBv2AttentionV1.updateAndAttendQueryBlocks(
-                row: rows[0], kind: kind, queries: queries, keys: keys, values: values,
-                scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        else { return nil }
-        // The offset advance `updateAndAttend` makes, host copy included
-        // (with `CBv2HostPositionOffsets` on, a device-only add here would
-        // leave the host copy behind by this chunk).
-        advancePositionOffsets(by: queries.dim(2))
-        return blocks
     }
 
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
@@ -200,7 +174,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        advancePositionOffsets(by: keys.dim(2))
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
         return output
     }
 
@@ -222,126 +196,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             serializeQueries: mtpSerializesRectangularAttention)
     }
 
-    // MARK: - Append written in place by a kernel (`CBv2InPlaceKVAppend`)
-
-    /// Where an `n`-row append a kernel writes itself goes: the one bound
-    /// row's key and value storage and the first row, or nil wherever
-    /// `updateAndAttend` would do anything but a plain update of one
-    /// contiguous full-attention row followed by `attendRowAfterUpdate`
-    /// (receipts, span or keep masks, sinks, several rows, other storage).
-    public func inPlaceAppendDestination(count n: Int, keyDType: DType, valueDType: DType)
-        -> (keys: MLXArray, values: MLXArray, row: Int, previous: MLXArray?)?
-    {
-        guard CBv2InPlaceKVAppend.enabled, kind.sharesKVWithLayer == nil,
-            case .full = kind.attention, !kind.isBidirectional, !kind.hasSinks,
-            rows.count == 1, let row = rows[0] as? CBv2FullSequenceKV,
-            attentionMetadata == nil, attentionPacket == nil, boundSpanContexts == nil
-        else { return nil }
-        return row.inPlaceAppendDestination(count: n, keyDType: keyDType, valueDType: valueDType)
-    }
-
-    /// `updateAndAttend(queries:keys:values:scale:sinks: nil)` for rows a
-    /// kernel already wrote at `inPlaceAppendDestination` (`fence` is an
-    /// output of that kernel): the same views, attention and offset advance.
-    public func attendAfterInPlaceAppend(queries: MLXArray, fence: MLXArray, scale: Float)
-        -> MLXArray
-    {
-        let row = rows[0] as! CBv2FullSequenceKV
-        let (cachedKeys, cachedValues) = row.commitInPlaceAppend(
-            count: queries.dim(2), fence: fence)
-        let output = CBv2AttentionV1.attendRowAfterUpdate(
-            kind: kind, queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
-            scale: scale, sinks: nil, softcap: attentionSoftcap, spanContext: nil)
-        advancePositionOffsets(by: queries.dim(2))
-        return output
-    }
-
     // MARK: - Private
 
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = Self.buildPositionOffsets(rows)
-        hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
-    }
-
-    /// `positionOffsets + n`: on the host (the same int32 values, no
-    /// launch; one array shared by every layer that holds them), or the
-    /// on-device add when `CBv2HostPositionOffsets` is off.
-    private func advancePositionOffsets(by n: Int) {
-        let advanced = hostPositionOffsets.map { $0 &+ Int32(n) }
-        if CBv2HostPositionOffsets.enabled,
-            CBv2HostPositionOffsets.agrees(
-                device: { self.cachedPositionOffsets + Int32(n) }, host: advanced)
-        {
-            cachedPositionOffsets = CBv2HostPositionOffsets.array(advanced)
-        } else {
-            cachedPositionOffsets = cachedPositionOffsets + Int32(n)
-        }
-        hostPositionOffsets = advanced
     }
 
     private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
         MLXArray(rows.map { Int32($0.absoluteOffset) })
     }
-}
-
-/// The advanced `positionOffsets` of an attention layer's step, built from a
-/// host copy advanced by the same `+ L` instead of by an on-device add per
-/// layer (16 one-element launches per verify window of the 27B). The host
-/// copy is set wherever the array is rebuilt and advanced exactly as the
-/// device chain is, so the values are the chain's, stale or not. Every layer
-/// of a step holds the same values, so they share one array.
-/// `MLXFAST_HOST_POSITION_OFFSETS=0` keeps the on-device add.
-enum CBv2HostPositionOffsets {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_HOST_POSITION_OFFSETS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
-    }()
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var last: (values: [Int32], array: MLXArray)?
-    nonisolated(unsafe) private static var verdict: Bool?
-
-    /// The first advance also runs the device add and compares it with the
-    /// host values; a mismatch keeps the device add for the process.
-    static func agrees(device: () -> MLXArray, host: [Int32]) -> Bool {
-        lock.withLock {
-            if let verdict { return verdict }
-            let same = device().asArray(Int32.self) == host
-            FileHandle.standardError.write(
-                (same
-                    ? "mlxfast host position offsets: first advance equals the device add; host copy\n"
-                    : "mlxfast host position offsets: mismatch; on-device add kept\n")
-                    .data(using: .utf8)!)
-            verdict = same
-            return same
-        }
-    }
-
-    static func array(_ values: [Int32]) -> MLXArray {
-        lock.withLock {
-            if let last, last.values == values { return last.array }
-            let array = MLXArray(values)
-            last = (values, array)
-            return array
-        }
-    }
-}
-
-/// An attention layer's KV append written by the kernel that produces the
-/// keys (the fused q/k prework stores the new key rows and copies the value
-/// rows straight into the row's storage) instead of by the two slice
-/// updates of `CBv2FullSequenceKV.update` (two copy launches per attention
-/// layer). The kernel's own self-test and trial decide whether it is used;
-/// `MLXFAST_INPLACE_KV_APPEND=0` keeps the slice updates everywhere.
-public enum CBv2InPlaceKVAppend {
-    public static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_INPLACE_KV_APPEND"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
 }
 
 // MARK: - Final-layer last-query prefill

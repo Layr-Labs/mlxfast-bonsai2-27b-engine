@@ -57,6 +57,22 @@ DRAFTER_DIR="${MLXFAST_DFLASH_DRAFTER_DIR:-reference_weights/Qwen3.8-27B-DFlash2
 
 echo "setup-dflash-drafter.sh: track ${TRACK_ID}; drafter ${DRAFTER_REPO}@${DRAFTER_REVISION} -> ${DRAFTER_DIR}"
 
+# A box can hold a verified copy of the drafter (MLXFAST_DFLASH_DRAFTER_REFERENCE_DIR).
+# When the drafter is not in this tree, take the files from that copy and do
+# not download them. setup.sh verifies each file against the pin file below,
+# so a copy that does not match is repaired from the published export.
+BOX_COPY="${MLXFAST_DFLASH_DRAFTER_REFERENCE_DIR:-}"
+if [[ -n "${BOX_COPY}" && -f "${BOX_COPY}/config.json" && ! -e "${DRAFTER_DIR}/config.json" ]]; then
+  mkdir -p "$(dirname "${DRAFTER_DIR}")"
+  rm -rf "${DRAFTER_DIR}"
+  # -c makes an APFS clone: no bytes are copied. It falls back to a copy.
+  cp -cR "${BOX_COPY}" "${DRAFTER_DIR}" 2>/dev/null \
+    || { rm -rf "${DRAFTER_DIR}"; cp -R "${BOX_COPY}" "${DRAFTER_DIR}"; }
+  chmod -R u+w "${DRAFTER_DIR}"
+  rm -f "${DRAFTER_DIR}/.mlxfast-reference-cache.lock"
+  echo "setup-dflash-drafter.sh: took the drafter from the box copy ${BOX_COPY}"
+fi
+
 # The drafter has no compatibility link of its own: nothing resolves it by a
 # legacy path. Point the link at the drafter directory so setup.sh does not
 # create or check one for the target while provisioning the drafter.

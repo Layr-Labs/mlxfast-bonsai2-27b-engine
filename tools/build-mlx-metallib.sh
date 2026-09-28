@@ -689,7 +689,13 @@ fi
 
 JOBS="${MLXFAST_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
-HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
+# The Metal and C++ sources are editable files. On an official run, the two
+# cmake commands run under Seatbelt (tools/sandboxed-build.sh): the compile
+# cannot read the evaluator-only paths and cannot use the network.
+SANDBOXED_BUILD=("$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)/sandboxed-build.sh"
+  --write "${CMAKE_BUILD_DIR}" --write "${METAL_COMPILER_HOME}" --)
+
+HOME="${METAL_COMPILER_HOME}" "${SANDBOXED_BUILD[@]}" "${CMAKE_BIN}" \
   -S "${MLX_SOURCE}" \
   -B "${CMAKE_BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -703,7 +709,7 @@ HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
   -DFETCHCONTENT_SOURCE_DIR_JSON="${JSON_SOURCE}" \
   -DFETCHCONTENT_SOURCE_DIR_FMT="${FMT_SOURCE}"
 
-HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
+HOME="${METAL_COMPILER_HOME}" "${SANDBOXED_BUILD[@]}" "${CMAKE_BIN}" \
   --build "${CMAKE_BUILD_DIR}" --target mlx-metallib --parallel "${JOBS}"
 
 METALLIB_PATHS=()

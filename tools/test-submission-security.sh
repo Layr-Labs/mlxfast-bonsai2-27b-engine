@@ -44,6 +44,14 @@ VERBOSE=0
 # explicitly.
 unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STEP_SUMMARY
 
+# The fixture repositories below commit with plain `git commit`. The caller's
+# global and system git configuration must not reach them: a user whose global
+# configuration sets commit.gpgsign=true with a passphrase key gets a
+# passphrase prompt at the first fixture commit, and the suite then waits on
+# the terminal, or fails every case that needs a commit when there is no
+# terminal. The suite reads no setting from those files.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
 # A section that stops running -- deleted, renamed out of the flow, or skipped by
 # an early `continue` -- leaves every REMAINING assertion green, so exit status
 # alone cannot notice it and the gate silently shrinks. This floor is the single

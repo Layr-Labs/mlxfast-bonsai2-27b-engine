@@ -62,11 +62,6 @@ extension EngineLoopV2 {
         mtp.recordSeedSteps(graph.seedRows.count)
 
         asyncEval(graph.asyncEvalTargets)
-        if !graph.lateEvalTargets.isEmpty {
-            // Its own submission: queued behind the step's, never ahead of
-            // the sampled tokens the step's finalize reads back.
-            asyncEval(graph.lateEvalTargets)
-        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
@@ -91,15 +86,14 @@ extension EngineLoopV2 {
                 uniqueKeysWithValues: work.map { ($0.rec.id, $0.rec.plannedPrefillChunkSize) })
         }
         if graph.verify != nil || !graph.seedRows.isEmpty
-            || !graph.committedObservationRows.isEmpty || !graph.prefillCarries.isEmpty
+            || !graph.committedObservationRows.isEmpty
         {
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden,
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
-                committedObservationRows: graph.committedObservationRows,
-                prefillCarries: graph.prefillCarries)
+                committedObservationRows: graph.committedObservationRows)
         }
         step.forwardShapes = shapes
         shapes?.attach()

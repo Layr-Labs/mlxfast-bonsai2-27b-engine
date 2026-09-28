@@ -7,7 +7,7 @@
 #
 # NO SECRET, ANYWHERE, BY DESIGN -- NOT AS A GAP. This file references no
 # repository secret, inherits none, and asks for no write permission, and it
-# never will: hidden material for this track (the 8 timed-pool tapes, the
+# never will: hidden material for this track (the timed-pool tapes, the
 # token-fidelity oracle, the reference baseline workspace) is STAGED ONTO THE
 # BOX out of band by the organizer. A box receives bundles, never keys
 # (bundles-no-keys, ruled 2026-08-21). What replaces the credential is
@@ -58,11 +58,12 @@
 #   1. benchd manifest mismatch. ./tools/fetch-benchd.sh accepts only bytes
 #      matching the channel's benchd.manifest.json; it never returns an unverified binary and
 #      never falls back to a PATH benchd or a source build.
-#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, a pool that is not 8 entries,
-#      or any entry whose sha256 is not 64 hex / bytes is not positive: refused,
-#      because there would be no pin to verify a staged file against.
+#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, an empty pool, or any
+#      entry whose sha256 is not 64 hex / bytes is not positive: refused,
+#      because there would be no pin to verify a staged file against. Two
+#      entries with the same sha256 or r2_path: refused.
 #   3. Missing staged asset. MLXFAST_QWEN38_GOLDEN_DIR unset or absent, a pool
-#      tape missing, the live golden not staged, or the paired leg pair
+#      tape missing, a live golden not staged, or the paired leg pair
 #      unstaged: MLXFAST_BASELINE_WORKSPACE / MLXFAST_BASELINE_CALIBRATION
 #      absent, a reference tree at the wrong commit, a reference tree with no
 #      staged worker or no transformed weights of its own, or a calibration
@@ -101,8 +102,8 @@
 #     the API today);
 #   - a registered self-hosted runner on the box advertising the three labels
 #     below (tools/box-runner/ owns that side);
-#   - box staging: the 8 pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
-#     golden among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
+#   - box staging: the pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
+#     goldens among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
 #     no Rust toolchain and this job holds no dist token, so the binary is
 #     placed there out of band), the reference checkpoint, and a macmon GPU
 #     temperature reader at the path this file pins into MLXFAST_MACMON and
@@ -422,6 +423,14 @@ jobs:
         # lock inside MLXFAST_REFERENCE_DIR after a verified download and
         # skips the full re-hash while that stamp is present.
         #
+        # THE COMPILE RUNS SANDBOXED. The build compiles editable C++, Metal
+        # and Swift files, and a compiler reads every file that a source names.
+        # setup.sh and tools/build-mlx-metallib.sh start each compile command
+        # through tools/sandboxed-build.sh, which runs it under sandbox-exec on
+        # this runner. The compile cannot read the evaluator-only paths or the
+        # runner registration, and it cannot use the network. The dependency
+        # fetch runs first, outside the sandbox.
+        #
         # On a build-cache hit setup.sh reuses the restored products
         # (MLXFAST_SKIP_SWIFT_BUILD is honoured only when both products are
         # present; the cache key already proves they were built from this
@@ -484,11 +493,27 @@ jobs:
         # the verified reference on APFS (1 s, no extra blocks on the box), and
         # benchd seals the tree's weights_hash into the artifact, so provenance
         # needs no cache and no box-staged tree.
+        #
+        # THE TRANSFORM RUNS SANDBOXED. The CLI links the editable transform
+        # module, and code in a linked module can run before main(), so the
+        # CLI does not confine itself. tools/sandboxed-cli.sh is trusted and
+        # links nothing: it writes the Seatbelt profile
+        # (tools/seatbelt-profile.py) and starts the CLI under
+        # /usr/bin/sandbox-exec, so the profile is in force before the CLI
+        # runs. The transform can write only weights/, its staging siblings
+        # and a private TMPDIR. It cannot use the network or start another
+        # program, and it cannot read or write the evaluator-only paths the
+        # runner service exports (the goldens, the reference workspace, the
+        # calibration file, benchd-bin, the build cache root, the runner
+        # registration). MLXFAST_OFFICIAL_BENCHMARK_RUN makes the wrapper
+        # refuse when the runner environment does not name those paths.
+        env:
+          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
         run: |
           set -euo pipefail
           [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
           rm -rf weights
-          .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+          tools/sandboxed-cli.sh transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
           [[ -f weights/config.json ]] || { echo "::error::the transform wrote no weights/config.json" >&2; exit 1; }
           echo "transformed tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
 
@@ -548,14 +573,18 @@ jobs:
         # contract between the legs.
         run: |
           set -euo pipefail
+          # The runner environment names the reader (MLXFAST_MACMON_BIN, written
+          # by the box converge). The job account is not the operator, so
+          # ${HOME}/bin is not where the box keeps it; the named file comes first.
           MLXFAST_MACMON=""
-          if command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
+          if [[ -n "${MLXFAST_MACMON_BIN:-}" && -x "${MLXFAST_MACMON_BIN}" ]]; then MLXFAST_MACMON="${MLXFAST_MACMON_BIN}"; fi
+          if [[ -z "${MLXFAST_MACMON}" ]] && command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
             IFS=: read -r -a candidates <<< "${MLXFAST_MACMON_CANDIDATES}:${HOME}/bin/macmon"
             for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
           fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
-            echo "::error::macmon was not found (PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
+            echo "::error::macmon was not found (MLXFAST_MACMON_BIN, PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2
             exit 1
           fi
           export MLXFAST_MACMON MLXFAST_MACMON_BIN="${MLXFAST_MACMON}"

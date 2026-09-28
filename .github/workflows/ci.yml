@@ -176,6 +176,18 @@ jobs:
       - name: Box-only inventory is current
         run: tools/ci-box-only-inventory.sh --check
 
+      - name: Transform sandbox wrapper and profile generator
+        # tools/seatbelt-profile.py rules and tools/sandboxed-cli.sh refusals.
+        # This host has no Seatbelt, so the part that runs the real CLI under
+        # sandbox-exec runs in the swift job instead.
+        run: tools/test-sandboxed-cli.sh
+
+      - name: Build sandbox wrapper and build profile
+        # tools/sandboxed-build.sh refusals and the build profile rules. This
+        # host has no Seatbelt, so the part that runs commands under
+        # sandbox-exec runs in the swift job instead.
+        run: tools/test-sandboxed-build.sh
+
       - name: Golden loader has ONE production entry point
         # The Qwen model-type rule and the model_provenance requirement live in
         # loadQwenGoldenFixture and bind only while nothing under Sources/ or
@@ -493,6 +505,22 @@ jobs:
 
       - name: First-party warnings are errors
         run: tools/ci-swift-warning-gate.sh swift-build.log
+
+      - name: The CLI runs under the real Seatbelt
+        # The real CLI under tools/sandboxed-cli.sh: it reads an index outside
+        # the evaluator paths, cannot read a canary golden, and cannot write
+        # into a canary benchd-bin.
+        env:
+          MLXFAST_SWIFT_BIN: .build/debug/mlxfast-swift
+        run: tools/test-sandboxed-cli.sh
+
+      - name: A compile cannot read the evaluator material
+        # The real Seatbelt: a command that tools/sandboxed-build.sh starts
+        # cannot read a canary golden or a canary runner registration, cannot
+        # write outside its build directory and cannot use the network. A
+        # compile that names a canary file (#include, .incbin) fails, and the
+        # file content is not in the output or in the object.
+        run: tools/test-sandboxed-build.sh
 
       - name: Frozen dependency graph is unchanged
         run: |

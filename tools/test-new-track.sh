@@ -203,7 +203,7 @@ if [[ -f "${F}" ]]; then
   [[ "$(jqf "${F}" '["official_scoring_enabled"]')" == "false" ]] || fail "fixture official_scoring_enabled is not false"
   [[ "$(jqf "${F}" '.get("official_baseline","__ABSENT__")')" == "\"__ABSENT__\"" ]] || fail "fixture still carries official_baseline; a new track has no measured baseline"
   [[ "$(jqf "${F}" '["mlx_swift_lm_revision"]')" == "\"${FORK_SHA}\"" ]] || fail "fixture mlx_swift_lm_revision: $(jqf "${F}" '["mlx_swift_lm_revision"]')"
-  [[ "$(jqf "${F}" '["live_golden"]')"           == '""' ]] || fail "fixture live_golden is not empty"
+  [[ "$(jqf "${F}" '["live_goldens"]')"          == "[]" ]] || fail "fixture live_goldens is not empty"
   [[ "$(jqf "${F}" '["timed_prompt_pool"]')"     == "[]" ]] || fail "fixture timed_prompt_pool is not empty"
   [[ "$(jqf "${F}" '["live_golden_speculative"]')" == "{}" ]] || fail "fixture live_golden_speculative is not empty"
   [[ "$(jqf "${F}" '["hidden_correctness_golden"]["sha256"]')" == '"DEMO1-0-9B-A1B-MLX-V1-PENDING-ORGANIZER"' ]] \

@@ -49,6 +49,22 @@ HEAD_DIR="${MLXFAST_MTP_HEAD_DIR:-reference_weights/Qwen3.8-27B-MTP-4bit}"
 
 echo "setup-mtp-head.sh: track ${TRACK_ID}; head ${HEAD_REPO}@${HEAD_REVISION} -> ${HEAD_DIR}"
 
+# A box can hold a verified copy of the head (MLXFAST_MTP_HEAD_REFERENCE_DIR).
+# When the head is not in this tree, take the files from that copy and do
+# not download them. setup.sh verifies each file against the pin file below,
+# so a copy that does not match is repaired from the published export.
+BOX_COPY="${MLXFAST_MTP_HEAD_REFERENCE_DIR:-}"
+if [[ -n "${BOX_COPY}" && -f "${BOX_COPY}/config.json" && ! -e "${HEAD_DIR}/config.json" ]]; then
+  mkdir -p "$(dirname "${HEAD_DIR}")"
+  rm -rf "${HEAD_DIR}"
+  # -c makes an APFS clone: no bytes are copied. It falls back to a copy.
+  cp -cR "${BOX_COPY}" "${HEAD_DIR}" 2>/dev/null \
+    || { rm -rf "${HEAD_DIR}"; cp -R "${BOX_COPY}" "${HEAD_DIR}"; }
+  chmod -R u+w "${HEAD_DIR}"
+  rm -f "${HEAD_DIR}/.mlxfast-reference-cache.lock"
+  echo "setup-mtp-head.sh: took the head from the box copy ${BOX_COPY}"
+fi
+
 # The head has no compatibility link of its own: nothing resolves it by a
 # legacy path. Point the link at the head directory so setup.sh does not
 # create or check one for the target while provisioning the head.
