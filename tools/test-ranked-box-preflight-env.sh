@@ -591,14 +591,14 @@ expect_official_refusal "case 33 (one writable file deep in a large tree)" "acco
 chmod a-w "${deep_file}"
 
 # Case 34: a file whose mode is read-only but whose ACL lets the job write it.
-# The access test applies the ACL. macOS has `chmod +a`; on a host without an
-# ACL tool the case is reported as not run.
+# The access test applies the ACL. The case runs on macOS only (`chmod +a`). On
+# Linux an ACL entry for the owner of a file has no effect, because the mode of
+# the owner applies, and this suite has one account. There the case is reported
+# as not run.
 acl_file="$(find "${RO}/goldens" -type f -name '*.json' | head -n 1)"
 acl_set=0
 chmod u+w "${RO}/goldens"
 if [[ "$(uname -s)" == "Darwin" ]] && chmod +a "user:$(/usr/bin/id -un) allow write" "${acl_file}" 2>/dev/null; then
-  acl_set=1
-elif command -v setfacl >/dev/null 2>&1 && setfacl -m "u:$(/usr/bin/id -un):rw" "${acl_file}" 2>/dev/null; then
   acl_set=1
 fi
 chmod a-w "${RO}/goldens"
@@ -607,10 +607,10 @@ if [[ "${acl_set}" == "1" ]]; then
     || fail "case 34 (write by ACL only): the fixture file ${acl_file} has the owner write bit in its mode"
   expect_official_refusal "case 34 (write by ACL only)" "account boundary check 7a: the job account can write ${acl_file}, which is part of the golden directory"
   chmod u+w "${RO}/goldens"
-  if [[ "$(uname -s)" == "Darwin" ]]; then chmod -N "${acl_file}"; else setfacl -b "${acl_file}"; fi
+  chmod -N "${acl_file}"
   chmod a-w "${RO}/goldens"
 else
-  echo "test-ranked-box-preflight-env.sh: case 34 (write by ACL only) NOT RUN: no ACL tool on this host"
+  echo "test-ranked-box-preflight-env.sh: case 34 (write by ACL only) NOT RUN: this host is not macOS"
 fi
 
 # Case 35: a writable directory two levels above a protected path. The parent
