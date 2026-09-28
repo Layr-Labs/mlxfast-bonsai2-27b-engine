@@ -314,7 +314,9 @@ extension EngineLoopV2 {
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
-            let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            // Built at its shape: an evaluated host array (not a lazy reshape)
+            // lets the model read a prompt's ids without a GPU round trip.
+            let inputs = MLXArray(slice.map(Int32.init), [1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
@@ -623,13 +625,18 @@ extension EngineLoopV2 {
                     // A fixed-depth leg plans that same depth; a smaller
                     // plan (never taken while the early gate holds) reads a
                     // prefix of the block, which is still only a proposal.
+                    // Lookup, when it fired, already replaced these ids.
                     precondition(
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
                 } else {
-                    proposal = try block.proposeBlock(
+                    let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
+                    proposal = CBv2PromptLookupDraft.override(
+                        drafted, history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k)
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -637,6 +644,9 @@ extension EngineLoopV2 {
                     // when the carry was captured).
                     block.trimBlockState(
                         requestState, toCommittedLength: carry.kvOffset)
+                    // The replacement does not depend on the drafter graph.
+                    // Keep that graph live so the cache writes are not dropped.
+                    assistantEvalTargets.append(drafted)
                 }
                 proposals.append(proposal)
                 assistantEvalTargets.append(proposal)
@@ -733,7 +743,9 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            stackedTokens: CBv2VerifyTokenStack.tokens(
+                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {

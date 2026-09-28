@@ -145,6 +145,9 @@ extension EngineLoopV2 {
             let context = verify.blockContext,
             let speculative = mtp.blockDrafter as? any CBv2MTPBlockSpeculation,
             mtp.config.fixedDraftTokens == k, let metadata = verify.rows.first,
+            // A row quoting the prompt looks its next ids up after the
+            // readback instead (`CBv2PromptLookupDraft.skipEnabled`).
+            !CBv2PromptLookupDraft.expectsPromptProposal(metadata.id),
             let state = metadata.assistantState, !step.discard.contains(metadata.id),
             let rec = scheduler.record(for: metadata.id),
             rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1,
@@ -446,7 +449,20 @@ extension EngineLoopV2 {
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil
                 let proposal: MLXArray?
-                if let adoptedProposal {
+                // The previous proposal came from the prompt and no block was
+                // built before the readback: the continuation is looked up
+                // first, and only a miss runs the drafter. On a hit the
+                // drafter's cache is untouched and the context rows
+                // `finalizeRound` just queued stay pending for the next block.
+                let promptProposal =
+                    adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
+                    ? CBv2PromptLookupDraft.lookup(
+                        history: rec.tokens, promptLength: rec.request.promptTokens.count,
+                        depth: k)
+                    : nil
+                if promptProposal != nil {
+                    proposal = nil
+                } else if let adoptedProposal {
                     proposal = adoptedProposal
                 } else if let leading {
                     proposal = try? leading.proposeBlock(
@@ -456,9 +472,20 @@ extension EngineLoopV2 {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
                 }
-                if let tokens = proposal {
+                if let tokens = promptProposal {
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
+                    CBv2VerifyQueueHint.markNothingAhead()
+                    earlyBlock = CBv2MTPEarlyBlockProposal(
+                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                } else if let drafted = proposal {
+                    // Same object when no unique prompt span matches. The
+                    // drafter graph stays in `drafted` either way.
+                    let tokens = CBv2PromptLookupDraft.override(
+                        drafted, history: rec.tokens,
+                        promptLength: rec.request.promptTokens.count, depth: k)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
-                    let targets = [tokens] + block.evaluationTargets(for: state)
+                    let targets = [tokens, drafted] + block.evaluationTargets(for: state)
                     if leading != nil {
                         deferredDraftTargets = targets
                     } else {
@@ -468,6 +495,9 @@ extension EngineLoopV2 {
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 }
             }
+            // No next block from this finalize (the row finished, or its next
+            // round is not a fixed-depth block): its next proposal starts over.
+            if earlyBlock == nil { CBv2PromptLookupDraft.noteProposal(id, fromPrompt: false) }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
