@@ -361,6 +361,7 @@ chmod +x "${TREE}/tools/resident-up.sh"
 # the declaration against.
 mkdir -p "${TREE}/fixtures"
 cp "${ROOT_DIR}/tools/spec-declaration.sh" "${TREE}/tools/spec-declaration.sh"
+cp "${ROOT_DIR}/tools/seatbelt-profile.py" "${TREE}/tools/seatbelt-profile.py"
 chmod +x "${TREE}/tools/spec-declaration.sh"
 cp "${ROOT_DIR}/fixtures/bonsai2_27b_mlx_v1_track.json" "${TREE}/fixtures/"
 # The stub is staged UNDER THE NAME benchd resolves, so the box-wide

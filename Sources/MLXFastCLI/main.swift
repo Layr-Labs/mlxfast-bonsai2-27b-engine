@@ -78,18 +78,11 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        // The transform module is an editable path. Confine it before it runs:
-        // it may write only its output tree, the hidden `.<output name>.*`
-        // staging siblings it builds that tree in, and its own temporary
-        // directory.
-        let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
-        try reexecUnderParentToolSandboxIfRequested(
-            subcommand: "transform",
-            writableSubpaths: [outputPath],
-            writablePrefixes: [
-                outputURL.deletingLastPathComponent().path + "/.\(outputURL.lastPathComponent)."
-            ]
-        )
+        // The transform module is an editable path. On an official run it
+        // must already be confined by tools/sandboxed-cli.sh, which allows
+        // writes only to the output tree, the hidden `.<output name>.*`
+        // staging siblings the transform builds it in, and a private TMPDIR.
+        try requireConfinementOnOfficialRun(subcommand: "transform")
         let report = try SwiftTransform.run(
             TransformOptions(referencePath: referencePath, outputPath: outputPath)
         )
@@ -130,31 +123,13 @@ private enum MLXFastCLI {
             optionLabel: "--max-bytes"
         )
         // verify-transform runs the editable transform again (SwiftTransform.run
-        // inside TransformVerifier), so it gets the same confinement. It may
-        // write only the scratch trees TransformVerifier creates: under an
-        // explicit --tmp-parent, or as `.mlxfast-transform-verify-*` (and the
+        // inside TransformVerifier), so on an official run it must already be
+        // confined the same way. tools/sandboxed-cli.sh allows writes only to
+        // the scratch trees TransformVerifier creates: under an explicit
+        // --tmp-parent, or as `.mlxfast-transform-verify-*` (and the
         // transform's `..mlxfast-transform-verify-*` staging siblings) beside
         // the weights directory.
-        if temporaryParentPath.isEmpty {
-            let weightsParent = URL(fileURLWithPath: weightsPath).standardizedFileURL
-                .deletingLastPathComponent().path
-            let verifyParent = weightsParent.isEmpty
-                ? FileManager.default.currentDirectoryPath
-                : weightsParent
-            try reexecUnderParentToolSandboxIfRequested(
-                subcommand: "verify-transform",
-                writableSubpaths: [],
-                writablePrefixes: [
-                    verifyParent + "/.mlxfast-transform-verify-",
-                    verifyParent + "/..mlxfast-transform-verify-",
-                ]
-            )
-        } else {
-            try reexecUnderParentToolSandboxIfRequested(
-                subcommand: "verify-transform",
-                writableSubpaths: [temporaryParentPath]
-            )
-        }
+        try requireConfinementOnOfficialRun(subcommand: "verify-transform")
         let report = try TransformVerifier.verify(
             TransformVerificationOptions(
                 referencePath: referencePath,
@@ -354,261 +329,113 @@ private enum MLXFastCLI {
         )
     }
 
-    // Confine the `transform` and `verify-transform` command paths behind a
-    // Seatbelt profile before they run any code from the editable transform
-    // module. These subcommands run the submission-built transform in THIS
-    // process (they do not spawn the separately sandboxed runtime worker), so
-    // on the ranked box they would otherwise run participant code with every
-    // right of the runner account. This re-executes the current process under
-    // `/usr/bin/sandbox-exec` with a profile that:
+    // The `transform` and `verify-transform` verbs run code from the editable
+    // transform module in THIS process. This binary also links that module,
+    // so it cannot confine itself: code in a linked module can run before
+    // main(). The confinement therefore starts outside this binary. On the
+    // ranked box, tools/sandboxed-cli.sh writes the Seatbelt profile
+    // (tools/seatbelt-profile.py) and starts this binary under
+    // /usr/bin/sandbox-exec.
     //
-    //   * denies network, process-fork, process-exec (of anything but this
-    //     binary) and the DNS resolver mach-lookup;
-    //   * denies every file write, then allows writes only to the subcommand's
-    //     own output tree and the hidden staging siblings the transform builds
-    //     it in, to a private temporary directory made for this run (TMPDIR
-    //     points at it), and to the harmless device nodes;
-    //   * denies every read and write of the evaluator-only material the
-    //     runner service environment names (hidden goldens, the reference
-    //     workspace of the paired control leg, the box calibration file, the
-    //     benchd binary directory, the private directory, the build cache
-    //     root and the runner registration files).
+    // This check is the second line. On an official run
+    // (MLXFAST_OFFICIAL_BENCHMARK_RUN=1, or RUNNER_ENVIRONMENT=self-hosted)
+    // the verb refuses unless the process is already confined:
     //
-    // Reads outside that list stay allowed: the transform reads the reference
-    // checkpoint, and dyld and Foundation read system paths.
+    //   * MLXFAST_NO_SANDBOX=1 is refused;
+    //   * the runner environment must name the evaluator-only paths that the
+    //     profile denies;
+    //   * positive control: a new file in TMPDIR (the private temporary
+    //     directory the wrapper makes) must be created, so the uid can write
+    //     and the probe below means something;
+    //   * denied write: a new file beside this binary, which is outside every
+    //     path the profile allows, must fail with EPERM. EPERM is the Seatbelt
+    //     deny. Any other result (success, EACCES, ENOENT, ENOSPC and so on)
+    //     is a refusal that names the errno.
     //
-    // Trigger + fail-closed policy: the ranked workflow sets
-    // MLXFAST_SANDBOX_PARENT_TOOLS=1 and MLXFAST_OFFICIAL_BENCHMARK_RUN=1 on the
-    // transform step; either one arms the sandbox. When armed, a missing
-    // sandbox-exec or MLXFAST_NO_SANDBOX=1 aborts the run. An official run
-    // also refuses when the runner environment does not name the evaluator
-    // paths, because the deny list would then be empty. The re-executed child
-    // proves that the profile is in force before it continues (a write probe
-    // outside the allowed paths must fail). Local invocations set neither
-    // flag, so participant workflows are unchanged. MLXFAST_PARENT_SANDBOX_ACTIVE=1
-    // is set on the re-exec so the sandboxed child does not recurse.
-    private static func reexecUnderParentToolSandboxIfRequested(
-        subcommand: String,
-        writableSubpaths: [String],
-        writablePrefixes: [String] = []
-    ) throws {
-        if environmentValue("MLXFAST_PARENT_SANDBOX_ACTIVE", fallback: "0") == "1" {
-            try requireParentToolSandboxInForce(subcommand: subcommand)
-            return
-        }
+    // Local invocations are not official, so participant workflows do not
+    // change.
+    private static func requireConfinementOnOfficialRun(subcommand: String) throws {
         let officialRun = environmentValue("MLXFAST_OFFICIAL_BENCHMARK_RUN", fallback: "0") == "1"
-        let requested = officialRun
-            || environmentValue("MLXFAST_SANDBOX_PARENT_TOOLS", fallback: "0") == "1"
-        guard requested else {
+            || environmentValue("RUNNER_ENVIRONMENT", fallback: "") == "self-hosted"
+        guard officialRun else {
             return
         }
         if environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
             throw MLXFastError.invalidInput(
-                "\(subcommand) in a benchmark context requires the parent-tool sandbox; unset MLXFAST_NO_SANDBOX"
+                "\(subcommand) in an official run must be confined; unset MLXFAST_NO_SANDBOX"
             )
         }
-        let sandboxExecutable = "/usr/bin/sandbox-exec"
-        guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
+        let missing = requiredEvaluatorPathVariables.filter {
+            environmentValue($0, fallback: "").isEmpty
+        }
+        guard missing.isEmpty else {
             throw MLXFastError.invalidInput(
-                "\(subcommand) in a benchmark context requires sandbox-exec for the parent-tool sandbox"
+                "\(subcommand) in an official run requires the runner environment to name "
+                    + "the evaluator-only paths the sandbox denies; unset: "
+                    + missing.joined(separator: ", ")
             )
         }
-        if officialRun {
-            let missing = requiredEvaluatorPathVariables.filter {
-                environmentValue($0, fallback: "").isEmpty
-            }
-            guard missing.isEmpty else {
-                throw MLXFastError.invalidInput(
-                    "\(subcommand) in an official run requires the runner environment to name "
-                        + "the evaluator-only paths the sandbox denies; unset: "
-                        + missing.joined(separator: ", ")
-                )
-            }
-        }
-        let executablePath = try currentExecutablePath()
-        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+        let temporaryDirectory = environmentValue("TMPDIR", fallback: "")
+        guard !temporaryDirectory.isEmpty else {
             throw MLXFastError.invalidInput(
-                "\(subcommand) parent-tool sandbox resolved a non-executable self path: \(executablePath)"
+                "\(subcommand) in an official run must be started by tools/sandboxed-cli.sh, "
+                    + "which sets TMPDIR to the private directory the profile allows; TMPDIR is unset"
             )
         }
-        let privateTemporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mlxfast-parent-tool-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: privateTemporaryDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let privateTemporaryPath = sandboxPath(privateTemporaryDirectory.path)
-        let profilePath = try writeParentToolSandboxProfile(
-            allowedExecutablePath: executablePath,
-            writableSubpaths: [privateTemporaryPath] + writableSubpaths.map(sandboxPath),
-            writablePrefixes: writablePrefixes.map(sandboxPrefix),
-            deniedSubpaths: evaluatorOnlyPaths(),
-            profileDirectory: privateTemporaryPath
-        )
-        let argv = [sandboxExecutable, "-f", profilePath, executablePath]
-            + Array(CommandLine.arguments.dropFirst())
-        setenv("MLXFAST_PARENT_SANDBOX_ACTIVE", "1", 1)
-        setenv("TMPDIR", privateTemporaryPath + "/", 1)
-        var cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
-        cArgs.append(nil)
-        defer {
-            for pointer in cArgs {
-                if let pointer {
-                    free(pointer)
-                }
-            }
+        let control = URL(fileURLWithPath: temporaryDirectory)
+            .appendingPathComponent(".mlxfast-confinement-control-\(UUID().uuidString)").path
+        let controlDescriptor = open(control, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard controlDescriptor >= 0 else {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) confinement probe: the positive control could not create \(control) "
+                    + "(\(errnoDescription(errno))); without it a denied write proves nothing"
+            )
         }
-        _ = sandboxExecutable.withCString { pathPointer in
-            execv(pathPointer, cArgs)
+        close(controlDescriptor)
+        unlink(control)
+
+        let executableDirectory = URL(fileURLWithPath: try currentExecutablePath())
+            .deletingLastPathComponent()
+        let probe = executableDirectory
+            .appendingPathComponent(".mlxfast-confinement-probe-\(UUID().uuidString)").path
+        let probeDescriptor = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        let probeErrno = errno
+        if probeDescriptor >= 0 {
+            close(probeDescriptor)
+            unlink(probe)
+            throw MLXFastError.invalidInput(
+                "\(subcommand) is not confined: a write outside the allowed paths (\(probe)) "
+                    + "succeeded. Start it with tools/sandboxed-cli.sh."
+            )
         }
-        // execv only returns on failure.
-        throw MLXFastError.invalidInput(
-            "\(subcommand) failed to re-exec under sandbox-exec (errno=\(errno))"
-        )
+        guard probeErrno == EPERM else {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) confinement probe: the write outside the allowed paths (\(probe)) "
+                    + "failed with \(errnoDescription(probeErrno)), not EPERM, so the failure "
+                    + "does not prove a Seatbelt deny. Start it with tools/sandboxed-cli.sh."
+            )
+        }
+    }
+
+    private static func errnoDescription(_ code: Int32) -> String {
+        let names: [Int32: String] = [
+            EPERM: "EPERM", ENOENT: "ENOENT", EACCES: "EACCES", EEXIST: "EEXIST",
+            ENOTDIR: "ENOTDIR", EISDIR: "EISDIR", ENOSPC: "ENOSPC", EROFS: "EROFS",
+            EDQUOT: "EDQUOT", ELOOP: "ELOOP", ENAMETOOLONG: "ENAMETOOLONG",
+        ]
+        let name = names[code] ?? "errno"
+        return "\(name) \(code): \(String(cString: strerror(code)))"
     }
 
     // The runner service exports these on the ranked box, and the workflow's
-    // first step refuses a box that does not. An official run needs all four
-    // before it arms the sandbox.
+    // runner-environment step refuses a box that does not. The profile denies
+    // them, so an official run needs all four.
     private static let requiredEvaluatorPathVariables = [
         "MLXFAST_QWEN38_GOLDEN_DIR",
         "MLXFAST_BASELINE_WORKSPACE",
         "MLXFAST_BASELINE_CALIBRATION",
         "BENCHD_BIN_DIR",
     ]
-
-    // Every evaluator-only path the environment names. A variable that is not
-    // set adds nothing. The build cache root has the same default that
-    // tools/build-cache.sh uses. The runner registration files sit two levels
-    // above RUNNER_WORKSPACE (<runner>/_work/<repository>) in a standard
-    // actions-runner layout; a deny of a path that does not exist is harmless.
-    private static func evaluatorOnlyPaths() -> [String] {
-        var paths: [String] = []
-        for name in requiredEvaluatorPathVariables + [
-            "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-            "MLXFAST_PRIVATE_DIR",
-        ] {
-            let value = environmentValue(name, fallback: "")
-            if !value.isEmpty {
-                paths.append(value)
-            }
-        }
-        let home = environmentValue("HOME", fallback: NSHomeDirectory())
-        paths.append(
-            environmentValue(
-                "MLXFAST_BUILD_CACHE_DIR",
-                fallback: home + "/.cache/mlxfast-engine-build"
-            )
-        )
-        let runnerWorkspace = environmentValue("RUNNER_WORKSPACE", fallback: "")
-        if !runnerWorkspace.isEmpty {
-            let runnerRoot = URL(fileURLWithPath: runnerWorkspace).standardizedFileURL
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-            for name in [".credentials", ".credentials_rsaparams", ".runner"] {
-                paths.append(runnerRoot.appendingPathComponent(name).path)
-            }
-        }
-        return paths.map(sandboxPath)
-    }
-
-    private static func writeParentToolSandboxProfile(
-        allowedExecutablePath: String,
-        writableSubpaths: [String],
-        writablePrefixes: [String],
-        deniedSubpaths: [String],
-        profileDirectory: String
-    ) throws -> String {
-        let profileURL = URL(fileURLWithPath: profileDirectory)
-            .appendingPathComponent("parent-tool.sb")
-        let absoluteExecutablePath = absolutePath(allowedExecutablePath)
-        var lines = [
-            "(version 1)",
-            "(allow default)",
-            "(deny network*)",
-            "(deny process-fork)",
-            "(deny process-exec*)",
-            "(allow process-exec (literal \"\(seatbeltEscaped(absoluteExecutablePath))\"))",
-            "(deny mach-lookup (global-name \"com.apple.mDNSResponder\"))",
-            "(deny mach-lookup (global-name \"com.apple.system.mDNSResponder\"))",
-            "(deny mach-lookup (global-name-prefix \"com.apple.mDNSResponder\"))",
-            "(deny file-write*)",
-            "(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\"))",
-        ]
-        for path in writableSubpaths {
-            lines.append("(allow file-write* (subpath \"\(seatbeltEscaped(path))\"))")
-        }
-        for prefix in writablePrefixes {
-            lines.append("(allow file-write* (regex #\"^\(seatbeltRegexEscaped(prefix))\"))")
-        }
-        // Last, so that these rules win over every allow above.
-        for path in deniedSubpaths {
-            lines.append("(deny file-read* file-write* (subpath \"\(seatbeltEscaped(path))\"))")
-        }
-        try (lines.joined(separator: "\n") + "\n")
-            .write(to: profileURL, atomically: true, encoding: .utf8)
-        return profileURL.path
-    }
-
-    // The re-executed child checks that the profile is in force before any
-    // editable code runs. Creating a file beside this binary is outside every
-    // allowed write path, so the sandbox must refuse it. When the create
-    // succeeds, no sandbox is in force: the probe is removed and the run stops.
-    private static func requireParentToolSandboxInForce(subcommand: String) throws {
-        let executableDirectory = URL(fileURLWithPath: try currentExecutablePath())
-            .deletingLastPathComponent()
-        let probe = executableDirectory
-            .appendingPathComponent(".mlxfast-parent-sandbox-probe-\(UUID().uuidString)").path
-        let descriptor = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        guard descriptor >= 0 else {
-            return
-        }
-        close(descriptor)
-        unlink(probe)
-        throw MLXFastError.invalidInput(
-            "\(subcommand) expected the parent-tool sandbox to be in force, but a write outside "
-                + "the allowed paths succeeded; refusing to run the transform unconfined"
-        )
-    }
-
-    // Seatbelt matches the resolved path. Resolve the deepest existing ancestor
-    // (so /tmp becomes /private/tmp and /var becomes /private/var) and keep the
-    // rest, because an output tree may not exist yet.
-    private static func sandboxPath(_ path: String) -> String {
-        var existing = URL(fileURLWithPath: absolutePath(path))
-        var rest: [String] = []
-        while !FileManager.default.fileExists(atPath: existing.path), existing.path != "/" {
-            rest.insert(existing.lastPathComponent, at: 0)
-            existing.deleteLastPathComponent()
-        }
-        guard let resolved = realpath(existing.path, nil) else {
-            return existing.path
-        }
-        defer { free(resolved) }
-        var url = URL(fileURLWithPath: String(cString: resolved))
-        for component in rest {
-            url.appendPathComponent(component)
-        }
-        return url.path
-    }
-
-    // A prefix ends in a partial file name, so only its directory is resolved.
-    private static func sandboxPrefix(_ prefix: String) -> String {
-        let url = URL(fileURLWithPath: prefix)
-        return sandboxPath(url.deletingLastPathComponent().path) + "/" + url.lastPathComponent
-    }
-
-    private static func seatbeltRegexEscaped(_ value: String) -> String {
-        var escaped = ""
-        for character in value {
-            if "\\^$.|?*+()[]{}\"".contains(character) {
-                escaped.append("\\")
-            }
-            escaped.append(character)
-        }
-        return escaped
-    }
 
     private static func absolutePath(_ path: String) -> String {
         let url: URL
@@ -623,20 +450,15 @@ private enum MLXFastCLI {
         return url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    private static func seatbeltEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
         try options.validate(valueOptions: ["--index"])
         let indexPath = options.value(for: "--index", default: "")
         guard !indexPath.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint-shards requires --index PATH")
         }
-        // Trusted code only: setup.sh runs this verb before any sandbox is in
-        // place, so it must not call into the editable transform module.
+        // Trusted code only: this verb must not call into the editable
+        // transform module. On an official run setup.sh starts it through
+        // tools/sandboxed-cli.sh.
         for shard in try CheckpointShardList.safetensorShardNames(fromIndexAt: indexPath) {
             print(shard)
         }

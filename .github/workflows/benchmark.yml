@@ -555,22 +555,27 @@ jobs:
         # benchd seals the tree's weights_hash into the artifact, so provenance
         # needs no cache and no box-staged tree.
         #
-        # THE TRANSFORM RUNS SANDBOXED. The two flags below arm the trusted
-        # CLI's parent-tool sandbox (Sources/MLXFastCLI/main.swift): the CLI
-        # re-executes itself under sandbox-exec before any editable code runs.
-        # The transform may then write only weights/, its staging siblings and
-        # a private TMPDIR, and it cannot read or write the evaluator-only paths
-        # the runner service exports (the goldens, the reference workspace, the
-        # calibration file, benchd-bin, the build cache, the runner
-        # registration). The CLI refuses when the sandbox cannot be applied.
+        # THE TRANSFORM RUNS SANDBOXED. The CLI links the editable transform
+        # module, and code in a linked module can run before main(), so the
+        # CLI does not confine itself. tools/sandboxed-cli.sh is trusted and
+        # links nothing: it writes the Seatbelt profile
+        # (tools/seatbelt-profile.py) and starts the CLI under
+        # /usr/bin/sandbox-exec, so the profile is in force before the CLI
+        # runs. The transform can write only weights/, its staging siblings
+        # and a private TMPDIR. It cannot use the network or start another
+        # program, and it cannot read or write the evaluator-only paths the
+        # runner service exports (the goldens, the reference workspace, the
+        # calibration file, benchd-bin, the build cache root, the runner
+        # registration). On this official run the CLI refuses unless it is
+        # already confined: a write outside the allowed paths must fail with
+        # EPERM, and a write to its TMPDIR must succeed.
         env:
-          MLXFAST_SANDBOX_PARENT_TOOLS: "1"
           MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
         run: |
           set -euo pipefail
           [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
           rm -rf weights
-          .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+          tools/sandboxed-cli.sh transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
           [[ -f weights/config.json ]] || { echo "::error::the transform wrote no weights/config.json" >&2; exit 1; }
           echo "transformed tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
 

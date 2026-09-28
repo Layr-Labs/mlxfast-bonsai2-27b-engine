@@ -1078,6 +1078,11 @@ On the ranked box, the code from your editable paths runs in a sandbox.
   socket. It cannot start another program.
 - Neither process can read or write the organizer material on the box.
 
+The sandbox starts before the transform process starts. A trusted script
+(`tools/sandboxed-cli.sh`) writes the profile and starts `mlxfast-swift` under
+`sandbox-exec`. On the ranked box, `mlxfast-swift` also stops before the
+transform when it finds that it is not in a sandbox.
+
 Make your transform obey these limits. A transform that writes to a different
 location fails on the ranked box, and the run gets no score.
 

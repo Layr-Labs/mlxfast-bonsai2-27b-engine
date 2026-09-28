@@ -176,6 +176,12 @@ jobs:
       - name: Box-only inventory is current
         run: tools/ci-box-only-inventory.sh --check
 
+      - name: Transform sandbox wrapper and profile generator
+        # tools/seatbelt-profile.py rules and tools/sandboxed-cli.sh refusals.
+        # This host has no Seatbelt, so the part that runs the real CLI under
+        # sandbox-exec runs in the swift job instead.
+        run: tools/test-sandboxed-cli.sh
+
       - name: Golden loader has ONE production entry point
         # The Qwen model-type rule and the model_provenance requirement live in
         # loadQwenGoldenFixture and bind only while nothing under Sources/ or
@@ -493,6 +499,15 @@ jobs:
 
       - name: First-party warnings are errors
         run: tools/ci-swift-warning-gate.sh swift-build.log
+
+      - name: The CLI runs the transform only when it is confined
+        # The real CLI under the real Seatbelt: an official transform started
+        # without tools/sandboxed-cli.sh refuses; under the wrapper it passes
+        # the confinement probe (EPERM outside, TMPDIR writable), cannot read a
+        # canary golden, and cannot write into a canary benchd-bin.
+        env:
+          MLXFAST_SWIFT_BIN: .build/debug/mlxfast-swift
+        run: tools/test-sandboxed-cli.sh
 
       - name: Frozen dependency graph is unchanged
         run: |

@@ -2,9 +2,9 @@ import Foundation
 
 /// The shard list of a safetensors checkpoint index, read by trusted code only.
 ///
-/// `mlxfast-swift checkpoint-shards` calls this during `./setup.sh`, before
-/// any sandbox is in place. It lives in this trusted module so that the setup
-/// step runs no code from an editable path. The output is the same as the
+/// `mlxfast-swift checkpoint-shards` calls this during `./setup.sh`. It lives
+/// in this trusted module so that the verb calls no code from an editable
+/// path. The output is the same as the
 /// earlier transform-module helper: the unique shard names of `weight_map`,
 /// sorted, each one checked by `validateSafetensorsShardName`.
 public enum CheckpointShardList {

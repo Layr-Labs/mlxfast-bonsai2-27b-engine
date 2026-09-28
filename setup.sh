@@ -2119,6 +2119,13 @@ list_reference_shards() {
 
   ensure_swift_harness_ready || return 1
 
+  # The CLI links the editable transform module, so on an official run (the
+  # ranked box) it starts under Seatbelt from outside: tools/sandboxed-cli.sh
+  # writes the profile and runs the CLI under sandbox-exec.
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+    MLXFAST_SWIFT_BIN="${SWIFT_BIN}" tools/sandboxed-cli.sh checkpoint-shards --index "${index_path}"
+    return
+  fi
   "${SWIFT_BIN}" checkpoint-shards --index "${index_path}"
 }
 
