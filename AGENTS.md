@@ -51,7 +51,7 @@ their names for the same reason.
 
 Official scoring is NOT armed. `fixtures/bonsai2_27b_mlx_v1_track.json`
 sets `official_scoring_enabled` to `false`, its `timed_prompt_pool` is empty,
-its `live_golden` is empty, and `hidden_correctness_golden` carries the pending
+its `live_goldens` is empty, and `hidden_correctness_golden` carries the pending
 sentinel `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`. The benchmarker
 refuses to seal an official artifact in that state.
 
@@ -66,10 +66,13 @@ in this repository under `correctness_prompts/bonsai2-27b-mlx-v1/`, so a local
 test needs no R2 access. Never commit a hidden golden, a pool tape, a prompt
 file or an R2 key.
 
-Scoring is paired, with a per-box baseline. A ranked run measures two legs on
-the same box in the same job, over the one live golden: a serial-control leg on
-the organizer's reference tree (`MLXFAST_BASELINE_WORKSPACE`) and the candidate
-leg at its declared decoder and draft depth. The score is the live ratio. **NO FILE STORES
+Scoring is paired, with a per-box baseline. A ranked run measures pairs on the
+same box in the same job. The fixture lists the live prompts in `live_goldens`.
+A ranked run measures each live prompt once, one pair per prompt, and the score
+is the lower-median pair. A pair measures two legs over one prompt: a
+serial-control leg on the organizer's reference tree
+(`MLXFAST_BASELINE_WORKSPACE`) and the candidate leg at its declared decoder and
+draft depth. The score of a pair is the live ratio. **NO FILE STORES
 A BASELINE PAIR.** No golden carries
 `benchmark.baseline_prefill_seconds_per_token` or
 `benchmark.baseline_decode_seconds_per_token`, and

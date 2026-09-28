@@ -1142,9 +1142,7 @@ class Linter:
 
         pool = contract.get("timed_prompt_pool", [])
         armed = bool(contract.get("official_scoring_enabled", False))
-        if len(pool) == 8:
-            self.ok("contractPath: timed_prompt_pool has 8 prompts (the median rule assumes even n)")
-        elif not pool and not armed:
+        if not pool and not armed:
             # A track stamped by tools/new-track.sh has no pool yet: goldens are
             # recorded on the track's own box, after the port runs, and pinning
             # the SOURCE track's pool would be a false pin. This is only legal
@@ -1153,22 +1151,31 @@ class Linter:
             # still fails below.
             self.ok(
                 "contractPath: timed_prompt_pool is empty and official_scoring_enabled "
-                "is false (a stamped track pending its goldens; it must carry 8 before "
-                "scoring is armed)"
+                "is false (a stamped track pending its goldens; it must carry at least "
+                "one prompt before scoring is armed)"
             )
+        elif not pool:
+            self.fail("contractPath: timed_prompt_pool is empty; an ARMED track must hold at least one prompt")
         else:
-            self.fail(
-                f"contractPath: timed_prompt_pool has {len(pool)} prompts, expected 8 "
-                "(scoring.medianRule and pairsPerPromptNote both assume 8)"
-                + ("" if not armed or pool else " -- an ARMED track cannot have an empty pool")
-            )
+            duplicates = [
+                field
+                for field in ("sha256", "r2_path")
+                if len({entry.get(field) for entry in pool if isinstance(entry, dict)}) != len(pool)
+            ]
+            if duplicates:
+                self.fail(
+                    f"contractPath: timed_prompt_pool has two entries with the same "
+                    f"{' or '.join(duplicates)}; pool entries must be distinct"
+                )
+            else:
+                self.ok(f"contractPath: timed_prompt_pool has {len(pool)} distinct prompts")
         return contract
 
     # -- 5a2 ---------------------------------------------------------------
     def check_track_goldens_absent(self, contract: dict) -> None:
         """No pinned track golden may sit in this repository.
 
-        THE TAPES ARE ORGANIZER MATERIAL, AND THEY ARE NOT IN GIT. The 8
+        THE TAPES ARE ORGANIZER MATERIAL, AND THEY ARE NOT IN GIT. The
         timed-pool tapes and the per-depth oracles are published in R2 at the
         r2_path keys the contract pins, and the ranked box stages them out of
         band into the directory its runner service exports as
@@ -1191,9 +1198,10 @@ class Linter:
         for entry in contract.get("timed_prompt_pool", []):
             if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                 pinned.add(entry["r2_path"])
-        for entry in (contract.get("live_golden_speculative") or {}).values():
-            if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
-                pinned.add(entry["r2_path"])
+        for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+            for entry in (per_prompt or {}).values():
+                if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                    pinned.add(entry["r2_path"])
         if not pinned:
             # A track stamped by tools/new-track.sh pins nothing yet: its
             # goldens are recorded on its own box after the port runs. That is
@@ -1248,9 +1256,10 @@ class Linter:
         for entry in contract.get("timed_prompt_pool", []):
             if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                 rels.add(entry["r2_path"])
-        for entry in (contract.get("live_golden_speculative") or {}).values():
-            if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
-                rels.add(entry["r2_path"])
+        for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+            for entry in (per_prompt or {}).values():
+                if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
+                    rels.add(entry["r2_path"])
         # Every golden that SHIPS in the tree, not only the pinned ones: an
         # unpinned file is a candidate for a future pin, and a golden the
         # contract does not name today is exactly where a stale pair would

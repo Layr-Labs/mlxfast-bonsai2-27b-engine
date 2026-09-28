@@ -56,16 +56,16 @@ cp "${REPO_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${ROOT}/fixtures/"
 # baseline_reference_commit stay under test, and so does the whole
 # byte-then-sha verification the preflight performs.
 #
-# A FRESHLY STAMPED TRACK HAS NO POOL AT ALL. Its live_golden is empty, its
+# A FRESHLY STAMPED TRACK HAS NO POOL AT ALL. Its live_goldens is empty, its
 # timed_prompt_pool is empty and its hidden correctness golden is still an
 # organizer sentinel, because the tapes do not exist yet. There is nothing to
-# re-pin in that state, so the block below AUTHORS the cohort instead: the 8
-# pool entries this track scores, a live_golden naming one of them, a per-depth
-# oracle for every contract-permitted draft depth, and a real digest for the
-# hidden golden. It also arms the copy, because every check after section 5
-# is unreachable on an unarmed contract (the arm gate keeps its own case
-# below, against a second root that is left unarmed). The shipped fixture is
-# never written.
+# re-pin in that state, so the block below AUTHORS the cohort instead: a
+# synthetic pool of POOL_SIZE entries, a live_goldens list naming one of them, a
+# per-depth oracle for every contract-permitted draft depth, and a real digest
+# for the hidden golden. It also arms the copy, because every check after
+# section 5 is unreachable on an unarmed contract (the arm gate keeps its own
+# case below, against a second root that is left unarmed). The shipped fixture
+# is never written.
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
 python3 - "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${GOLDEN_DIR}" <<'REPINEOF'
@@ -74,7 +74,7 @@ import hashlib, json, os, sys
 contract_path, golden_dir = sys.argv[1:3]
 contract = json.load(open(contract_path, encoding="utf-8"))
 
-# The cohort size the preflight enforces, and the size this track scores.
+# Any size of one or more passes the preflight.
 POOL_SIZE = 8
 
 
@@ -98,9 +98,9 @@ if not contract.get("timed_prompt_pool"):
     live = "synthetic-live"
     names = [live] + ["synthetic-pool-%d" % n for n in range(1, POOL_SIZE)]
     contract["timed_prompt_pool"] = [entry(name) for name in names]
-    contract["live_golden"] = live
+    contract["live_goldens"] = [live]
     contract["live_golden_speculative"] = {
-        "mtp%d" % depth: entry("%s.mtp%d" % (live, depth))
+        "mtp%d" % depth: {live: entry("%s.mtp%d" % (live, depth))}
         for depth in contract.get("mtp_head", {}).get("permitted_draft_depths", [])
     }
     # The hidden oracle is pinned by digest only and never staged here, so any
@@ -114,8 +114,9 @@ if not contract.get("timed_prompt_pool"):
 else:
     for pool_entry in contract["timed_prompt_pool"]:
         pool_entry["sha256"], pool_entry["bytes"] = stage(pool_entry["r2_path"])
-    for spec_entry in (contract.get("live_golden_speculative") or {}).values():
-        spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
+    for per_prompt in (contract.get("live_golden_speculative") or {}).values():
+        for spec_entry in per_prompt.values():
+            spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
 with open(contract_path, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
@@ -181,23 +182,26 @@ write_calibration() {
     --arg box "${BOX_NAME}" \
     --arg commit "${REF_COMMIT}" \
     --arg captured "${CAPTURED_AT}" \
+    --argjson live "$(jq -c '.live_goldens' "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")" \
     '{
-      version: 1,
+      version: 2,
       track_id: $track,
       box: $box,
       reference_commit: $commit,
-      prompt: "pool-1",
-      passes: 4,
-      prefill_seconds_per_token_mean: 0.0006282488193359375,
-      decode_seconds_per_token_mean: 0.0329116748046875,
-      prefill_cv: 0.004,
-      decode_cv: 0.002,
-      prefill_band_low: 0.95,
-      prefill_band_high: 1.05,
-      decode_band_low: 0.98,
-      decode_band_high: 1.02,
       captured_at: $captured,
-      benchd_source_commit: "0123456789abcdef0123456789abcdef01234567"
+      benchd_source_commit: "0123456789abcdef0123456789abcdef01234567",
+      prompts: [$live[] | {
+        prompt: .,
+        passes: 4,
+        prefill_seconds_per_token_mean: 0.0006282488193359375,
+        decode_seconds_per_token_mean: 0.0329116748046875,
+        prefill_cv: 0.004,
+        decode_cv: 0.002,
+        prefill_band_low: 0.95,
+        prefill_band_high: 1.05,
+        decode_band_low: 0.98,
+        decode_band_high: 1.02
+      }]
     }' | jq "${filter}" > "${path}"
 }
 
@@ -325,8 +329,8 @@ printf 'not json at all\n' > "${BAD}"
 expect_refusal "case 9 (unparseable)" "does not parse as JSON" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.version = 2'
-expect_refusal "case 10 (wrong version)" "version is 2" \
+write_calibration "${BAD}" '.version = 3'
+expect_refusal "case 10 (wrong version)" "version is 3" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.track_id = "some-other-track-mlx-v9"'
@@ -341,12 +345,20 @@ write_calibration "${BAD}" '.reference_commit = "0000000000000000000000000000000
 expect_refusal "case 13 (wrong reference commit)" "measured a different reference tree" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.decode_seconds_per_token_mean = -1'
+write_calibration "${BAD}" '.prompts[-1].decode_seconds_per_token_mean = -1'
 expect_refusal "case 14 (negative measurement)" "must be positive" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
-write_calibration "${BAD}" '.prefill_band_low = 1.02'
+write_calibration "${BAD}" '.prompts[-1].prefill_band_low = 1.02'
 expect_refusal "case 15 (band does not straddle 1)" "must straddle" \
+  "MLXFAST_BASELINE_CALIBRATION=${BAD}"
+
+write_calibration "${BAD}" 'del(.prompts[-1])'
+expect_refusal "case 15b (a live prompt has no entry)" "has no entry for live prompt" \
+  "MLXFAST_BASELINE_CALIBRATION=${BAD}"
+
+write_calibration "${BAD}" '.version = 1 | . + .prompts[0] | del(.prompts)'
+expect_refusal "case 15c (a version 1 file holds one prompt only)" "has no entry for live prompt" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.captured_at = "2001-01-01T00:00:00+00:00"'
@@ -407,8 +419,74 @@ elif ! grep -q "official_scoring_enabled" "${WORK}/out"; then
   fail "case 19 (unarmed contract): the refusal does not name the arm field: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
 fi
 
+# --- cases 20-21: the live_goldens list ------------------------------------
+# Every name in live_goldens must name a pinned pool entry, and the list must
+# not be empty. Each case gets a root of its own, so the root above stays
+# healthy.
+# run_live_goldens_case <label> <needle> <jq filter>
+run_live_goldens_case() {
+  local label="$1" needle="$2" filter="$3" case_root="${WORK}/$1"
+  mkdir -p "${case_root}/tools" "${case_root}/fixtures"
+  cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
+  chmod +x "${case_root}/tools/ranked-box-preflight.sh"
+  jq "${filter}" "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" \
+    > "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json"
+  env -i PATH="${PATH}" HOME="${HOME}" \
+    MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+    MLXFAST_MACMON="${MACMON}" \
+    MLXFAST_QWEN38_GOLDEN_DIR="${GOLDEN_DIR}" \
+    RUNNER_NAME="${BOX_NAME}" \
+    MLXFAST_BASELINE_WORKSPACE="${REF_WS}" \
+    MLXFAST_BASELINE_CALIBRATION="${CALIBRATION}" \
+    "${case_root}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+  rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    fail "${label}: the preflight PASSED; it must refuse"
+  elif ! grep -q -- "${needle}" "${WORK}/out"; then
+    fail "${label}: the refusal does not name '${needle}'; got: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+  fi
+}
+run_live_goldens_case case20 "declares no live_goldens" '.live_goldens = []'
+run_live_goldens_case case21 "live golden 'no-such-prompt' names no timed_prompt_pool entry" \
+  '.live_goldens += ["no-such-prompt"]'
+
+# --- cases 22-23: the pool size is not fixed, and its entries are distinct --
+run_live_goldens_case case22 "two entries with the same sha256" \
+  '.timed_prompt_pool += [.timed_prompt_pool[0]]'
+
+# A pool with one more entry than the fixture passes. The extra tape is staged
+# in a directory of its own, so the directory above stays healthy.
+case_root="${WORK}/case23"
+mkdir -p "${case_root}/tools" "${case_root}/fixtures" "${case_root}/goldens"
+cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
+chmod +x "${case_root}/tools/ranked-box-preflight.sh"
+cp "${GOLDEN_DIR}"/*.json "${case_root}/goldens/"
+extra_tape="${case_root}/goldens/synthetic-extra.golden.json"
+printf '{"synthetic_golden":"synthetic-extra"}\n' > "${extra_tape}"
+jq --arg path "correctness_prompts/${TRACK_ID}/synthetic-extra.golden.json" \
+  --arg sha "$(shasum -a 256 "${extra_tape}" | awk '{print $1}')" \
+  --argjson bytes "$(wc -c < "${extra_tape}" | tr -d '[:space:]')" \
+  '.timed_prompt_pool += [{r2_path: $path, sha256: $sha, bytes: $bytes}]' \
+  "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" \
+  > "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json"
+pool_size="$(jq '.timed_prompt_pool | length' "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json")"
+env -i PATH="${PATH}" HOME="${HOME}" \
+  MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+  MLXFAST_MACMON="${MACMON}" \
+  MLXFAST_QWEN38_GOLDEN_DIR="${case_root}/goldens" \
+  RUNNER_NAME="${BOX_NAME}" \
+  MLXFAST_BASELINE_WORKSPACE="${REF_WS}" \
+  MLXFAST_BASELINE_CALIBRATION="${CALIBRATION}" \
+  "${case_root}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+rc=$?
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 23 (pool of ${pool_size}): the preflight refused a correctly staged pool: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+elif ! grep -q "timed pool armed: ${pool_size} pinned tapes" "${WORK}/out"; then
+  fail "case 23 (pool of ${pool_size}): the pass line does not state the pool size"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 20 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all 24 cases passed"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

@@ -339,7 +339,7 @@ write_all_contract() {
     {"r2_path": "${ALL_KEY_B}", "sha256": "${B_SHA}", "bytes": $2}
   ],
   "live_golden_speculative": {
-    "mtp1": {"r2_path": "${ALL_KEY_C}", "sha256": "${C_SHA}", "bytes": ${C_BYTES}}
+    "mtp1": {"all-pool-a": {"r2_path": "${ALL_KEY_C}", "sha256": "${C_SHA}", "bytes": ${C_BYTES}}}
   },
   "hidden_correctness_golden": {"sha256": "${A_SHA}", "bytes": ${A_BYTES}}
 }

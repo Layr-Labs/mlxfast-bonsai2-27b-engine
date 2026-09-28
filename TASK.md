@@ -204,7 +204,8 @@ The score is serial-anchored. A faster candidate scores above 1.
 The ranked run measures two legs on the same box, in the same job: a
 serial-control leg on the organizer's reference tree, then your candidate leg
 at the decoder and draft depth you declare. Each leg times one stream over a 512-token
-seed and a 128-step decode window. It runs 4 pairs. The floor is 0.90. The
+seed and a 128-step decode window. The run measures each live prompt once, one
+pair per prompt, and the score is the lower-median pair. The floor is 0.90. The
 ceiling is 5.0. The KV backend is pinned `contiguous`.
 
 The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
@@ -218,7 +219,7 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 > **NOTE — the track is NOT armed.**
 > `fixtures/bonsai2_27b_mlx_v1_track.json` sets `official_scoring_enabled` to
 > `false`, and the benchmarker refuses to seal an official scoring artifact
-> while it is. The timed prompt pool and the live golden are empty, and the
+> while it is. The timed prompt pool and the live goldens are empty, and the
 > hidden correctness oracle carries the pending sentinel
 > `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`. No ORGANIZER goldens exist
 > for this track, and no runner advertises the ranked label.

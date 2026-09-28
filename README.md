@@ -416,8 +416,8 @@ it.
 > The ranked run sends the decoder and the depth to the engine on each request
 > and seals the engine's `effective_spec` echo.
 >
-> A declared depth is scored against the oracle recorded AT THAT DEPTH
-> (`fixtures/bonsai2_27b_mlx_v1_track.json` `live_golden_speculative`).
+> A declared depth is scored against the oracle recorded AT THAT DEPTH for each
+> live prompt (`fixtures/bonsai2_27b_mlx_v1_track.json` `live_golden_speculative`).
 > The runner verifies a draft window in one target forward, and the multi-row
 > kernels round differently from the single-row ones, so a speculative run is
 > not token-identical to the serial tape; it is token-identical to its own
@@ -573,8 +573,10 @@ The score is serial-anchored. A faster candidate scores above 1.
 
 ### The pair is measured, not stored
 
-A ranked run measures TWO legs. It measures them on the SAME box, in the SAME
-job, over the ONE prompt the fixture names in `live_golden`:
+A ranked run measures pairs, on the SAME box, in the SAME job. The fixture
+lists the live prompts in `live_goldens`. A ranked run measures each live prompt
+once, one pair per prompt, and the score is the lower-median pair. A pair
+measures TWO legs over one prompt:
 
 1. The **serial-control leg**. It runs on the organizer's reference tree. That
    tree is a build of this repository at the commit the fixture names in
@@ -582,8 +584,8 @@ job, over the ONE prompt the fixture names in `live_golden`:
    checked against the serial tape, never against a per-depth tape.
 2. The **candidate leg**. It runs on your tree, at the draft depth you declare.
 
-The score is the ratio of the two measurements. Both numbers come from the same
-machine, minutes apart.
+The score of a pair is the ratio of its two measurements. Both numbers come
+from the same machine, minutes apart.
 
 **NO FILE HOLDS A BASELINE PAIR.** The scoring constants hold none. The fixture
 holds none. The goldens hold none. A golden that carries
@@ -618,9 +620,9 @@ tools/calibrate-box.sh "<runner name>" /path/to/baseline-calibration.json
 The command takes the box GPU lock. It then runs the serial-control leg four
 times under the full official methodology: the quiescence gate and the cool gate
 before each pass, one
-resident worker for each pass, and the same live golden the ranked run scores
-over. It writes the mean, the coefficient of variation and the band for prefill
-and for decode. It writes no file when the coefficient of variation is more
+resident worker for each pass, and the same live goldens the ranked run scores
+over. It writes one file with one entry per live golden. Each entry holds the
+mean, the coefficient of variation and the band for prefill and for decode. It writes no file when the coefficient of variation is more
 than 1 percent on either axis. A box that cannot repeat itself has no band.
 
 The `box` value in the file must equal the runner name. The `reference_commit`
@@ -635,10 +637,13 @@ value must equal the fixture's `baseline_reference_commit`.
 | Checked decode steps | 128 |
 | Golden shape | 512 prompt tokens and 129 expected tokens |
 | Streams per window | 1 |
-| Timed prompts per leg | 1 (the fixture's `live_golden`) |
-| Legs per ranked job | 2 (serial control, then candidate) |
+| Timed prompts per leg | 1 (one name from the fixture's `live_goldens`) |
+| Pairs per ranked job | the fixture's `official_pairs`, one pair per live prompt |
+| Legs per pair | 2 (serial control, then candidate) |
 
-The two legs run one after the other. Each leg loads the weights once. The
+The score is the lower-median pair.
+
+The two legs of a pair run one after the other. Each leg loads the weights once. The
 unmeasured warm-up prefill pass stays at 1 pass, and it applies to both legs in
 the same way.
 
@@ -764,7 +769,7 @@ Five statements are true right now.
    `official_scoring_enabled` to `false`. That flag is the single authority on
    the arm state, and the benchmarker enforces it. It refuses to seal an
    official scoring artifact while the flag is false.
-2. The track has no goldens. `timed_prompt_pool` is empty, `live_golden` is
+2. The track has no goldens. `timed_prompt_pool` is empty, `live_goldens` is
    empty, and `hidden_correctness_golden` carries the pending sentinel
    `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`.
 3. No runner advertises the ranked label set

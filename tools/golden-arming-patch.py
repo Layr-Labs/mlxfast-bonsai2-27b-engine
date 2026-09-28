@@ -8,11 +8,14 @@ never prints their contents.
 
 The directory holds these files, and nothing else:
 
-  <name>.golden.json              the 8 timed-pool tapes, recorded serial.
-                                  --live names one of them.
-  <live>.mtpN.golden.json         one per-depth oracle for every depth in
+  <name>.golden.json              the timed-pool tapes, recorded serial. Each
+                                  one is one pool entry. --live names one or
+                                  more of them.
+  <live>.mtpN.golden.json         for each live name, one per-depth oracle for
+                                  every depth in
                                   mtp_head.permitted_draft_depths.
-  <live>.dflashN.golden.json      one per-depth oracle for every depth in
+  <live>.dflashN.golden.json      for each live name, one per-depth oracle for
+                                  every depth in
                                   dflash_drafter.permitted_draft_depths.
   public-local-iterate.golden.json
   public-local-submit.golden.json the two public captures for the local modes.
@@ -22,17 +25,17 @@ The directory holds these files, and nothing else:
 
 THE PER-DEPTH SHAPE IS DECIDED BY THE BYTES. A per-depth oracle can differ from
 the serial tape (a speculative round verifies at M > 1, and MLX dispatches a
-different kernel there), and it can equal it. Every live_golden_speculative key
-gets its own pin, but keys whose bytes are identical share ONE R2 object: a key
-whose oracle equals the serial live golden points at the live golden's pool
-key, and a key whose oracle equals an earlier key's points at that key's
+different kernel there), and it can equal it. Every live_golden_speculative
+depth key holds one pin per live name, but pins whose bytes are identical share
+ONE R2 object: an oracle that equals a serial tape points at that tape's pool
+key, and an oracle that equals an earlier oracle points at that oracle's
 object. The organizer uploads each distinct object once. The upload list goes
 to stderr, followed by one `ship:` line per public capture naming the
 repository path to copy it to.
 
 Usage:
-  python3 tools/golden-arming-patch.py --dir DIR --live NAME
-  python3 tools/golden-arming-patch.py --dir DIR --live NAME --apply
+  python3 tools/golden-arming-patch.py --dir DIR --live NAME [NAME ...]
+  python3 tools/golden-arming-patch.py --dir DIR --live NAME [NAME ...] --apply
 
 Without --apply the tool prints the patch (JSON, values only) on stdout. With
 --apply it writes the values into the fixture in place.
@@ -50,7 +53,6 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTRACT = os.path.join(ROOT, "fixtures", "bonsai2_27b_mlx_v1_track.json")
-POOL_SIZE = 8
 PUBLIC_ROLES = ("local_iterate", "local_submit")
 FORBIDDEN_BENCHMARK_KEYS = (
     "baseline_prefill_seconds_per_token",
@@ -81,7 +83,7 @@ def pin(path: str) -> dict:
     return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 
 
-def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[str], list[str]]:
+def build_patch(contract: dict, directory: str, live: list[str]) -> tuple[dict, list[str], list[str]]:
     track = contract["track_id"]
     prefix = f"correctness_prompts/{track}/"
     names = sorted(n for n in os.listdir(directory) if n.endswith(".golden.json"))
@@ -101,19 +103,20 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
         if name in public_names:
             public_files[public_names[name]] = name
         elif match:
-            if match["name"] != live:
-                raise Refusal(f"{name} is a per-depth oracle for {match['name']}, not for the live golden {live}")
+            if match["name"] not in live:
+                raise Refusal(f"{name} is a per-depth oracle for {match['name']}, which is not a live golden")
             if match["key"] not in depth_keys:
                 raise Refusal(f"{name} is for {match['key']}, which no decoder declares")
-            depth_files[match["key"]] = name
+            depth_files[(match["key"], match["name"])] = name
         else:
             pool_names.append(name[: -len(".golden.json")])
 
-    if len(pool_names) != POOL_SIZE:
-        raise Refusal(f"found {len(pool_names)} timed-pool tapes, expected {POOL_SIZE}: {', '.join(pool_names)}")
-    if live not in pool_names:
-        raise Refusal(f"--live {live} is not one of the timed-pool tapes")
-    missing = [key for key in depth_keys if key not in depth_files]
+    if not pool_names:
+        raise Refusal("found no timed-pool tapes; the pool holds at least one")
+    for name in live:
+        if name not in pool_names:
+            raise Refusal(f"--live {name} is not one of the timed-pool tapes")
+    missing = [f"{key} for {name}" for name in live for key in depth_keys if (key, name) not in depth_files]
     if missing:
         raise Refusal(f"no per-depth oracle for: {', '.join(missing)} (the measure script refuses a declared depth without one)")
     missing = [role for role in PUBLIC_ROLES if role not in public_files]
@@ -121,23 +124,29 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
         raise Refusal(f"no public capture for: {', '.join(missing)}")
 
     pool = []
-    live_entry = None
+    pool_by_name = {}
     for name in pool_names:
         entry = {"r2_path": f"{prefix}{name}.golden.json", **pin(os.path.join(directory, f"{name}.golden.json"))}
         pool.append(entry)
-        if name == live:
-            live_entry = entry
-    assert live_entry is not None
+        pool_by_name[name] = entry
+    same = sorted({a for a in pool_names for b in pool_names if a < b and pool_by_name[a]["sha256"] == pool_by_name[b]["sha256"]})
+    if same:
+        raise Refusal(f"timed-pool tapes with the same bytes as a later tape: {', '.join(same)}; pool entries must be distinct")
 
     # Content addressing: identical bytes share one R2 object.
-    object_by_sha = {live_entry["sha256"]: live_entry["r2_path"]}
+    object_by_sha = {pool_by_name[name]["sha256"]: pool_by_name[name]["r2_path"] for name in live}
     speculative = {}
+    oracles = []
     for key in depth_keys:
-        own = pin(os.path.join(directory, depth_files[key]))
-        r2_path = object_by_sha.setdefault(own["sha256"], f"{prefix}{depth_files[key]}")
-        speculative[key] = {"r2_path": r2_path, **own}
+        speculative[key] = {}
+        for name in live:
+            file = depth_files[(key, name)]
+            own = pin(os.path.join(directory, file))
+            r2_path = object_by_sha.setdefault(own["sha256"], f"{prefix}{file}")
+            speculative[key][name] = {"r2_path": r2_path, **own}
+            oracles.append((file, speculative[key][name]))
 
-    hidden_shas = {entry["sha256"] for entry in pool} | {entry["sha256"] for entry in speculative.values()}
+    hidden_shas = {entry["sha256"] for entry in pool} | {entry["sha256"] for _, entry in oracles}
     ships = []
     for role in PUBLIC_ROLES:
         own = pin(os.path.join(directory, public_files[role]))
@@ -147,29 +156,29 @@ def build_patch(contract: dict, directory: str, live: str) -> tuple[dict, list[s
 
     patch = {
         "official_scoring_enabled": True,
-        "live_golden": live,
+        "live_goldens": live,
         "timed_prompt_pool": pool,
-        "hidden_correctness_golden": {"sha256": live_entry["sha256"], "bytes": live_entry["bytes"]},
+        "hidden_correctness_golden": {"sha256": pool_by_name[live[0]]["sha256"], "bytes": pool_by_name[live[0]]["bytes"]},
         "live_golden_speculative": speculative,
     }
 
     uploads = []
     local_by_r2 = {entry["r2_path"]: f"{os.path.basename(entry['r2_path'])}" for entry in pool}
-    for key in depth_keys:
-        local_by_r2.setdefault(speculative[key]["r2_path"], depth_files[key])
-    pins_by_r2 = {e["r2_path"]: e for e in pool + list(speculative.values())}
+    for file, entry in oracles:
+        local_by_r2.setdefault(entry["r2_path"], file)
+    pins_by_r2 = {e["r2_path"]: e for e in pool + [entry for _, entry in oracles]}
     for r2_path in sorted(local_by_r2):
         entry = pins_by_r2[r2_path]
         uploads.append(f"{local_by_r2[r2_path]} -> {r2_path} ({entry['sha256'][:12]}..., {entry['bytes']} bytes)")
-    shared = sum(1 for key in depth_keys if speculative[key]["r2_path"] != f"{prefix}{depth_files[key]}")
-    uploads.append(f"{len(local_by_r2)} distinct object(s); {shared} of {len(depth_keys)} per-depth key(s) share an earlier object")
+    shared = sum(1 for file, entry in oracles if entry["r2_path"] != f"{prefix}{file}")
+    uploads.append(f"{len(local_by_r2)} distinct object(s); {shared} of {len(oracles)} per-depth oracle(s) share an earlier object")
     return patch, uploads, ships
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", required=True, help="the directory of recorded golden files")
-    ap.add_argument("--live", required=True, help="the pool tape the track scores over (its name without .golden.json)")
+    ap.add_argument("--live", required=True, nargs="+", help="the pool tapes the track scores over, in order (names without .golden.json)")
     ap.add_argument("--apply", action="store_true", help="write the values into the fixture in place")
     ap.add_argument("--contract", default=CONTRACT, help=argparse.SUPPRESS)
     args = ap.parse_args()

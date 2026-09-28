@@ -80,6 +80,9 @@ of the two is stale. The code is the authority.
 The ranked score denominator is the live serial-control leg, measured on the
 same box in the same job as the candidate leg. Nothing caches it.
 
+A ranked run measures each live prompt once, one pair per prompt. The fixture
+lists the live prompts in `live_goldens`. The score is the lower-median pair.
+
 **NO FILE STORES A BASELINE PAIR.** Not the constants above, not the contract
 fixture, not a golden. `tools/lint-benchmark-manifest.py` check 5b keeps
 `benchmark.baseline_prefill_seconds_per_token` and
