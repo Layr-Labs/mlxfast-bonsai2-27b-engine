@@ -261,11 +261,6 @@ jobs:
         # toolchain, weights, GPU, or network.
         run: tools/test-resident-up.sh
 
-      - name: Worker build cache keys, misses, hits and refuses corruption
-        # Drives the REAL tools/build-cache.sh in a scratch clone with stub
-        # products: key stability, key change on a source change, empty-cache
-        # miss, save/restore round trip, corrupted-artefact refusal. Hermetic.
-        run: tools/test-build-cache.sh
       - name: spec declaration envelope (tools/test-spec-declaration.sh)
         run: tools/test-spec-declaration.sh
 

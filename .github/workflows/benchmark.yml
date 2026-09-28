@@ -260,14 +260,6 @@ jobs:
       # env-driven)"), so leaving it unset takes the same value without asserting
       # a track-specific derivation nobody has done yet.
       MLXFAST_MACMON_CANDIDATES: /opt/homebrew/bin/macmon
-      # --- The worker build cache is for trusted dispatches only ------------
-      # Yukon dispatches a participant submission on a `submissions/*` branch.
-      # Its checkout carries participant code, so it must not restore products
-      # another job left in the box cache, and it must not save products a
-      # later job would restore. Only a dispatch on `main` or on a Yukon
-      # baseline branch (`yukon/baseline/*`, cut at a main commit) uses the
-      # cache. Every other dispatch builds cold.
-      MLXFAST_BUILD_CACHE_TRUSTED: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/yukon/baseline/')) && '1' || '0' }}
       # THE TIMED-POOL TAPES ARE NOT NAMED HERE. They are organizer material
       # published in R2 and staged on the box out of band, so no checkout
       # carries them and there is nothing here to point at. The runner service
@@ -454,33 +446,10 @@ jobs:
         # hard refusal, never a replacement.
         run: ./tools/fetch-benchd.sh
 
-      - name: Restore the worker build cache (content-keyed, box-owned)
-        # tools/build-cache.sh keys the build on every tracked source, the
-        # vendored fork sources, the resolved packages, the vendored Metal
-        # fingerprint and the
-        # toolchain; a hit restores bench-worker, the trusted CLI and the
-        # metallib pair from ~/.cache/mlxfast-engine-build after a sha256 check
-        # against the manifest the save wrote. A miss (first dispatch on a box,
-        # or any source change) builds below exactly as before and saves.
-        #
-        # TRUSTED DISPATCHES ONLY (MLXFAST_BUILD_CACHE_TRUSTED, job env). A
-        # participant submission neither restores nor saves: the cache lives in
-        # the job account's home beside its MANIFEST, so a product planted
-        # there would pass the manifest check. A submission therefore builds
-        # cold every time. On a box that runs each job as a single-use account
-        # whose home is removed after the job, the cache is always empty and
-        # every dispatch builds cold.
-        run: |
-          set -euo pipefail
-          if [[ "${MLXFAST_BUILD_CACHE_TRUSTED}" != "1" ]]; then
-            echo "build cache skipped: ${GITHUB_REF} is not a trusted dispatch ref (main or yukon/baseline/*); building cold"
-            echo "MLXFAST_BUILD_CACHE_HIT=0" >> "${GITHUB_ENV}"
-          elif tools/build-cache.sh restore; then
-            echo "MLXFAST_BUILD_CACHE_HIT=1" >> "${GITHUB_ENV}"
-          else
-            echo "MLXFAST_BUILD_CACHE_HIT=0" >> "${GITHUB_ENV}"
-          fi
-
+      # NO BUILD CACHE. The job builds the worker and the CLI from this
+      # checkout every time. The job account's home is removed after each job,
+      # so a cache would always be empty, and preflight check 7d refuses a
+      # cache that the job account can write.
       - name: Setup (toolchain, Metal kernels, pinned checkpoint)
         # Second half of benchmark.json's setupCommand, verbatim. setup.sh
         # verifies the reference checkpoint against
@@ -490,29 +459,9 @@ jobs:
         # in full once per box: setup.sh writes its trusted reference cache
         # lock inside MLXFAST_REFERENCE_DIR after a verified download and
         # skips the full re-hash while that stamp is present.
-        #
-        # On a build-cache hit setup.sh reuses the restored products
-        # (MLXFAST_SKIP_SWIFT_BUILD is honoured only when both products are
-        # present; the cache key already proves they were built from this
-        # exact tree) and adopts the restored metallib pair.
         run: |
           set -euo pipefail
-          if [[ "${MLXFAST_BUILD_CACHE_HIT}" == "1" ]]; then
-            want="$(tools/build-mlx-metallib.sh --print-fingerprint)"
-            have="$(awk '/^mlxfast-metallib-fingerprint-v1 /{print $2}' .build-worker/release/mlx.metallib.fingerprint)"
-            if [[ -z "${have}" || "${have}" != "${want}" ]]; then
-              echo "::error::the cached mlx.metallib.fingerprint (${have:-none}) is not this checkout's vendored-source fingerprint (${want}); the build cache key is broken, refusing" >&2
-              exit 1
-            fi
-            echo "build cache hit: reusing bench-worker, the trusted CLI and mlx.metallib (fingerprint ${want})"
-            MLXFAST_SKIP_SWIFT_BUILD=1 MLXFAST_SKIP_MLX_METALLIB=1 MLXFAST_MLX_METALLIB="${PWD}/.build-worker/release/mlx.metallib" ./setup.sh
-            # setup.sh's stager keeps its hands off the metallib when the skip
-            # knob is set, so the staged worker in .build/release has no
-            # sibling (run 34031386618: "Failed to load the default metallib").
-            # Stage once more without the knob: the pair beside the scored
-            # engine is copied next to the staged binary.
-            tools/stage-bench-worker.sh
-          elif [[ "${{ inputs.prestaged_metallib }}" == "true" ]] \
+          if [[ "${{ inputs.prestaged_metallib }}" == "true" ]] \
             && [[ "$(awk '/^mlxfast-metallib-fingerprint-v1 /{print $2}' "${MLXFAST_METALLIB_STAGE}/mlx.metallib.fingerprint")" == "$(tools/build-mlx-metallib.sh --print-fingerprint)" ]]; then
             # The pre-staged library is adopted ONLY when its fingerprint is this
             # checkout's vendored-source fingerprint. A submission that edits a
@@ -525,13 +474,16 @@ jobs:
             # scratch directory only AFTER the build: on a fresh scratch path
             # SwiftPM replaces .build-worker/release with a symlink into
             # arm64-apple-macosx/, which discards anything placed there before
-            # (run 34031097821 lost the copy and the cache save refused).
+            # (run 34031097821 lost the copy).
             MLXFAST_SKIP_MLX_METALLIB=1 MLXFAST_MLX_METALLIB="${stage}/mlx.metallib" ./setup.sh
             mkdir -p .build-worker/release
             cp "${stage}/mlx.metallib" .build-worker/release/mlx.metallib
             cp "${stage}/mlx.metallib.fingerprint" .build-worker/release/mlx.metallib.fingerprint
-            # Same reason as on the cache-hit path: stage again without the
-            # skip knob so the staged worker gets its metallib sibling.
+            # setup.sh's stager keeps its hands off the metallib when the skip
+            # knob is set, so the staged worker in .build/release has no
+            # sibling (run 34031386618: "Failed to load the default metallib").
+            # Stage once more without the knob: the pair beside the scored
+            # engine is copied next to the staged binary.
             tools/stage-bench-worker.sh
           else
             if [[ "${{ inputs.prestaged_metallib }}" == "true" ]]; then
@@ -539,11 +491,6 @@ jobs:
             fi
             ./setup.sh
           fi
-
-      - name: Save the worker build cache
-        # Trusted dispatches only; see the restore step.
-        if: env.MLXFAST_BUILD_CACHE_HIT != '1' && env.MLXFAST_BUILD_CACHE_TRUSTED == '1'
-        run: tools/build-cache.sh save
 
       - name: Transform the reference checkpoint with the candidate's transform
         # The documented path runs `mlxfast-swift transform` as its own command

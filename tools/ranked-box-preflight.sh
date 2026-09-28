@@ -593,7 +593,9 @@ fi
 #       transform and resident Seatbelt profiles deny those files.
 #   7d. The worker build cache root (MLXFAST_BUILD_CACHE_DIR, else
 #       ~/.cache/mlxfast-engine-build) is absent, or the job account does not
-#       own it and cannot write it.
+#       own it and cannot write it. The ranked job uses no build cache. This
+#       check refuses a cache directory that a job could write, because such a
+#       directory can carry build products from one job to a later job.
 #   7e. Seatbelt works for this account on this box. A child under
 #       sandbox-exec, with a profile from tools/seatbelt-profile.py (the same
 #       generator that tools/sandboxed-cli.sh and tools/resident-up.sh use),
