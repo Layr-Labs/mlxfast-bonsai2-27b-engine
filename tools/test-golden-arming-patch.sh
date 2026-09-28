@@ -6,8 +6,8 @@
 # The synthetic set has the shape the per-depth rule must handle: the seven
 # MTP oracles are identical to each other and differ from the serial tape,
 # dflash1 is byte-identical to the serial tape, and dflash2..16 are identical
-# to each other. So 23 keys need 2 new objects, and 8 tapes + 2 oracles = 10
-# distinct uploads. The two public captures are not uploads: they ship in git.
+# to each other. So 23 keys need 2 new objects, and the 8 synthetic tapes + 2
+# oracles = 10 distinct uploads. The two public captures are not uploads: they ship in git.
 #
 # Usage: tools/test-golden-arming-patch.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)
@@ -121,6 +121,30 @@ if python3 "${TOOL}" --dir "${WORK}/set" --live alpha --apply --contract "${WORK
   fi
 else
   fail "case 5: --apply refused ($(cat "${WORK}/case5.err"))"
+fi
+
+# --- case 6: two pool tapes with the same bytes are refused ------------------
+make_set "${WORK}/dup"
+cp "${WORK}/dup/bravo.golden.json" "${WORK}/dup/charlie.golden.json"
+if python3 "${TOOL}" --dir "${WORK}/dup" --live alpha > /dev/null 2> "${WORK}/case6.err"; then
+  fail "case 6: the tool accepted two pool tapes with the same bytes"
+elif grep -q "pool entries must be distinct" "${WORK}/case6.err"; then
+  pass "two pool tapes with the same bytes are refused"
+else
+  fail "case 6: refused for the wrong reason ($(cat "${WORK}/case6.err"))"
+fi
+
+# --- case 7: the pool is the tapes in the directory, at any size -------------
+make_set "${WORK}/small"
+rm "${WORK}/small/"{delta,echo,foxtrot,golf,hotel}.golden.json
+if python3 "${TOOL}" --dir "${WORK}/small" --live alpha > "${WORK}/small.json" 2> "${WORK}/case7.err"; then
+  if [[ "$(q "${WORK}/small.json" 'len(d["timed_prompt_pool"])')" == "3" ]]; then
+    pass "a directory of 3 tapes gives a pool of 3"
+  else
+    fail "case 7: the pool is not the 3 tapes in the directory"
+  fi
+else
+  fail "case 7: the tool refused a set of 3 tapes ($(cat "${WORK}/case7.err"))"
 fi
 
 echo

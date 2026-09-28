@@ -8,8 +8,9 @@ never prints their contents.
 
 The directory holds these files, and nothing else:
 
-  <name>.golden.json              the 8 timed-pool tapes, recorded serial.
-                                  --live names one or more of them.
+  <name>.golden.json              the timed-pool tapes, recorded serial. Each
+                                  one is one pool entry. --live names one or
+                                  more of them.
   <live>.mtpN.golden.json         for each live name, one per-depth oracle for
                                   every depth in
                                   mtp_head.permitted_draft_depths.
@@ -52,7 +53,6 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONTRACT = os.path.join(ROOT, "fixtures", "bonsai2_27b_mlx_v1_track.json")
-POOL_SIZE = 8
 PUBLIC_ROLES = ("local_iterate", "local_submit")
 FORBIDDEN_BENCHMARK_KEYS = (
     "baseline_prefill_seconds_per_token",
@@ -111,8 +111,8 @@ def build_patch(contract: dict, directory: str, live: list[str]) -> tuple[dict, 
         else:
             pool_names.append(name[: -len(".golden.json")])
 
-    if len(pool_names) != POOL_SIZE:
-        raise Refusal(f"found {len(pool_names)} timed-pool tapes, expected {POOL_SIZE}: {', '.join(pool_names)}")
+    if not pool_names:
+        raise Refusal("found no timed-pool tapes; the pool holds at least one")
     for name in live:
         if name not in pool_names:
             raise Refusal(f"--live {name} is not one of the timed-pool tapes")
@@ -129,6 +129,9 @@ def build_patch(contract: dict, directory: str, live: list[str]) -> tuple[dict, 
         entry = {"r2_path": f"{prefix}{name}.golden.json", **pin(os.path.join(directory, f"{name}.golden.json"))}
         pool.append(entry)
         pool_by_name[name] = entry
+    same = sorted({a for a in pool_names for b in pool_names if a < b and pool_by_name[a]["sha256"] == pool_by_name[b]["sha256"]})
+    if same:
+        raise Refusal(f"timed-pool tapes with the same bytes as a later tape: {', '.join(same)}; pool entries must be distinct")
 
     # Content addressing: identical bytes share one R2 object.
     object_by_sha = {pool_by_name[name]["sha256"]: pool_by_name[name]["r2_path"] for name in live}

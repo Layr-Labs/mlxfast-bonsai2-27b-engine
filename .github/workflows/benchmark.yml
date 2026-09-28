@@ -7,7 +7,7 @@
 #
 # NO SECRET, ANYWHERE, BY DESIGN -- NOT AS A GAP. This file references no
 # repository secret, inherits none, and asks for no write permission, and it
-# never will: hidden material for this track (the 8 timed-pool tapes, the
+# never will: hidden material for this track (the timed-pool tapes, the
 # token-fidelity oracle, the reference baseline workspace) is STAGED ONTO THE
 # BOX out of band by the organizer. A box receives bundles, never keys
 # (bundles-no-keys, ruled 2026-08-21). What replaces the credential is
@@ -58,9 +58,10 @@
 #   1. benchd manifest mismatch. ./tools/fetch-benchd.sh accepts only bytes
 #      matching the channel's benchd.manifest.json; it never returns an unverified binary and
 #      never falls back to a PATH benchd or a source build.
-#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, a pool that is not 8 entries,
-#      or any entry whose sha256 is not 64 hex / bytes is not positive: refused,
-#      because there would be no pin to verify a staged file against.
+#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, an empty pool, or any
+#      entry whose sha256 is not 64 hex / bytes is not positive: refused,
+#      because there would be no pin to verify a staged file against. Two
+#      entries with the same sha256 or r2_path: refused.
 #   3. Missing staged asset. MLXFAST_QWEN38_GOLDEN_DIR unset or absent, a pool
 #      tape missing, a live golden not staged, or the paired leg pair
 #      unstaged: MLXFAST_BASELINE_WORKSPACE / MLXFAST_BASELINE_CALIBRATION
@@ -101,7 +102,7 @@
 #     the API today);
 #   - a registered self-hosted runner on the box advertising the three labels
 #     below (tools/box-runner/ owns that side);
-#   - box staging: the 8 pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
+#   - box staging: the pinned tapes in MLXFAST_QWEN38_GOLDEN_DIR (the live
 #     goldens among them), benchd-bin/benchd + benchd.manifest.json agreeing (the box has
 #     no Rust toolchain and this job holds no dist token, so the binary is
 #     placed there out of band), the reference checkpoint, and a macmon GPU

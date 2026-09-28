@@ -23,7 +23,7 @@
 #      without them. Run tools/ranked-box-preflight.sh afterwards: it verifies
 #      the staged set against the contract again.
 #
-# WHY THE GOLDENS ARE NOT IN THIS REPOSITORY. The 8 timed-pool tapes and the
+# WHY THE GOLDENS ARE NOT IN THIS REPOSITORY. The timed-pool tapes and the
 # per-depth oracles are organizer material. They are published in R2 at the
 # r2_path keys the contract pins, and the ranked box stages them out of band.
 # They are never in git. The public captures are different material: they are
@@ -237,7 +237,7 @@ It matches a timed_prompt_pool[] tape or hidden_correctness_golden in
 fixtures/bonsai2_27b_mlx_v1_track.json. Those objects are organizer-side: the GETs
 are credentialed, the tapes are a benchd format local --golden modes cannot
 load, and the anti-lottery cohort stops being hidden the moment a participant
-holds all eight.
+holds them all.
 
 If you are the organizer staging a box, use --all --out DIR, which stages the
 whole pinned set (credentials are required as well); --allow-hidden lifts this

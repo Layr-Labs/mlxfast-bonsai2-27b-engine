@@ -19,7 +19,7 @@
 # comes from the runner process environment under the name
 # tools/bonsai2-27b-measure-and-score.sh already reads:
 #
-#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the 8 timed-pool tapes
+#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the timed-pool tapes
 #                                      (the live goldens the run scores over
 #                                      among them). The name is the FLEET's
 #                                      golden-dir contract, which every box
@@ -207,7 +207,11 @@ if grep -q 'PENDING-ORGANIZER' "${CONTRACT}"; then
 fi
 
 pool_count="$(jq -r '.timed_prompt_pool | length' "${CONTRACT}")"
-[[ "${pool_count}" == "8" ]] || fail "timed_prompt_pool has ${pool_count} entries, expected 8 (the cohort size this track scores)"
+[[ "${pool_count}" =~ ^[1-9][0-9]*$ ]] || fail "timed_prompt_pool has ${pool_count} entries; it must hold at least one"
+for field in sha256 r2_path; do
+  [[ "$(jq -r --arg f "${field}" '[.timed_prompt_pool[][$f]] | unique | length' "${CONTRACT}")" == "${pool_count}" ]] \
+    || fail "timed_prompt_pool has two entries with the same ${field}; pool entries must be distinct"
+done
 
 # A pin is {sha256, bytes} together; neither half alone is one. An entry that
 # fails this is unarmed no matter what it is called.
@@ -230,12 +234,12 @@ printf '%s' "${hidden_sha}" | grep -Eq '^[0-9a-f]{64}$' \
   || fail "hidden_correctness_golden.sha256 is not a 64-hex digest; the token-fidelity oracle is unarmed"
 printf '%s' "${hidden_bytes}" | grep -Eq '^[1-9][0-9]*$' \
   || fail "hidden_correctness_golden.bytes is not a positive integer"
-ok "timed pool armed: 8 pinned tapes + a pinned hidden correctness golden"
+ok "timed pool armed: ${pool_count} pinned tapes + a pinned hidden correctness golden"
 
 # --- 4. the staged tapes match the pins -------------------------------------
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the 8 timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
   || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
 
@@ -261,7 +265,7 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
 done <<EOF
 $(jq -r '.timed_prompt_pool[] | [.r2_path, .sha256, (.bytes | tostring)] | @tsv' "${CONTRACT}")
 EOF
-ok "all 8 staged timed-pool tapes match their contract pins (bytes then sha256)"
+ok "all ${pool_count} staged timed-pool tapes match their contract pins (bytes then sha256)"
 
 # Per-depth oracles (David ruling 2026-09-07): every live_golden_speculative
 # entry (one per depth and live golden) must be a well-formed pin AND staged, so

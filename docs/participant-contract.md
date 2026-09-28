@@ -779,8 +779,8 @@ The timed prompt pool is EMPTY. `timed_prompt_pool` holds no entry,
 `live_goldens` is an empty list, `live_golden_speculative` holds no per-depth
 oracle, and `hidden_correctness_golden` carries the pending sentinel
 `BONSAI2-27B-MLX-V1-PENDING-ORGANIZER`. An empty pool is legal only
-while the track is unarmed: `tools/lint-benchmark-manifest.py` requires 8
-pinned pool prompts before `official_scoring_enabled` may be `true`.
+while the track is unarmed: `tools/lint-benchmark-manifest.py` requires at
+least one pinned pool prompt before `official_scoring_enabled` may be `true`.
 `tools/ranked-box-preflight.sh` refuses a contract that still carries that
 sentinel. The sentinel is matched exactly; it is never a prefix test.
 

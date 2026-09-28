@@ -59,8 +59,8 @@ cp "${REPO_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${ROOT}/fixtures/"
 # A FRESHLY STAMPED TRACK HAS NO POOL AT ALL. Its live_goldens is empty, its
 # timed_prompt_pool is empty and its hidden correctness golden is still an
 # organizer sentinel, because the tapes do not exist yet. There is nothing to
-# re-pin in that state, so the block below AUTHORS the cohort instead: the 8
-# pool entries this track scores, a live_goldens list naming one of them, a
+# re-pin in that state, so the block below AUTHORS the cohort instead: a
+# synthetic pool of POOL_SIZE entries, a live_goldens list naming one of them, a
 # per-depth oracle for every contract-permitted draft depth, and a real digest
 # for the hidden golden. It also arms the copy, because every check after
 # section 5 is unreachable on an unarmed contract (the arm gate keeps its own
@@ -74,7 +74,7 @@ import hashlib, json, os, sys
 contract_path, golden_dir = sys.argv[1:3]
 contract = json.load(open(contract_path, encoding="utf-8"))
 
-# The cohort size the preflight enforces, and the size this track scores.
+# Any size of one or more passes the preflight.
 POOL_SIZE = 8
 
 
@@ -450,8 +450,43 @@ run_live_goldens_case case20 "declares no live_goldens" '.live_goldens = []'
 run_live_goldens_case case21 "live golden 'no-such-prompt' names no timed_prompt_pool entry" \
   '.live_goldens += ["no-such-prompt"]'
 
+# --- cases 22-23: the pool size is not fixed, and its entries are distinct --
+run_live_goldens_case case22 "two entries with the same sha256" \
+  '.timed_prompt_pool += [.timed_prompt_pool[0]]'
+
+# A pool with one more entry than the fixture passes. The extra tape is staged
+# in a directory of its own, so the directory above stays healthy.
+case_root="${WORK}/case23"
+mkdir -p "${case_root}/tools" "${case_root}/fixtures" "${case_root}/goldens"
+cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
+chmod +x "${case_root}/tools/ranked-box-preflight.sh"
+cp "${GOLDEN_DIR}"/*.json "${case_root}/goldens/"
+extra_tape="${case_root}/goldens/synthetic-extra.golden.json"
+printf '{"synthetic_golden":"synthetic-extra"}\n' > "${extra_tape}"
+jq --arg path "correctness_prompts/${TRACK_ID}/synthetic-extra.golden.json" \
+  --arg sha "$(shasum -a 256 "${extra_tape}" | awk '{print $1}')" \
+  --argjson bytes "$(wc -c < "${extra_tape}" | tr -d '[:space:]')" \
+  '.timed_prompt_pool += [{r2_path: $path, sha256: $sha, bytes: $bytes}]' \
+  "${ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" \
+  > "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json"
+pool_size="$(jq '.timed_prompt_pool | length' "${case_root}/fixtures/bonsai2_27b_mlx_v1_track.json")"
+env -i PATH="${PATH}" HOME="${HOME}" \
+  MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+  MLXFAST_MACMON="${MACMON}" \
+  MLXFAST_QWEN38_GOLDEN_DIR="${case_root}/goldens" \
+  RUNNER_NAME="${BOX_NAME}" \
+  MLXFAST_BASELINE_WORKSPACE="${REF_WS}" \
+  MLXFAST_BASELINE_CALIBRATION="${CALIBRATION}" \
+  "${case_root}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+rc=$?
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 23 (pool of ${pool_size}): the preflight refused a correctly staged pool: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+elif ! grep -q "timed pool armed: ${pool_size} pinned tapes" "${WORK}/out"; then
+  fail "case 23 (pool of ${pool_size}): the pass line does not state the pool size"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 22 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all 24 cases passed"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

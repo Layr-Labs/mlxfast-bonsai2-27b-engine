@@ -64,8 +64,8 @@ struct Bonsai2TrackFixtureTests {
         }
     }
 
-    /// THE TRACK IS ARMED, AND COHERENTLY. Scoring on, eight pool pins, a
-    /// non-empty list of live goldens that each name one of them, a hidden
+    /// THE TRACK IS ARMED, AND COHERENTLY. Scoring on, one or more distinct pool
+    /// pins, a non-empty list of live goldens that each name one of them, a hidden
     /// correctness golden equal to the first live golden's pin, and one oracle
     /// pin per live golden for every declarable depth must travel together:
     /// any of them missing is a fixture that would let a ranked run start
@@ -83,8 +83,10 @@ struct Bonsai2TrackFixtureTests {
         }
         #expect(object["official_scoring_enabled"] as? Bool == true)
         let pool = try #require(object["timed_prompt_pool"] as? [[String: Any]])
-        #expect(pool.count == 8)
+        #expect(!pool.isEmpty)
         #expect(pool.allSatisfy(isPin))
+        #expect(Set(pool.compactMap { $0["sha256"] as? String }).count == pool.count)
+        #expect(Set(pool.compactMap { $0["r2_path"] as? String }).count == pool.count)
         let live = try #require(object["live_goldens"] as? [String])
         #expect(!live.isEmpty)
         #expect(Set(live).count == live.count)
