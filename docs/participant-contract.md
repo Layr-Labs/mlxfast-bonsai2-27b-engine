@@ -1089,6 +1089,30 @@ location fails on the ranked box, and the run gets no score.
 The ranked run also records every non-editable file at checkout. The run stops
 before the measurement when one of these files changes during the job.
 
+### 8.2 Accepted risk: the Hugging Face Hub cache code
+
+Advisory GHSA-vvrq-6cfc-v43m reports path defects in the cache code of
+`swift-huggingface`. Version 0.11.0 corrects some of these defects, but not all
+of them. Some cache operations can still read or write a path outside the cache
+directory.
+
+We accept this risk for these reasons:
+
+- `Package.resolved` pins `swift-huggingface` at 0.11.0. The build refuses a
+  different version.
+- The library is linked into `mlxfast-swift` and `bench-worker`, because the
+  tokenizer library needs it. But no code on the benchmark path calls the Hub
+  client, the Hub cache or a download function. The tokenizer loads only from a
+  local directory.
+- A hosted CI check (`tools/ci-hub-reachability-scan.py`) enforces this. It
+  fails when code in a target that is linked into `mlxfast-swift` or
+  `bench-worker` uses the Hub client, the Hub cache, a download function or the
+  Hub macros.
+
+The defects stay in the upstream library until a new upstream version corrects
+them. Do not call the Hub client or the Hub cache from an editable path. The CI
+check fails on that change.
+
 ## 9. Submitting
 
 Use the Yukon CLI for every account operation and every submission operation.

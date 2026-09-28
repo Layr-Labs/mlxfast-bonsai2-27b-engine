@@ -176,6 +176,17 @@ jobs:
       - name: Box-only inventory is current
         run: tools/ci-box-only-inventory.sh --check
 
+      - name: No benchmark-path code calls the Hub client or cache
+        # GHSA-vvrq-6cfc-v43m: the pinned swift-huggingface 0.11.0 still has
+        # path defects in its cache code, and it is linked into mlxfast-swift
+        # and bench-worker through the tokenizer library. The accepted risk is
+        # that no benchmark-path code calls it (docs/participant-contract.md
+        # section 8.2). This check follows both manifests from the two
+        # binaries and fails on a Hub client, cache, download or Hub macro use
+        # in any linked target. Files off the benchmark path are allowlisted
+        # by name, and the allowlist must stay exact.
+        run: python3 tools/ci-hub-reachability-scan.py
+
       - name: Transform sandbox wrapper and profile generator
         # tools/seatbelt-profile.py rules and tools/sandboxed-cli.sh refusals.
         # This host has no Seatbelt, so the part that runs the real CLI under
