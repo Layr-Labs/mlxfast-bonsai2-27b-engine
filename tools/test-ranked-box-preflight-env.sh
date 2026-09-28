@@ -25,8 +25,22 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
+# The official-run cases keep the evaluator trees in a read-only directory
+# directly under /tmp. /tmp has the sticky bit, which check 7a accepts above a
+# path that the job account does not own; every other directory above a
+# protected path must not be writable, and the directories above ${WORK} are.
+RO="$(cd "$(mktemp -d /tmp/ranked-preflight-ro.XXXXXX)" && pwd -P)"
 # The official-run cases make read-only trees; make them writable to remove them.
-trap 'chmod -R u+w "${WORK}" 2>/dev/null; rm -rf "${WORK}"' EXIT
+trap 'chmod -R u+w "${WORK}" "${RO}" 2>/dev/null; rm -rf "${WORK}" "${RO}"' EXIT
+
+# The preflight waits between temperature samples (2 s and 5 s). The stub
+# reader below moves on every call, so the waits prove nothing here and only
+# make each of the 36 runs take 4 s or more. A `sleep` that returns at once
+# comes first on PATH for every run.
+mkdir -p "${WORK}/fast-sleep"
+printf '#!/bin/sh\nexit 0\n' > "${WORK}/fast-sleep/sleep"
+chmod +x "${WORK}/fast-sleep/sleep"
+export PATH="${WORK}/fast-sleep:${PATH}"
 
 failures=0
 fail() {
@@ -43,7 +57,7 @@ BOX_NAME="synthetic-ranked-box"
 # --- the synthetic root: the real script, the real contract, the real goldens
 ROOT="${WORK}/root"
 mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
-cp "${REPO_ROOT}/tools/ranked-box-preflight.sh" "${ROOT}/tools/"
+cp "${REPO_ROOT}/tools/ranked-box-preflight.sh" "${REPO_ROOT}/tools/seatbelt-profile.py" "${ROOT}/tools/"
 chmod +x "${ROOT}/tools/ranked-box-preflight.sh"
 cp "${REPO_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${ROOT}/fixtures/"
 
@@ -430,11 +444,10 @@ expect_refusal "case 21 (MLXFAST_BOX_NAME names another box)" "but this box is '
 # has privilege, runs a runner that is not single-use, can write the build
 # cache, or cannot apply Seatbelt. The job account is simulated: a stub `id`
 # gives the job a uid that owns nothing here (570), and a stub `sudo` fails.
-# The evaluator trees are copies under a read-only directory, so the real
-# access test (`-w`) fails for them as it does on the box.
+# The evaluator trees are copies under a read-only directory (${RO}, made at
+# the top), so the real access test fails for them as it does on the box.
 OFF="${WORK}/official"
-RO="${OFF}/ro"
-mkdir -p "${RO}" "${OFF}/stubs" "${OFF}/home" "${OFF}/tmp"
+mkdir -p "${OFF}/stubs" "${OFF}/home" "${OFF}/tmp"
 cp -R "${GOLDEN_DIR}" "${RO}/goldens"
 cp -R "${REF_WS}" "${RO}/reference"
 cp "${CALIBRATION}" "${RO}/baseline-calibration.json"
@@ -444,6 +457,13 @@ printf '{}\n' > "${RO}/benchd-bin/benchd.manifest.json"
 printf '{}\n' > "${RO}/reference-checkpoint/config.json"
 cp "${MACMON}" "${RO}/bin/macmon"
 printf 'metallib\n' > "${RO}/metallib-stage/mlx.metallib"
+# A build tree with more items than the old 64-file sample, and a second
+# temperature reader two directories below ${RO}, for cases 33-35.
+mkdir -p "${RO}/reference/.build/many" "${RO}/hidden/deep"
+for n in $(seq 1 130); do
+  printf '%s\n' "${n}" > "${RO}/reference/.build/many/f${n}"
+done
+cp "${MACMON}" "${RO}/hidden/deep/macmon"
 chmod -R a-w "${RO}"
 RUNNER_ROOT="${OFF}/runner"
 mkdir -p "${RUNNER_ROOT}/_work/mlxfast-bonsai2-27b-engine"
@@ -512,6 +532,8 @@ if [[ -x /usr/bin/sandbox-exec ]]; then
       grep -q "ok    account boundary ${check}:" "${WORK}/out" \
         || fail "case 22 (converged box): no pass line for account boundary ${check}"
     done
+    grep -Eq "ok    account boundary 7a: .*checked [0-9]+ items in 7 protected trees .* and [0-9]+ directories above them up to /" "${WORK}/out" \
+      || fail "case 22 (converged box): the 7a pass line does not give what it checked: $(grep 'account boundary 7a' "${WORK}/out")"
   fi
 else
   for check in 7a 7b 7c 7d; do
@@ -542,7 +564,7 @@ chmod a-w "${RO}/benchd-bin/benchd"
 
 # Case 27: the parent directory of the evaluator trees is writable.
 chmod u+w "${RO}"
-expect_official_refusal "case 27 (writable parent)" "account boundary check 7a: the job account can write ${RO}, the parent directory of the golden directory"
+expect_official_refusal "case 27 (writable parent)" "account boundary check 7a: the job account can write ${RO}, a directory above the golden directory"
 chmod a-w "${RO}"
 
 # Cases 28-30: privilege.
@@ -561,8 +583,45 @@ printf '{"agentName":"%s"}' "${BOX_NAME}" > "${RUNNER_ROOT}/.runner"
 expect_official_refusal "case 32 (runner with no ephemeral field)" "account boundary check 7c"
 mv "${OFF}/runner.single-use" "${RUNNER_ROOT}/.runner"
 
+# Case 33: one writable file deep in a large tree. The check is not a sample:
+# the last file that find lists is writable, and the refusal names it.
+deep_file="$(find "${RO}/reference/.build/many" -type f | tail -n 1)"
+chmod u+w "${deep_file}"
+expect_official_refusal "case 33 (one writable file deep in a large tree)" "account boundary check 7a: the job account can write ${deep_file}, which is part of the reference workspace"
+chmod a-w "${deep_file}"
+
+# Case 34: a file whose mode is read-only but whose ACL lets the job write it.
+# The access test applies the ACL. macOS has `chmod +a`; on a host without an
+# ACL tool the case is reported as not run.
+acl_file="$(find "${RO}/goldens" -type f -name '*.json' | head -n 1)"
+acl_set=0
+chmod u+w "${RO}/goldens"
+if [[ "$(uname -s)" == "Darwin" ]] && chmod +a "user:$(/usr/bin/id -un) allow write" "${acl_file}" 2>/dev/null; then
+  acl_set=1
+elif command -v setfacl >/dev/null 2>&1 && setfacl -m "u:$(/usr/bin/id -un):rw" "${acl_file}" 2>/dev/null; then
+  acl_set=1
+fi
+chmod a-w "${RO}/goldens"
+if [[ "${acl_set}" == "1" ]]; then
+  [[ -z "$(find "${acl_file}" -perm -u+w)" ]] \
+    || fail "case 34 (write by ACL only): the fixture file ${acl_file} has the owner write bit in its mode"
+  expect_official_refusal "case 34 (write by ACL only)" "account boundary check 7a: the job account can write ${acl_file}, which is part of the golden directory"
+  chmod u+w "${RO}/goldens"
+  if [[ "$(uname -s)" == "Darwin" ]]; then chmod -N "${acl_file}"; else setfacl -b "${acl_file}"; fi
+  chmod a-w "${RO}/goldens"
+else
+  echo "test-ranked-box-preflight-env.sh: case 34 (write by ACL only) NOT RUN: no ACL tool on this host"
+fi
+
+# Case 35: a writable directory two levels above a protected path. The parent
+# of the temperature reader is read-only; the directory above it is not.
+chmod u+w "${RO}/hidden"
+expect_official_refusal "case 35 (writable directory above the parent)" "account boundary check 7a: the job account can write ${RO}/hidden, a directory above the temperature reader" \
+  MLXFAST_MACMON="${RO}/hidden/deep/macmon"
+chmod a-w "${RO}/hidden"
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 33 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all 36 cases passed"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

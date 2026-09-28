@@ -571,16 +571,20 @@ fi
 # run by the operator owns these paths by design, and is not checked.
 #
 #   7a. The job account does not own, and cannot write, the evaluator material:
-#       the goldens, the correctness golden, benchd-bin and every file in it,
-#       the reference workspace, the calibration file, the reference
-#       checkpoint, the temperature reader and the metallib stage. For each
-#       path the parent directory must not be writable either, because a
-#       writable parent lets the job replace the path. Ownership is checked
-#       for every item under the path. Write access is checked with a real
-#       access test (`-w`) on the path, its parent, and a sample of the
-#       directories and files under it.
+#       the goldens, the correctness golden, benchd-bin, the reference
+#       workspace, the calibration file, the reference checkpoint, the
+#       temperature reader and the metallib stage. The check is exhaustive:
+#       one python3 walk looks at every item in each tree and at every
+#       directory above each path up to /, because a writable directory above
+#       a path lets the job replace the path. Ownership is read from lstat.
+#       Write access is a real access test (os.access W_OK), so it applies the
+#       mode and the ACL. A writable sticky directory above a path (/tmp) is
+#       accepted only when neither it nor the next item on the path belongs to
+#       the job account. The pass line gives the counts.
 #   7b. The job account has no privilege: its uid is not 0, it is not in the
-#       admin, wheel or sudo group, and `sudo -n true` fails.
+#       admin, wheel or sudo group, and `sudo -n true` fails. 7b runs before
+#       7a, because a root account owns every directory above every path and
+#       its 7a refusal would not name the real fault.
 #   7c. The runner is single-use: the actions-runner `.runner` file, two
 #       levels above RUNNER_WORKSPACE, has "ephemeral": true. The runner reads
 #       and writes its `.runner` and `.credentials` files as the job account,
@@ -591,14 +595,14 @@ fi
 #       ~/.cache/mlxfast-engine-build) is absent, or the job account does not
 #       own it and cannot write it.
 #   7e. Seatbelt works for this account on this box. A child under
-#       sandbox-exec, with the same rule set as the transform profile (deny
-#       all writes, allow writes to one output directory, deny reads and
-#       writes of the evaluator paths), must fail to read a golden and must
-#       fail to write outside its output directory. It must also succeed to
-#       write inside its output directory, which proves that the child ran.
-#       The trusted CLI is not built yet when this script runs, so the rule
-#       set is written here. At transform time the CLI writes its own profile
-#       and its child proves again that a write outside the output tree fails.
+#       sandbox-exec, with a profile from tools/seatbelt-profile.py (the same
+#       generator that tools/sandboxed-cli.sh and tools/resident-up.sh use),
+#       must write inside its output directory, which proves that the child
+#       ran. Its read of a golden and its write outside that directory must
+#       then fail with EPERM, the Seatbelt deny. Any other failure is a
+#       refusal, because it does not prove a deny. At transform time the CLI
+#       runs under tools/sandboxed-cli.sh, and the CLI proves again that it is
+#       confined before it runs the transform.
 official_run=0
 if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
   official_run=1
@@ -615,58 +619,91 @@ job_owned_item() {
   { find "$1" -user "${JOB_UID}" -print 2>/dev/null || true; } | head -n 1
 }
 
-# sample_items <path>: the path, and up to 64 directories and 64 files under it.
-sample_items() {
-  printf '%s\n' "$1"
-  if [[ -d "$1" ]]; then
-    { find "$1" -mindepth 1 -type d -print 2>/dev/null || true; } | head -n 64
-    { find "$1" -mindepth 1 -type f -print 2>/dev/null || true; } | head -n 64
-  fi
-}
-
-# require_not_job_writable <label> <path> <sample|all>
+# require_not_job_writable <label> <path> [<label> <path>]...: one walk over
+# every protected tree. For every item in each tree (the path itself, every
+# directory, file and symlink under it) the job account must not own it and a
+# real access test (os.access W_OK, which applies the mode AND the ACL) must
+# say the job account cannot write it. For every directory above each path, up
+# to /, on the path as given and on its resolved path, the job account must not
+# own it and must not be able to write it. One exception: a writable directory
+# with the sticky bit (/tmp) is accepted when neither it nor the next item on
+# the path belongs to the job account, because then the job cannot rename or
+# remove that item.
 require_not_job_writable() {
-  local label="$1" path="$2" scope="$3" owned parent item
-  [[ -e "${path}" ]] || boundary_refuse 7a "${label} does not exist at ${path}"
-  owned="$(job_owned_item "${path}")"
-  [[ -z "${owned}" ]] \
-    || boundary_refuse 7a "the job account (uid ${JOB_UID}) owns ${owned}, which is part of ${label}. The operator account must own it. Run the box converge."
-  parent="$(dirname "${path}")"
-  [[ ! -w "${parent}" ]] \
-    || boundary_refuse 7a "the job account can write ${parent}, the parent directory of ${label}, so it can replace ${path}. Run the box converge."
-  if [[ "${scope}" == "all" ]]; then
-    while IFS= read -r item; do
-      [[ ! -w "${item}" ]] || boundary_refuse 7a "the job account can write ${item}, which is part of ${label}. Run the box converge."
-    done < <(printf '%s\n' "${path}"; { find "${path}" -mindepth 1 -print 2>/dev/null || true; })
-  else
-    while IFS= read -r item; do
-      [[ ! -w "${item}" ]] || boundary_refuse 7a "the job account can write ${item}, which is part of ${label}. Run the box converge."
-    done < <(sample_items "${path}")
-  fi
+  local result
+  result="$(python3 - "${JOB_UID}" "$@" <<'PYEOF'
+import os
+import stat
+import sys
+
+uid = int(sys.argv[1])
+pairs = list(zip(sys.argv[2::2], sys.argv[3::2]))
+
+
+def refuse(message):
+    print(message)
+    sys.exit(1)
+
+
+def walk_error(error):
+    refuse("cannot list %s (%s); every item under it must be checked" % (error.filename, error.strerror))
+
+
+entry_count = 0
+checked_ancestors = set()
+
+
+def check_entry(path, label):
+    global entry_count
+    entry_count += 1
+    if os.lstat(path).st_uid == uid:
+        refuse("the job account (uid %d) owns %s, which is part of %s. The operator account must own it. Run the box converge." % (uid, path, label))
+    if os.access(path, os.W_OK):
+        refuse("the job account can write %s, which is part of %s. Run the box converge." % (path, label))
+
+
+def check_ancestors(path, label, top):
+    child = path
+    parent = os.path.dirname(child)
+    while True:
+        if (parent, child) not in checked_ancestors:
+            checked_ancestors.add((parent, child))
+            info = os.stat(parent)
+            if info.st_uid == uid:
+                refuse("the job account (uid %d) owns %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (uid, parent, label, top, top))
+            if os.access(parent, os.W_OK):
+                sticky = info.st_mode & stat.S_ISVTX
+                if not (sticky and os.lstat(child).st_uid != uid):
+                    refuse("the job account can write %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (parent, label, top, top))
+        if parent == "/":
+            break
+        child, parent = parent, os.path.dirname(parent)
+
+
+for label, path in pairs:
+    if not os.path.lexists(path):
+        refuse("%s does not exist at %s" % (label, path))
+    check_entry(path, label)
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path, onerror=walk_error):
+            for name in dirs + files:
+                check_entry(os.path.join(root, name), label)
+    lexical = os.path.abspath(path)
+    check_ancestors(lexical, label, path)
+    resolved = os.path.realpath(path)
+    if resolved != lexical:
+        check_ancestors(resolved, label, path)
+
+directories = len({parent for parent, _ in checked_ancestors})
+print("checked %d items in %d protected trees (owner, and write access by mode and ACL) and %d directories above them up to /" % (entry_count, len(pairs), directories))
+PYEOF
+)" || boundary_refuse 7a "${result}"
+  printf '%s' "${result}"
 }
 
 if [[ "${official_run}" == "1" ]]; then
   JOB_UID="$(id -u)"
   [[ "${JOB_UID}" =~ ^[0-9]+$ ]] || boundary_refuse 7b "cannot read the uid of the job account"
-
-  # 7a
-  for var in BENCHD_BIN_DIR MLXFAST_REFERENCE_DIR; do
-    eval "value=\${${var}:-}"
-    [[ -n "${value}" ]] || boundary_refuse 7a "${var} is not set; an official run needs the runner environment to name it"
-  done
-  require_not_job_writable "the golden directory (MLXFAST_QWEN38_GOLDEN_DIR)" "${GOLDEN_DIR}" sample
-  if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
-    require_not_job_writable "the correctness golden (MLXFAST_CORRECTNESS_GOLDEN_PATH)" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" sample
-  fi
-  require_not_job_writable "benchd-bin (BENCHD_BIN_DIR)" "${BENCHD_BIN_DIR}" all
-  require_not_job_writable "the reference workspace (MLXFAST_BASELINE_WORKSPACE)" "${BASELINE_WORKSPACE}" sample
-  require_not_job_writable "the calibration file (MLXFAST_BASELINE_CALIBRATION)" "${BASELINE_CALIBRATION}" sample
-  require_not_job_writable "the reference checkpoint (MLXFAST_REFERENCE_DIR)" "${MLXFAST_REFERENCE_DIR}" sample
-  require_not_job_writable "the temperature reader (MLXFAST_MACMON)" "${MLXFAST_MACMON}" sample
-  if [[ -n "${MLXFAST_METALLIB_STAGE:-}" ]]; then
-    require_not_job_writable "the metallib stage (MLXFAST_METALLIB_STAGE)" "${MLXFAST_METALLIB_STAGE}" sample
-  fi
-  ok "account boundary 7a: the job account (uid ${JOB_UID}) owns none of the evaluator material and cannot write it"
 
   # 7b
   [[ "${JOB_UID}" != "0" ]] || boundary_refuse 7b "the job runs as root (uid 0); it must run as the unprivileged runner account"
@@ -680,6 +717,28 @@ if [[ "${official_run}" == "1" ]]; then
     boundary_refuse 7b "sudo -n true succeeds for the job account; it must have no privilege"
   fi
   ok "account boundary 7b: the job account is not root, not in admin, wheel or sudo, and has no sudo"
+
+  # 7a
+  for var in BENCHD_BIN_DIR MLXFAST_REFERENCE_DIR; do
+    eval "value=\${${var}:-}"
+    [[ -n "${value}" ]] || boundary_refuse 7a "${var} is not set; an official run needs the runner environment to name it"
+  done
+  protected=(
+    "the golden directory (MLXFAST_QWEN38_GOLDEN_DIR)" "${GOLDEN_DIR}"
+    "benchd-bin (BENCHD_BIN_DIR)" "${BENCHD_BIN_DIR}"
+    "the reference workspace (MLXFAST_BASELINE_WORKSPACE)" "${BASELINE_WORKSPACE}"
+    "the calibration file (MLXFAST_BASELINE_CALIBRATION)" "${BASELINE_CALIBRATION}"
+    "the reference checkpoint (MLXFAST_REFERENCE_DIR)" "${MLXFAST_REFERENCE_DIR}"
+    "the temperature reader (MLXFAST_MACMON)" "${MLXFAST_MACMON}"
+  )
+  if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+    protected+=("the correctness golden (MLXFAST_CORRECTNESS_GOLDEN_PATH)" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")
+  fi
+  if [[ -n "${MLXFAST_METALLIB_STAGE:-}" ]]; then
+    protected+=("the metallib stage (MLXFAST_METALLIB_STAGE)" "${MLXFAST_METALLIB_STAGE}")
+  fi
+  walk_summary="$(require_not_job_writable "${protected[@]}")" || exit 1
+  ok "account boundary 7a: the job account (uid ${JOB_UID}) owns none of the evaluator material and cannot write it: ${walk_summary}"
 
   # 7c
   [[ -n "${RUNNER_WORKSPACE:-}" ]] || boundary_refuse 7c "RUNNER_WORKSPACE is not set, so the runner registration cannot be found"
@@ -722,45 +781,46 @@ PYEOF
   probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/ranked-preflight-sandbox.XXXXXX")" \
     || boundary_refuse 7e "cannot make a probe directory"
   mkdir "${probe_dir}/out"
-  python3 - "${probe_dir}" "${GOLDEN_DIR}" "${BASELINE_WORKSPACE}" "${BASELINE_CALIBRATION}" \
-    "${BENCHD_BIN_DIR}" "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" > "${probe_dir}/probe.sb" <<'PYEOF'
-import os
-import sys
-
-
-def quote(path):
-    return os.path.realpath(path).replace("\\", "\\\\").replace('"', '\\"')
-
-
-probe_dir = sys.argv[1]
-print("(version 1)")
-print("(allow default)")
-print("(deny file-write*)")
-print('(allow file-write* (literal "/dev/null"))')
-print('(allow file-write* (subpath "%s"))' % quote(os.path.join(probe_dir, "out")))
-for path in sys.argv[2:]:
-    if path:
-        print('(deny file-read* file-write* (subpath "%s"))' % quote(path))
-PYEOF
+  # The same profile generator as the transform wrapper and the resident. The
+  # child is /bin/bash with builtins only, because the profile denies fork
+  # and every exec except the one it names.
+  python3 "${REPO_ROOT}/tools/seatbelt-profile.py" --official --exec /bin/bash \
+    --tree "${REPO_ROOT}" --write-subpath "${probe_dir}/out" > "${probe_dir}/probe.sb" \
+    || boundary_refuse 7e "could not write the probe profile"
+  # Exit 10: the allowed write failed (the child did not run as expected).
+  # Exit 11 or 12: the denied read or write succeeded. Exit 13 or 14: the
+  # denied read or write failed for a reason that is not a Seatbelt deny
+  # (EPERM, "Operation not permitted"); the error is in out/*.err.
   cat > "${probe_dir}/child.sh" <<'CHILDEOF'
 : > "$1/out/inside" || exit 10
-cat "$2" > /dev/null 2>&1 && exit 11
-: > "$1/outside" 2>/dev/null && exit 12
+if : 2> "$1/out/read.err" < "$2"; then exit 11; fi
+read -r message < "$1/out/read.err" || message=""
+[[ "${message}" == *"Operation not permitted"* ]] || exit 13
+if : 2> "$1/out/write.err" > "$1/outside"; then exit 12; fi
+read -r message < "$1/out/write.err" || message=""
+[[ "${message}" == *"Operation not permitted"* ]] || exit 14
 exit 0
 CHILDEOF
   probe_rc=0
-  "${sandbox_exec}" -f "${probe_dir}/probe.sb" /bin/sh "${probe_dir}/child.sh" \
+  LC_ALL=C "${sandbox_exec}" -f "${probe_dir}/probe.sb" /bin/bash "${probe_dir}/child.sh" \
     "${probe_dir}" "${probe_golden}" > /dev/null 2>&1 || probe_rc=$?
   outside_written=0
   [[ ! -e "${probe_dir}/outside" ]] || outside_written=1
+  probe_error=""
+  case "${probe_rc}" in
+    13) probe_error="$(cat "${probe_dir}/out/read.err" 2>/dev/null || true)" ;;
+    14) probe_error="$(cat "${probe_dir}/out/write.err" 2>/dev/null || true)" ;;
+  esac
   rm -rf "${probe_dir}"
   case "${probe_rc}:${outside_written}" in
     0:0) ;;
     11:*) boundary_refuse 7e "a sandboxed child read the golden ${probe_golden}; Seatbelt does not deny the evaluator paths for this account" ;;
     12:*|*:1) boundary_refuse 7e "a sandboxed child wrote outside its output directory; Seatbelt does not deny writes for this account" ;;
+    13:*) boundary_refuse 7e "the sandboxed read of the golden ${probe_golden} failed, but not with EPERM, so it does not prove a Seatbelt deny: ${probe_error}" ;;
+    14:*) boundary_refuse 7e "the sandboxed write outside the output directory failed, but not with EPERM, so it does not prove a Seatbelt deny: ${probe_error}" ;;
     *) boundary_refuse 7e "the sandboxed probe child did not run (exit ${probe_rc}); Seatbelt cannot be applied for this account" ;;
   esac
-  ok "account boundary 7e: a sandboxed child cannot read a golden and cannot write outside its output directory"
+  ok "account boundary 7e: a sandboxed child wrote inside its output directory, and its read of a golden and its write outside that directory failed with EPERM"
 else
   ok "account boundary not checked: this is not an official run (RUNNER_ENVIRONMENT is not self-hosted and MLXFAST_OFFICIAL_BENCHMARK_RUN is not 1)"
 fi
