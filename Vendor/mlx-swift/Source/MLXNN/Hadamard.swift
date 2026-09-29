@@ -733,6 +733,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     nonisolated(unsafe) public static var tensorPackedMatmulNarrow: TensorPackedMatmulNarrow?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowApplies:
         ((_ rows: Int, _ n: Int, _ k: Int) -> Bool)?
+    /// The verify-width form over the quantized rotation (`forwardInt8` of
+    /// the activation padded to 16 rows, as the prompt route quantizes it):
+    /// codes `[16, k]`, scales and scaled sums `[16, k / groupSize]`; returns
+    /// `[16, n]`. Installed by the model file; preferred over
+    /// `tensorPackedMatmulNarrow` when both are installed.
+    public typealias TensorPackedMatmulNarrowInt8 = (
+        _ activation: SignedBlockHadamard.Int8Activation, _ weight: MLXArray, _ scales: MLXArray,
+        _ biases: MLXArray, _ groupSize: Int, _ outputDType: DType,
+        _ layoutCache: HadamardConstantLayoutCache
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8: TensorPackedMatmulNarrowInt8?
+    static var narrowRouteInstalled: Bool {
+        (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
+            && tensorPackedMatmulNarrowApplies != nil
+    }
     /// A verify window: at most this many rows take the narrow form.
     static let tensorRouteMaximumNarrowRows = 16
 
@@ -769,8 +784,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let verifyWidth = rows <= Self.tensorRouteMaximumNarrowRows
         guard k % 128 == 0,
             (promptWidth && Self.tensorPackedMatmul != nil && Self.tensorPackedMatmulApplies != nil)
-                || (verifyWidth && Self.tensorPackedMatmulNarrow != nil
-                    && Self.tensorPackedMatmulNarrowApplies != nil)
+                || (verifyWidth && Self.narrowRouteInstalled)
         else { return nil }
         var n = 0
         for sibling in siblings {
@@ -927,6 +941,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ x: MLXArray, rows: Int, k: Int, n: Int, siblings: [HadamardQuantizedLinear],
         preSigned: Bool, outputDType: DType, leading: [Int]
     ) -> [MLXArray]? {
+        if let matmul = Self.tensorPackedMatmulNarrowInt8 {
+            return tensorRouteForwardNarrowInt8(
+                x, rows: rows, k: k, n: n, siblings: siblings, preSigned: preSigned,
+                outputDType: outputDType, leading: leading, matmul: matmul)
+        }
         guard let matmul = Self.tensorPackedMatmulNarrow,
             let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k),
             let (rotated, sums) = transform.forwardWithGroupSums(
@@ -951,6 +970,43 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let fusedBiases = fused.biases,
             let wide = matmul(
                 a, g, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
+                fused.operands.layoutCache)
+        else { return nil }
+        let rowsOut = rows < padded ? wide[0 ..< rows] : wide
+        return MLX.split(
+            rowsOut.reshaped(leading + [n]), indices: Array(fused.boundaries.dropLast()), axis: -1)
+    }
+
+    /// The verify-width tensor route over the quantized rotation: the FP32
+    /// activation padded to 16 rows, one quantizing rotation (8-bit codes per
+    /// 128-group, as the prompt route), one packed matmul over the (stacked)
+    /// codes, the real rows sliced back.
+    private func tensorRouteForwardNarrowInt8(
+        _ x: MLXArray, rows: Int, k: Int, n: Int, siblings: [HadamardQuantizedLinear],
+        preSigned: Bool, outputDType: DType, leading: [Int],
+        matmul: TensorPackedMatmulNarrowInt8
+    ) -> [MLXArray]? {
+        guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
+        else { return nil }
+        let padded = Self.tensorRouteMaximumNarrowRows
+        let input =
+            rows < padded
+            ? concatenated([x, MLXArray.zeros([padded - rows, k], dtype: x.dtype)], axis: 0) : x
+        guard
+            let activation = transform.forwardInt8(
+                input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
+        else { return nil }
+        if siblings.count == 1 {
+            guard let y = matmul(
+                activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
+            else { return nil }
+            let rowsOut = rows < padded ? y[0 ..< rows] : y
+            return [rowsOut.reshaped(leading + [n])]
+        }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases,
+            let wide = matmul(
+                activation, fused.weight, fused.scales, fusedBiases, groupSize, outputDType,
                 fused.operands.layoutCache)
         else { return nil }
         let rowsOut = rows < padded ? wide[0 ..< rows] : wide
@@ -1003,7 +1059,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         {
             return nil
         }
-        if Self.tensorRouteEnabled, Self.tensorPackedMatmulNarrow != nil,
+        if Self.tensorRouteEnabled, Self.narrowRouteInstalled,
             rows <= Self.tensorRouteMaximumNarrowRows
         {
             return nil
