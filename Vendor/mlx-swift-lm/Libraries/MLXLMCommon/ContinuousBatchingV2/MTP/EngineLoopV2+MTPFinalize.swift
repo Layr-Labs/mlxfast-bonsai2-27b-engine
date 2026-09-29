@@ -166,12 +166,31 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        // In a lookup streak, the next round's verify prefix, built while
+        // the GPU still runs this round (`CBv2MTPVerifyPrebuild`).
+        var prebuild = mtpPrebuildVerify(verify: verify, step: step, driver: mtp)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
+        if let candidate = prebuild {
+            // The hit is the target confirming exactly the columns the prefix
+            // assumed; its recorded submissions go to the GPU now, ahead of
+            // everything else this finalize does. Anything else drops it.
+            let targets = (0 ..< targetWidth).map { Int(host[draftCount + $0]) }
+            if !CBv2MTPLookupPipeline.forcesMiss, targets == candidate.confirmedIfHit {
+                candidate.submit()
+                FileHandle.standardError.write(
+                    Data(
+                        ("dflash2 prompt lookup: match=\(candidate.match) depth=\(k), "
+                            + "drafter skipped, verify prebuilt\n").utf8))
+            } else {
+                candidate.discard()
+                prebuild = nil
+            }
+        }
         var anyRejected = false
 
         struct RowOutcome {
@@ -454,12 +473,22 @@ extension EngineLoopV2 {
                 // first, and only a miss runs the drafter. On a hit the
                 // drafter's cache is untouched and the context rows
                 // `finalizeRound` just queued stay pending for the next block.
-                let promptProposal =
-                    adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
-                    ? CBv2PromptLookupDraft.lookup(
-                        history: rec.tokens, promptLength: rec.request.promptTokens.count,
-                        depth: k)
-                    : nil
+                let promptProposal: MLXArray?
+                if let prebuild, prebuild.id == id {
+                    // The hit: the block the prefix was built on, which is the
+                    // lookup's answer on this history (checked at the build).
+                    precondition(
+                        confirmed == 1 + k,
+                        "CBv2 verify prefix hit without a full acceptance")
+                    promptProposal = prebuild.earlyTokens
+                } else {
+                    promptProposal =
+                        adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
+                        ? CBv2PromptLookupDraft.lookup(
+                            history: rec.tokens, promptLength: rec.request.promptTokens.count,
+                            depth: k)
+                        : nil
+                }
                 if promptProposal != nil {
                     proposal = nil
                 } else if let adoptedProposal {
@@ -498,14 +527,28 @@ extension EngineLoopV2 {
             // No next block from this finalize (the row finished, or its next
             // round is not a fixed-depth block): its next proposal starts over.
             if earlyBlock == nil { CBv2PromptLookupDraft.noteProposal(id, fromPrompt: false) }
+            if earlyBlock == nil, let candidate = prebuild, candidate.id == id {
+                // A hit whose row takes no next block after all: the prefix
+                // must not outlive this round (its columns are then rewritten
+                // by whatever the row does next).
+                candidate.discard()
+                prebuild = nil
+            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
                     // accepted prefix commits by device-side selection of the
                     // captured state at position `confirmed`; zero confirmed
                     // tokens restore the pre-verify snapshot by rollback.
+                    let prebuilt = prebuild?.id == id
                     do {
-                        if confirmed > 0 {
+                        if prebuilt, let prebuild {
+                            // The commit the prefix was built over, installed
+                            // as prepared. The replays the prefix resolved are
+                            // in flight with it; the rest stay unbuilt, so
+                            // there is nothing to submit here.
+                            try evaluations[0].commit(prepared: prebuild.prepared)
+                        } else if confirmed > 0 {
                             try evaluations[0].commit(keepPositions: confirmed)
                         } else {
                             try evaluations[0].rollback()
@@ -514,7 +557,7 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
-                    submitCommittedRecurrentState(for: id)
+                    if !prebuilt { submitCommittedRecurrentState(for: id) }
                 } else {
                     precondition(
                         evaluations.count == 1 + k,
@@ -615,7 +658,8 @@ extension EngineLoopV2 {
                     needsHistoryTransition: mtp.carryNeedsHistoryTransition,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens,
-                    earlyBlock: earlyBlock)
+                    earlyBlock: earlyBlock,
+                    verifyPrebuild: prebuild?.id == id ? prebuild : nil)
             }
         }
 

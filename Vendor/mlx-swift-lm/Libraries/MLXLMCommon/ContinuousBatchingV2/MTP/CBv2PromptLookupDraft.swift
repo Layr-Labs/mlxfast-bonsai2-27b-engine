@@ -364,3 +364,269 @@ public enum CBv2VerifyQueueHint {
         return nothingAhead
     }
 }
+
+
+// MARK: - The next verify built ahead of the readback
+
+// In a lookup streak the next round's verify is built ahead of this round's
+// readback. A row whose draft ids came from the prompt has its NEXT ids known
+// before the target answers, provided the target accepts the whole block and
+// its bonus token is the prompt's next token: the next block is the prompt's
+// continuation, looked up on the history a full acceptance leaves. Then
+// everything the next verify reads is known as well: its ids, the KV rows
+// after the 1+k accepted columns (already written, the offsets already
+// advanced), and the recurrent state the commit at 1+k installs (prepared
+// now, installed at the readback). So the first `layers` trunk layers of that
+// verify are built while the GPU still runs this round, their boundary
+// submissions recorded instead of issued. At the readback a hit issues them at
+// once, before the rest of finalize, and the round's build resumes the window
+// from layer `layers`: the GPU goes from this verify into the next without the
+// host's finalize and first layers in between. A miss drops the prefix:
+// nothing of it was submitted, so the rows' lazy writes are put back, the
+// speculative recurrent binding is abandoned, and the stock path runs
+// untouched. The proposals, the emitted tokens and the acceptance are the
+// stock path's; only when the first layers are built and submitted moves.
+//
+// `MLXFAST_LOOKUP_PIPELINE=0` turns it off; `MLXFAST_LOOKUP_PIPELINE_LAYERS`
+// sets the prefix (default 8). `MLXFAST_LOOKUP_PIPELINE_FORCE_MISS=1` builds
+// the prefix and always drops it (a test of the miss path).
+
+enum CBv2MTPLookupPipeline {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_LOOKUP_PIPELINE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let layers: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_LOOKUP_PIPELINE_LAYERS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(1, raw.flatMap(Int.init) ?? 8)
+    }()
+
+    static let forcesMiss: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_LOOKUP_PIPELINE_FORCE_MISS"] == "1"
+}
+
+/// One row's verify prefix, built ahead of its round. Exactly one of
+/// `adopt` (the round's build resumed it) or `discard` ends it.
+final class CBv2MTPVerifyPrebuild {
+    let id: CBv2RequestID
+    let k: Int
+    /// The columns this round confirms on a hit: its k draft ids, then the
+    /// predicted bonus token, which anchors the next window.
+    let confirmedIfHit: [Int]
+    let match: Int
+    /// `[1, k]` draft ids of the next window, the early block a hit stores.
+    let earlyTokens: MLXArray
+    /// `[1, 1 + k]`, concatenated as the round's build concatenates them.
+    let tokens: MLXArray
+    let positionIds: MLXArray?
+    let evaluation: CBv2RecurrentStateEvaluation
+    let prepared: CBv2RecurrentRequestState.PreparedCommit
+    let cursor: AnyObject
+    /// The KV offset the next round anchors at (its carry's `kvOffset`).
+    let anchorOffset: Int
+    private let deferredSubmissions: [[MLXArray]]
+    /// The rows' storage and offsets before the prefix, for a miss; released
+    /// at a hit (an alias alive at evaluation would forbid the donation the
+    /// in-place write relies on), after which only the offsets remain.
+    private var restores: [(row: CBv2FullSequenceKV, checkpoint: CBv2FullSequenceKV.Checkpoint)]?
+    private let offsets: [(row: CBv2FullSequenceKV, offset: Int)]
+    private weak var engine: EngineLoopV2?
+    private(set) var submitted = false
+    private var resolved = false
+
+    init(
+        id: CBv2RequestID, k: Int, confirmedIfHit: [Int], match: Int,
+        earlyTokens: MLXArray, tokens: MLXArray, positionIds: MLXArray?,
+        evaluation: CBv2RecurrentStateEvaluation,
+        prepared: CBv2RecurrentRequestState.PreparedCommit,
+        prefix: CBv2VerifyPrefix, anchorOffset: Int,
+        checkpoints: [(row: CBv2FullSequenceKV, checkpoint: CBv2FullSequenceKV.Checkpoint)],
+        engine: EngineLoopV2
+    ) {
+        self.id = id
+        self.k = k
+        self.confirmedIfHit = confirmedIfHit
+        self.match = match
+        self.earlyTokens = earlyTokens
+        self.tokens = tokens
+        self.positionIds = positionIds
+        self.evaluation = evaluation
+        self.prepared = prepared
+        self.cursor = prefix.cursor
+        self.deferredSubmissions = prefix.deferredSubmissions
+        self.anchorOffset = anchorOffset
+        self.restores = checkpoints
+        self.offsets = checkpoints.map { ($0.row, $0.checkpoint.offset) }
+        self.engine = engine
+    }
+
+    deinit { discard() }
+
+    /// The hit: the prefix's recorded submissions, in order.
+    func submit() {
+        precondition(!submitted && !resolved, "CBv2 verify prebuild submitted twice")
+        restores = nil
+        for targets in deferredSubmissions { asyncEval(targets) }
+        submitted = true
+    }
+
+    /// The round's build resumed the window.
+    func adopt() {
+        precondition(submitted && !resolved, "CBv2 verify prebuild adopted without a hit")
+        resolved = true
+    }
+
+    /// Drop the prefix. Before a hit nothing of it reached the GPU, so the
+    /// rows' lazy writes are put back; after one, its K/V rows are written
+    /// past the row's offset (a rejected round leaves the same), so only the
+    /// offsets come back. Either way the row is rebound before its next use.
+    func discard() {
+        guard !resolved else { return }
+        resolved = true
+        if let restores {
+            for (row, checkpoint) in restores { row.restore(checkpoint) }
+            self.restores = nil
+        } else {
+            for (row, offset) in offsets { row.rollback(row.absoluteOffset - offset) }
+        }
+        do { try evaluation.abandon() } catch {
+            preconditionFailure("CBv2 verify prebuild binding could not be abandoned: \(error)")
+        }
+        engine?.eagerCompositionStale = true
+    }
+}
+
+extension EngineLoopV2 {
+
+    /// Build the next round's verify prefix for the single verify row of a
+    /// lookup streak, or nil where the next window is not knowable, not
+    /// splittable, or not exactly the stock build. Called before the readback.
+    func mtpPrebuildVerify(
+        verify: CBv2MTPRoundInFlight.Verify, step: CBv2InFlightStep,
+        driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPVerifyPrebuild? {
+        guard CBv2MTPLookupPipeline.enabled, verify.rows.count == 1,
+            let metadata = verify.rows.first, mtp.blockDrafter != nil,
+            mtp.usesRequestStatefulDrafter, mtp.config.fixedDraftTokens == verify.k,
+            CBv2PromptLookupDraft.expectsPromptProposal(metadata.id),
+            !step.discard.contains(metadata.id),
+            let rec = scheduler.record(for: metadata.id),
+            logitDiagnostic == nil, rec.request.stopStrings.isEmpty,
+            let evaluations = verify.recurrentEvaluations[metadata.id],
+            evaluations.count == 1, evaluations[0].isCaptured,
+            let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
+            recurrentModel.recurrentStateSpec != nil,
+            recurrentModel.supportsCapturedVerifyWindow,
+            !backend.requiresMaterializedSnapshots,
+            let recurrentState = recurrentStates[metadata.id],
+            let state = kvStates[metadata.id]
+        else { return nil }
+        let k = verify.k
+        let width = 1 + k
+        switch mtp.config.verificationMode {
+        case .serialTarget: return nil
+        case .rectangular, .rectangularExact: break
+        case .automatic:
+            guard width <= mtp.config.maxAutomaticRectangularTokens else { return nil }
+        }
+        // A hit confirms 1+k tokens and the row then takes a full next round:
+        // the stock early block's own length condition, one round early.
+        guard rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1 else { return nil }
+        let promptLength = rec.request.promptTokens.count
+        // The ids this round verifies came from the prompt (`override` and
+        // `lookup` both take this continuation first, on this history), so
+        // the history a full acceptance leaves is known, and the next window
+        // with it. The stock lookup on that history must return the same
+        // block, or the next round is not this one.
+        guard let current = CBv2PromptLookupDraft.continuation(
+            history: rec.tokens, promptLength: promptLength, depth: k)
+        else { return nil }
+        let accepted = rec.tokens + current.ids
+        guard let predicted = CBv2PromptLookupDraft.continuation(
+            history: accepted, promptLength: promptLength, depth: width),
+            let next = CBv2PromptLookupDraft.continuation(
+                history: accepted + [predicted.ids[0]], promptLength: promptLength, depth: k),
+            next.ids == Array(predicted.ids[1...])
+        else { return nil }
+        let confirmedIfHit = current.ids + [predicted.ids[0]]
+        guard !confirmedIfHit.contains(where: { rec.request.stopTokens.contains($0) }) else {
+            return nil
+        }
+        // Contiguous rows, all at the offset the next round anchors at (this
+        // round's columns already written).
+        let rows = state.compactMap { $0 }
+        let anchorOffset = rec.numComputedTokens
+        guard !rows.isEmpty, rows.allSatisfy({ $0.absoluteOffset == anchorOffset }) else {
+            return nil
+        }
+        var checkpoints: [(row: CBv2FullSequenceKV, checkpoint: CBv2FullSequenceKV.Checkpoint)] = []
+        for row in rows {
+            guard let full = row as? CBv2FullSequenceKV else { return nil }
+            checkpoints.append((full, full.checkpoint()))
+        }
+        // The recurrent commit a hit installs, and the binding over it. Every
+        // layer's replay must stay unbuilt, as the stock commit leaves it.
+        let prepared: CBv2RecurrentRequestState.PreparedCommit
+        do { prepared = try evaluations[0].prepareCommit(keepPositions: width) } catch { return nil }
+        guard prepared.allReplaysPending,
+            let evaluation = try? recurrentState.bindSpeculative(over: prepared)
+        else { return nil }
+        func abandon() {
+            do { try evaluation.abandon() } catch {
+                preconditionFailure("CBv2 verify prebuild binding could not be abandoned: \(error)")
+            }
+        }
+        // The window's ids, built as the round's build builds them from its
+        // early block (`mtpBuildVerifyGraph`, `mtpBuildTargetVerification`).
+        let earlyTokens = MLXArray(next.ids, [1, k])
+        let seedColumn = MLXArray([Int32(predicted.ids[0])]).reshaped([1, 1])
+        let draftSteps = (0 ..< k).map { earlyTokens[0..., $0] }
+        let columns = [seedColumn] + draftSteps.map { $0.reshaped([1, 1]) }
+        let tokens =
+            CBv2VerifyTokenStack.tokens(seed: seedColumn, block: earlyTokens, columns: columns)
+            ?? concatenated(columns, axis: 1)
+        let caches = eagerCaches(rowStates: [state])
+        let serializing = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
+        // Plain layer caches with no attention observation bound: a forward
+        // built here is not one an observer expects.
+        guard serializing.count == caches.count,
+            caches.allSatisfy({
+                ($0 as? CBv2LayerCache).map {
+                    $0.attentionMetadata == nil && $0.attentionPacket == nil
+                } ?? false
+            })
+        else {
+            abandon()
+            return nil
+        }
+        for cache in serializing {
+            cache.mtpSerializesRectangularAttention = true
+            cache.mtpBatchesRectangularAttention = mtp.drafter.prefersBatchedRectangularAttention
+        }
+        defer {
+            for cache in serializing {
+                cache.mtpSerializesRectangularAttention = false
+                cache.mtpBatchesRectangularAttention = false
+            }
+        }
+        let positionIds = CBv2PositionState.decodePositionIds(
+            states: [rec.request.positionState], cacheOffsets: [anchorOffset], length: width)
+        guard let prefix = recurrentModel.forwardVerifyPrefix(
+            tokens: tokens, caches: caches, recurrentState: [evaluation],
+            positionIds: positionIds, layers: CBv2MTPLookupPipeline.layers)
+        else {
+            for (row, checkpoint) in checkpoints { row.restore(checkpoint) }
+            abandon()
+            eagerCompositionStale = true
+            return nil
+        }
+        return CBv2MTPVerifyPrebuild(
+            id: metadata.id, k: k, confirmedIfHit: confirmedIfHit, match: next.match,
+            earlyTokens: earlyTokens, tokens: tokens, positionIds: positionIds,
+            evaluation: evaluation, prepared: prepared, prefix: prefix,
+            anchorOffset: anchorOffset, checkpoints: checkpoints, engine: self)
+    }
+}

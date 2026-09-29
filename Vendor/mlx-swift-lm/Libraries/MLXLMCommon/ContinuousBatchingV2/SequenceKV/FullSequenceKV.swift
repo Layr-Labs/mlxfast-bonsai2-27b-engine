@@ -8,6 +8,7 @@
 // in `CBv2LayerCache.rows`).
 
 import Foundation
+import Cmlx
 import MLX
 
 /// Counters for the v2 core runtime's own host-interaction points.
@@ -93,6 +94,9 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     private var keys: MLXArray?
     private var values: MLXArray?
+    /// Fence of the last append a kernel wrote into `keys`/`values` in place
+    /// (`commitInPlaceAppend`); nil once the storage arrays are ordered after it.
+    private var pendingWrite: MLXArray?
     private var capacity: Int
 
     /// - Parameters:
@@ -149,6 +153,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
 
+        orderStorageAfterWrites()
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
         let (writtenKeys, writtenValues) = CBv2SqueezedKVUpdate.updates(newKeys, newValues)
@@ -169,6 +174,16 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
                 absoluteOffset
             )
+        }
+        if let fence = pendingWrite {
+            // Views ordered after the last in-place append.
+            let views = depends(
+                inputs: [
+                    keys[.ellipsis, ..<absoluteOffset, 0...],
+                    values[.ellipsis, ..<absoluteOffset, 0...],
+                ],
+                dependencies: [fence])
+            return (views[0], views[1], absoluteOffset)
         }
         return (
             keys[.ellipsis, ..<absoluteOffset, 0...],
@@ -197,7 +212,93 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values].compactMap { $0 }
+        [keys, values, pendingWrite].compactMap { $0 }
+    }
+
+    // MARK: - Append written in place (`CBv2InPlaceKVAppend`)
+
+    /// The storage an `n`-row append written by a kernel goes into: both
+    /// buffers (grown exactly as `update` grows them), the first row, and
+    /// the previous in-place write's fence (the kernel takes it as an input,
+    /// so writes to this row stay in order), or nil when there is no storage
+    /// yet or it holds other dtypes. The rows `row ..< row + n` are past
+    /// every view this row has handed out at its current offset: the rows
+    /// `update` would assign.
+    func inPlaceAppendDestination(count n: Int, keyDType: DType, valueDType: DType)
+        -> (keys: MLXArray, values: MLXArray, row: Int, previous: MLXArray?)?
+    {
+        guard n > 0, absoluteOffset + n <= maxLength, let keys, let values,
+            keys.dtype == keyDType, values.dtype == valueDType,
+            keys.ndim == 4, values.ndim == 4, keys.dim(0) == 1, values.dim(0) == 1,
+            keys.dim(1) == kvHeads, values.dim(1) == kvHeads
+        else { return nil }
+        if absoluteOffset + n > capacity { orderStorageAfterWrites() }
+        ensureCapacity(absoluteOffset + n, keyTemplate: self.keys!, valueTemplate: self.values!)
+        return (self.keys!, self.values!, absoluteOffset, pendingWrite)
+    }
+
+    /// Adopt the `n` rows a kernel wrote at `inPlaceAppendDestination`'s row
+    /// (`fence` is an output of that kernel): the views `update` returns,
+    /// ordered after the write. The storage arrays stay as they are; the
+    /// fence orders every later reader or writer of them
+    /// (`orderStorageAfterWrites`, the next kernel's input, `snapshot`).
+    func commitInPlaceAppend(count n: Int, fence: MLXArray) -> (MLXArray, MLXArray) {
+        pendingWrite = fence
+        absoluteOffset += n
+        let views = depends(
+            inputs: [
+                keys![.ellipsis, ..<absoluteOffset, 0...],
+                values![.ellipsis, ..<absoluteOffset, 0...],
+            ],
+            dependencies: [fence])
+        return (views[0], views[1])
+    }
+
+    /// The storage arrays themselves ordered after the last in-place write,
+    /// before an operation that reads or copies them whole.
+    private func orderStorageAfterWrites() {
+        guard let fence = pendingWrite, let keys, let values else { return }
+        let ordered = depends(inputs: [keys, values], dependencies: [fence])
+        self.keys = ordered[0]
+        self.values = ordered[1]
+        pendingWrite = nil
+    }
+
+    // MARK: - Verify built ahead of its round (`CBv2MTPVerifyPrebuild`)
+
+    /// The row's lazy storage and offset as they are now. `restore` puts
+    /// exactly these back, which is exact only while nothing that was built
+    /// on them afterwards has been evaluated (the lazy writes are dropped).
+    public struct Checkpoint {
+        fileprivate let keys: MLXArray?
+        fileprivate let values: MLXArray?
+        fileprivate let capacity: Int
+        public let offset: Int
+    }
+
+    public func checkpoint() -> Checkpoint {
+        Checkpoint(
+            keys: Self.alias(keys), values: Self.alias(values), capacity: capacity,
+            offset: absoluteOffset)
+    }
+
+    /// A second handle to the same array. `update` writes through the row's
+    /// handle in place, so the array as it was stays reachable only through
+    /// another one; this is not an op, and the alias is released with the
+    /// checkpoint (an alias alive at evaluation would forbid the donation
+    /// the in-place write relies on).
+    private static func alias(_ array: MLXArray?) -> MLXArray? {
+        guard let array else { return nil }
+        var handle = mlx_array_new()
+        mlx_array_set(&handle, array.ctx)
+        return MLXArray(handle)
+    }
+
+    public func restore(_ checkpoint: Checkpoint) {
+        keys = checkpoint.keys
+        values = checkpoint.values
+        capacity = checkpoint.capacity
+        absoluteOffset = checkpoint.offset
     }
 
     // MARK: - Private

@@ -623,6 +623,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`),
             // and the target's arrays only the window reads.
             DFlash2ResidencyPrefetch.arm(drafter, window: target.dFlash2WindowResidencyArrays())
+            // And the seed's first prompt layer, now (`Qwen35SeedResidencyTouch`).
+            Qwen35SeedResidencyTouch.submit(target.seedFirstLayerResidencyArrays())
         } else {
             target.dFlash2TapLayerIds = nil
         }
@@ -855,8 +857,30 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
+        if Self.rootsOnlyTargets, !state.roots.isEmpty { return state.roots }
         return state.caches.flatMap { $0.innerState() } + state.roots
     }
+
+    /// With a proposal pending, `evaluationTargets` is the proposal alone
+    /// (default on; `MLXFAST_DFLASH_ROOT_TARGETS=0` adds the cache arrays).
+    ///
+    /// Every cache array a proposal wrote is an input of that proposal (the
+    /// attention reads the written rows), so evaluating the proposal
+    /// evaluates them; naming them too changes no value. It does change
+    /// their lifetime: the verify build appends these targets to the verify
+    /// forward's `eval`, whose completion handler holds the buffer of every
+    /// named array until the verify finishes on the GPU. The block built
+    /// before the readback (`speculateBlock`) writes its leading layers' K
+    /// and V rows while that verify is still running, so MLX could not
+    /// donate those layers' cache buffers and copied each whole buffer
+    /// ([1, 8, 2047, 128] BF16, 4 MB) before writing 32 rows: four such
+    /// copies per round. Without the extra hold the rows are written in
+    /// place, as the other layers' already are.
+    static let rootsOnlyTargets: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ROOT_TARGETS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// A round's confirmed columns become the next block's context.
     ///
@@ -970,6 +994,35 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let block = Self.warmBlockSize
         let classes = drafter.contextRowClasses(rows: block)
         speculationPlan = SpeculationPlan(classes: classes)
+        drafter.prepareSpeculativeFront(blockSize: block)
+        var (failure, compared) = speculationCheck(block: block)
+        // The front's one-launch forms passed their own self-tests; should the
+        // whole block still differ, the composed front is proven instead of
+        // losing the block before the readback.
+        var frontNote = DFlash2SpeculativeFront.active ? "; one-launch front" : ""
+        if failure != nil, DFlash2SpeculativeFront.active {
+            DFlash2SpeculativeFront.deactivate()
+            frontNote = "; one-launch front FAILED (\(failure!)), composed front kept"
+            speculationPlan = SpeculationPlan(classes: classes)
+            (failure, compared) = speculationCheck(block: block)
+        }
+        Stream().synchronize()
+        Memory.clearCache()
+        if failure != nil { speculationPlan = nil }
+        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        FileHandle.standardError.write(Data((failure.map {
+            "dflash2 next block before readback: self-test FAILED (\($0)); off; \(ms) ms\n"
+        } ?? ("dflash2 next block before readback: self-test passed (confirmed counts 1-\(block), "
+            + "\(compared) values compared bitwise, 0 mismatches; context row classes "
+            + "\(Array(classes.dropFirst()))); "
+            + (speculationPlan!.single
+                ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
+                : "the previous round's class built before the readback") + frontNote + "; \(ms) ms\n")).utf8))
+    }
+
+    /// `establishSpeculation`'s comparison: the failure, if any, and the
+    /// number of values compared.
+    private func speculationCheck(block: Int) -> (String?, Int) {
         var failure: String?
         var compared = 0
         do {
@@ -1026,17 +1079,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         } catch {
             failure = "\(error)"
         }
-        Stream().synchronize()
-        Memory.clearCache()
-        if failure != nil { speculationPlan = nil }
-        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        FileHandle.standardError.write(Data((failure.map {
-            "dflash2 next block before readback: self-test FAILED (\($0)); off; \(ms) ms\n"
-        } ?? ("dflash2 next block before readback: self-test passed (confirmed counts 1-\(block), "
-            + "\(compared) values compared bitwise, 0 mismatches; context row classes "
-            + "\(Array(classes.dropFirst()))); "
-            + (speculationPlan!.single
-                ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
-                : "the previous round's class built before the readback") + "; \(ms) ms\n")).utf8))
+        return (failure, compared)
     }
 }
