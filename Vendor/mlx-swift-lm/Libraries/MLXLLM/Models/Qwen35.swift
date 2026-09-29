@@ -5712,3 +5712,4 @@ extension Qwen35Model: MTPCapable {
         languageModel.makeMTPCache()
     }
 }
+private let gauntletRedraw_19798571_20260926T025244Z: Int = 0
