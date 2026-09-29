@@ -5,6 +5,17 @@
 import Foundation
 import MLX
 
+/// On unless explicitly disabled: a round whose driver does not use the
+/// marginal depth policy drops the dead verify top-two readback.
+/// `DARKBLOOM_MTP_SKIP_DEAD_MARGIN=0` keeps the readback.
+enum CBv2MTPDeadMarginSkip {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MTP_SKIP_DEAD_MARGIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
     let start: Int
@@ -33,6 +44,13 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
+    /// Prompt rows that sampled their first token in this step and can carry
+    /// straight into a block-drafter round (no seed forward).
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
+    /// Work submitted in its own command buffer AFTER `asyncEvalTargets`, so
+    /// the step's sampled tokens never wait for it: a block drafter's
+    /// absorption of a prompt's committed context.
+    let lateEvalTargets: [MLXArray]
 }
 
 extension EngineLoopV2 {
@@ -291,10 +309,14 @@ extension EngineLoopV2 {
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
+        var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
+        var lateEvalTargets: [MLXArray] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
-            let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            // Built at its shape: an evaluated host array (not a lazy reshape)
+            // lets the model read a prompt's ids without a GPU round trip.
+            let inputs = MLXArray(slice.map(Int32.init), [1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
@@ -339,6 +361,11 @@ extension EngineLoopV2 {
                     positionIds: positions, requirement: requirement) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = mtp.committedObservationHidden(forward.lastHidden)
+                if row.samples, Self.mtpPrefillCarryEnabled, mtp.blockDrafter != nil {
+                    let width = forward.lastHidden.dim(1)
+                    prefillCarries.append(
+                        (id: rec.id, hidden: forward.lastHidden[0..., (width - 1)..., 0...]))
+                }
                 do {
                     cacheInnerState.append(contentsOf: try evaluation.evaluate())
                 } catch {
@@ -370,6 +397,17 @@ extension EngineLoopV2 {
             }
             if let observedHidden {
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+                // A prompt row that carries into a block round: its drafter
+                // context is a function of the rows just observed, not of the
+                // token this step samples, so it is absorbed now and
+                // submitted behind the step (`lateEvalTargets`).
+                if row.samples, Self.mtpPrefillCarryEnabled, let block = mtp.blockDrafter,
+                    let observed = committedObservationRows.last, observed.id == rec.id
+                {
+                    lateEvalTargets.append(
+                        contentsOf: block.prefetchCommittedContext(
+                            requestState: observed.assistantState))
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -459,8 +497,22 @@ extension EngineLoopV2 {
             seedHidden: seedHidden,
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
-            committedObservationRows: committedObservationRows)
+            committedObservationRows: committedObservationRows,
+            prefillCarries: prefillCarries,
+            lateEvalTargets: lateEvalTargets)
     }
+
+    /// A BLOCK drafter's first block needs only the prompt's tapped context
+    /// and the prompt's sampled token as its anchor, so a prompt row can carry
+    /// straight into a round: the one-token seed forward that re-established a
+    /// carry after the prompt is skipped (its position is computed by that
+    /// first round's verify instead). `DARKBLOOM_BONSAI_PREFILL_CARRY=0`
+    /// restores the seed step.
+    static let mtpPrefillCarryEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_CARRY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
@@ -551,6 +603,7 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        var blockDraftIDs: MLXArray?
         if let block = mtp.blockDrafter {
             // ONE propose per round. The block is the row's last committed
             // token followed by k mask tokens, and the drafter's single
@@ -563,22 +616,48 @@ extension EngineLoopV2 {
                     preconditionFailure(
                         "CBv2 block MTP assistant state missing for \(row.rec.id)")
                 }
-                let proposal = try block.proposeBlock(
-                    anchor: row.carry!.token, depth: k, requestState: requestState)
+                let carry = row.carry!
+                let proposal: MLXArray
+                if let early = carry.earlyBlock {
+                    // Proposed and submitted at the previous round's finalize
+                    // with this carry's anchor and offset (`storeCarry`
+                    // checks both), and the drafter cache already trimmed.
+                    // A fixed-depth leg plans that same depth; a smaller
+                    // plan (never taken while the early gate holds) reads a
+                    // prefix of the block, which is still only a proposal.
+                    // Lookup, when it fired, already replaced these ids.
+                    precondition(
+                        k <= early.depth,
+                        "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
+                    proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else {
+                    let drafted = try block.proposeBlock(
+                        anchor: carry.token, depth: k, requestState: requestState)
+                    proposal = CBv2PromptLookupDraft.override(
+                        drafted, history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k)
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
+                    // Align the drafter's context cache with the TARGET's
+                    // committed length, exactly where the reference does it:
+                    // after the proposal absorbed this round's context rows.
+                    // `kvOffset` IS that length (the row's `numComputedTokens`
+                    // when the carry was captured).
+                    block.trimBlockState(
+                        requestState, toCommittedLength: carry.kvOffset)
+                    // The replacement does not depend on the drafter graph.
+                    // Keep that graph live so the cache writes are not dropped.
+                    assistantEvalTargets.append(drafted)
+                }
                 proposals.append(proposal)
-                // Align the drafter's context cache with the TARGET's
-                // committed length, exactly where the reference does it:
-                // after the proposal absorbed this round's context rows.
-                // `kvOffset` IS that length (the row's `numComputedTokens`
-                // when the carry was captured).
-                block.trimBlockState(
-                    requestState, toCommittedLength: row.carry!.kvOffset)
                 assistantEvalTargets.append(proposal)
                 assistantEvalTargets.append(
                     contentsOf: block.evaluationTargets(for: requestState))
             }
             let batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
+            // The block proposal already has the [B, k] draft-ID layout; keep
+            // it instead of re-stacking its columns (terrapinelf `7502085`).
+            blockDraftIDs = batched
             // The whole block is known before target construction starts, so
             // publish it now; finalization still joins it through the
             // acceptance packet.
@@ -649,7 +728,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = blockDraftIDs ?? stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -664,7 +743,9 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            stackedTokens: CBv2VerifyTokenStack.tokens(
+                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -685,7 +766,11 @@ extension EngineLoopV2 {
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
-            policyTopTwoValues: target.policyTopTwo?.values,
+            // The verify top-two values feed only the marginal depth policy
+            // (`previousTopTwoMargin`); with a fixed draft depth nothing
+            // reads them, so the round neither retains nor reads them back.
+            policyTopTwoValues: (mtp.usesMarginalPolicy || !CBv2MTPDeadMarginSkip.enabled)
+                ? target.policyTopTwo?.values : nil,
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill

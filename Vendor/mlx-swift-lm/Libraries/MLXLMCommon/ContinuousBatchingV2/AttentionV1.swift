@@ -18,6 +18,8 @@
 
 import Foundation
 import MLX
+import MLXFast
+import MLXNN
 
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
@@ -223,7 +225,10 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
 
         if B == 1 {
-            if serializeQueries, L > 1 {
+            // A verify rectangle without a keep mask attends in ONE causal
+            // call: the same visible prefix per query, one dispatch instead of
+            // one per column. Near-tie rounding is priced by the token gate.
+            if serializeQueries, L > 1, keepMask != nil {
                 return updateAndAttendRowSerialQueries(
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
@@ -380,8 +385,25 @@ enum CBv2AttentionV1 {
         metadata: CBv2AttentionMetadataObservation? = nil,
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
-        let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return attendRowAfterUpdate(
+            kind: kind, queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
+            scale: scale, sinks: sinks, softcap: softcap, spanContext: spanContext,
+            keepMask: keepMask, metadata: metadata, packet: packet)
+    }
+
+    /// `updateAndAttendRow` after the row's update: the same attention over
+    /// the views the update returned. Also the attention of an append that a
+    /// kernel wrote in place (`CBv2LayerCache.attendAfterInPlaceAppend`).
+    @inline(__always)
+    static func attendRowAfterUpdate(
+        kind: CBv2LayerKind, queries: MLXArray, cachedKeys: MLXArray, cachedValues: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?, keepMask: MLXArray? = nil,
+        metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
+    ) -> MLXArray {
+        let L = queries.dim(2)
         if let keepMask {
             precondition(
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
@@ -400,6 +422,17 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        // A verify window's causal block (fewer rows than the prompt width),
+        // composed as SDPA's fallback composes it (`CBv2PromptCausalAttention`).
+        if keepMask == nil, metadata == nil, packet == nil, sinks == nil, softcap == nil,
+            window(of: kind) == nil, !kind.isBidirectional,
+            L < BonsaiPromptWidth.minimumRows,
+            let composed = CBv2PromptCausalAttention.attend(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, promptRows: L, verify: true)
+        {
+            return composed
         }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
@@ -625,6 +658,42 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext? = nil,
         keepMask: MLXArray? = nil
     ) -> MLXArray {
+        let outputs = attendQueryBlockList(
+            queries: queries, keys: keys, values: values, newTokenCount: newTokenCount,
+            window: window, scale: scale, sinks: sinks, softcap: softcap, blockSize: blockSize,
+            spanContext: spanContext, keepMask: keepMask)
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// `updateAndAttendRow` for B == 1 and no keep mask or span overlay,
+    /// when it takes the query-block branch: the same update and the same
+    /// block outputs, returned in query order (not concatenated). Nil, before
+    /// the row is updated, when that branch would not be taken.
+    static func updateAndAttendQueryBlocks(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> [MLXArray]? {
+        let L = queries.dim(2)
+        guard queries.dim(0) == 1, shouldBlockQueries(L), !kind.isBidirectional else {
+            return nil
+        }
+        let effectiveSinks = dispatchSinks(sinks, kind: kind, queries: queries, softcap: softcap)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return attendQueryBlockList(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
+    }
+
+    /// The query blocks' outputs of `attendQueryBlocks`, in query order.
+    private static func attendQueryBlockList(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        newTokenCount: Int, window: Int?, scale: Float,
+        sinks: MLXArray?, softcap: Float?, blockSize: Int,
+        spanContext: CBv2SpanChunkContext? = nil,
+        keepMask: MLXArray? = nil
+    ) -> [MLXArray] {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         precondition(
             keepMask == nil || spanContext == nil,
@@ -684,16 +753,24 @@ enum CBv2AttentionV1 {
                 let blockKeepMask = keepMask.map {
                     $0[0..., 0..., offset ..< (offset + count), visibleStart ..< visibleEnd]
                 }
-                outputs.append(
-                    attend(
+                if keepMask == nil, window == nil, sinks == nil, softcap == nil,
+                    let composed = CBv2PromptCausalAttention.attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
-                        scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap,
-                        keepMask: blockKeepMask))
+                        scale: scale, promptRows: newTokenCount)
+                {
+                    outputs.append(composed)
+                } else {
+                    outputs.append(
+                        attend(
+                            queries: querySlice, keys: keySlice, values: valueSlice,
+                            scale: scale, L: count, kL: visibleEnd - visibleStart,
+                            window: window, sinks: sinks, softcap: softcap,
+                            keepMask: blockKeepMask))
+                }
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return outputs
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
@@ -905,5 +982,290 @@ enum CBv2AttentionV1 {
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
             boolMask: mask, sinks: sinks, softcap: softcap)
+    }
+}
+
+/// One causal query block of a prompt-width forward, composed exactly as
+/// MLX's SDPA fallback (`fast.cpp`) composes it for a head dim with no fused
+/// kernel at this width (192 or 256 at more than 8 queries: the Qwen 3.5 and
+/// Gemma 4 attention layers), minus two of its passes.
+///
+/// The fallback scales q (`Multiply`, a full copy of the block's queries),
+/// runs `q·kᵀ`, builds the causal mask (two `Arange` and a `GreaterEqual`),
+/// selects `finfo(float32).min` where it is false, then the precise softmax
+/// and `p·v`. Here the GEMM reads the unscaled query slice, and ONE kernel
+/// applies the scale and the causal select to the scores the GEMM wrote,
+/// `j <= offset + i ? s * scale : -FLT_MAX` (the fallback's `q_idx >= k_idx`
+/// with `q_idx = offset + i`, `offset = kL - L`), and runs MLX's own
+/// single-row softmax on them (`softmaxKernel`) before `p·v`.
+///
+/// Same values: the scale is required to be a power of two (256^-0.5 is
+/// 2^-4), and multiplying every q element by 2^-e scales every product and
+/// every rounded partial sum of the GEMM by exactly 2^-e (round-to-nearest
+/// commutes with a power-of-two scaling while nothing falls into the
+/// subnormal range, which normalized-and-rotated q·k terms never approach),
+/// so `fl(q·2^-e)·k` equals `fl(q·k)·2^-e` bit for bit, whatever order the
+/// GEMM accumulates in. The GEMM itself is the same: the same M, N, K,
+/// transposes and batch shape (k's zero stride on the repeat axis keeps the
+/// batch at [kvHeads, repeats] either way), so the same kernel; only the
+/// query operand's batch stride differs. The fill is -FLT_MAX passed as a
+/// runtime value (a traced constant would print with seven digits and not
+/// round-trip). FP32 operands only.
+///
+/// Fewer than 1024 queries per block (a 128-query block always is): from
+/// 1024 causal queries at head dim 256 a device with NAX runs SDPA's fused
+/// head-dim-split kernel instead of the fallback (`use_fallback`), which this
+/// composition does not reproduce.
+///
+/// Nil when any condition does not hold; the caller then runs SDPA as
+/// before. Prompt width only (`BonsaiPromptWidth.minimumRows`);
+/// `BONSAI_PROMPT_CAUSAL_BLOCK=0` disables it.
+///
+/// `verify: true` serves a verify window's block (fewer rows than the prompt
+/// width: 16 queries at depth 15), where SDPA takes the same fallback (more
+/// than 8 queries at head dim 256), in three launches instead of the
+/// fallback's eight: the same composition, exact by the same argument. Its
+/// key count need not be a multiple of 4 while `softmaxKernel` serves it: that
+/// kernel pads a partial last read exactly as MLX's single-row softmax does
+/// (only `maskKernel`, past 4096 keys, needs whole four-column groups).
+/// `BONSAI_VERIFY_CAUSAL_BLOCK=0` disables it.
+package enum CBv2PromptCausalAttention {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_CAUSAL_BLOCK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let verifyEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_CAUSAL_BLOCK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// On unless explicitly disabled: a verify block's query heads that share
+    /// a KV head go through the two GEMMs as ONE matrix of `repeats * L` rows
+    /// (`[B, kvHeads, repeats * L, D]`, a free view of the contiguous
+    /// `[B, H, L, D]` queries) instead of `kvHeads * repeats` batches of `L`
+    /// rows against a broadcast K/V. At `L = 16` every batch of the latter is
+    /// a single 64-row M tile with 48 padding rows, on both the steel GEMM
+    /// and the NAX GEMM; folded, the 96 rows fill 1.5 tiles, so the scores
+    /// and the output take a third as many tiles and read each K/V tile for
+    /// six heads at once. Bit-identical: both GEMMs reduce every output
+    /// element over K in the same fixed BK / SK steps whatever the element's
+    /// row, tile, alignment class or batch (`gemm_loop`), so moving a query
+    /// row between tiles and batches does not change its value; the scores
+    /// keep the `[..., repeats, L, kL]` row order the softmax indexes by.
+    /// `BONSAI_VERIFY_FOLD_REPEATS=0` restores the broadcast batches.
+    static let verifyFoldRepeats: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_FOLD_REPEATS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
+    /// per thread (kL % 4 == 0, so they share a row).
+    private static let maskKernel = MLXFast.metalKernel(
+        name: "bonsai_prompt_causal_scale_select",
+        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
+        outputNames: ["out"],
+        source: """
+            const uint base = thread_position_in_grid.x * 4;
+            const uint kl = uint(c_kl);
+            const int j = int(base % kl);
+            const int i = int((base / kl) % uint(c_ql));
+            const int last = c_off + i;
+            #pragma clang loop unroll(full)
+            for (int w = 0; w < 4; w++) {
+              out[base + w] = (j + w <= last) ? scores[base + w] * c_scale : c_fill;
+            }
+            """,
+        ensureRowContiguous: true)
+
+    /// MLX's `softmax_single_row<float, float, 4>` (the precise FP32
+    /// softmax `Softmax::eval_gpu` runs on a row of at most 4096 columns) with
+    /// `maskKernel`'s select and scale folded into its load, so the masked
+    /// scores are never stored and read back. The body is that kernel's,
+    /// verbatim (`mlx-generated/softmax.cpp`): same threadgroup size
+    /// (32 * ceil(ceil(kL / 4) / 32)), same tail padding and max, the same
+    /// `fast::exp`, reductions and reciprocal, built in the same (safe) math
+    /// mode MLX builds its own kernels in. The one new contraction candidate,
+    /// `s * scale - max`, has an exact product (a power-of-two scale), so an
+    /// FMA would round it exactly as the stored product was.
+    private static let softmaxKernel = MLXFast.metalKernel(
+        name: "bonsai_prompt_causal_scale_select_softmax",
+        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
+        outputNames: ["out"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint gid = threadgroup_position_in_grid.x;
+            const int lid = int(thread_position_in_threadgroup.x);
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const int axis_size = c_kl;
+            // The block row's last visible key: the fallback's q_idx >= k_idx.
+            const int last = c_off + int(gid % uint(c_ql));
+
+            threadgroup float local_max[SIMD_SIZE];
+            threadgroup float local_normalizer[SIMD_SIZE];
+
+            float ld[N_READS];
+
+            const device float* in = scores + gid * size_t(axis_size) + lid * N_READS;
+            if (lid * N_READS + N_READS <= axis_size) {
+              for (int i = 0; i < N_READS; i++) {
+                ld[i] = (lid * N_READS + i <= last) ? in[i] * c_scale : c_fill;
+              }
+            } else {
+              for (int i = 0; i < N_READS; i++) {
+                ld[i] = ((lid * N_READS + i) < axis_size)
+                    ? ((lid * N_READS + i <= last) ? in[i] * c_scale : c_fill)
+                    : Limits<float>::min;
+              }
+            }
+            // Only initialize unused slots. Active SIMD groups write their
+            // own slots below, so these stores are disjoint and need no barrier.
+            const uint groups = uint((axis_size + 127) / 128);
+            if (simd_group_id == 0 && simd_lane_id >= groups) {
+              local_max[simd_lane_id] = Limits<float>::min;
+              local_normalizer[simd_lane_id] = 0;
+            }
+
+            // Get the max
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+              maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (simd_lane_id == 0) {
+              local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Every SIMD group reduces the same 32 ordered partials. This
+            // preserves the reduction tree and avoids a group-zero broadcast.
+            maxval = simd_max(local_max[simd_lane_id]);
+
+            // Compute exp(x_i - maxval) and store the partial sums in local_normalizer
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+              float exp_x = metal::fast::exp(ld[i] - maxval);
+              ld[i] = exp_x;
+              normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (simd_lane_id == 0) {
+              local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
+
+            // Normalize and write to the output
+            device float* o = out + gid * size_t(axis_size) + lid * N_READS;
+            if (lid * N_READS + N_READS <= axis_size) {
+              for (int i = 0; i < N_READS; i++) {
+                o[i] = float(ld[i] * normalizer);
+              }
+            } else {
+              for (int i = 0; i < N_READS; i++) {
+                if ((lid * N_READS + i) < axis_size) {
+                  o[i] = float(ld[i] * normalizer);
+                }
+              }
+            }
+            """,
+        ensureRowContiguous: true)
+
+    /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
+    private static let softmaxSingleRowLimit = 4096
+
+    /// The verify block's composition once per key count in `keyLengths`, on
+    /// throwaway zeros, for a load-time warm: the two FP32 matmuls pick their
+    /// steel GEMM pipeline by whether the key count fills whole tiles
+    /// (`align_N` for the scores, `align_K` for the output), so a window
+    /// whose key count lands in an alignment class the warm verify did not
+    /// see built that pipeline inside a timed round. Nothing here reads or
+    /// writes a cache; the caller evaluates and drops the results.
+    package static func warmVerifyBlock(
+        heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int]
+    ) -> [MLXArray] {
+        guard verifyEnabled, heads > 0, kvHeads > 0, headDim > 0, rows > 0 else { return [] }
+        var outputs: [MLXArray] = []
+        for keyLength in keyLengths where keyLength >= rows {
+            let queries = MLXArray.zeros([1, heads, rows, headDim], dtype: .float32)
+            let keys = MLXArray.zeros([1, kvHeads, keyLength, headDim], dtype: .float32)
+            let values = MLXArray.zeros([1, kvHeads, keyLength, headDim], dtype: .float32)
+            if let output = attend(
+                queries: queries, keys: keys, values: values, scale: scale, promptRows: rows,
+                verify: true)
+            {
+                outputs.append(output)
+            }
+        }
+        return outputs
+    }
+
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
+        verify: Bool = false
+    ) -> MLXArray? {
+        guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            scale > 0, scale.isNormal, scale.significandBitPattern == 0
+        else { return nil }
+        let B = queries.dim(0)
+        let H = queries.dim(1)
+        let L = queries.dim(2)
+        let D = queries.dim(3)
+        let kvHeads = keys.dim(1)
+        let kL = keys.dim(2)
+        guard L > 8, L < 1024, D == 192 || D == 256, keys.dim(0) == B, values.dim(0) == B,
+            keys.dim(3) == D, values.dim(1) == kvHeads, values.dim(2) == kL,
+            kvHeads > 0, H % kvHeads == 0, kL >= L,
+            kL % 4 == 0 || (verify && kL <= softmaxSingleRowLimit),
+            B * H * L * kL < Int(Int32.max)
+        else { return nil }
+        let repeats = H / kvHeads
+        var q = queries
+        var k = keys
+        var v = values
+        if repeats > 1, verify, verifyFoldRepeats {
+            // One kvHeads-batched GEMM over repeats * L rows per KV head (see
+            // `verifyFoldRepeats`): the same buffer in the same row order, so
+            // the scores, the softmax rows and the output keep their layout.
+            q = q.reshaped([B, kvHeads, repeats * L, D])
+        } else if repeats > 1 {
+            q = q.reshaped([B, kvHeads, repeats, L, D])
+            k = k.expandedDimensions(axis: 2)
+            v = v.expandedDimensions(axis: 2)
+        }
+        let scores = matmul(q, k.swappedAxes(-1, -2))
+        let operands: [any ScalarOrArray] = [
+            scores, MLXArray(Int32(kL - L)), MLXArray(Int32(L)), MLXArray(Int32(kL)),
+            MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude),
+        ]
+        let probabilities: MLXArray
+        if kL <= softmaxSingleRowLimit {
+            let threads = 32 * (((kL + 3) / 4 + 31) / 32)
+            probabilities = softmaxKernel(
+                operands,
+                grid: ((scores.size / kL) * threads, 1, 1),
+                threadGroup: (threads, 1, 1),
+                outputShapes: [scores.shape],
+                outputDTypes: [.float32])[0]
+        } else {
+            let masked = maskKernel(
+                operands,
+                grid: (scores.size / 4, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [scores.shape],
+                outputDTypes: [.float32])[0]
+            probabilities = softmax(masked, axis: -1, precise: true)
+        }
+        var out = matmul(probabilities, v)
+        if repeats > 1 {
+            out = out.reshaped([B, H, L, out.dim(-1)])
+        }
+        return out
     }
 }
