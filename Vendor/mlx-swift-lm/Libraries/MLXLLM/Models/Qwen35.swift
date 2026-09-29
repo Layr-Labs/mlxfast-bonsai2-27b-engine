@@ -4490,8 +4490,13 @@ enum Qwen35FusedHadamard {
           }
           part = simd_sum(part);
           if ((i & 31) == 0) {
-            qscale[gbase + size_t(2 * j)] = qs;
-            qsum[gbase + size_t(2 * j)] = qs * part;
+            const uint ml = row & 63u;
+            const size_t qidx = MPERM
+              ? (size_t(row >> 6) * size_t(W / 128) * 64 + (size_t(bcol / 128) + size_t(i >> 5) + size_t(2 * j)) * 64
+                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (gbase + size_t(2 * j));
+            qscale[qidx] = qs;
+            qsum[qidx] = qs * part;
           }
         }
         """
@@ -4638,7 +4643,9 @@ enum Qwen35FusedHadamard {
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const OutT o = OutT(buf[index + r] * 0.03125f);
-            out[rowbase + bcol + uint(index + r)] = o;
+            const uint kk = uint(index + r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            out[rowbase + bcol + kp] = o;
             part += float(o);
           }
           part = simd_sum(part);
@@ -4723,6 +4730,7 @@ enum Qwen35FusedHadamard {
                 ("InT", x.dtype), ("OutT", DType.uint8), ("W", width), ("BPR", blocksPerRow),
                 ("PRESIGNED", preSigned ? 1 : 0), ("GR", repeats), ("GKH", keyHeads), ("GD", headDim),
                 ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0 ? 1 : 0),
             ]
             let groupShape = Array(x.shape.dropLast()) + [width / 128]
             let outputs = kernelInt8(
@@ -4761,7 +4769,7 @@ enum Qwen35FusedHadamard {
                 ("QSIM", 0),
             ]
             let outputs = kernelWithGroupSums(
-                [x, signs], template: template,
+                [x, signs], template: template + [("PERM", Qwen35TensorPackedMatmul.verifyForm == .staged8 ? 1 : 0)],
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [x.shape, Array(x.shape.dropLast()) + [width / 128]],
                 outputDTypes: [outputDType, .float32])
@@ -4830,6 +4838,7 @@ enum Qwen35FusedHadamard {
                 ("InT", a.dtype), ("W", width), ("BPR", blocksPerRow),
                 ("GR", repeats), ("GKH", keyHeads), ("GD", headDim), ("PROD", prod),
                 ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0 ? 1 : 0),
                 ("AHD", aHead), ("BHD", bHead),
             ]
             let outShape = [rows, width]
@@ -4957,6 +4966,7 @@ enum Qwen35FusedBoundaryQ8 {
         let groupShape = [rows, width / 128]
         let template: [(String, any KernelTemplateArg)] = [
             ("W", width), ("PRESIGNED", gainSigned), ("PERM", perm),
+            ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -5232,8 +5242,13 @@ enum Qwen35FusedBoundaryQ8 {
           }
           part = simd_sum(part);
           if (lane == 0) {
-            qscale[size_t(row) * NG + g] = qs;
-            qsum[size_t(row) * NG + g] = qs * part;
+            const uint ml = row & 63u;
+            const size_t qidx = MPERM
+              ? (size_t(row >> 6) * size_t(NG) * 64 + size_t(g) * 64
+                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (size_t(row) * NG + g);
+            qscale[qidx] = qs;
+            qsum[qidx] = qs * part;
           }
         }
         """
@@ -5320,6 +5335,8 @@ enum Qwen35TensorPackedMatmul {
         const device float4* up1 = (const device float4*)(uT + nb + 32);
         const int NQ = N / 4;
         const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        // Row-tiled constants: this lane's four rows are adjacent in the tile.
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
         for (int g = 0; g < Kg; g++) {
           auto tA = A.template slice<128, 64>(g * 128, m0);
           auto tB = B.template slice<128, 64>(g * 128, n0);
@@ -5328,8 +5345,15 @@ enum Qwen35TensorPackedMatmul {
           const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
           const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
           float as[4], rb[4];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          if (MPERM) {
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          }
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
             const int c = i & 3; const int nh = (i >> 3) & 1;
@@ -5564,18 +5588,148 @@ enum Qwen35TensorPackedMatmul {
     /// True when the toolchain takes `tensor` operands at all (either form).
     static var tensorOperandsAvailable: Bool { support != .none }
 
-    /// The verify-width route needs the native 2-bit operand: its staged
-    /// forms measured no faster than the record's verify kernels, so without
-    /// `uint2b_format` that route stays off. Probed separately (once).
-    static let verifyNativeAvailable: Bool = {
-        if support == .native2b { return true }
-        let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PACKED"]?
+    /// The verify-width route's operand form: `native2b` (the 2-bit tensor
+    /// operand) where the toolchain has it, otherwise `none` (the record's
+    /// verify kernels): at 16 rows a weight byte feeds one op, so staging it
+    /// through threadgroup memory costs about what the op saves, and the
+    /// int8-staged form (`staged8`, the same kernel structure over
+    /// threadgroup-staged slices) measured 2% slower than the record's
+    /// kernels end to end. It stays available for measurement:
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM=native|staged8|off` forces one.
+    static let verifyForm: PackedOperandSupport = {
+        let forced = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_FORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if forced == "uint4b" || forced == "staged" || forced == "off" || forced == "none" || forced == "0" {
-            return false
+        switch forced {
+        case "native", "uint2b": return probe("bonsai_probe_uint2b", probeSourceNative) ? .native2b : .none
+        case "staged8", "uint8": return support == .staged8 ? .staged8 : .none
+        case "off", "none", "0": return .none
+        default: break
         }
-        return probe("bonsai_probe_uint2b", probeSourceNative)
+        if support == .native2b || probe("bonsai_probe_uint2b", probeSourceNative) { return .native2b }
+        return .none
     }()
+
+    static var verifyNativeAvailable: Bool { verifyForm == .native2b }
+
+    /// The widest projection the verify-width route takes: every tower
+    /// projection and the vocabulary head (n = 248320) by default. Excluding
+    /// gate|up (n = 34816) measured 3% slower in situ although the record's
+    /// few-row core streams it faster in isolation; the head on the route
+    /// measured 1.2% faster on the decode window.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_MAXN` overrides it.
+    static let verifyMaximumColumns: Int = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_VERIFY_MAXN"],
+            let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0
+        {
+            return value
+        }
+        return 262144
+    }()
+
+    /// Row-tiled activation constants for the prompt route: the quantizing
+    /// rotations store each 64-row tile's scales and scaled sums as
+    /// `[tile][group][64]` in the packed kernels' lane order, so a lane reads
+    /// its four rows' constants as one `float4` per group instead of eight
+    /// scalar loads. `DARKBLOOM_BONSAI_TENSOR_ROUTE_MPERM=0` keeps `[rows,
+    /// groups]`.
+    static let rowTiledConstants: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_MPERM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // Verify width without the 2-bit operand: the native kernel's structure
+    // (32 columns per threadgroup, four simdgroups splitting K, a threadgroup
+    // reduce) with each simdgroup's 128-group slice of the 32 columns staged
+    // as int8 in its own threadgroup buffer (2-bit codes expanded, K
+    // permuted, simdgroup barriers only). The activation is read in the
+    // permuted K order the staged prompt kernel uses.
+    private static let sourceNarrowStaged8 = """
+        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int gper = Kg / 4;
+        const int g0 = int(sg) * gper;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
+        threadgroup uint32_t bs[4][1][32 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[sg][0], dextents<int, 2>(128, 32));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[sg][1 - 1], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, float>();
+        constexpr int CAP = 32 / 2;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        // staging: 32 columns x 8 words per group over 32 lanes: lane -> column lane % 32, word part lane / 32
+        constexpr int PARTS = 32 / 32;             // lanes per column (1 for 32=32, 2 for 32=16)
+        constexpr int WPP = 8 / PARTS;             // 2-bit words per lane per group
+        const int sc = int(lane) % 32; const int sp = int(lane) / 32;
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sp * WPP;
+        auto stage = [&](int g, int buf) {
+          threadgroup uint32_t* dst = bs[sg][buf] + sc * 32 + sp * (WPP * 4);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < WPP; j++) {
+            const uint32_t wv = wrow[g * 8 + j];
+            dst[4 * j + 0] = wv & 0x03030303u;
+            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
+            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
+            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+          }
+        };
+        stage(g0, 0);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = g0; g < g0 + gper; g++) {
+          const int cur = (1 == 2) ? ((g - g0) & 1) : 0;
+          if (1 == 2 && g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          float4 sv[32 / 16], bv[32 / 16];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 32 / 16; q++) {
+            sv[q] = float4(*(const device half4*)(scalesT + (size_t)g * N + n0 + fn + 16 * q));
+            bv[q] = float4(*(const device half4*)(biasesT + (size_t)g * N + n0 + fn + 16 * q));
+          }
+          const float rs0 = rowsum[(size_t)fm * Kg + g];
+          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            acc[i] = fma(sv[nq][c], cT[i], fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
+        }
+        threadgroup float red[4 - 1][CAP * 32];
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            float v = acc[i];
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelNarrowStaged8 = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_m16_s8",
+        inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
+        outputNames: ["out"],
+        source: sourceNarrowStaged8,
+        header: header,
+        ensureRowContiguous: true)
 
     // The prompt-width kernel for a toolchain without `uint2b_format`: the
     // same math, the 64 x 128 weight tile of each 128-group expanded from the
@@ -5615,6 +5769,8 @@ enum Qwen35TensorPackedMatmul {
         const device float4* up1 = (const device float4*)(uT + nb + 32);
         const int NQ = N / 4;
         const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        // Row-tiled constants: this lane's four rows are adjacent in the tile.
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
         // staging assignment: thread t -> column c = t >> 1, K half h = t & 1 (64 codes = 4 words -> 8 words of nibbles)
         const int sc = int(tid >> 1); const int sh = int(tid & 1);
         const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
@@ -5642,8 +5798,15 @@ enum Qwen35TensorPackedMatmul {
           const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
           const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
           float as[4], rb[4];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          if (MPERM) {
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          }
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
             const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
@@ -5702,6 +5865,8 @@ enum Qwen35TensorPackedMatmul {
         const device float4* up1 = (const device float4*)(uT + nb + 32);
         const int NQ = N / 4;
         const size_t mrow[4] = {(size_t)mb, (size_t)(mb + 8), (size_t)(mb + 32), (size_t)(mb + 40)};
+        // Row-tiled constants: this lane's four rows are adjacent in the tile.
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
         // staging assignment: thread t -> column c = t >> 1, K half h = t & 1 (64 codes = 4 words -> 8 words of nibbles)
         const int sc = int(tid >> 1); const int sh = int(tid & 1);
         const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
@@ -5729,8 +5894,15 @@ enum Qwen35TensorPackedMatmul {
           const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
           const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
           float as[4], rb[4];
-          #pragma clang loop unroll(full)
-          for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          if (MPERM) {
+            const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+            const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+            as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+            rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) { as[q] = ascale[mrow[q] * Kg + g]; rb[q] = rsb[mrow[q] * Kg + g]; }
+          }
           #pragma clang loop unroll(full)
           for (int i = 0; i < CAP; i++) {
             const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
@@ -5893,9 +6065,9 @@ enum Qwen35TensorPackedMatmul {
         HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
             rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
         }
-        if verifyEnabled, verifyNativeAvailable {
+        if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrowApplies = { rows, n, k in
-                rows <= 16 && n % 32 == 0 && k % 512 == 0 && n < 65536
+                rows <= 16 && n % 64 == 0 && k % 512 == 0 && n <= verifyMaximumColumns
             }
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
@@ -5913,8 +6085,8 @@ enum Qwen35TensorPackedMatmul {
                 else { return nil }
                 let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
                 let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
-                if !verifyNativeAvailable {
-                    return kernelNarrowStaged(
+                if verifyForm == .staged8 {
+                    return kernelNarrowStaged8(
                         [rotated, weight, scalesT, biasesT, sums, dimsArray(k: k, m: m, n: n)],
                         template: [("OutT", outputDType)],
                         grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -5961,7 +6133,7 @@ enum Qwen35TensorPackedMatmul {
             return packedKernel(
                 [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                template: [("OutT", outputDType)],
+                template: [("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0)],
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
