@@ -297,7 +297,7 @@ enum CBv2HostPositionOffsets {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_HOST_POSITION_OFFSETS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let lock = NSLock()
