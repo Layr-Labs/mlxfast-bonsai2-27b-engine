@@ -661,9 +661,29 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// `updateAndAttend(queries:keys:values:scale:sinks:)` for a one-row
+    /// prompt chunk that attends in query blocks, returning each block's
+    /// output (`[1, queryHeads, block, headDim]`, in query order) instead of
+    /// their concatenation along the query axis: the same K/V update, the
+    /// same offset advance and the same per-block attention; only the final
+    /// concatenation is left to the caller (a consumer that reads the
+    /// blocks where they are skips its copies). Nil, with nothing updated,
+    /// whenever that chunk would not take the query-block path; the caller
+    /// then calls `updateAndAttend`. The default declines.
+    func updateAndAttendQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]?
 }
 
 extension CBv2AttendingLayerCache {
+    public func updateAndAttendQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]? {
+        nil
+    }
+
     /// Fail-safe default: a cache that does not implement the keep-mask
     /// overload has no keep-mask semantics, so a non-nil mask is refused by
     /// name rather than silently dropped into a dense attention.
