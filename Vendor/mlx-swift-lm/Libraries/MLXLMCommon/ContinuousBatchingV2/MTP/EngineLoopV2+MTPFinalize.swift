@@ -479,11 +479,13 @@ extension EngineLoopV2 {
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
                 } else if let drafted = proposal {
                     // Same object when no unique prompt span matches. The
-                    // drafter graph stays in `drafted` either way.
-                    let tokens = CBv2PromptLookupDraft.override(
+                    // drafter graph stays in `drafted` either way. The
+                    // source is reported, not read off object identity: the
+                    // splice returns a new object whether or not it fired.
+                    let (tokens, fromPrompt) = CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
-                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: fromPrompt)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets = [tokens, drafted] + block.evaluationTargets(for: state)
                     if leading != nil {

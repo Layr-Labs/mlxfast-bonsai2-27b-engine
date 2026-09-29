@@ -633,10 +633,11 @@ extension EngineLoopV2 {
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
-                    proposal = CBv2PromptLookupDraft.override(
+                    let (tokens, fromPrompt) = CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
-                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
+                    proposal = tokens
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: fromPrompt)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.

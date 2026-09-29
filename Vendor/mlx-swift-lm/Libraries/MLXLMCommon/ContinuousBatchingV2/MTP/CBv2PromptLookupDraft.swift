@@ -103,21 +103,48 @@ enum CBv2PromptLookupDraft {
     static let spliceTrace: Bool =
         ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_TRACE"] == "1"
 
-    /// The proposal, or the same object when lookup does not apply.
+    /// `MLXFAST_DFLASH_QUOTE_RUN` sets how many committed tokens must already
+    /// run along a prompt span before a spliced round counts as quoting the
+    /// prompt (`fromPrompt` below). 4 by default; 0 counts every spliced
+    /// round, which was the behaviour before this knob.
+    ///
+    /// The splice runs on the device and its choice is never read back, so
+    /// the host cannot tell a spliced round that fired from one that kept the
+    /// drafter's block. Counting every spliced round as a prompt round made
+    /// `expectsPromptProposal` true after every drafter round, which turned
+    /// the next block before the readback (`CBv2MTPDraftBeforeReadback`) off
+    /// in every round of an output that does not quote its prompt. The
+    /// committed suffix's run along the prompt is host evidence the splice
+    /// already computes: an output that has started quoting runs along a
+    /// span, and one that has not rarely runs 4 tokens (on the public
+    /// capture's non-quoting half, 11 of 512 positions).
+    static let quoteRun: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_QUOTE_RUN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(0, raw.flatMap(Int.init) ?? 4)
+    }()
+
+    /// The next round's ids, and whether they come from the prompt: the host
+    /// lookup hit, or the splice ran while the committed suffix already runs
+    /// `quoteRun` tokens along a prompt span. When lookup does not apply the
+    /// ids are the same object as `proposal`. Only the draft changes; the
+    /// target verifies every id.
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
-    ) -> MLXArray {
+    ) -> (tokens: MLXArray, fromPrompt: Bool) {
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
-        else { return proposal }
+        else { return (proposal, false) }
         if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
             FileHandle.standardError.write(
                 Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
-            return MLXArray(hit.ids, [1, depth])
+            return (MLXArray(hit.ids, [1, depth]), true)
         }
-        guard spliceEnabled else { return proposal }
-        return splice(proposal, history: history, promptLength: promptLength, depth: depth)
-            ?? proposal
+        guard spliceEnabled,
+            let spliced = splice(
+                proposal, history: history, promptLength: promptLength, depth: depth)
+        else { return (proposal, false) }
+        return (spliced.tokens, spliced.longestRun >= quoteRun)
     }
 
     /// Integer-only equivalent of the array splice below. Keep the array path
@@ -197,7 +224,7 @@ enum CBv2PromptLookupDraft {
     /// request's own prompt, every round, and is not kept.
     static func splice(
         _ drafted: MLXArray, history: [Int], promptLength: Int, depth: Int
-    ) -> MLXArray? {
+    ) -> (tokens: MLXArray, longestRun: Int)? {
         let minimum = spliceMinimum
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
@@ -211,6 +238,7 @@ enum CBv2PromptLookupDraft {
         // largest r with history[c - r + 1 ... c] equal to the last r tokens.
         let anchor = history[count - 1]
         var runs = [Int32](repeating: 0, count: candidates)
+        var longestRun = 0
         for c in 0 ..< candidates where history[c] == anchor {
             var length = 1
             while length < 64, c - length >= 0,
@@ -219,6 +247,7 @@ enum CBv2PromptLookupDraft {
                 length += 1
             }
             runs[c] = Int32(length)
+            longestRun = max(longestRun, length)
         }
 
         if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
@@ -229,10 +258,11 @@ enum CBv2PromptLookupDraft {
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
-            return splicePick(
+            let tokens = splicePick(
                 [ranked, block, promptIDs, dims],
                 grid: (256, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[1, depth]], outputDTypes: [.int32])[0].asType(drafted.dtype)
+            return (tokens, longestRun)
         }
 
         // The prompt continuation of every alignment, [candidates, depth].
@@ -286,7 +316,7 @@ enum CBv2PromptLookupDraft {
                         + "j=\(Int(flat) / candidates) c=\(Int(flat) % candidates) "
                         + "depth=\(depth)\n").utf8))
         }
-        return proposal
+        return (proposal, longestRun)
     }
 
     struct Hit {
