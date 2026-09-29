@@ -742,6 +742,10 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        // The leading layers built before the previous readback, when this
+        // verify is the one they were built for (`CBv2VerifyLeading`).
+        let leadingArmed = armVerifyLeadingHandoff(verifyRows, k: k)
+        defer { if leadingArmed { closeVerifyLeadingHandoff() } }
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp,
             stackedTokens: CBv2VerifyTokenStack.tokens(

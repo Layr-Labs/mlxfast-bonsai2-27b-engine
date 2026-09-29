@@ -2685,3 +2685,562 @@ enum Qwen35PreworkSplit {
                 + report.joined(separator: "; ") + "\n").data(using: .utf8)!)
     }
 }
+
+// MARK: - Next verify's leading layers before the readback
+
+/// Layers `0 ..< layers` of a verify window built ahead of its verify
+/// (`CBv2VerifyLeading`): the outputs the forward continues from, and the
+/// detached transaction holding those layers' stages.
+final class Qwen35VerifyLeadingHandle {
+    let h: MLXArray
+    let f: MLXArray?
+    let layers: Int
+    let rows: Int
+    let verifyPending: Bool
+    let evaluation: CBv2RecurrentStateEvaluation
+
+    init(
+        h: MLXArray, f: MLXArray?, layers: Int, rows: Int, verifyPending: Bool,
+        evaluation: CBv2RecurrentStateEvaluation
+    ) {
+        self.h = h
+        self.f = f
+        self.layers = layers
+        self.rows = rows
+        self.verifyPending = verifyPending
+        self.evaluation = evaluation
+    }
+}
+
+/// The model side of `CBv2VerifyLeading`: the leading layers through the
+/// same layer calls `Qwen35TextModelInner.cbv2Forward` makes, their adoption
+/// into the verify's own transaction, and the load-time bitwise self-test.
+enum Qwen35VerifyLeading {
+    /// The self-test's verdict (nil: not run).
+    nonisolated(unsafe) static var verdict: Bool?
+
+    /// The leading layers of a window of `tokens` over `evaluation`; nil
+    /// where they are not all recurrent, a tap layer is among them, or the
+    /// window's path is not one this reproduces.
+    static func build(
+        _ inner: Qwen35TextModelInner, tokens: MLXArray,
+        evaluation: CBv2RecurrentStateEvaluation, layers count: Int
+    ) -> Qwen35VerifyLeadingHandle? {
+        let decoder = inner.cbv2DecoderLayers
+        guard count >= 1, count < decoder.count, !inner.exactTargetVerify,
+            tokens.ndim == 2, tokens.dim(0) == 1,
+            decoder.prefix(count).allSatisfy(\.isLinear),
+            !(inner.dFlash2Tap.layerIds ?? []).contains(where: { $0 < count }),
+            !Qwen35GDNReplayBatch.enabled
+        else { return nil }
+        let rows = tokens.dim(1)
+        let verifyPending = inner.cbv2VerifyTakesPending(windowRows: rows)
+        var h = inner.embedTokens(tokens)
+        var pending: MLXArray? = nil
+        for index in 0 ..< count {
+            if verifyPending {
+                let out = decoder[index].cbv2ForwardPending(
+                    h, pending: pending, modelLayerIndex: index, attentionCache: nil,
+                    recurrentState: [evaluation], positionIds: nil, lastRowOnly: false,
+                    captureRecurrentWindow: true)
+                h = out.h
+                pending = out.f
+            } else {
+                h = decoder[index].cbv2Forward(
+                    h, modelLayerIndex: index, attentionCache: nil,
+                    recurrentState: [evaluation], positionIds: nil,
+                    captureRecurrentWindow: true, exactTargetVerify: false, lastRowOnly: false)
+            }
+        }
+        return Qwen35VerifyLeadingHandle(
+            h: h, f: pending, layers: count, rows: rows, verifyPending: verifyPending,
+            evaluation: evaluation)
+    }
+
+    /// The engine's speculation: built and submitted behind the verify. A
+    /// layer whose input is the in-flight verify's deferred full-acceptance
+    /// replay waits here for that verify's tape of the layer
+    /// (`Qwen35GDNReplayFused.launch` evaluates it); host time only, inside
+    /// the measured rounds.
+    static func speculate(
+        _ inner: Qwen35TextModelInner, tokens: [Int32],
+        recurrentState: CBv2RecurrentStateEvaluation, layers: Int
+    ) -> AnyObject? {
+        guard verdict == true,
+            let handle = build(
+                inner, tokens: MLXArray(tokens).reshaped([1, tokens.count]),
+                evaluation: recurrentState, layers: layers)
+        else { return nil }
+        asyncEval(handle.f.map { [handle.h, $0] } ?? [handle.h])
+        return handle
+    }
+
+    /// True when the verify's input state of `index` is the one the handle's
+    /// input previewed: the same deferred replay inputs and keep, or the same
+    /// final state. Never builds a pending replay.
+    private static func sameCommit(
+        _ real: CBv2RecurrentLayerState?, _ preview: CBv2RecurrentLayerState?
+    ) -> Bool {
+        guard let real, let preview else { return false }
+        if let a = real.deferredReplay, let b = preview.deferredReplay {
+            return a.inputs === b.inputs && a.keep == b.keep
+        }
+        guard real.deferredReplay == nil, preview.deferredReplay == nil,
+            let a = real.ssm, let b = preview.ssm
+        else { return false }
+        return a === b
+    }
+
+    /// The handoff, adopted into `recurrentState`'s transaction: its stages
+    /// move over and the verify's pending committed replays take the values
+    /// the speculation's scans resolved. nil (nothing changed) when anything
+    /// differs from what the handle was built for.
+    static func adopt(
+        _ recurrentState: [CBv2RecurrentStateEvaluation], rows: Int, verifyPending: Bool
+    ) -> Qwen35VerifyLeadingHandle? {
+        guard let handle = CBv2VerifyLeading.takeHandoff() as? Qwen35VerifyLeadingHandle,
+            recurrentState.count == 1, handle.rows == rows,
+            handle.verifyPending == verifyPending
+        else { return nil }
+        let real = recurrentState[0]
+        let indices = Array(0 ..< handle.layers)
+        for index in indices
+        where !sameCommit(
+            real.inputState(modelLayerIndex: index),
+            handle.evaluation.inputState(modelLayerIndex: index))
+        {
+            return nil
+        }
+        do {
+            try real.adoptStagedPrefixReplay(from: handle.evaluation, layers: indices)
+        } catch {
+            return nil
+        }
+        for index in indices {
+            if let deferred = real.inputState(modelLayerIndex: index)?.deferredReplay,
+                deferred.isPending,
+                let ssm = handle.evaluation.inputState(modelLayerIndex: index)?.ssm
+            {
+                _ = deferred.resolve(ssm)
+            }
+        }
+        CBv2VerifyLeading.noteAdopted()
+        return handle
+    }
+
+    /// Bitwise comparisons (the elements as unsigned integers of their
+    /// width, reduced to one flag each), evaluated in batches: one readback
+    /// per `flush`.
+    private final class Comparison {
+        private(set) var values = 0
+        private(set) var failures: [String] = []
+        private var queued: [(what: String, differ: MLXArray, size: Int)] = []
+
+        func add(_ a: MLXArray?, _ b: MLXArray?, _ what: String) {
+            guard let a, let b else {
+                if (a == nil) != (b == nil) { failures.append("\(what) presence") }
+                return
+            }
+            guard a.shape == b.shape, a.dtype == b.dtype else {
+                failures.append("\(what) shape")
+                return
+            }
+            let bits: DType =
+                switch a.dtype.size {
+                case 1: .uint8
+                case 2: .uint16
+                case 8: .uint64
+                default: .uint32
+                }
+            queued.append((what, (a.view(dtype: bits) .!= b.view(dtype: bits)).any(), a.size))
+        }
+
+        func fail(_ what: String) { failures.append(what) }
+
+        func flush() {
+            guard !queued.isEmpty else { return }
+            eval(queued.map(\.differ))
+            for entry in queued {
+                if !entry.differ.item(Bool.self) {
+                    values += entry.size
+                } else {
+                    failures.append(entry.what)
+                }
+            }
+            queued.removeAll()
+        }
+    }
+
+    /// One case of the leading-layer self-test: the rows the first and the
+    /// second window's commits keep, and how state A's second window gets its
+    /// leading layers.
+    private struct LeadingCase {
+        enum Path {
+            /// Handed to the verify, which adopts them (full acceptance).
+            case adopted
+            /// Built at full acceptance, then dropped by the engine (a bonus or
+            /// lookup mismatch): never handed over; the verify builds its own.
+            case dropped
+            /// Handed over after a strict-prefix commit: the model refuses them.
+            case refused
+        }
+        let keep: Int
+        let later: Int
+        let path: Path
+        /// The first window as a verify that stored its final state (what a
+        /// verify leaves with `MLXFAST_GDN_VERIFY_STATE_SKIP=0` or the chunked
+        /// verify on): full acceptance commits that state as is, so the
+        /// verify's input matches by identity, with no deferred replay.
+        var stored = false
+    }
+
+    private static let leadingCases: [LeadingCase] = [
+        LeadingCase(keep: 16, later: 16, path: .adopted),
+        LeadingCase(keep: 16, later: 5, path: .adopted),
+        LeadingCase(keep: 16, later: 11, path: .dropped),
+        LeadingCase(keep: 15, later: 5, path: .refused),
+        LeadingCase(keep: 8, later: 11, path: .refused),
+        LeadingCase(keep: 1, later: 1, path: .refused),
+        LeadingCase(keep: 16, later: 16, path: .adopted, stored: true),
+        LeadingCase(keep: 16, later: 5, path: .adopted, stored: true),
+    ]
+
+    private static func randomState(
+        _ layer: CBv2RecurrentLayerStateSpec, seed: UInt64
+    ) -> (conv: MLXArray, ssm: MLXArray) {
+        let conv = (MLXRandom.normal(layer.convShape, key: MLXRandom.key(seed)) * 0.5)
+            .asType(layer.convDType)
+        let ssm = (MLXRandom.normal(layer.ssmShape, key: MLXRandom.key(seed + 500)) * 0.05)
+            .asType(layer.ssmDType)
+        eval(conv, ssm)
+        return (conv, ssm)
+    }
+
+    /// `LeadingCase.stored`'s first window: each layer staged with a stored
+    /// final state, full acceptance by the model's own form for one
+    /// (`Qwen35GatedDeltaNet`'s compact replay stage).
+    private static func stageStored(
+        _ evaluation: CBv2RecurrentStateEvaluation, layers: [CBv2RecurrentLayerStateSpec],
+        rows: Int, seed: UInt64
+    ) throws {
+        for (j, layer) in layers.enumerated() {
+            let (conv, ssm) = randomState(layer, seed: seed + UInt64(j))
+            try evaluation.stagePrefixReplay(
+                modelLayerIndex: layer.modelLayerIndex, positions: rows, finalConv: conv,
+                finalSSM: ssm, materializedByteCount: 0, evaluationRoots: [conv, ssm],
+                strictReplayRetainedByteCount: 0, strictReplayRetainedRoots: [],
+                fullAcceptance: {
+                    CBv2RecurrentLayerState(
+                        conv: conv + MLXArray.zeros(conv.shape, dtype: conv.dtype), ssm: ssm)
+                },
+                replay: { _ in CBv2RecurrentLayerState(conv: conv, ssm: ssm) })
+        }
+    }
+
+    /// Bitwise self-test, in two parts.
+    ///
+    /// Layers `0 ..< layers` alone (`leadingCases`): two request states with
+    /// the same random committed state each run a 16-row window through
+    /// `build` (the forward's own layer calls) and commit it, and a second
+    /// window follows. On A the second window's layers were built before the
+    /// first commit, from the full-acceptance preview, and are adopted,
+    /// dropped or refused as the case says; B builds them after the commit, as
+    /// the record does. The outputs, every staged array, the resolved input
+    /// states and the states a later commit leaves must be identical.
+    ///
+    /// The real forward (`forwardCase`): the target's own capture-verify
+    /// forward over a lookup streak with 1, 2 and 3 layers adopted, against
+    /// the handoff off.
+    static func selfTest(
+        _ target: Qwen35TextModel, tap: [Int]?, layers count: Int = 3
+    ) -> (passed: Bool, detail: String) {
+        let inner = target.model
+        let specLayers = target.cbv2RecurrentStateSpec.layers.filter { $0.modelLayerIndex < count }
+        guard specLayers.count == count else { return (false, "leading layers not recurrent") }
+        let spec = CBv2RecurrentStateSpec(layers: specLayers)
+        let indices = Array(0 ..< count)
+        let rows = 16
+        let compare = Comparison()
+        // Freed buffers go straight back to the system while the test runs:
+        // its forward case makes many one-off sizes, and MLX's cache (by
+        // default as large as the memory limit) would otherwise keep them,
+        // raising the process footprint at load beside the resident weights.
+        let cacheLimit = Memory.cacheLimit
+        Memory.cacheLimit = 0
+        defer {
+            CBv2VerifyLeading.handoff = nil
+            _ = CBv2VerifyLeading.takeAdopted()
+            Memory.cacheLimit = cacheLimit
+            Memory.clearCache()
+        }
+        func tokens(_ seed: UInt64) -> MLXArray {
+            MLXRandom.randInt(Int32(0) ..< Int32(20_000), [1, rows], key: MLXRandom.key(seed))
+                .asType(.int32)
+        }
+        do {
+            for (caseIndex, c) in leadingCases.enumerated() {
+                let seed = UInt64(10 * caseIndex)
+                var committed: [Int: CBv2RecurrentLayerState] = [:]
+                for (j, layer) in specLayers.enumerated() {
+                    let (conv, ssm) = randomState(layer, seed: 1000 + seed + UInt64(j))
+                    committed[layer.modelLayerIndex] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+                }
+                let first = tokens(3000 + UInt64(caseIndex))
+                let second = tokens(4000 + UInt64(caseIndex))
+                let a = try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: committed)
+                let b = try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: committed)
+                var windows: [CBv2RecurrentStateEvaluation] = []
+                for state in [a, b] {
+                    let evaluation = try state.bind()
+                    if c.stored {
+                        try stageStored(evaluation, layers: specLayers, rows: rows, seed: 5000 + seed)
+                        eval(try evaluation.evaluate())
+                    } else {
+                        guard let out = build(inner, tokens: first, evaluation: evaluation, layers: count)
+                        else { return (false, "leading layers do not apply") }
+                        asyncEval(try evaluation.evaluate() + [out.h] + (out.f.map { [$0] } ?? []))
+                    }
+                    windows.append(evaluation)
+                }
+                // Before the first window's commit, while it may still run,
+                // as the engine builds it before the readback.
+                guard let preview = a.speculativeFullAcceptanceEvaluation(layers: indices),
+                    let handle = build(inner, tokens: second, evaluation: preview, layers: count)
+                else { return (false, "no full-acceptance preview") }
+                asyncEval(handle.f.map { [handle.h, $0] } ?? [handle.h])
+                try windows[0].commit(keepPositions: c.keep)
+                try windows[1].commit(keepPositions: c.keep)
+                let ea = try a.bind()
+                let eb = try b.bind()
+                var adopted: Qwen35VerifyLeadingHandle?
+                if c.path == .dropped {
+                    // The dropped speculation runs to completion first.
+                    eval(handle.f.map { [handle.h, $0] } ?? [handle.h])
+                } else {
+                    CBv2VerifyLeading.handoff = handle
+                    adopted = adopt([ea], rows: rows, verifyPending: handle.verifyPending)
+                    CBv2VerifyLeading.handoff = nil
+                    if CBv2VerifyLeading.takeAdopted() != (adopted != nil)
+                        || (adopted != nil) != (c.path == .adopted)
+                    {
+                        return (false, "case \(caseIndex): adoption \(adopted != nil)")
+                    }
+                }
+                let outA: (h: MLXArray, f: MLXArray?)
+                if let adopted {
+                    outA = (adopted.h, adopted.f)
+                } else {
+                    guard let out = build(inner, tokens: second, evaluation: ea, layers: count)
+                    else { return (false, "leading layers do not apply") }
+                    outA = (out.h, out.f)
+                }
+                guard let outB = build(inner, tokens: second, evaluation: eb, layers: count)
+                else { return (false, "leading layers do not apply") }
+                let ra = try ea.evaluate()
+                let rb = try eb.evaluate()
+                let label = "case \(caseIndex)"
+                compare.add(outA.h, outB.h, "\(label) h")
+                compare.add(outA.f, outB.f, "\(label) f")
+                if ra.count != rb.count { compare.fail("\(label) staged count") }
+                for (x, y) in zip(ra, rb) { compare.add(x, y, "\(label) staged") }
+                for index in indices {
+                    let x = ea.inputState(modelLayerIndex: index)
+                    let y = eb.inputState(modelLayerIndex: index)
+                    compare.add(x?.conv, y?.conv, "\(label) input conv \(index)")
+                    compare.add(x?.ssm, y?.ssm, "\(label) input ssm \(index)")
+                }
+                try ea.commit(keepPositions: c.later)
+                try eb.commit(keepPositions: c.later)
+                for index in indices {
+                    let x = a.state(modelLayerIndex: index)
+                    let y = b.state(modelLayerIndex: index)
+                    compare.add(x?.conv, y?.conv, "\(label) committed conv \(index)")
+                    compare.add(x?.ssm, y?.ssm, "\(label) committed ssm \(index)")
+                }
+                compare.flush()
+                try a.release()
+                try b.release()
+            }
+            if compare.failures.isEmpty,
+                let failure = try forwardCase(target, tap: tap, compare: compare)
+            {
+                return (false, failure)
+            }
+        } catch {
+            return (false, "error \(error)")
+        }
+        compare.flush()
+        if !compare.failures.isEmpty {
+            return (
+                false,
+                "\(compare.failures.count) mismatches (\(compare.failures.prefix(3).joined(separator: "; ")))"
+            )
+        }
+        return (
+            true,
+            "self-test passed (leading \(count) layers vs the verify's own build: adopted at keep 16"
+                + " then 16/5, stored state adopted then 16/5, dropped at 16, refused at 15/8/1;"
+                + " real forward, 4-window lookup streak with 1/2/3 layers adopted vs off: logits,"
+                + " hidden, tap, GDN and KV state; \(compare.values) values bitwise, 0 mismatches)"
+        )
+    }
+
+    /// The real forward, adopted against off: two fresh request states
+    /// (attention caches, KV rows, recurrent state) take the same 48-token
+    /// prompt, then the same four 16-row windows through the target's own
+    /// capture-verify forward (`cbv2ForwardWithHiddenCaptured`, the drafter's
+    /// tap armed), each committed at full acceptance, the last at 7 rows. On
+    /// A the leading 1, 2 and 3 layers of windows 2-4 are built from the
+    /// full-acceptance preview while the window before is in flight, as the
+    /// engine builds them before its readback, and handed to that verify,
+    /// which must adopt them; B's handoff is off. The logits, final hidden,
+    /// tap, every staged recurrent array and resolved input state of each
+    /// window, then every GDN state and KV row the last commit leaves, must
+    /// be identical. Returns the failure, or nil.
+    private static func forwardCase(
+        _ target: Qwen35TextModel, tap: [Int]?, compare: Comparison
+    ) throws -> String? {
+        let adapter = CBv2SteppableLanguageModelAdapter(target)
+        guard adapter.supportsCapturedVerifyWindow, let spec = adapter.recurrentStateSpec
+        else { return "no captured verify" }
+        let promptRows = 48
+        let rows = 16
+        let windows = 4
+        let backend = CBv2ContiguousKVBackend(
+            config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
+        let previousTap = target.dFlash2TapLayerIds
+        target.dFlash2TapLayerIds = tap
+        var legs:
+            [(bank: CBv2LayerCacheBank, row: [(any CBv2SequenceKV)?], state: CBv2RecurrentRequestState)] =
+                []
+        defer {
+            target.dFlash2TapLayerIds = previousTap
+            target.model.dFlash2Tap.tappedHidden = nil
+            CBv2VerifyLeading.handoff = nil
+            _ = CBv2VerifyLeading.takeAdopted()
+            for leg in legs {
+                leg.bank.releaseBoundRows()
+                backend.release(leg.row)
+                if !leg.state.isReleased { try? leg.state.release() }
+            }
+        }
+        for _ in 0 ..< 2 {
+            let caches = target.newCacheV2(makeLayerCache: { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            })
+            let row = try backend.makeSequenceState(
+                layerKinds: target.cbv2LayerKinds, promptLength: 0,
+                maxLength: promptRows + windows * rows + 16)
+            let state = try CBv2RecurrentRequestState(spec: spec)
+            legs.append((CBv2LayerCacheBank(caches: caches), row, state))
+        }
+        let prompt = MLXArray((0 ..< promptRows).map { Int32(100 + ($0 &* 7919) % 20_000) })
+            .reshaped([1, promptRows])
+        for leg in legs {
+            let evaluation = try leg.state.bind()
+            let out = adapter.forwardWithHiddenForPrefill(
+                tokens: prompt, caches: leg.bank.layerCaches(rowStates: [leg.row]),
+                recurrentState: [evaluation], positionIds: nil, requirement: .lastPositionLogits)
+            let roots = try evaluation.evaluate()
+            eval([out.logits, out.lastHidden] + roots)
+            try evaluation.commit()
+        }
+        func ids(_ window: Int) -> MLXArray {
+            MLXArray((0 ..< rows).map { Int32(100 + (($0 + rows * window) &* 104_729) % 20_000) })
+                .reshaped([1, rows])
+        }
+        let names = ["logits", "hidden", "tap"]
+        var handle: Qwen35VerifyLeadingHandle?
+        for window in 0 ..< windows {
+            var evaluations: [CBv2RecurrentStateEvaluation] = []
+            var outputs: [[MLXArray?]] = []
+            for (legIndex, leg) in legs.enumerated() {
+                let caches = leg.bank.layerCaches(rowStates: [leg.row])
+                let serializing = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
+                for cache in serializing { cache.mtpSerializesRectangularAttention = true }
+                let evaluation = try leg.state.bind()
+                let armed = legIndex == 0 ? handle : nil
+                CBv2VerifyLeading.handoff = armed
+                let out = adapter.forwardWithHiddenCaptured(
+                    tokens: ids(window), caches: caches, recurrentState: [evaluation],
+                    positionIds: nil)
+                for cache in serializing { cache.mtpSerializesRectangularAttention = false }
+                CBv2VerifyLeading.handoff = nil
+                if CBv2VerifyLeading.takeAdopted() != (armed != nil) {
+                    return "forward window \(window + 1): adoption \(armed == nil)"
+                }
+                guard evaluation.isCaptured else { return "forward window not captured" }
+                let roots = try evaluation.evaluate()
+                let tapped = target.dFlash2TappedHidden
+                asyncEval([out.logits, out.lastHidden] + (tapped.map { [$0] } ?? []) + roots)
+                if legIndex == 0 {
+                    handle = nil
+                    if window + 1 < windows {
+                        // The next window's leading layers before this one's
+                        // readback, from its full-acceptance preview.
+                        let count = min(window + 1, 3)
+                        guard
+                            let preview = leg.state.speculativeFullAcceptanceEvaluation(
+                                layers: Array(0 ..< count)),
+                            let next = build(
+                                target.model, tokens: ids(window + 1), evaluation: preview,
+                                layers: count)
+                        else { return "forward window \(window + 2): no speculation" }
+                        asyncEval(next.f.map { [next.h, $0] } ?? [next.h])
+                        handle = next
+                    }
+                }
+                evaluations.append(evaluation)
+                outputs.append([out.logits, out.lastHidden, tapped] + (roots as [MLXArray?]))
+            }
+            let label = "forward window \(window + 1)"
+            if outputs[0].count != outputs[1].count { compare.fail("\(label) staged count") }
+            for (index, (x, y)) in zip(outputs[0], outputs[1]).enumerated() {
+                compare.add(x, y, "\(label) " + (index < names.count ? names[index] : "staged"))
+            }
+            for layer in spec.layers {
+                let x = evaluations[0].inputState(modelLayerIndex: layer.modelLayerIndex)
+                let y = evaluations[1].inputState(modelLayerIndex: layer.modelLayerIndex)
+                compare.add(x?.conv, y?.conv, "\(label) input conv \(layer.modelLayerIndex)")
+                compare.add(x?.ssm, y?.ssm, "\(label) input ssm \(layer.modelLayerIndex)")
+            }
+            let keep = window + 1 == windows ? 7 : rows
+            for evaluation in evaluations { try evaluation.commit(keepPositions: keep) }
+            compare.flush()
+        }
+        for layer in spec.layers {
+            let x = legs[0].state.state(modelLayerIndex: layer.modelLayerIndex)
+            let y = legs[1].state.state(modelLayerIndex: layer.modelLayerIndex)
+            compare.add(x?.conv, y?.conv, "forward committed conv \(layer.modelLayerIndex)")
+            compare.add(x?.ssm, y?.ssm, "forward committed ssm \(layer.modelLayerIndex)")
+        }
+        for (x, y) in zip(legs[0].row, legs[1].row) {
+            guard let x, let y else { continue }
+            let p = x.snapshot()
+            let q = y.snapshot()
+            if p.offset != q.offset { compare.fail("forward kv offset") }
+            compare.add(p.keys, q.keys, "forward kv keys")
+            compare.add(p.values, q.values, "forward kv values")
+        }
+        compare.flush()
+        return nil
+    }
+}
+
+extension Qwen35TextModel: CBv2VerifyLeadingSpeculating {
+    public func speculateVerifyLeading(
+        tokens: [Int32], recurrentState: CBv2RecurrentStateEvaluation, layers: Int
+    ) -> AnyObject? {
+        Qwen35VerifyLeading.speculate(
+            model, tokens: tokens, recurrentState: recurrentState, layers: layers)
+    }
+}
+
+extension Qwen35Model: CBv2VerifyLeadingSpeculating {
+    public func speculateVerifyLeading(
+        tokens: [Int32], recurrentState: CBv2RecurrentStateEvaluation, layers: Int
+    ) -> AnyObject? {
+        languageModel.speculateVerifyLeading(
+            tokens: tokens, recurrentState: recurrentState, layers: layers)
+    }
+}

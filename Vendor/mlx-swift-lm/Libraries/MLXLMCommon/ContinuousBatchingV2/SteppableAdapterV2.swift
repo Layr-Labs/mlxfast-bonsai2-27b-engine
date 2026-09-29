@@ -457,6 +457,15 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
 
 
 
+extension CBv2SteppableLanguageModelAdapter: CBv2VerifyLeadingSpeculating {
+    public func speculateVerifyLeading(
+        tokens: [Int32], recurrentState: CBv2RecurrentStateEvaluation, layers: Int
+    ) -> AnyObject? {
+        (model as? any CBv2VerifyLeadingSpeculating)?.speculateVerifyLeading(
+            tokens: tokens, recurrentState: recurrentState, layers: layers)
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
         (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true

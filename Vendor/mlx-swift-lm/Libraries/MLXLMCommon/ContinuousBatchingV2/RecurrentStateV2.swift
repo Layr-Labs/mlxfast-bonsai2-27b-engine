@@ -571,15 +571,7 @@ public final class CBv2RecurrentRequestState {
             // A replayed commit may stay deferred (`CBv2DeferredRecurrentReplay`):
             // its builder is exactly the eager expression beside it.
             if fullAcceptance {
-                committed = replay.mapValues { stage in
-                    if stage.finalState.ssm == nil,
-                        let deferred = stage.deferredState(
-                            keep: keep, build: { stage.fullAcceptance?() ?? stage.finalState })
-                    {
-                        return deferred
-                    }
-                    return stage.fullAcceptance?() ?? stage.finalState
-                }
+                committed = replay.mapValues { Self.fullAcceptanceState($0, keep: keep) }
             } else {
                 committed = replay.mapValues { stage in
                     stage.deferredState(keep: keep, build: { stage.replay(keep) })
@@ -614,6 +606,43 @@ public final class CBv2RecurrentRequestState {
             committed = first.layers
         }
         pending.removeFirst()
+    }
+
+    /// The committed state of one compact-replay layer after all `keep`
+    /// (= its positions) rows: deferred when the stage defers, else its
+    /// full-acceptance builder or final state.
+    private static func fullAcceptanceState(
+        _ stage: CBv2RecurrentPrefixReplayStage, keep: Int
+    ) -> CBv2RecurrentLayerState {
+        if stage.finalState.ssm == nil,
+            let deferred = stage.deferredState(
+                keep: keep, build: { stage.fullAcceptance?() ?? stage.finalState })
+        {
+            return deferred
+        }
+        return stage.fullAcceptance?() ?? stage.finalState
+    }
+
+    /// A detached transaction over `layers` whose input is the state
+    /// `commit(keepPositions:)` of the one pending compact-replay window
+    /// would leave at full acceptance, built by the same builders; nil for
+    /// any other pending shape. This state is not changed, and nothing it
+    /// tracks sees the transaction (`CBv2VerifyLeading`).
+    public func speculativeFullAcceptanceEvaluation(
+        layers: [Int]
+    ) -> CBv2RecurrentStateEvaluation? {
+        guard !isReleased, !bindingOpen, pending.count == 1,
+            let replay = pending[0].prefixReplay,
+            let positions = replay.values.first?.positions
+        else { return nil }
+        var input: [Int: CBv2RecurrentLayerState] = [:]
+        for index in layers {
+            guard let stage = replay[index] else { return nil }
+            input[index] = Self.fullAcceptanceState(stage, keep: positions)
+        }
+        return CBv2RecurrentStateEvaluation(
+            owner: self, generation: .max, input: input, requiredLayers: Set(layers),
+            detached: true)
     }
 
     fileprivate func rollback(generation: UInt64) throws {
@@ -664,6 +693,8 @@ public final class CBv2RecurrentStateEvaluation {
     private var stagedPrefixReplay: [Int: CBv2RecurrentPrefixReplayStage] = [:]
     private var evaluated = false
     private var finalized = false
+    /// Not tracked by its owner: stages only, for `adoptStagedPrefixReplay`.
+    private let detached: Bool
 
     /// True when this transaction staged per-position captured stacks
     /// (MTP capture-verify) and must be finalized via
@@ -674,16 +705,46 @@ public final class CBv2RecurrentStateEvaluation {
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
-        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>
+        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>,
+        detached: Bool = false
     ) {
         self.owner = owner
         self.generation = generation
         self.input = input
         self.requiredLayers = requiredLayers
+        self.detached = detached
     }
 
     deinit {
-        if !evaluated { owner.abandonBinding() }
+        if !evaluated, !detached { owner.abandonBinding() }
+    }
+
+    /// Moves a detached transaction's compact-replay stages of `layers` into
+    /// this one, as if this transaction had staged them. All or nothing.
+    public func adoptStagedPrefixReplay(
+        from other: CBv2RecurrentStateEvaluation, layers: [Int]
+    ) throws {
+        guard other.detached, !detached, !evaluated, !finalized, staged.isEmpty,
+            stagedCapturedPositions == nil
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation("invalid staged adoption")
+        }
+        var moved: [Int: CBv2RecurrentPrefixReplayStage] = [:]
+        for index in layers {
+            guard requiredLayers.contains(index), stagedPrefixReplay[index] == nil,
+                let stage = other.stagedPrefixReplay[index]
+            else {
+                throw CBv2RecurrentStateError.lifecycleViolation(
+                    "staged adoption of layer \(index) is not possible")
+            }
+            moved[index] = stage
+        }
+        guard Set((moved.values.map(\.positions)) + stagedPrefixReplay.values.map(\.positions))
+            .count <= 1
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation("staged adoption width mismatch")
+        }
+        for (index, stage) in moved { stagedPrefixReplay[index] = stage }
     }
 
     public func inputState(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {

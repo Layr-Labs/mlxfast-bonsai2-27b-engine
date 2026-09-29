@@ -55,12 +55,26 @@ enum CBv2PromptLookupDraft {
     /// Requests whose newest proposal came from the prompt.
     nonisolated(unsafe) private static var fromPrompt: Set<CBv2RequestID> = []
 
+    /// The ids of the newest host lookup hit (`lookup`/`override`), nil after
+    /// a miss or a splice; under `lock`.
+    nonisolated(unsafe) private static var hitIDs: [Int]?
+    static var lastHitIDs: [Int]? { lock.withLock { hitIDs } }
+    private static func noteHit(_ ids: [Int]?) { lock.withLock { hitIDs = ids } }
+    /// Each request's newest proposal ids when they came from a host lookup.
+    nonisolated(unsafe) private static var proposedIDs: [CBv2RequestID: [Int]] = [:]
+
     /// Records where `id`'s newest proposal came from.
     static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool) {
         guard enabled, skipEnabled else { return }
         lock.withLock {
             if prompt { fromPrompt.insert(id) } else { fromPrompt.remove(id) }
+            proposedIDs[id] = prompt ? hitIDs : nil
         }
+    }
+
+    /// `id`'s newest proposal ids when a host lookup made them (not a splice).
+    static func hostProposal(_ id: CBv2RequestID) -> [Int]? {
+        lock.withLock { fromPrompt.contains(id) ? proposedIDs[id] : nil }
     }
 
     /// True when `id`'s newest proposal came from the prompt, so its next
@@ -72,11 +86,13 @@ enum CBv2PromptLookupDraft {
 
     /// The next round's ids from the prompt, or nil (then the drafter runs).
     static func lookup(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+        noteHit(nil)
         guard enabled, depth > 0,
             let hit = continuation(history: history, promptLength: promptLength, depth: depth)
         else { return nil }
         FileHandle.standardError.write(
             Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth), drafter skipped\n".utf8))
+        noteHit(hit.ids)
         return MLXArray(hit.ids, [1, depth])
     }
 
@@ -107,12 +123,14 @@ enum CBv2PromptLookupDraft {
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
+        noteHit(nil)
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
         else { return proposal }
         if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
             FileHandle.standardError.write(
                 Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
+            noteHit(hit.ids)
             return MLXArray(hit.ids, [1, depth])
         }
         guard spliceEnabled else { return proposal }
