@@ -957,6 +957,17 @@ public final class EngineLoopV2: @unchecked Sendable {
                     finishRequest(
                         rec.id, reason: .cancelled, nowNanos: drainNanos, now: drainNow)
                 }
+                // Running rows are cancelled at the next step boundary instead
+                // of being left to finish naturally. A free-run row asks for
+                // thousands of tokens, so a natural finish always ran into the
+                // shutdown timeout, and that path returns while the loop is
+                // still stepping: its GPU work then completes after the
+                // caller's allocator drain and repopulates the buffer cache.
+                // Cancelling ends the drain one round later, with nothing left
+                // in flight (`completeStop` synchronizes before resuming).
+                if Self.drainCancelsRunningRows {
+                    for rec in scheduler.running { requestCancel(rec.id) }
+                }
                 publishGauges()
                 drainWaiters.append(waiter)
                 completeDrainIfReady()
@@ -993,7 +1004,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// `CBV2_DRAIN_CANCELS_RUNNING=0` restores the natural-finish drain.
+    static let drainCancelsRunningRows: Bool = {
+        let value = ProcessInfo.processInfo.environment["CBV2_DRAIN_CANCELS_RUNNING"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private func completeStop() {
+        // Nothing the loop submitted may still be executing once the drain
+        // waiters resume: the caller clears the allocator cache next, and a
+        // command buffer that completes afterwards returns its buffers to the
+        // cache it just cleared. Synchronize this queue's default stream and
+        // the global streams (the idiom `handlePagedWriteFailure` uses).
+        if Self.drainCancelsRunningRows {
+            Stream().synchronize()
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+        }
         mtp?.removeAllRequestState()
         logitDiagnostic = nil
         attentionMetadata?.discardPendingForward()

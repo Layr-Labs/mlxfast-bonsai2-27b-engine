@@ -2380,7 +2380,10 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
 
   // Few-row path: three disjoint partial arrays fit in the existing Xs/Ws.
   // Keep the baseline pairwise addition order: (C0 + C1) + (C2 + C3).
-  if constexpr (kHalves == 1) {
+  // It needs 2 * 16 * SIMD_SIZE floats in red0, which only the FP32-typed
+  // Xs holds; an FP16-typed tile takes the tree reduction below, which sums
+  // in the same order within 8 * SIMD_SIZE floats per half.
+  if constexpr (kHalves == 1 && sizeof(T) == sizeof(float)) {
     constexpr int partial_size = 16 * SIMD_SIZE;
     if (simd_gid != 0) {
       threadgroup float* dst = simd_gid == 3 ? red1 :
@@ -2559,6 +2562,28 @@ template <
           (threadgroup float*)Xs, (threadgroup float*)Ws);
     }
     return;
+  }
+  // FP16 input takes the same body: its fragments and accumulators are FP32
+  // (U), and the half activations, scales and offsets widen exactly on load,
+  // so every product and sum is the one the FP32 body forms from those
+  // values. The FP32 scratch of the cross-simdgroup reduction fits in the
+  // half-typed Xs / Ws for one 16-row half; wider tiles keep the SIMD body.
+  if constexpr (
+      kSplitkNax && metal::is_same_v<T, half> && bits == 2 &&
+      group_size == 128 && BM == 32 && BN == 32) {
+    static_assert(
+        2 * 8 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
+        "splitk NAX half reduction must fit in Xs / Ws");
+    const int rows = min(M - int(tid.y) * BM, BM);
+    if (rows <= 16) {
+      const device T* xt = x + int(tid.y) * BM * static_cast<int64_t>(K);
+      device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
+      qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
+          (const device uint32_t*)wl, scales, biases, xt, yt, K, N, rows,
+          k_partition_size, int(tid.x) * BN, simd_gid, simd_lid,
+          (threadgroup float*)Xs, (threadgroup float*)Ws);
+      return;
+    }
   }
 #endif
   qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
