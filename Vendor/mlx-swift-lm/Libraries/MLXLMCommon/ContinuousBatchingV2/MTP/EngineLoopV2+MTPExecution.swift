@@ -685,6 +685,21 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else if let tokens = CBv2PromptLookupDraft.firstRoundLookup(
+                    history: row.rec.tokens,
+                    promptLength: row.rec.request.promptTokens.count, depth: k)
+                {
+                    // The first round after the prompt quotes it from its first
+                    // token: the prompt's ids are the block and the drafter's
+                    // block is not built. Its cache keeps the prompt's absorbed
+                    // context untouched; this round's committed rows queue as
+                    // pending for the next block that runs.
+                    proposal = tokens
+                    // A host lookup's continuation, as the finalize path's
+                    // lookup notes it: the next block is held until the
+                    // readback, when the lookup runs first again.
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: true, host: true)
+                    CBv2VerifyQueueHint.markNothingAhead()
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
