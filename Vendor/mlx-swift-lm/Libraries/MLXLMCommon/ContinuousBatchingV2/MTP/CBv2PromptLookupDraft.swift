@@ -16,20 +16,6 @@
 import Foundation
 import MLX
 
-/// What the model may know about the verify being built: whether its
-/// proposal came from the prompt (the lookup or the splice). Set by the
-/// engine around a single-row block verify's graph build, false otherwise.
-public enum CBv2VerifyRoundHint {
-    nonisolated(unsafe) public private(set) static var proposalFromPrompt = false
-
-    /// Runs `body` (the verify build) with the hint set to `fromPrompt`.
-    static func building<T>(fromPrompt: Bool, _ body: () throws -> T) rethrows -> T {
-        proposalFromPrompt = fromPrompt
-        defer { proposalFromPrompt = false }
-        return try body()
-    }
-}
-
 enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_LOOKUP=0` keeps the drafter's block.
     static let enabled: Bool = {
@@ -69,76 +55,19 @@ enum CBv2PromptLookupDraft {
     /// Requests whose newest proposal came from the prompt.
     nonisolated(unsafe) private static var fromPrompt: Set<CBv2RequestID> = []
 
-    /// Requests whose newest proposal is a host lookup's continuation (the
-    /// ids read from the prompt on the host, not a device-side splice).
-    nonisolated(unsafe) private static var hostLookup: Set<CBv2RequestID> = []
-
-    /// Records where `id`'s newest proposal came from; `host` when it is a host
-    /// lookup's continuation (`lookup`, or `override`'s own match).
-    static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool, host: Bool = false) {
-        guard enabled else { return }
+    /// Records where `id`'s newest proposal came from.
+    static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool) {
+        guard enabled, skipEnabled else { return }
         lock.withLock {
-            if host { hostLookup.insert(id) } else { hostLookup.remove(id) }
-            guard skipEnabled else { return }
             if prompt { fromPrompt.insert(id) } else { fromPrompt.remove(id) }
         }
     }
-
-    /// True when `id`'s newest proposal is a host lookup's continuation.
-    static func proposalIsHostLookup(_ id: CBv2RequestID) -> Bool {
-        guard enabled else { return false }
-        return lock.withLock { hostLookup.contains(id) }
-    }
-
-    /// Whether the last `override` returned its host lookup's continuation.
-    /// Read by the engine thread right after the call that set it.
-    nonisolated(unsafe) static var lastOverrideWasHostLookup = false
 
     /// True when `id`'s newest proposal came from the prompt, so its next
     /// round looks the continuation up before running the drafter.
     static func expectsPromptProposal(_ id: CBv2RequestID) -> Bool {
         guard enabled, skipEnabled else { return false }
         return lock.withLock { fromPrompt.contains(id) }
-    }
-
-    /// `MLXFAST_DFLASH_SPLICE_SPECULATION=0` restores the old gate: no next
-    /// block before the readback after any proposal that went through the
-    /// prompt path.
-    ///
-    /// The splice decides on the device, so it returns a new array in every
-    /// round it runs, and `noteProposal` marked every drafter block it saw as
-    /// a proposal from the prompt: for any prompt longer than the depth the
-    /// engine then never built the next block before the readback
-    /// (`CBv2MTPDraftBeforeReadback`), even while nothing is quoted. With this
-    /// on, only a host lookup's continuation (the output is quoting the
-    /// prompt) holds the next block back (`holdsSpeculation`). After a splice
-    /// the block is built before the readback as after any drafter block, and
-    /// it is dropped, unadopted, whenever the host lookup then hits
-    /// (`lookupPreempts`), so the lookup path runs exactly as it did: the
-    /// drafter skipped and the round's context rows left pending. A round
-    /// the lookup misses adopts the block, which the load-time self-test
-    /// proves equal, bit for bit, to `finalizeRound` + `proposeBlock` (ids,
-    /// every cached row and cursor); its ids then go through `override` as
-    /// before. Drafts, acceptance and tokens are unchanged.
-    static let spliceSpeculationEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_SPECULATION"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// True when `id`'s next block may not be built before the readback.
-    static func holdsSpeculation(_ id: CBv2RequestID) -> Bool {
-        guard expectsPromptProposal(id) else { return false }
-        return !spliceSpeculationEnabled || proposalIsHostLookup(id)
-    }
-
-    /// True when a block built before the readback must be dropped because
-    /// the lookup that runs first (`expectsPromptProposal`) hits.
-    static func lookupPreempts(
-        _ id: CBv2RequestID, history: [Int], promptLength: Int, depth: Int
-    ) -> Bool {
-        guard spliceSpeculationEnabled, expectsPromptProposal(id) else { return false }
-        return continuation(history: history, promptLength: promptLength, depth: depth) != nil
     }
 
     /// The next round's ids from the prompt, or nil (then the drafter runs).
@@ -178,14 +107,12 @@ enum CBv2PromptLookupDraft {
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
-        lastOverrideWasHostLookup = false
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
         else { return proposal }
         if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
             FileHandle.standardError.write(
                 Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
-            lastOverrideWasHostLookup = true
             return MLXArray(hit.ids, [1, depth])
         }
         guard spliceEnabled else { return proposal }
@@ -379,15 +306,6 @@ enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
-        // Every longer eligible match contains this suffix and leaves the
-        // same continuation inside the prompt. Prove a miss in one scan
-        // before scanning all longer lengths; ambiguous hits still use the
-        // original longest-match selection below.
-        let minimumSuffix = history[(count - minimum) ..< count]
-        let lastMinimumStart = prompt - minimum - depth
-        guard (0 ... lastMinimumStart).contains(where: { start in
-            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
-        }) else { return nil }
         for length in stride(from: longest, through: minimum, by: -1) {
             let suffix = count - length
             let lastStart = prompt - length - depth

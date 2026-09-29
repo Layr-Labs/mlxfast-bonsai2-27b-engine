@@ -175,10 +175,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
                 row: rows[0], kind: kind, queries: queries, keys: keys, values: values,
                 scale: scale, sinks: sinks, softcap: attentionSoftcap)
         else { return nil }
-        // The offset advance `updateAndAttend` makes, host copy included
-        // (with `CBv2HostPositionOffsets` on, a device-only add here would
-        // leave the host copy behind by this chunk).
-        advancePositionOffsets(by: queries.dim(2))
+        // The offset advance `updateAndAttend` makes.
+        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return blocks
     }
 
@@ -220,40 +218,6 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention)
-    }
-
-    // MARK: - Append written in place by a kernel (`CBv2InPlaceKVAppend`)
-
-    /// Where an `n`-row append a kernel writes itself goes: the one bound
-    /// row's key and value storage and the first row, or nil wherever
-    /// `updateAndAttend` would do anything but a plain update of one
-    /// contiguous full-attention row followed by `attendRowAfterUpdate`
-    /// (receipts, span or keep masks, sinks, several rows, other storage).
-    public func inPlaceAppendDestination(count n: Int, keyDType: DType, valueDType: DType)
-        -> (keys: MLXArray, values: MLXArray, row: Int, previous: MLXArray?)?
-    {
-        guard CBv2InPlaceKVAppend.enabled, kind.sharesKVWithLayer == nil,
-            case .full = kind.attention, !kind.isBidirectional, !kind.hasSinks,
-            rows.count == 1, let row = rows[0] as? CBv2FullSequenceKV,
-            attentionMetadata == nil, attentionPacket == nil, boundSpanContexts == nil
-        else { return nil }
-        return row.inPlaceAppendDestination(count: n, keyDType: keyDType, valueDType: valueDType)
-    }
-
-    /// `updateAndAttend(queries:keys:values:scale:sinks: nil)` for rows a
-    /// kernel already wrote at `inPlaceAppendDestination` (`fence` is an
-    /// output of that kernel): the same views, attention and offset advance.
-    public func attendAfterInPlaceAppend(queries: MLXArray, fence: MLXArray, scale: Float)
-        -> MLXArray
-    {
-        let row = rows[0] as! CBv2FullSequenceKV
-        let (cachedKeys, cachedValues) = row.commitInPlaceAppend(
-            count: queries.dim(2), fence: fence)
-        let output = CBv2AttentionV1.attendRowAfterUpdate(
-            kind: kind, queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
-            scale: scale, sinks: nil, softcap: attentionSoftcap, spanContext: nil)
-        advancePositionOffsets(by: queries.dim(2))
-        return output
     }
 
     // MARK: - Private
@@ -328,20 +292,6 @@ enum CBv2HostPositionOffsets {
             return array
         }
     }
-}
-
-/// An attention layer's KV append written by the kernel that produces the
-/// keys (the fused q/k prework stores the new key rows and copies the value
-/// rows straight into the row's storage) instead of by the two slice
-/// updates of `CBv2FullSequenceKV.update` (two copy launches per attention
-/// layer). The kernel's own self-test and trial decide whether it is used;
-/// `MLXFAST_INPLACE_KV_APPEND=0` keeps the slice updates everywhere.
-public enum CBv2InPlaceKVAppend {
-    public static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_INPLACE_KV_APPEND"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
 }
 
 // MARK: - Final-layer last-query prefill
