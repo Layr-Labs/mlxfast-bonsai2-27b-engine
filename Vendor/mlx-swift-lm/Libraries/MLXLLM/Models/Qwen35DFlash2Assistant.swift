@@ -169,10 +169,17 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
+                // The trials' copies are in place: the residency budget is
+                // raised over them if the load-time arm was below (raised
+                // only, and no-op under `MLXFAST_WIRED_RESIDENCY=0`).
+                Qwen35WiredResidency.arm()
             }
         }
         Stream().synchronize()
         Memory.clearCache()
+        // Every buffer the load left active joins a residency set now, so the
+        // served phases' first command buffers bind nothing after the gates.
+        Qwen35WiredResidency.arm()
     }
 
     /// The verify int8 kernels' in-situ trial

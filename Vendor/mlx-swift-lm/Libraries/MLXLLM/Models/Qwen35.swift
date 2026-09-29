@@ -5166,6 +5166,78 @@ final class Qwen35DecoderLayer: Module {
 
 // MARK: - Prompt embedding rows gathered on the host
 
+/// Keeps the loaded model GPU-resident across the benchmark's idle gates.
+///
+/// MLX puts an allocation into a Metal residency set only while the process's
+/// wired limit covers it, and that limit starts at zero: nothing the engine
+/// allocates is ever in a set, so the OS unmaps the buffers while the box sits
+/// behind the cool-down and quiescence gates, and every timed phase binds them
+/// again as its command buffers commit, about 0.1 ms per 10 MB (the drafter's
+/// residency prefetch and the seed's host embedding gather exist to hide that
+/// cost behind queued work; the first command buffer of every prompt forward
+/// and the timed prefill's embedding gather still pay it). Raising the limit
+/// to cover the loaded model adds every tracked allocation to a set at once
+/// (`ResidencySets::resize`), and later allocations join as they are made
+/// while the budget holds. The sets are attached to the command queue with a
+/// standing residency request, so the buffers stay mapped through the gates.
+/// No value changes anywhere.
+///
+/// The budget is the active memory at arm time plus 2 %, and never more than
+/// 70 % of the device's recommended working set, which the allocator refuses
+/// to exceed. It is kept that tight on purpose: every allocation that joins a
+/// set commits it under the allocator's lock (`ResidencySets::insert`), so a
+/// loose budget would make the fresh intermediates of the first timed forward
+/// after `warmSpeculativeShapes` drains the cache pay one commit each. With
+/// the model filling the budget, a later allocation is tracked but left out
+/// (no commit), and each re-arm (after the deferred trials adopt their
+/// copies, after the drain) raises it over what is active then. `MLXFAST_WIRED_RESIDENCY=0` leaves the limit
+/// alone; a number sets the budget in GiB. The limit is only ever raised.
+enum Qwen35WiredResidency {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var applied = 0
+    nonisolated(unsafe) private static var announced = false
+
+    private static let setting: String =
+        ProcessInfo.processInfo.environment["MLXFAST_WIRED_RESIDENCY"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+
+    /// `arm`, unless a budget is already in place: the prompt forward's call,
+    /// so a worker that never builds the assistant (the prefill phase's)
+    /// wires its model at its untimed warm-up prompt.
+    static func armOnce() {
+        lock.lock()
+        let armed = applied > 0
+        lock.unlock()
+        if !armed { arm() }
+    }
+
+    static func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        let raw = setting
+        if ["0", "false", "no", "off"].contains(raw) { return }
+        guard let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0 else { return }
+        let ceiling = recommended / 10 * 7
+        let active = Memory.activeMemory
+        var budget = active + active / 50
+        if let gib = Double(raw), gib > 0, gib < 4096 {
+            budget = Int(gib * Double(1 << 30))
+        }
+        let limit = min(budget, ceiling)
+        guard limit > applied else { return }
+        var previous: size_t = 0
+        guard mlx_set_wired_limit(&previous, size_t(limit)) == 0 else { return }
+        applied = limit
+        if !announced {
+            announced = true
+            FileHandle.standardError.write(
+                ("mlxfast-worker: wired residency: limit \(limit >> 20) MB "
+                    + "(active \(active >> 20) MB, recommended working set \(recommended >> 20) MB)\n")
+                    .data(using: .utf8)!)
+        }
+    }
+}
+
 /// A prompt-width embedding lookup reads its packed rows on the host.
 ///
 /// WHY. A decode request's prompt forward (the seed) is the first GPU work
@@ -5229,6 +5301,7 @@ enum Qwen35PromptEmbeddingHostGather {
             inputs.dtype == .int32, inputs.size >= BonsaiPromptWidth.minimumRows,
             passesSelfTest(table)
         else { return nil }
+        Qwen35WiredResidency.armOnce()
         if let early = Qwen35PromptEmbeddingEarly.take(inputs) { return early }
         Qwen35PromptEmbeddingEarly.makeHostAvailable(inputs)
         return embed(table, inputs)
