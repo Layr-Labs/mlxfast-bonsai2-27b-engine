@@ -496,9 +496,9 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
+template <typename U, int N, int bits, typename W>
 inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -584,18 +584,29 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
 }
 
 // Same values as four dequantize<U, 4, 2> calls on the bytes of `word`.
-template <typename U>
+// Keeping one decoded quad in an aligned aggregate lets the threadgroup store
+// use the natural transaction width of the four values instead of four scalar
+// stores to the padded loader tile.
+template <typename U, int N>
+struct alignas(sizeof(U)) DequantizedPack {
+  U v[N];
+};
+
+template <typename U, typename W>
 inline void
-dequantize_2bit_word(uint32_t word, U scale, U bias, threadgroup U* w_local) {
+dequantize_2bit_word(uint32_t word, U scale, U bias, W w_local) {
   const float s = float(scale);
   const float b = float(bias);
   float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
   for (int i = 0; i < 4; i++) {
     const uint8_t wb = static_cast<uint8_t>((word >> (8 * i)) & 0xff);
-    w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
-    w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
-    w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
-    w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
+    DequantizedPack<U, 4> pack = {{
+        static_cast<U>(sc[0] * (wb & 0x03) + b),
+        static_cast<U>(sc[1] * (wb & 0x0c) + b),
+        static_cast<U>(sc[2] * (wb & 0x30) + b),
+        static_cast<U>(sc[3] * (wb & 0xc0) + b),
+    }};
+    *((threadgroup DequantizedPack<U, 4>*)(&w_local[4 * i])) = pack;
   }
 }
 
