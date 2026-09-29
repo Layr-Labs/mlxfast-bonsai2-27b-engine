@@ -66,10 +66,12 @@ extension EngineLoopV2 {
         guard Self.submitsCommittedRecurrentStateEarly,
             let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
         else { return }
-        let arrays = snapshot.keys.sorted().flatMap { index -> [MLXArray] in
-            let layer = snapshot[index]!
-            if layer.deferredReplay?.isPending == true { return [] }
-            return [layer.conv, layer.ssm].compactMap { $0 }
+        var arrays = [MLXArray]()
+        arrays.reserveCapacity(snapshot.count * 2)
+        for layer in snapshot.values {
+            if layer.deferredReplay?.isPending == true { continue }
+            if let conv = layer.conv { arrays.append(conv) }
+            if let ssm = layer.ssm { arrays.append(ssm) }
         }
         if !arrays.isEmpty { asyncEval(arrays) }
     }
@@ -236,14 +238,17 @@ extension EngineLoopV2 {
                     accepted: accepted))
         }
 
-        round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
+        round.finalizedVerifyIDs = outcomes.count == 1 ? [outcomes[0].metadata.id] : Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
             finalizedVerifyIDs: round.finalizedVerifyIDs,
             measurement: step.mtpMeasurement)
 
         if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
+            let stepAccepted =
+                outcomes.count == 1
+                ? min(outcomes[0].accepted, commonEmitted)
+                : (outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0)
             let observedDrafts =
                 commonEmitted <= stepAccepted
                 ? commonEmitted : min(k, stepAccepted + 1)
@@ -268,6 +273,7 @@ extension EngineLoopV2 {
             let detokenizer = detokenizers[id]
             let hasStopStrings = !rec.request.stopStrings.isEmpty
             var kept: [Int] = []
+            kept.reserveCapacity(emitted.count)
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
             for token in emitted {
@@ -292,9 +298,15 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
-            round.committedVerifyTokenCount += kept.filter {
-                !rec.request.stopTokens.contains($0)
-            }.count
+            if rec.request.stopTokens.isEmpty {
+                round.committedVerifyTokenCount += confirmed
+            } else {
+                var valid = 0
+                for token in kept where !rec.request.stopTokens.contains(token) {
+                    valid += 1
+                }
+                round.committedVerifyTokenCount += valid
+            }
             for packet in verify.diagnostics where packet.requestID == id {
                 let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
                 packet.reconcile(
@@ -459,7 +471,8 @@ extension EngineLoopV2 {
                 // drafter's cache is untouched and the context rows
                 // `finalizeRound` just queued stay pending for the next block.
                 let promptProposal =
-                    adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
+                    adoptedProposal == nil
+                    && (CBv2PromptLookupDraft.expectsPromptProposal(id) || CBv2PromptLookupDraft.skipEnabled)
                     ? CBv2PromptLookupDraft.lookup(
                         history: rec.tokens, promptLength: rec.request.promptTokens.count,
                         depth: k)
