@@ -821,18 +821,25 @@ extension DFlash2Attention {
     /// `joined`, when given, is that `rows` matrix already (`x` then only
     /// gives the block's shape; `DFlash2SpeculativeFront.rows`), and `pos`
     /// (`[offset, offset, L]`) lets the q and k heads take one launch
-    /// (`DFlash2SpeculativeFront.heads`).
+    /// (`DFlash2SpeculativeFront.heads`). Without `joined`, `context` (the
+    /// rows `base` starts with) lets the rows take one launch
+    /// (`DFlash2SpeculativeRows.rows`) instead of the dynamic slice update.
     func speculative(
         _ x: MLXArray, joined: MLXArray? = nil, base: MLXArray, confirmed: MLXArray,
         queryOffset: MLXArray, pos: MLXArray? = nil, rope: RoPELayer,
-        cache: DFlash2BlockKVCache, keyMask: MLXArray
+        cache: DFlash2BlockKVCache, keyMask: MLXArray, context: MLXArray? = nil
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
         let (B, L, n) = (x.dim(0), x.dim(1), base.dim(1))
         guard B == 1, n == 2 * L, let held = cache.inPlaceRows,
             joined.map({ $0.shape == [B, n, x.dim(2)] }) ?? true
         else { return nil }
         let start = confirmed.reshaped([1])
-        let rows = joined ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
+        let rows =
+            joined
+            ?? context.flatMap {
+                DFlash2SpeculativeRows.rows(context: $0, block: x, start: start, count: n)
+            }
+            ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
         guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
         else { return nil }
         let queries: MLXArray
@@ -2834,7 +2841,8 @@ private final class DFlash2DecoderLayer: Module {
 
     /// `callAsFunction` through `DFlash2Attention.speculative`.
     /// With `context` (the rows `base` starts with) and `pos`, the front
-    /// takes `DFlash2SpeculativeFront`'s launches where they apply.
+    /// takes `DFlash2SpeculativeFront`'s launches where they apply, else
+    /// `DFlash2SpeculativeRows`' rows launch.
     func speculative(
         _ x: MLXArray, base: MLXArray, context: MLXArray? = nil, confirmed: MLXArray,
         queryOffset: MLXArray, pos: MLXArray? = nil, rope: RoPELayer,
@@ -2855,7 +2863,8 @@ private final class DFlash2DecoderLayer: Module {
         guard
             let a = selfAttn.speculative(
                 attentionInput, joined: joined, base: base, confirmed: confirmed,
-                queryOffset: queryOffset, pos: pos, rope: rope, cache: cache, keyMask: keyMask)
+                queryOffset: queryOffset, pos: pos, rope: rope, cache: cache, keyMask: keyMask,
+                context: context)
         else { return nil }
         let attended = attentionConv.finish(a.output, projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
@@ -4466,6 +4475,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // The front's one-launch forms read `context` and `c` themselves;
         // `base` is then never evaluated.
         let front = DFlash2SpeculativeFront.active
+        // Without the front's joined rows, `DFlash2SpeculativeRows` reads
+        // `context` for each layer's rows as well.
+        let rowsLaunch = DFlash2SpeculativeRows.enabled
         let pos: MLXArray? = DFlash2SpeculativeFront.headsChosen
             ? MLXArray([Int32(geometry.offset), Int32(geometry.offset), Int32(blockSize)]) : nil
         var writes: [(keys: MLXArray, values: MLXArray)] = []
@@ -4478,7 +4490,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         for (index, layer) in layers.enumerated() {
             guard
                 let out = layer.speculative(
-                    h, base: base, context: front ? context : nil, confirmed: c,
+                    h, base: base, context: front || rowsLaunch ? context : nil, confirmed: c,
                     queryOffset: queryOffset, pos: pos, rope: rope,
                     cache: caches[index], keyMask: keyMask)
             else { preconditionFailure("DFlash 2: a checked layer refused its speculative block") }
@@ -5005,6 +5017,114 @@ enum DFlash2Concat {
             return same
         }
     }
+}
+
+// MARK: - Speculative block rows at a device-valued start
+
+/// The speculative block forward (`DFlash2Attention.speculative`) builds each
+/// layer's `[context; zeros]` base with the block's rows written at the
+/// device-valued confirmed count (`dynamicSliceUpdate`: a copy of the base, an
+/// offset launch and the row copy), after one `[context; zeros]`
+/// concatenation per block (a fill and two copies). Here one launch per layer
+/// writes the layer's rows straight from the context, the block and zero
+/// (`rows`), where `DFlash2SpeculativeFront`'s joined rows do not apply (its
+/// rows form off or not chosen at bind). Every element is copied in its own
+/// dtype (a zero row is `T(0)`, as `zeros`), so the rows and the product are
+/// the same bits. Checked once, on first use, bit for bit against
+/// `dynamicSliceUpdate` (BF16 and FP16, context rows 1, 8 and 16, starts 1, 8
+/// and 16); the drafter's own check of the block built ahead of the readback
+/// runs through it as well. `MLXFAST_DFLASH_SPEC_ROWS=0` keeps the dynamic
+/// slice update.
+enum DFlash2SpeculativeRows {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPEC_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_speculative_rows",
+        inputNames: ["ctx", "x", "st", "dims"],
+        outputNames: ["out"],
+        source: """
+            const uint j = thread_position_in_grid.x;
+            const uint r = thread_position_in_grid.y;
+            const size_t W = size_t(dims[0]);
+            const int rel = int(r) - st[0];
+            T v;
+            if (rel >= 0 && rel < dims[2]) {
+              v = x[size_t(rel) * W + j];
+            } else if (r < uint(dims[1])) {
+              v = ctx[size_t(r) * W + j];
+            } else {
+              v = T(0);
+            }
+            out[size_t(r) * W + j] = v;
+            """,
+        ensureRowContiguous: true)
+
+    private static func launch(_ context: MLXArray, _ block: MLXArray, _ start: MLXArray, _ count: Int)
+        -> MLXArray
+    {
+        let w = block.dim(2)
+        // Widths and row counts are runtime operands (the context row count
+        // varies per round): one compiled kernel per dtype.
+        return kernel(
+            [context, block, start, MLXArray([Int32(w), Int32(context.dim(1)), Int32(block.dim(1))])],
+            template: [("T", block.dtype)],
+            grid: (w, count, 1), threadGroup: (min(w, 256), 1, 1),
+            outputShapes: [[1, count, w]], outputDTypes: [block.dtype])[0]
+    }
+
+    /// `dynamicSliceUpdate(concatenated([context, zeros]), update: block,
+    /// start: start, axes: [1])` for `count` rows, or nil when it does not
+    /// apply. The start must keep the block inside the rows (the speculative
+    /// forward's confirmed count, 1 ... L, with `count` = 2 L).
+    static func rows(context: MLXArray, block: MLXArray, start: MLXArray, count: Int) -> MLXArray? {
+        guard enabled, context.ndim == 3, block.ndim == 3, context.dim(0) == 1, block.dim(0) == 1,
+            context.dim(2) == block.dim(2), context.dtype == block.dtype,
+            [DType.bfloat16, .float16].contains(block.dtype), context.dim(1) <= count,
+            2 * block.dim(1) == count, start.size == 1, start.dtype == .int32, verified
+        else { return nil }
+        return launch(context, block, start, count)
+    }
+
+    private static let verified: Bool = {
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for dtype in [DType.bfloat16, .float16] {
+                    let (L, w) = (16, 512)
+                    let block = MLXRandom.normal([1, L, w], key: MLXRandom.key(61)).asType(dtype)
+                    for contextRows in [1, 8, 16] {
+                        let context = MLXRandom.normal([1, contextRows, w], key: MLXRandom.key(64))
+                            .asType(dtype)
+                        let base = concatenated(
+                            [context, MLXArray.zeros([1, 2 * L - contextRows, w], dtype: dtype)], axis: 1)
+                        for c in [1, 8, 16] {
+                            let start = MLXArray([Int32(c)])
+                            let reference = dynamicSliceUpdate(base, update: block, start: start, axes: [1])
+                            let candidate = launch(context, block, start, 2 * L)
+                            let ok = reference.shape == candidate.shape
+                                && all(reference.view(dtype: .uint16) .== candidate.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            try error.check()
+                            same = same && ok
+                            compared += reference.size
+                        }
+                    }
+                }
+            }
+        } catch {
+            same = false
+        }
+        FileHandle.standardError.write(
+            (same
+                ? "dflash2 speculative rows: self-test passed (\(compared) values bitwise); one launch per layer, no dynamic slice update\n"
+                : "dflash2 speculative rows: self-test failed; dynamic slices kept\n").data(using: .utf8)!)
+        return same
+    }()
 }
 
 // MARK: - Head RMSNorm over a strided view
