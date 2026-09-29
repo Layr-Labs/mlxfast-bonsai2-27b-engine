@@ -754,15 +754,21 @@ extension Qwen35GDNPrework {
         if loadsFirst {
             // q, k, v, g, beta, ci, ao, bo: the tail is the conv input's last
             // NK rows, as the reads-first launch returns it.
-            let outputs = launch(
-                inputs, template: template,
-                grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
-                outputShapes: [
-                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
-                    [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
-                    [B, KS - 1 + S, CD], [B, S, valueHeads], [B, S, valueHeads],
-                ],
-                outputDTypes: Array(repeating: DType.float32, count: 8))
+            let lfShapes: [[Int]] = [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1 + S, CD], [B, S, valueHeads], [B, S, valueHeads],
+            ]
+            // The value columns in their own threadgroups (same outputs).
+            let outputs =
+                Qwen35PreworkSplit.launch(
+                    inputs, template: template, keyHeads: keyHeads, valueHeads: valueHeads,
+                    S: S, B: B, outputShapes: lfShapes, dtype: qkv.dtype)
+                ?? launch(
+                    inputs, template: template,
+                    grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+                    outputShapes: lfShapes,
+                    outputDTypes: Array(repeating: DType.float32, count: 8))
             return Outputs(
                 q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
                 tail: outputs[5][0..., S..., 0...], convInput: outputs[5],
