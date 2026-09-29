@@ -148,6 +148,9 @@ final class CBv2MTPRoundInFlight {
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
+    /// Prompt rows whose first sampled token becomes a round carry at
+    /// finalize (block drafters only; see `mtpPrefillCarryEnabled`).
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -165,13 +168,15 @@ final class CBv2MTPRoundInFlight {
         seedRows: [(id: CBv2RequestID, decodeIndex: Int)],
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
-        committedObservationRows: [CommittedObservationRow]
+        committedObservationRows: [CommittedObservationRow],
+        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
     ) {
         self.verify = verify
         self.seedRows = seedRows
         self.seedHidden = seedHidden
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
+        self.prefillCarries = prefillCarries
     }
 }
 

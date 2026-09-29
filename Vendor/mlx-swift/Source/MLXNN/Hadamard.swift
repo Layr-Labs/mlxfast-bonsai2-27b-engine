@@ -45,11 +45,42 @@ public struct SignedBlockHadamard {
             && (signs === other.signs || signValues == other.signValues)
     }
 
+    /// A one-launch implementation of the forward transform, installed by a
+    /// module that can build custom Metal kernels (the model file installs
+    /// it at load). It receives the activation, the sign vector, the block
+    /// size, whether the activation already carries the signs, an optional
+    /// GDN layout to gather through, and the output dtype. It must compute
+    /// exactly what the op chain computes (FP32 sign multiply, the FP32
+    /// block transform with the stock kernel's butterfly order and scale,
+    /// then one cast to the output dtype). Returns nil to decline.
+    public typealias FusedTransform = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int, _ preSigned: Bool,
+        _ gdnLayout: HadamardGDNLayout?, _ outputDType: DType
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedTransform: FusedTransform?
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        forward(x, gdnLayout: nil, outputDType: x.dtype)
+    }
+
+    /// The forward transform of `x` (optionally gathered through a GDN
+    /// layout first), returned in `outputDType`. Same values as
+    /// `callAsFunction(layout(x)).asType(outputDType)`.
+    public func forward(_ x: MLXArray, gdnLayout: HadamardGDNLayout?, outputDType: DType)
+        -> MLXArray
+    {
         validate(x)
-        return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
-            .reshaped(x.shape).asType(x.dtype)
+        if let fused = Self.fusedTransform,
+            let y = fused(x, signs, blockSize, false, gdnLayout, outputDType)
+        {
+            return y
+        }
+        let laidOut = gdnLayout.map { $0(x) } ?? x
+        let rotated = hadamardTransform(
+            (laidOut.asType(.float32) * signs).reshaped([-1, blockSize])
+        ).reshaped(x.shape).asType(x.dtype)
+        return rotated.dtype == outputDType ? rotated : rotated.asType(outputDType)
     }
 
     /// The sign vector as an array, for a caller that folds the sign flip into
@@ -60,9 +91,21 @@ public struct SignedBlockHadamard {
     /// (`x * signVector`, in FP32). Identical to `callAsFunction` on the
     /// unsigned activation; the multiply has simply been done by the caller.
     public func applyPreSigned(_ signed: MLXArray) -> MLXArray {
+        applyPreSigned(signed, outputDType: signed.dtype)
+    }
+
+    /// `applyPreSigned` returned in `outputDType` (the cast folded into the
+    /// transform when a fused implementation is installed).
+    public func applyPreSigned(_ signed: MLXArray, outputDType: DType) -> MLXArray {
         validate(signed)
-        return hadamardTransform(signed.asType(.float32).reshaped([-1, blockSize]))
+        if let fused = Self.fusedTransform,
+            let y = fused(signed, signs, blockSize, true, nil, outputDType)
+        {
+            return y
+        }
+        let rotated = hadamardTransform(signed.asType(.float32).reshaped([-1, blockSize]))
             .reshaped(signed.shape).asType(signed.dtype)
+        return rotated.dtype == outputDType ? rotated : rotated.asType(outputDType)
     }
 
     /// Recover the original basis after looking up folded embedding rows.
@@ -331,7 +374,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The input transform alone: GDN layout, signs, Hadamard, dtype restore.
     public func rotate(_ x: MLXArray) -> MLXArray {
-        transform(gdnLayout.map { $0(x) } ?? x)
+        transform.forward(x, gdnLayout: gdnLayout, outputDType: x.dtype)
+    }
+
+    /// `rotate` returned in `outputDType` (one cast folded into the transform
+    /// when a fused implementation is installed).
+    public func rotate(_ x: MLXArray, outputDType: DType) -> MLXArray {
+        transform.forward(x, gdnLayout: gdnLayout, outputDType: outputDType)
     }
 
     /// The packed matmul on an input already passed through `rotate`.
@@ -461,15 +510,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The routed matmul over `x` (any leading shape, `[..., K]`) with the
     /// given packed operand; returns `[..., N]` in `x.dtype`.
+    /// The activation dtype the route reads for a projection of `n` output
+    /// rows at `rows` input rows whose activation was originally `sourceDType`.
+    static func routeInputDType(rows: Int, n: Int, sourceDType: DType) -> DType {
+        let paddedRows = max(rows, matrixRegimeMinimumRows)
+        let nTiles = (n + 31) / 32
+        let mTiles = (paddedRows + 31) / 32
+        let narrow = nTiles * mTiles <= splitKTileCeiling
+        return (narrow || n >= vocabularyHeadMinimumRows || sourceDType == .bfloat16)
+            ? .float32 : matrixRouteInputDType
+    }
+
     private static func matrixRoutedMatmul(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, mode: QuantizationMode,
-        operands: HadamardMatrixRouteOperands, widenOutput: Bool = true
+        operands: HadamardMatrixRouteOperands, widenOutput: Bool = true,
+        sourceDType: DType? = nil
     ) -> MLXArray {
         let k = x.dim(-1)
         let rows = x.size / k
         let n = weight.dim(0)
         let paddedRows = max(rows, matrixRegimeMinimumRows)
+        // The dtype the caller's activation had before the rotation; a fused
+        // rotation may already have produced `x` in the route dtype.
+        let sourceDType = sourceDType ?? x.dtype
 
         // The core splits K for a projection with at most 256 32x32 tiles and
         // runs the split-K body; that body is on the tensor unit for FP32
@@ -481,7 +545,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let mTiles = (paddedRows + 31) / 32
         let narrow = nTiles * mTiles <= splitKTileCeiling
         let inputDType: DType =
-            (narrow || n >= vocabularyHeadMinimumRows || x.dtype == .bfloat16)
+            (narrow || n >= vocabularyHeadMinimumRows || sourceDType == .bfloat16)
             ? .float32 : matrixRouteInputDType
         let routeScales: MLXArray
         let routeBiases: MLXArray?
@@ -516,7 +580,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         // The core promotes a BF16 activation with FP16 constants to FP32 and
         // returns FP32; the widened result therefore matches what the plain
         // operator would have returned for either input dtype.
-        let plainOutputDType: DType = x.dtype == .bfloat16 ? .float32 : x.dtype
+        let plainOutputDType: DType = sourceDType == .bfloat16 ? .float32 : sourceDType
         if widenOutput, output.dtype != plainOutputDType {
             output = output.asType(plainOutputDType)
         }
@@ -545,24 +609,42 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     ///
     /// Returns nil when the siblings do not all fit the route (a caller then
     /// applies each one to the rotated activation as before).
-    fileprivate func fusedSiblingsForward(
-        _ rotated: MLXArray, siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
-    ) -> [MLXArray]? {
-        guard Self.siblingFusionEnabled, siblings.count >= 2,
-            rotated.dtype == .float32, rotated.ndim >= 2
-        else { return nil }
-        let k = rotated.dim(-1)
-        guard rotated.size / k >= 2, k % 64 == 0 else { return nil }
+    /// True when `fusedSiblingsForward` will take these siblings for an
+    /// activation of this shape (the route applies to every sibling).
+    fileprivate func fusedSiblingsApply(
+        _ siblings: [HadamardQuantizedLinear], rows: Int, k: Int
+    ) -> Bool {
+        guard Self.siblingFusionEnabled, siblings.count >= 2, rows >= 2, k % 64 == 0
+        else { return false }
         for sibling in siblings {
             guard Self.routeApplies(to: sibling), sibling.groupSize == groupSize,
                 sibling.weight.dim(1) == weight.dim(1), k % sibling.groupSize == 0
-            else { return nil }
+            else { return false }
         }
+        return true
+    }
+
+    /// The dtype the stacked sibling matmul reads at `rows` input rows.
+    fileprivate func fusedSiblingsInputDType(
+        _ siblings: [HadamardQuantizedLinear], rows: Int, sourceDType: DType
+    ) -> DType {
+        let n = siblings.reduce(0) { $0 + $1.weight.dim(0) }
+        return Self.routeInputDType(rows: rows, n: n, sourceDType: sourceDType)
+    }
+
+    fileprivate func fusedSiblingsForward(
+        _ rotated: MLXArray, siblings: [HadamardQuantizedLinear], widenOutput: Bool = true,
+        sourceDType: DType = .float32
+    ) -> [MLXArray]? {
+        guard rotated.ndim >= 2, rotated.dtype == .float32 || rotated.dtype == .float16
+        else { return nil }
+        let k = rotated.dim(-1)
+        guard fusedSiblingsApply(siblings, rows: rotated.size / k, k: k) else { return nil }
         let fused = matrixRoute.fusedSiblings(for: siblings)
         let wide = Self.matrixRoutedMatmul(
             rotated, weight: fused.weight, scales: fused.scales, biases: fused.biases,
             groupSize: groupSize, bits: bits, mode: mode, operands: fused.operands,
-            widenOutput: widenOutput)
+            widenOutput: widenOutput, sourceDType: sourceDType)
         return MLX.split(wide, indices: Array(fused.boundaries.dropLast()), axis: -1)
     }
 
@@ -589,6 +671,22 @@ public func sharedHadamardProjections(
             layer.sharesInputTransform(with: first)
         else { return nil }
         packed.append(layer)
+    }
+    // When the siblings will run as one routed stack, rotate straight into the
+    // dtype that stack reads: the fused transform folds the cast into its
+    // single launch, and the route then has nothing left to cast.
+    let k = x.dim(-1)
+    if x.dtype == .float32, first.fusedSiblingsApply(packed, rows: x.size / k, k: k) {
+        let routeDType = first.fusedSiblingsInputDType(
+            packed, rows: x.size / k, sourceDType: x.dtype)
+        let rotated = first.rotate(x, outputDType: routeDType)
+        if let fused = first.fusedSiblingsForward(
+            rotated, siblings: packed, widenOutput: widenOutput, sourceDType: x.dtype)
+        {
+            return fused
+        }
+        let plain = routeDType == x.dtype ? rotated : rotated.asType(x.dtype)
+        return packed.map { $0.applyRotated(plain) }
     }
     let rotated = first.rotate(x)
     if let fused = first.fusedSiblingsForward(
@@ -625,6 +723,21 @@ public func sharedHadamardProjectionsPreSigned(
     guard let first = siblings.first,
         siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
     else { return nil }
+    // As in `sharedHadamardProjections`: when the siblings run as one routed
+    // stack, rotate straight into the dtype the stack reads.
+    let k = signed.dim(-1)
+    if signed.dtype == .float32, first.fusedSiblingsApply(siblings, rows: signed.size / k, k: k) {
+        let routeDType = first.fusedSiblingsInputDType(
+            siblings, rows: signed.size / k, sourceDType: signed.dtype)
+        let rotated = first.transform.applyPreSigned(signed, outputDType: routeDType)
+        if let fused = first.fusedSiblingsForward(
+            rotated, siblings: siblings, widenOutput: widenOutput, sourceDType: signed.dtype)
+        {
+            return fused
+        }
+        let plain = routeDType == signed.dtype ? rotated : rotated.asType(signed.dtype)
+        return siblings.map { $0.applyRotated(plain) }
+    }
     let rotated = first.transform.applyPreSigned(signed)
     if let fused = first.fusedSiblingsForward(
         rotated, siblings: siblings, widenOutput: widenOutput)

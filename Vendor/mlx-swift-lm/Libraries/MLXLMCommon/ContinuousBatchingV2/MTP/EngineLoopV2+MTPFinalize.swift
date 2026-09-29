@@ -58,6 +58,22 @@ extension EngineLoopV2 {
             }
         }
 
+        // A prompt row that just sampled its first token carries into a round
+        // directly (block drafter): the token is the next block's anchor and
+        // the prompt's tapped rows are its context. The carry fingerprints the
+        // row exactly as a seed step's would (`tokens.count`, `numComputed`).
+        for carry in round.prefillCarries {
+            guard !step.discard.contains(carry.id),
+                let rec = scheduler.record(for: carry.id),
+                rec.pendingSamples == 0,
+                rec.tokens.count > rec.request.promptTokens.count,
+                let token = rec.tokens.last
+            else { continue }
+            mtp.storeCarry(
+                id: carry.id, token: token, hidden: carry.hidden,
+                tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+        }
+
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
