@@ -53,39 +53,6 @@ struct CBv2MTPGraphBuild {
     let lateEvalTargets: [MLXArray]
 }
 
-/// A prompt row that carries into a block round submits its tapped context
-/// (the target rows the drafter's first block reads: at the scored seed width a
-/// `[1, 512, 5 x 5120]` concat of five layer taps, 26 MB) with the drafter's
-/// context absorb that consumes it, in the late submission behind the step,
-/// rather than in the step's own evaluation. The step's evaluation carries the
-/// sampled token, and every array in one evaluation shares its completion
-/// event, so the seed token's readback waited for the concat's copies. The
-/// same arrays with the same values; only which submission they ride changes.
-/// Decode rows (seed steps) keep their observation in the step.
-/// `MLXFAST_PROMPT_TAP_LATE=0` keeps the tapped context in the step.
-/// A prompt row that samples (the seed's) has its input embedding built and
-/// submitted at the top of the round graph, before the row's cache and state
-/// binds and the model entry, so the step's first command buffer and the GPU's
-/// wake-up after an idle go out that much earlier; the forward takes that
-/// embedding for the same ids (`CBv2PromptEmbeddingPrefetching`). Only one row
-/// (the model holds one), and never a multimodal one.
-/// `MLXFAST_PROMPT_EMBED_EARLY=0` builds the embedding inside the forward.
-enum CBv2MTPPromptEmbeddingEarly {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_EMBED_EARLY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-}
-
-enum CBv2MTPPromptTapLate {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_TAP_LATE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-}
-
 extension EngineLoopV2 {
 
     /// Record only the assignments the scheduler demoted. Known capacity
@@ -180,18 +147,6 @@ extension EngineLoopV2 {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
-
-        // The seed's prompt embedding first (`CBv2MTPPromptEmbeddingEarly`).
-        if CBv2MTPPromptEmbeddingEarly.enabled,
-            let row = work.first(where: {
-                !$0.isDecode && $0.carry == nil && $0.samples && multimodalByID[$0.rec.id] == nil
-            }),
-            let prefetching = (mtp.model as? any CBv2PromptEmbeddingPrefetching)
-                ?? (model as? any CBv2PromptEmbeddingPrefetching)
-        {
-            let slice = row.rec.tokens[row.start ..< row.start + row.count]
-            prefetching.cbv2PrefetchPromptEmbedding(MLXArray(slice.map(Int32.init), [1, row.count]))
-        }
 
         // Plain and seed rows share one eager [B, 1] target batch. Seed rows
         // retain the pre-norm hidden; logits remain identical to plain eager.
@@ -449,16 +404,6 @@ extension EngineLoopV2 {
                 if row.samples, Self.mtpPrefillCarryEnabled, let block = mtp.blockDrafter,
                     let observed = committedObservationRows.last, observed.id == rec.id
                 {
-                    // The tapped context itself rides the same late
-                    // submission (`CBv2MTPPromptTapLate`), not the step's.
-                    if CBv2MTPPromptTapLate.enabled,
-                        let index = committedObservationEvalTargets.lastIndex(where: {
-                            $0 === observedHidden
-                        })
-                    {
-                        committedObservationEvalTargets.remove(at: index)
-                        lateEvalTargets.append(observedHidden)
-                    }
                     lateEvalTargets.append(
                         contentsOf: block.prefetchCommittedContext(
                             requestState: observed.assistantState))
@@ -691,9 +636,7 @@ extension EngineLoopV2 {
                     proposal = CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
-                    CBv2PromptLookupDraft.noteProposal(
-                        row.rec.id, fromPrompt: proposal !== drafted,
-                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup)
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -799,18 +742,10 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        // A single row whose block is a host lookup's continuation (the output
-        // quoting the prompt): its verify may store the window's final state
-        // for a full acceptance (the model decides).
-        let proposalFromPrompt =
-            mtp.blockDrafter != nil && verifyRows.count == 1
-            && CBv2PromptLookupDraft.proposalIsHostLookup(verifyRows[0].rec.id)
-        let target = try CBv2VerifyRoundHint.building(fromPrompt: proposalFromPrompt) {
-            try mtpBuildTargetVerification(
-                columns: targetColumns, rows: verifyRows, driver: mtp,
-                stackedTokens: CBv2VerifyTokenStack.tokens(
-                    seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
-        }
+        let target = try mtpBuildTargetVerification(
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            stackedTokens: CBv2VerifyTokenStack.tokens(
+                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {

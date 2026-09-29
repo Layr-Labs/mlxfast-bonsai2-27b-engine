@@ -494,19 +494,3 @@ public enum CBv2DeferredLoadWarm {
         warm?()
     }
 }
-
-
-/// A model that can build and submit a prompt's input embedding ahead of the
-/// prompt forward that will take it (`EngineLoopV2.mtpBuildRoundGraph`,
-/// `MLXFAST_PROMPT_EMBED_EARLY`). The forward must take exactly that array for
-/// exactly those ids and otherwise build its own; the call is a scheduling
-/// hint, never a change of any value.
-public protocol CBv2PromptEmbeddingPrefetching: AnyObject {
-    func cbv2PrefetchPromptEmbedding(_ tokens: MLXArray)
-}
-
-extension CBv2SteppableLanguageModelAdapter: CBv2PromptEmbeddingPrefetching {
-    public func cbv2PrefetchPromptEmbedding(_ tokens: MLXArray) {
-        (model as? any CBv2PromptEmbeddingPrefetching)?.cbv2PrefetchPromptEmbedding(tokens)
-    }
-}

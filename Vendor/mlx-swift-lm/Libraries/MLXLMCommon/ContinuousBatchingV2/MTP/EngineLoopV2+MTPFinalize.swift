@@ -147,7 +147,7 @@ extension EngineLoopV2 {
             mtp.config.fixedDraftTokens == k, let metadata = verify.rows.first,
             // A row quoting the prompt looks its next ids up after the
             // readback instead (`CBv2PromptLookupDraft.skipEnabled`).
-            !CBv2PromptLookupDraft.holdsSpeculation(metadata.id),
+            !CBv2PromptLookupDraft.expectsPromptProposal(metadata.id),
             let state = metadata.assistantState, !step.discard.contains(metadata.id),
             let rec = scheduler.record(for: metadata.id),
             rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1,
@@ -313,11 +313,7 @@ extension EngineLoopV2 {
             if let speculation, speculation.id == id, finishReason == nil,
                 confirmed == accepted + 1, mtp.config.fixedDraftTokens == k,
                 rec.request.maxTokens - rec.generatedTokenCount > k,
-                let state = metadata.assistantState,
-                // The lookup below runs first and hits: dropped, as if unbuilt.
-                !CBv2PromptLookupDraft.lookupPreempts(
-                    id, history: rec.tokens, promptLength: rec.request.promptTokens.count,
-                    depth: k)
+                let state = metadata.assistantState
             {
                 adoptedProposal = speculation.drafter.adoptSpeculativeBlock(
                     speculation.block, confirmed: confirmed, requestState: state)
@@ -477,7 +473,7 @@ extension EngineLoopV2 {
                         anchor: anchor, depth: k, requestState: state)
                 }
                 if let tokens = promptProposal {
-                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true, host: true)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
                     CBv2VerifyQueueHint.markNothingAhead()
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
@@ -487,9 +483,7 @@ extension EngineLoopV2 {
                     let tokens = CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
-                    CBv2PromptLookupDraft.noteProposal(
-                        id, fromPrompt: tokens !== drafted,
-                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets = [tokens, drafted] + block.evaluationTargets(for: state)
                     if leading != nil {

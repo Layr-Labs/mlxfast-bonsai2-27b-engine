@@ -721,10 +721,15 @@ enum Qwen35WideNMatmul {
     private static let reduceSource = """
         const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
-        if (i >= uint(M * N)) { return; }
-        float v = 0.0f;
-        for (int s = 0; s < KS; s++) { v += part[(size_t)s * M * N + i]; }
-        out[i] = v;
+        // apply admits rows divisible by 64 and N divisible by 32. Each
+        // FP32 chunk plane is therefore aligned and has no four-wide tail.
+        const size_t vectors = size_t(M) * size_t(N) / 4;
+        if (size_t(i) >= vectors) { return; }
+        const device float4* p4 = reinterpret_cast<const device float4*>(part);
+        device float4* o4 = reinterpret_cast<device float4*>(out);
+        float4 v = float4(0.0f);
+        for (int s = 0; s < KS; s++) { v += p4[size_t(s) * vectors + i]; }
+        o4[i] = v;
         """
 
     private static let partialKernel = MLXFast.metalKernel(
@@ -733,198 +738,6 @@ enum Qwen35WideNMatmul {
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_widen_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: true)
-
-    // The staged form (`staged`): one threadgroup per (32 rows, 32 columns,
-    // chunk), two simdgroups of 32 x 16 outputs. Each KB-wide K slice of the
-    // chunk's 32 activation rows and 32 weight rows is loaded as float4 runs
-    // (one pass, both simdgroups) into threadgroup memory, double-buffered,
-    // and the simdgroups load their 8 x 8 operands from there: the same
-    // values in the same `simdgroup_multiply_accumulate` sequence per output
-    // (k ascending within the chunk, one chain per 8 x 8 block from zero), so
-    // every partial has the stock partial's bits. grid (N / 32 * 64, M / 32,
-    // K / KC), threadgroup (64, 1, 1). Templates KC, KB, PAD (row padding).
-    private static let stagedPartialSource = """
-        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
-        const int kc = int(threadgroup_position_in_grid.z);
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = thread_position_in_threadgroup.x;
-        const int mt = int(threadgroup_position_in_grid.y) * 32;
-        const int nt = int(threadgroup_position_in_grid.x) * 32;
-        constexpr int SA = KB + PAD;
-        threadgroup float sa[2][32 * SA];
-        threadgroup float sw[2][32 * SA];
-        simdgroup_matrix<float, 8, 8> c[4][2];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < 4; i++) {
-          c[i][0] = simdgroup_matrix<float, 8, 8>(0.0f);
-          c[i][1] = simdgroup_matrix<float, 8, 8>(0.0f);
-        }
-        simdgroup_matrix<float, 8, 8> a[4], b[2];
-        constexpr int Q = KB / 4;                // float4 per row and slice
-        constexpr int L = 32 * Q / 64;           // float4 per thread and operand
-        static_assert(L >= 1 && 32 * Q % 64 == 0, "whole float4 runs per thread");
-        const device float* xg = x + (size_t)mt * K + kc * KC;
-        const device float* wg = w + (size_t)nt * K + kc * KC;
-        float4 ra[L], rb[L];
-        auto gload = [&](int ks) {
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < L; j++) {
-            const int e = int(tid) + 64 * j; const int r = e / Q; const int q = e % Q;
-            ra[j] = *(const device float4*)(xg + (size_t)r * K + ks * KB + 4 * q);
-            rb[j] = *(const device float4*)(wg + (size_t)r * K + ks * KB + 4 * q);
-          }
-        };
-        auto sstore = [&](int buf) {
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < L; j++) {
-            const int e = int(tid) + 64 * j; const int r = e / Q; const int q = e % Q;
-            *(threadgroup float4*)(&sa[buf][r * SA + 4 * q]) = ra[j];
-            *(threadgroup float4*)(&sw[buf][r * SA + 4 * q]) = rb[j];
-          }
-        };
-        const int nb0 = 16 * int(sg);
-        constexpr int NS = KC / KB;
-        gload(0);
-        sstore(0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int ks = 0; ks < NS; ks++) {
-          const int buf = ks & 1;
-          if (ks + 1 < NS) { gload(ks + 1); }
-          #pragma clang loop unroll(full)
-          for (int kk = 0; kk < KB; kk += 8) {
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < 4; i++) { simdgroup_load(a[i], &sa[buf][(8 * i) * SA + kk], SA); }
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < 2; j++) {
-              simdgroup_load(b[j], &sw[buf][(nb0 + 8 * j) * SA + kk], SA, ulong2(0, 0), true);
-            }
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < 4; i++) {
-              simdgroup_multiply_accumulate(c[i][0], a[i], b[0], c[i][0]);
-              simdgroup_multiply_accumulate(c[i][1], a[i], b[1], c[i][1]);
-            }
-          }
-          if (ks + 1 < NS) { sstore(buf ^ 1); }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        device float* p = part + ((size_t)kc * M + mt) * N + nt + nb0;
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < 4; i++) {
-          simdgroup_store(c[i][0], p + 8 * i * N, N);
-          simdgroup_store(c[i][1], p + 8 * i * N + 8, N);
-        }
-        """
-
-    // The reduce four outputs per thread: float4 loads of each chunk's
-    // partials, added in chunk order from zero (component-wise, the stock
-    // fold per output). grid (M * N / 4, rounded up to 256), threadgroup 256.
-    private static let stagedReduceSource = """
-        const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
-        const uint i = thread_position_in_grid.x;
-        if (i >= uint(M * N / 4)) { return; }
-        const device float4* p4 = (const device float4*)part;
-        const size_t stride = (size_t)M * N / 4;
-        float4 v = float4(0.0f);
-        for (int s = 0; s < KS; s++) { v += p4[(size_t)s * stride + i]; }
-        ((device float4*)out)[i] = v;
-        """
-
-    private static let stagedPartialKernel = MLXFast.metalKernel(
-        name: "qwen35_widen_partial_staged", inputNames: ["x", "w", "dims"], outputNames: ["part"],
-        source: stagedPartialSource, ensureRowContiguous: true)
-    private static let stagedReduceKernel = MLXFast.metalKernel(
-        name: "qwen35_widen_reduce4", inputNames: ["part", "dims"], outputNames: ["out"],
-        source: stagedReduceSource, ensureRowContiguous: true)
-
-    /// The staged partial and the four-wide reduce in place of the stock pair
-    /// (on by default, after the load-time self-test; a failure keeps stock).
-    /// `BONSAI_PROMPT_SPLITK_BA_STAGED=0` keeps the stock pair.
-    static let stagedEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_SPLITK_BA_STAGED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let stagedLock = NSLock()
-    nonisolated(unsafe) private static var stagedVerdict: Bool?
-    nonisolated(unsafe) private static var stagedFailed = false
-
-    /// Whether `apply` takes the staged pair: decided once, at the first
-    /// prompt-width call (the load-time warm), by `stagedSelfTest`.
-    static var staged: Bool {
-        guard stagedEnabled else { return false }
-        return stagedLock.withLock {
-            if let stagedVerdict { return stagedVerdict }
-            let (passed, summary) = stagedSelfTest()
-            stagedVerdict = passed
-            FileHandle.standardError.write(
-                Data(("qwen35 prompt split-K b|a staged: " + summary
-                    + (passed ? "; staged partial and four-wide reduce\n" : "; stock kernels kept\n")).utf8))
-            return passed
-        }
-    }
-
-    /// Both pairs on synthetic operands at 64 and 512 rows (K 5120, N 96, the
-    /// production shape; and K 1024, N 64): every partial and every output
-    /// compared bit for bit. The activations carry exact zeros, negative
-    /// zeros and large values; a compile or run error counts as a failure.
-    private static func stagedSelfTest() -> (Bool, String) {
-        var values = 0
-        var mismatches = 0
-        stagedFailed = false
-        withErrorHandler({ _ in Qwen35WideNMatmul.stagedFailed = true }) {
-            for (index, (rows, k, n)) in [(64, 1024, 64), (512, 5120, 96)].enumerated() {
-                let seed = UInt64(401 + 16 * index)
-                var x = MLXRandom.normal([rows, k], key: MLXRandom.key(seed))
-                let pick = MLXRandom.randInt(Int32(0) ..< Int32(97), [rows, k], key: MLXRandom.key(seed + 1))
-                x = which(pick .== MLXArray(Int32(0)), MLXArray(Float(-0.0)), x)
-                x = which(pick .== MLXArray(Int32(1)), MLXArray(Float(0.0)), x)
-                x = which(pick .== MLXArray(Int32(2)), x * MLXArray(Float(1e4)), x)
-                let w = MLXRandom.normal([n, k], key: MLXRandom.key(seed + 2)) * MLXArray(Float(0.02))
-                let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
-                let (p0, y0) = launch(x, w, dims, rows: rows, k: k, n: n, staged: false)
-                let (p1, y1) = launch(x, w, dims, rows: rows, k: k, n: n, staged: true)
-                let bad = (p0.view(dtype: .uint32) .!= p1.view(dtype: .uint32)).asType(.int32).sum()
-                    + (y0.view(dtype: .uint32) .!= y1.view(dtype: .uint32)).asType(.int32).sum()
-                eval(bad)
-                mismatches += bad.item(Int.self)
-                values += p0.size + y0.size
-            }
-        }
-        let passed = !stagedFailed && mismatches == 0 && values > 0
-        let summary = stagedFailed
-            ? "self-test error"
-            : "self-test \(passed ? "passed" : "FAILED") (2 shapes, \(values) values bitwise, \(mismatches) mismatches)"
-        return (passed, summary)
-    }
-
-    /// One product as partials and reduce, by either pair.
-    private static func launch(
-        _ x: MLXArray, _ w: MLXArray, _ dims: MLXArray, rows: Int, k: Int, n: Int, staged: Bool
-    ) -> (MLXArray, MLXArray) {
-        let part: MLXArray
-        let y: MLXArray
-        if staged {
-            part = stagedPartialKernel(
-                [x, w, dims], template: [("KC", chunk), ("KB", 16), ("PAD", 4)],
-                grid: (n / 32 * 64, rows / 32, k / chunk), threadGroup: (64, 1, 1),
-                outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
-            y = stagedReduceKernel(
-                [part, dims], template: [("KC", chunk)],
-                grid: ((rows * n / 4 + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
-        } else {
-            part = partialKernel(
-                [x, w, dims], template: [("KC", chunk)],
-                grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
-                outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
-            y = reduceKernel(
-                [part, dims], template: [("KC", chunk)],
-                grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
-        }
-        return (part, y)
-    }
 
     nonisolated(unsafe) private static var announced = false
 
@@ -936,7 +749,14 @@ enum Qwen35WideNMatmul {
                 Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
         }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
-        let (_, y) = launch(x.reshaped(rows, k), w, dims, rows: rows, k: k, n: n, staged: staged)
+        let part = partialKernel(
+            [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
+            grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
+            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+        let y = reduceKernel(
+            [part, dims], template: [("KC", chunk)],
+            grid: ((rows * n / 4 + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
 }
