@@ -43,13 +43,18 @@ extension EngineLoopV2 {
     /// that replay would run inside the next verify, on the critical path.
     /// Submitting it here lets the GPU run it behind the early block proposal
     /// while the host finishes finalize. The arrays and their values are
-    /// exactly the ones the next verify reads.
+    /// exactly the ones the next verify reads. A layer whose commit is still a
+    /// deferred replay (`CBv2DeferredRecurrentReplay`) submits nothing: the
+    /// next verify's scan computes that state, and any other reader builds
+    /// the replay when it reads it.
     func submitCommittedRecurrentState(for id: CBv2RequestID) {
         guard Self.submitsCommittedRecurrentStateEarly,
             let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
         else { return }
-        let arrays = snapshot.keys.sorted().flatMap { index in
-            [snapshot[index]!.conv, snapshot[index]!.ssm].compactMap { $0 }
+        let arrays = snapshot.keys.sorted().flatMap { index -> [MLXArray] in
+            let layer = snapshot[index]!
+            if layer.deferredReplay?.isPending == true { return [] }
+            return [layer.conv, layer.ssm].compactMap { $0 }
         }
         if !arrays.isEmpty { asyncEval(arrays) }
     }
