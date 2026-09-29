@@ -4486,7 +4486,7 @@ enum Qwen35FusedHadamard {
             part += q;
             const uint kk = uint(index + r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            out[rowbase + bcol + kp] = uint8_t(int(q) + 128);
+            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
           }
           part = simd_sum(part);
           if ((i & 31) == 0) {
@@ -4727,7 +4727,8 @@ enum Qwen35FusedHadamard {
             guard rows > 0 else { return nil }
             let blocksPerRow = width / 1024
             let template: [(String, any KernelTemplateArg)] = [
-                ("InT", x.dtype), ("OutT", DType.uint8), ("W", width), ("BPR", blocksPerRow),
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", blocksPerRow), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
                 ("PRESIGNED", preSigned ? 1 : 0), ("GR", repeats), ("GKH", keyHeads), ("GD", headDim),
                 ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
                 ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0 ? 1 : 0),
@@ -4737,7 +4738,7 @@ enum Qwen35FusedHadamard {
                 [x, signs], template: template,
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [x.shape, groupShape, groupShape],
-                outputDTypes: [.uint8, .float32, .float32])
+                outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
         }
@@ -4840,6 +4841,7 @@ enum Qwen35FusedHadamard {
                 ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
                 ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0 ? 1 : 0),
                 ("AHD", aHead), ("BHD", bHead),
+                ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
             ]
             let outShape = [rows, width]
             let groupShape = [rows, width / 128]
@@ -4847,7 +4849,7 @@ enum Qwen35FusedHadamard {
                 [aView, bView, w, eps, signs], template: template,
                 grid: (64 * rows * blocksPerRow, 1, 1), threadGroup: (64, 1, 1),
                 outputShapes: [outShape, groupShape, groupShape],
-                outputDTypes: [.uint8, .float32, .float32])
+                outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
         }
@@ -4967,6 +4969,7 @@ enum Qwen35FusedBoundaryQ8 {
         let template: [(String, any KernelTemplateArg)] = [
             ("W", width), ("PRESIGNED", gainSigned), ("PERM", perm),
             ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0),
+            ("SIGNED", Qwen35TensorPackedMatmul.signedCodes),
         ]
         let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
         if writeNormed {
@@ -4974,7 +4977,7 @@ enum Qwen35FusedBoundaryQ8 {
                 inputs, template: template,
                 grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
                 outputShapes: [x.shape, codesShape, groupShape, groupShape, x.shape],
-                outputDTypes: [.float16, .uint8, .float32, .float32, .float32])
+                outputDTypes: [.float16, Qwen35TensorPackedMatmul.codesDType, .float32, .float32, .float32])
             return Output(
                 h: outs[0], normed: outs[4],
                 activation: SignedBlockHadamard.Int8Activation(
@@ -4984,7 +4987,7 @@ enum Qwen35FusedBoundaryQ8 {
             inputs, template: template,
             grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
             outputShapes: [x.shape, codesShape, groupShape, groupShape],
-            outputDTypes: [.float16, .uint8, .float32, .float32])
+            outputDTypes: [.float16, Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
         return Output(
             h: outs[0], normed: nil,
             activation: SignedBlockHadamard.Int8Activation(
@@ -5238,7 +5241,7 @@ enum Qwen35FusedBoundaryQ8 {
             part += q;
             const uint kk = lane * 4 + uint(r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128);
+            if (SIGNED) { codes[base + size_t(g) * 128 + kp] = int8_t(q); } else { codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128); }
           }
           part = simd_sum(part);
           if (lane == 0) {
@@ -5611,6 +5614,27 @@ enum Qwen35TensorPackedMatmul {
 
     static var verifyNativeAvailable: Bool { verifyForm == .native2b }
 
+    /// The int8-staged prompt kernel reads the activation codes as signed
+    /// int8 (`q`, not `q + 128`): its products then carry no `128 * colsum`
+    /// offset, so the epilogue's folded-offset term and its two 16-byte loads
+    /// per lane and group go away. Same values bit for bit: `fma(s, C, -128 s
+    /// colsum)` and `s * (C - 128 colsum)` each round once to the same
+    /// number (the offset is exact in FP32). Only that form takes it; the
+    /// native and 4-bit-staged forms keep the unsigned codes.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_SIGNED=0` keeps the unsigned codes.
+    static let signedCodes: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_SIGNED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(value ?? "") { return false }
+        guard support == .staged8 else { return false }
+        return probe(
+            "bonsai_probe_int8",
+            probeSourceStaged8.replacingOccurrences(of: "uint8_t", with: "int8_t"), aDType: .int8)
+    }()
+
+    /// The dtype of the activation codes the quantizing rotations write.
+    static var codesDType: DType { signedCodes ? .int8 : .uint8 }
+
     /// The widest projection the verify-width route takes: every tower
     /// projection and the vocabulary head (n = 248320) by default. Excluding
     /// gate|up (n = 34816) measured 3% slower in situ although the record's
@@ -5842,11 +5866,13 @@ enum Qwen35TensorPackedMatmul {
         const uint tid = thread_position_in_threadgroup.x;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-        tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)xq, dextents<int, 2>(K, M));
-        // staged B: 64 columns x 128 codes as 4-bit, 2 per byte, k inner: byte index (n * 128 + k) / 2
+        // SIGNED: the codes are int8 (q) and the products carry no offset.
+        typedef typename metal::conditional<SIGNED != 0, int8_t, uint8_t>::type CodeT;
+        tensor<device CodeT, dextents<int, 2>, tensor_inline> A((device CodeT*)xq, dextents<int, 2>(K, M));
+        // staged B: 64 columns x 128 codes as int8 bytes, k inner
         threadgroup uint32_t bs[2][64 * 128 / 4];
-        tensor<threadgroup uint8_t, dextents<int, 2>, tensor_inline> B0((threadgroup uint8_t*)bs[0], dextents<int, 2>(128, 64));
-        tensor<threadgroup uint8_t, dextents<int, 2>, tensor_inline> B1((threadgroup uint8_t*)bs[1], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B0((threadgroup CodeT*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup CodeT, dextents<int, 2>, tensor_inline> B1((threadgroup CodeT*)bs[1], dextents<int, 2>(128, 64));
         auto tA0 = A.template slice<128, 64>(0, m0);
         auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
         constexpr int CAP = 32;
@@ -5892,7 +5918,8 @@ enum Qwen35TensorPackedMatmul {
           if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
           const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
-          const float4 u0 = up0[g * NQ], u1 = up1[g * NQ];
+          float4 u0 = 0.0f, u1 = 0.0f;
+          if (!SIGNED) { u0 = up0[g * NQ]; u1 = up1[g * NQ]; }
           float as[4], rb[4];
           if (MPERM) {
             const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
@@ -5909,7 +5936,7 @@ enum Qwen35TensorPackedMatmul {
             const float s = nh ? s1[c] : s0[c];
             const float b = nh ? b1[c] : b0[c];
             const float u = nh ? u1[c] : u0[c];
-            const float t = fma(s, float(cT[i]), u);
+            const float t = SIGNED ? s * float(cT[i]) : fma(s, float(cT[i]), u);
             acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6105,7 +6132,7 @@ enum Qwen35TensorPackedMatmul {
         HadamardQuantizedLinear.tensorPackedMatmul = {
             activation, weight, scales, biases, groupSize, outputDType, cache in
             let codes = activation.codes
-            guard groupSize == 128, codes.dtype == .uint8, codes.ndim == 2,
+            guard groupSize == 128, codes.dtype == codesDType, codes.ndim == 2,
                 activation.scales.dtype == .float32, activation.scaledSums.dtype == .float32,
                 weight.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
                 [DType.float16, .float32].contains(outputDType)
@@ -6133,7 +6160,10 @@ enum Qwen35TensorPackedMatmul {
             return packedKernel(
                 [codes, weight, scalesT, biasesT, foldedSums, activation.scales,
                  activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                template: [("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0)],
+                template: [
+                    ("OutT", outputDType), ("MPERM", rowTiledConstants ? 1 : 0),
+                    ("SIGNED", signedCodes ? 1 : 0),
+                ],
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
