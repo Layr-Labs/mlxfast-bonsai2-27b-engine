@@ -240,10 +240,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   first 8 layers (a LEADING verify submission, the verify's first ~5
 ///   command buffers) and a second after 24: the GPU gets the front of the
 ///   verify as soon as it is built, runs layers 8..23 while the host builds
-///   the other 40, and never waits on the host's ~0.1 ms per layer. Two
-///   boundaries rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   the other 40. This experiment adds a third boundary after layer 40 to
+///   overlap more of the remaining host build. It can lose: every extra
+///   command buffer at verify width has a cost (slices every 2 layers had
+///   lengthened the ranked window). `MLXFAST_VERIFY_SLICE_LAYERS`
 ///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
 ///   again. Both trunk paths honour it: the plain per-layer loop and the
@@ -307,12 +307,14 @@ enum Qwen35TrunkSubmission {
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
-        // 24..63 while the GPU runs 8..23. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
-        // keeps the single boundary; `MLXFAST_VERIFY_SLICE_LAYERS` sets
-        // another plan, `0` turns it off.
+        // 24..63 while the GPU runs 8..23. A third boundary after layer 40
+        // tests whether submitting the tail sooner hides more host work; it
+        // also adds a command-buffer handoff that can cost more than it saves.
+        // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -328,7 +330,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
@@ -9863,6 +9865,28 @@ extension Qwen35TextModel: DFlash2TapTarget {
             arrays = [reading.weight]
         }
         return arrays + Qwen35TensorPackedMatmul.windowResidencyArrays()
+    }
+}
+
+extension Qwen35TextModel {
+    /// The arrays the seed's first prompt layer binds, for
+    /// `Qwen35SeedResidencyTouch`: layer 0's parameters, except that a packed
+    /// projection is read through its prompt-route operands where the prompt
+    /// tensor route is on (it never binds the stored words and constants).
+    func seedFirstLayerResidencyArrays() -> [MLXArray] {
+        guard let layer = model.layers.first else { return [] }
+        let tensorRoute = HadamardQuantizedLinear.tensorRouteTakesPromptRows(512)
+        var arrays: [MLXArray] = []
+        var replaced = Set<ObjectIdentifier>()
+        for (_, module) in layer.namedModules() {
+            guard tensorRoute, let projection = module as? HadamardQuantizedLinear else { continue }
+            arrays += Qwen35TensorPackedMatmul.promptResidencyArrays(projection)
+            for stored in [projection.weight, projection.scales] + (projection.biases.map { [$0] } ?? []) {
+                replaced.insert(ObjectIdentifier(stored))
+            }
+        }
+        return arrays
+            + layer.parameters().flattened().map(\.1).filter { !replaced.contains(ObjectIdentifier($0)) }
     }
 }
 
