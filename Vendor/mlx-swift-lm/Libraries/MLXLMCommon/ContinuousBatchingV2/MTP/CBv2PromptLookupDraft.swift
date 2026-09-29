@@ -126,6 +126,14 @@ enum CBv2PromptLookupDraft {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// `DARKBLOOM_DFLASH_FIRST_LOOKUP=0` keeps the drafter's block in the
+    /// first round after the prompt.
+    static let firstRoundEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_FIRST_LOOKUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// True when `id`'s next block may not be built before the readback.
     static func holdsSpeculation(_ id: CBv2RequestID) -> Bool {
         guard expectsPromptProposal(id) else { return false }
@@ -139,6 +147,38 @@ enum CBv2PromptLookupDraft {
     ) -> Bool {
         guard spliceSpeculationEnabled, expectsPromptProposal(id) else { return false }
         return continuation(history: history, promptLength: promptLength, depth: depth) != nil
+    }
+
+    /// The first round after the prompt, before any drafter block: its ids
+    /// from the prompt, or nil (then the drafter's block and the splice run).
+    ///
+    /// The committed output is one token here. When that token and the
+    /// prompt's own last token run along exactly one prompt position `c`
+    /// (`history[c - 1]` and `history[c]` equal the last two committed
+    /// tokens) whose next `depth` tokens lie inside the prompt, those tokens
+    /// are the block. Two or more such positions are ambiguous and fall back
+    /// to the drafter. No block is built: the prompt's context rows stay in
+    /// the drafter's cache (absorbed after the prompt forward) or pending,
+    /// and the next block that runs takes every committed row, as after any
+    /// lookup round. Only the draft changes; the target verifies every id.
+    static func firstRoundLookup(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+        guard enabled, firstRoundEnabled, depth > 0 else { return nil }
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard count == prompt + 1, prompt >= depth + 2 else { return nil }
+        let anchor = history[count - 1]
+        let previous = history[count - 2]
+        var chosen = -1
+        for c in 1 ... (prompt - depth - 1)
+        where history[c] == anchor && history[c - 1] == previous {
+            if chosen >= 0 { return nil }
+            chosen = c
+        }
+        guard chosen >= 0 else { return nil }
+        let ids = Array(history[(chosen + 1) ... (chosen + depth)])
+        FileHandle.standardError.write(
+            Data("dflash2 first-round lookup: position=\(chosen) depth=\(depth), drafter skipped\n".utf8))
+        return MLXArray(ids, [1, depth])
     }
 
     /// The next round's ids from the prompt, or nil (then the drafter runs).
@@ -169,10 +209,38 @@ enum CBv2PromptLookupDraft {
         return max(6, raw.flatMap(Int.init) ?? 8)
     }()
 
-    /// `MLXFAST_DFLASH_SPLICE_TRACE=1` reads the splice's choice back and
-    /// prints it. Diagnostic only: the readback waits for the drafter.
+    /// `DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN` sets the evidence an ANCHORED
+    /// alignment needs: block position `j` = 0 at a prompt position whose
+    /// committed suffix already runs along the span (run >= 1). 5 by default;
+    /// `0` or `off` holds every alignment to `spliceMinimum`.
+    ///
+    /// The committed run is capped by how much output there is. In the first
+    /// round after the seed the output is ONE token, so an anchored alignment
+    /// can show at most that token plus the prompt-template tokens that also
+    /// precede the quoted span (`\n\n` before the opening fence on the public
+    /// captures): a run of 2. Under the general bar of 8 that round's block
+    /// is continued only when the drafter is itself right for 6 or more
+    /// tokens. The spliced block equals the drafter's on its first `a`
+    /// positions, so it can accept fewer tokens than the drafter's block only
+    /// when the drafter was right past the point where it and the prompt
+    /// part; an anchored alignment that the drafter follows for `a` tokens
+    /// risks nothing the drafter got right before `a`. Every other alignment
+    /// (`j` > 0, or no committed run) keeps the general bar, and the best
+    /// alignment is still the one with the most evidence, so a round the
+    /// general bar already fired picks the same continuation.
+    static let spliceAnchorMinimum: Int = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let raw, ["0", "false", "no", "off"].contains(raw) { return 0 }
+        return max(2, raw.flatMap(Int.init) ?? 5)
+    }()
+
+    /// `MLXFAST_DFLASH_SPLICE_TRACE=1` (or `DARKBLOOM_DFLASH_SPLICE_TRACE=1`,
+    /// which the benchmarker forwards to its worker) reads the splice's choice
+    /// back and prints it. Diagnostic only: the readback waits for the drafter.
     static let spliceTrace: Bool =
         ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_TRACE"] == "1"
+        || ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_TRACE"] == "1"
 
     /// The proposal, or the same object when lookup does not apply.
     static func override(
@@ -207,13 +275,15 @@ enum CBv2PromptLookupDraft {
         source: """
 
         uint x = thread_position_in_grid.x;
-        int n = dims[0], d = dims[1], minimum = dims[2];
+        int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
         if (x >= n*d) return;
         int j = int(x)/n, c = int(x)%n;
         int a = 0;
         while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
         int s = a + (j == 0 ? runs[c] : 0);
-        ranked[x] = a > 0 && s >= minimum ? s : 0;
+        // anchored > 0: j = 0 on a committed run takes the lower bar.
+        bool eligible = s >= minimum || (anchored > 0 && j == 0 && runs[c] >= 1 && s >= anchored);
+        ranked[x] = a > 0 && eligible ? s : 0;
         """, ensureRowContiguous: true)
 
     private static let splicePick = MLXFast.metalKernel(
@@ -222,7 +292,8 @@ enum CBv2PromptLookupDraft {
         source: """
 
         uint tid = thread_position_in_threadgroup.x;
-        int n = dims[0], d = dims[1], minimum = dims[2];
+        int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
+        int floor_ = anchored > 0 && anchored < minimum ? anchored : minimum;
         int bs = 0, bi = 0;
         for (int i = int(tid); i < n*d; i += 256) {
          int s = ranked[i];
@@ -243,7 +314,7 @@ enum CBv2PromptLookupDraft {
         }
         if (tid < uint(d)) {
          int j=indices[0]/n, c=indices[0]%n;
-         out[tid] = scores[0] >= minimum && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
+         out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
         """, ensureRowContiguous: true)
 
@@ -297,7 +368,8 @@ enum CBv2PromptLookupDraft {
         if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
             let block = drafted.reshaped([depth]).asType(.int32)
             let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
-            let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum)])
+            let anchored = spliceAnchorMinimum > 0 && spliceAnchorMinimum < minimum ? spliceAnchorMinimum : 0
+            let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum), Int32(anchored)])
             let ranked = spliceScore(
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
@@ -337,12 +409,25 @@ enum CBv2PromptLookupDraft {
             MLXArray(Int32(-1)))
         // Leading agreement of each (j, c): [depth, candidates].
         let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
-        let score =
-            agree + MLXArray(firstRow, [depth, 1]) * MLXArray(runs, [1, candidates])
-        let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
+        let firstRows = MLXArray(firstRow, [depth, 1])
+        let runColumns = MLXArray(runs, [1, candidates])
+        let score = agree + firstRows * runColumns
+        let agreeing = agree .>= MLXArray(Int32(1))
+        var eligible = agreeing .&& (score .>= MLXArray(Int32(minimum)))
+        // Anchored alignments (j = 0 on a committed run) take the lower bar.
+        let anchorMinimum = spliceAnchorMinimum
+        var fireFloor = minimum
+        if anchorMinimum > 0, anchorMinimum < minimum {
+            let anchored =
+                (firstRows .== MLXArray(Int32(1))) .&& (runColumns .>= MLXArray(Int32(1)))
+            eligible =
+                eligible
+                .|| (anchored .&& agreeing .&& (score .>= MLXArray(Int32(anchorMinimum))))
+            fireFloor = anchorMinimum
+        }
         let ranked = which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
         let best = argMax(ranked, axis: 0).asType(.int32)
-        let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(minimum))
+        let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(fireFloor))
         let j = floorDivide(best, MLXArray(Int32(candidates)))
         let c = best - j * MLXArray(Int32(candidates))
         let steps = MLXArray((0 ..< depth).map { Int32($0) })
@@ -351,13 +436,22 @@ enum CBv2PromptLookupDraft {
         let spliced = which(steps .< j, block, take(promptIDs, source, axis: 0))
         let proposal = which(fire, spliced, block).reshaped([1, depth]).asType(drafted.dtype)
         if spliceTrace {
-            eval(best, fire)
-            let flat = best.item(Int32.self)
-            FileHandle.standardError.write(
-                Data(
-                    ("dflash2 prompt splice: fire=\(fire.item(Bool.self)) "
-                        + "j=\(Int(flat) / candidates) c=\(Int(flat) % candidates) "
-                        + "depth=\(depth)\n").utf8))
+            let open = which(agreeing, score, MLXArray(Int32(0))).reshaped([depth * candidates])
+            let openBest = argMax(open, axis: 0).asType(.int32)
+            let openScore = take(open, openBest, axis: 0)
+            let bestScore = take(ranked, best, axis: 0)
+            eval(best, fire, bestScore, openBest, openScore)
+            let flat = Int(best.item(Int32.self))
+            let openFlat = Int(openBest.item(Int32.self))
+            let fired: Bool = fire.item(Bool.self)
+            let chosenScore = Int(bestScore.item(Int32.self))
+            let anyScore = Int(openScore.item(Int32.self))
+            let anyRun = Int(runs[openFlat % candidates])
+            var line = "dflash2 prompt splice: fire=\(fired) j=\(flat / candidates)"
+            line += " c=\(flat % candidates) score=\(chosenScore)"
+            line += " best-any=\(anyScore)@j\(openFlat / candidates)c\(openFlat % candidates)"
+            line += " run=\(anyRun) committed=\(count - prompt) depth=\(depth)\n"
+            FileHandle.standardError.write(Data(line.utf8))
         }
         return proposal
     }
