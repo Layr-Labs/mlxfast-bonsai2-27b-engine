@@ -45,7 +45,7 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 }
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
-public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Sendable {
+public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unchecked Sendable {
 
     public let drafter: DFlash2DraftModel
     private let target: Qwen35TextModel
@@ -110,7 +110,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         try drafter.bind(target: text)
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
-        assistant.warmSpeculativeShapes()
+        assistant.warmSpeculativeShapes(serving: target)
         return assistant
     }
 
@@ -137,12 +137,136 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// dropped, and the buffer cache is drained afterwards, as the resident's
     /// own warm does, so the served phases start from the footprint a cold
     /// load leaves.
-    func warmSpeculativeShapes() {
+    func warmSpeculativeShapes(serving: (any LanguageModel)? = nil) {
         guard Self.speculativeWarmEnabled else { return }
         warmTargetPrefill()
         warmDrafter()
+        if let serving {
+            warmEngineRound(serving: serving)
+            // Once more after the runner has adopted the model, at the
+            // resident's boot warm: locally the load-time engine round left
+            // part of the first timed round's cost in place in some processes,
+            // and a round run after the full load removed it in every one.
+            CBv2DeferredLoadWarm.register { [weak self] in
+                guard let self else { return }
+                self.warmEngineRound(serving: serving)
+                Stream().synchronize()
+                Memory.clearCache()
+            }
+        }
         Stream().synchronize()
         Memory.clearCache()
+    }
+
+    /// `MLXFAST_ENGINE_ROUND_WARM=0` skips `warmEngineRound`.
+    static let engineRoundWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ENGINE_ROUND_WARM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Runs one short request through a real `EngineV2` at load: the engine's
+    /// seed step and its first speculative round, on throwaway state.
+    ///
+    /// The model-level warms above run the same target and drafter calls, but
+    /// not the engine's own round machinery (planning, the round graph, the
+    /// early block, finalize, the round journal). Nothing before the timed
+    /// window runs that machinery either: the timed prefill goes through the
+    /// teacher-forced stepper, and the seed window ends at the seed token. So
+    /// a fresh process paid its first-use costs inside the window's first
+    /// round: on the local M4 Max that round's early drafter submission took
+    /// 143-208 ms instead of 36-41 ms and the round 464-534 ms instead of
+    /// ~358 ms, with +1.2-1.8 G instructions, ~150 page faults and ~+0.13 s
+    /// of system time in the window, and none of it in any later window of
+    /// the same process. One engine request of 16 tokens at load removes all
+    /// of it; a model-level round does not.
+    ///
+    /// The engine is built the way the benchmark worker builds a DFlash leg
+    /// (contiguous KV, one stream, the scored seed width in one chunk, fixed
+    /// depth 15, rectangular verify), over the SERVING model this drafter is
+    /// bound to, so the same code runs. The prompt is the same fixed token
+    /// pattern `warmTargetPrefill` uses, greedy, so nothing depends on any
+    /// request's input; the engine is shut down, the tap restored, and
+    /// `warmSpeculativeShapes` drains the buffer cache afterwards.
+    private func warmEngineRound(serving: any LanguageModel) {
+        guard Self.engineRoundWarmEnabled else { return }
+        let layerKinds: [CBv2LayerKind]
+        let caches: [any CBv2AttendingLayerCache]
+        do {
+            let make: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache = {
+                index, kind in CBv2LayerCache(layerIndex: index, kind: kind)
+            }
+            if let model = serving as? Qwen35Model {
+                layerKinds = model.cbv2LayerKinds
+                caches = try model.newCacheV2(makeLayerCache: make)
+            } else if let model = serving as? Qwen35TextModel {
+                layerKinds = model.cbv2LayerKinds
+                caches = try model.newCacheV2(makeLayerCache: make)
+            } else {
+                return
+            }
+        } catch {
+            return
+        }
+        let previousTap = target.dFlash2TapLayerIds
+        guard (try? setBlockContextArmed(true)) != nil else { return }
+        defer {
+            target.dFlash2TapLayerIds = previousTap
+            target.model.dFlash2Tap.tappedHidden = nil
+        }
+        let depth = Self.warmBlockSize - 1
+        let rows = Self.warmPromptRows
+        weak var released: EngineV2?
+        do {
+            let engine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(serving),
+                layerKinds: layerKinds,
+                backend: CBv2ContiguousKVBackend(
+                    config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30)),
+                cacheProvider: CBv2LayerCacheBank(caches: caches),
+                sampler: CBv2DefaultSampler(),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 1,
+                    prefillChunkSize: max(CBv2SchedulerConfig().prefillChunkSize, rows),
+                    maxWaiting: 1,
+                    enablePrefixCache: false),
+                mtpDrafter: self,
+                mtpConfig: CBv2MTPConfig(
+                    enabled: true,
+                    maxDraftTokens: depth,
+                    maxSpeculativeBatch: 1,
+                    fixedDraftTokens: depth,
+                    verificationMode: .automatic,
+                    maxAutomaticRectangularTokens: 1 + depth,
+                    draftTokenCeiling: CBv2MTPConfig.testedMaxBlockDraftTokens))
+            released = engine
+            var request = CBv2Request(
+                id: CBv2RequestID(1),
+                promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
+                maxTokens: 1 + Self.warmBlockSize)
+            request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
+            request.stopTokens = []
+            let warmRequest = request
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                if let events = try? engine.submit(warmRequest) {
+                    for await _ in events {}
+                }
+                await engine.shutdown()
+                done.signal()
+            }
+            done.wait()
+        }
+        // The engine is out of scope here; its last references go as the
+        // task above unwinds and its queues drain. Wait (bounded) until it is
+        // gone, so its arrays are back in the cache before
+        // `warmSpeculativeShapes` drains it, and the served phases start from
+        // the footprint a cold load leaves.
+        var waited = 0
+        while released != nil, waited < 500 {
+            usleep(1_000)
+            waited += 1
+        }
     }
 
     /// `MLXFAST_SEED_PREFILL_WARM=0` skips `warmTargetPrefill`.
@@ -396,6 +520,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
+        try proposeBlock(
+            anchor: anchor, depth: depth, requestState: requestState,
+            submittingLeadingLayers: 0)
+    }
+
+    public func proposeBlock(
+        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
+        submittingLeadingLayers leadingLayers: Int
+    ) throws -> MLXArray {
         let state = self.state(requestState)
         // A state whose committed rows were all absorbed ahead of this round
         // (`prefetchCommittedContext`) proposes over its cache alone.
@@ -410,7 +543,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         seedCacheOffsets(state)
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1)
+            blockSize: depth + 1, submittingLeadingLayers: leadingLayers)
         state.absorbPending()
         state.contextPrefetched = false
         state.roots.append(tokens)
