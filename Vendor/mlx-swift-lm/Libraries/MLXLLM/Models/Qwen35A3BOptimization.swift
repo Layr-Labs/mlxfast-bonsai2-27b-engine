@@ -940,3 +940,6 @@ enum Qwen35WideNMatmul {
         return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
 }
+
+/// Re-measurement tag (inert: nothing references it).
+private enum Qwen35ReMeasurementTag { static let value: UInt32 = 0x09292024 }
