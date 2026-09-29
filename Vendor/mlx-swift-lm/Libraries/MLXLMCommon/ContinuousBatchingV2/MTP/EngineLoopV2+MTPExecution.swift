@@ -314,7 +314,9 @@ extension EngineLoopV2 {
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
-            let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            // Built at its shape: an evaluated host array (not a lazy reshape)
+            // lets the model read a prompt's ids without a GPU round trip.
+            let inputs = MLXArray(slice.map(Int32.init), [1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
@@ -629,24 +631,12 @@ extension EngineLoopV2 {
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
                 } else {
-                    // A unique prompt span decides the ids on the host; the
-                    // drafter then only absorbs this round's context rows
-                    // (`absorbLookupRound`, as the early block path does).
-                    let lookup = CBv2PromptLookupDraft.proposal(
-                        history: row.rec.tokens,
+                    let drafted = try block.proposeBlock(
+                        anchor: carry.token, depth: k, requestState: requestState)
+                    proposal = CBv2PromptLookupDraft.override(
+                        drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
-                    if let lookup, let absorbed = block.absorbLookupRound(requestState: requestState) {
-                        proposal = lookup
-                        assistantEvalTargets.append(contentsOf: absorbed)
-                    } else {
-                        let drafted = try block.proposeBlock(
-                            anchor: carry.token, depth: k, requestState: requestState)
-                        proposal = lookup ?? drafted
-                        // The replacement does not depend on the drafter graph.
-                        // Keep that graph live so the cache writes are not dropped.
-                        assistantEvalTargets.append(drafted)
-                    }
-                    block.noteLookupRound(lookup != nil, requestState: requestState)
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -654,6 +644,9 @@ extension EngineLoopV2 {
                     // when the carry was captured).
                     block.trimBlockState(
                         requestState, toCommittedLength: carry.kvOffset)
+                    // The replacement does not depend on the drafter graph.
+                    // Keep that graph live so the cache writes are not dropped.
+                    assistantEvalTargets.append(drafted)
                 }
                 proposals.append(proposal)
                 assistantEvalTargets.append(proposal)
