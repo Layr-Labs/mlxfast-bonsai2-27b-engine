@@ -46,6 +46,7 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
 public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MTPBlockSpeculation,
+    CBv2MTPBlockTreeProposing,
     @unchecked Sendable
 {
 
@@ -464,6 +465,136 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         warmTargetVerify(
             adapter: adapter, caches: bank.layerCaches(rowStates: [rowState]),
             recurrent: recurrent)
+        warmTargetVerifyTree(
+            adapter: adapter, caches: bank.layerCaches(rowStates: [rowState]),
+            recurrent: recurrent, rows: rowState.compactMap { $0 })
+    }
+
+    /// The bound-tree pass of the load-time verify warm (tree verify), on the
+    /// same throwaway state: a verify forward over a fixed 16-row tree (its
+    /// layout bound on every full-attention cache and the recurrent
+    /// transaction), the commit of one path (K/V compaction, compacted replay
+    /// tapes, tapped context gather), then a second tree forward over that
+    /// committed state, rolled back. Every tree kernel is built before a timed
+    /// round and every layer is seen to take its tree path: only then, and
+    /// when the tree kernels' load-time checks passed, are tree rounds on
+    /// (`CBv2TreeVerify.modelReady`). One stderr line.
+    private func warmTargetVerifyTree(
+        adapter: CBv2SteppableLanguageModelAdapter, caches: [CBv2AttendingLayerCache],
+        recurrent: CBv2RecurrentRequestState, rows: [CBv2SequenceKV]
+    ) {
+        guard CBv2TreeVerify.requested else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var failure: String?
+        defer {
+            CBv2TreeVerify.modelReady = failure == nil
+            let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            FileHandle.standardError.write(
+                Data(("mlxfast tree verify: bound-tree warm "
+                    + (failure.map { "FAILED (\($0)); tree rounds off" }
+                        ?? "passed (\(Qwen35TreeVerifyGDN.taken) GDN tree windows); tree rounds on")
+                    + "; \(ms) ms\n").utf8))
+        }
+        let full = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard adapter.supportsCapturedVerifyWindow, !rows.isEmpty, full.count == rows.count else {
+            failure = "no captured verify window or contiguous KV"
+            return
+        }
+        guard Qwen35TreeVerifySelfTest.passed else {
+            failure = "the GDN tree block / conv tap self-test did not pass"
+            return
+        }
+        guard Qwen35TreeAttentionSelfTest.verdict == true else {
+            failure = "the tree attention self-test did not pass"
+            return
+        }
+        guard DFlash2GreedyWalk.treeActive else {
+            failure = "the proposal tree self-test did not pass"
+            return
+        }
+        let serializing = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
+        for cache in serializing { cache.mtpSerializesRectangularAttention = true }
+        let attention = caches.compactMap { $0 as? CBv2LayerCache }.filter {
+            $0.kind.attention == .full && $0.kind.sharesKVWithLayer == nil && !$0.kind.isBidirectional
+        }
+        Qwen35TreeVerifyGDN.warming = true
+        Qwen35TreeVerifyGDN.declined = false
+        Qwen35TreeVerifyGDN.taken = 0
+        defer {
+            for cache in serializing { cache.mtpSerializesRectangularAttention = false }
+            for cache in attention { cache.bindTreeVerify(nil) }
+            Qwen35TreeVerifyGDN.warming = false
+        }
+        // Back to the prompt's rows (the chain warm left its window).
+        for row in full where row.absoluteOffset > Self.warmPromptRows {
+            row.rollback(row.absoluteOffset - Self.warmPromptRows)
+        }
+        let block = Self.warmBlockSize
+        guard full.allSatisfy({ $0.absoluteOffset == Self.warmPromptRows }) else {
+            failure = "unexpected KV offsets"
+            return
+        }
+        for cache in attention { cache.setRows(cache.rows) }
+        // A spine with siblings at every depth (a best-first tree's shape).
+        let parents = [-1, 0, 0, 0, 1, 1, 2, 4, 4, 5, 7, 7, 8, 10, 11, 13]
+        let path = [0, 1, 4, 7, 10]
+        let ids = (0 ..< block).map { Int32(100 + ($0 &* 104_729) % 20_000) }
+        let host = CBv2TreeVerifyLayout(parents: parents)
+        func forward() -> CBv2RecurrentStateEvaluation? {
+            guard let evaluation = try? recurrent.bind() else { return nil }
+            let layout = CBv2TreeVerifyLayout(
+                parents: MLXArray(parents.map { Int32($0) }), ancestors: host.ancestors,
+                depths: host.depths)
+            layout.acceptedRows = path
+            for cache in attention { cache.bindTreeVerify(layout) }
+            evaluation.treeVerify = layout
+            let output = adapter.forwardWithHiddenCaptured(
+                tokens: MLXArray(ids).reshaped([1, block]), caches: caches,
+                recurrentState: [evaluation], positionIds: nil)
+            for cache in attention { cache.bindTreeVerify(nil) }
+            evaluation.treeVerify = nil
+            guard evaluation.isCaptured, let roots = try? evaluation.evaluate() else {
+                try? evaluation.rollback()
+                return nil
+            }
+            var targets = [argMax(output.logits, axis: -1), output.lastHidden] + roots
+            if let tapped = target.dFlash2TappedHidden {
+                targets.append(take(tapped, MLXArray(path.map { Int32($0) }), axis: 1).asType(drafter.dtype))
+            }
+            targets.append(all(isFinite(output.logits)))
+            eval(targets)
+            guard targets.last!.item(Bool.self) else {
+                failure = "tree logits are not finite"
+                try? evaluation.rollback()
+                return nil
+            }
+            return evaluation
+        }
+        guard let first = forward() else {
+            failure = failure ?? "the tree forward did not stage a captured window"
+            return
+        }
+        if Qwen35TreeVerifyGDN.declined || Qwen35TreeVerifyGDN.taken == 0 {
+            try? first.rollback()
+            failure = "a GDN layer declined the tree window"
+            return
+        }
+        // Commit the path exactly as a round's finalize does.
+        for row in full {
+            row.compactTreeWindow(windowCount: block, rows: path)
+            row.rollback(block - path.count)
+        }
+        for cache in attention { cache.setRows(cache.rows) }
+        do { try first.commit(keepPositions: path.count) } catch {
+            failure = "commit: \(error)"
+            return
+        }
+        guard let again = forward() else {
+            failure = failure ?? "the second tree forward did not stage a captured window"
+            return
+        }
+        try? again.rollback()
+        if Qwen35TreeVerifyGDN.declined { failure = "a GDN layer declined the second tree window" }
     }
 
     /// `MLXFAST_VERIFY_WARM=0` skips `warmTargetVerify`.
@@ -655,6 +786,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         var isReleased = false
         /// Columns the last round confirmed (the speculative block's row class guess).
         var lastConfirmed: Int?
+        /// The newest proposal's tree (tree verify), lazy.
+        var lastTree: DFlash2TreeProposal?
 
         init(caches: [any KVCache]) { self.caches = caches }
 
@@ -706,6 +839,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             roots.removeAll(keepingCapacity: false)
             pendingRows = 0
             contextPrefetched = false
+            lastTree = nil
             isReleased = true
         }
     }
@@ -785,10 +919,21 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             anchor: [anchor], targetHidden: context, cache: state.caches,
             blockSize: depth + 1, submittingLeadingLayers: leadingLayers)
         DFlash2KernelTrial.recordProposed(tokens, position: state.observedRows)
+        state.lastTree = drafter.latestTree
         state.absorbPending()
         state.contextPrefetched = false
         state.roots.append(tokens)
         return tokens
+    }
+
+    /// The newest proposal's tree (`CBv2MTPBlockTreeProposing`): nil without
+    /// one, or with one child per node (always the greedy chain).
+    public func proposalTree(requestState: any CBv2MTPRequestState) -> CBv2MTPProposalTree? {
+        let state = self.state(requestState)
+        guard DFlash2GreedyWalk.treeChildren > 1, !state.isReleased, let tree = state.lastTree
+        else { return nil }
+        return CBv2MTPProposalTree(
+            ids: tree.ids, parents: tree.parent, depths: tree.depth, ancestors: tree.ancestors)
     }
 
     /// The cache must sit where the retained context actually starts. This is
@@ -953,6 +1098,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         // As `finalizeRound` of the confirmed rows, then `proposeBlock`.
         state.roots.removeAll(keepingCapacity: true)
         state.roots.append(s.block.tokens)
+        state.lastTree = s.block.tree
         state.lastConfirmed = confirmed
         state.observedRows += confirmed
         state.contextPrefetched = false

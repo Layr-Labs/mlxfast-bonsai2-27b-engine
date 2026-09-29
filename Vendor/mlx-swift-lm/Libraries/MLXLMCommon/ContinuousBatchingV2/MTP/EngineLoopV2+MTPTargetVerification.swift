@@ -66,9 +66,13 @@ extension EngineLoopV2 {
     /// with genuine target samples drawn with the request's real sampler
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
+    /// `tree`: the window is a token tree (tree verify, one row): its layout
+    /// is bound on every full-attention cache and on the row's recurrent
+    /// transaction for this one forward and cleared on every exit.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        stackedTokens: MLXArray? = nil
+        stackedTokens: MLXArray? = nil,
+        tree: CBv2TreeVerifyLayout? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -205,6 +209,9 @@ extension EngineLoopV2 {
             }
         }
         mtp.recordVerificationStrategy(rectangular: useRectangular)
+        precondition(
+            tree == nil || (useRectangular && recurrentModel != nil && rows.count == 1),
+            "CBv2 tree verify requires a one-row captured rectangular verify")
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
@@ -302,6 +309,19 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
+                var treeCaches: [CBv2LayerCache] = []
+                if let tree {
+                    treeCaches = caches.compactMap { $0 as? CBv2LayerCache }.filter {
+                        $0.kind.attention == .full && $0.kind.sharesKVWithLayer == nil
+                            && !$0.kind.isBidirectional
+                    }
+                    for cache in treeCaches { cache.bindTreeVerify(tree) }
+                    for evaluation in evaluations { evaluation.treeVerify = tree }
+                }
+                defer {
+                    for cache in treeCaches { cache.bindTreeVerify(nil) }
+                    for evaluation in evaluations { evaluation.treeVerify = nil }
+                }
                 output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
                     tokens: tokens, caches: caches, recurrentState: evaluations,
                     positionIds: positionIds) }

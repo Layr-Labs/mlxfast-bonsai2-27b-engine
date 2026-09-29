@@ -674,9 +674,15 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> [MLXArray]?
+    /// The token tree bound for the verify window about to be attended
+    /// (`CBv2TreeVerifyLayout`), or nil for the causal chain: the model reads
+    /// it for its rotary depths, the cache applies its mask.
+    var treeVerify: CBv2TreeVerifyLayout? { get }
 }
 
 extension CBv2AttendingLayerCache {
+    public var treeVerify: CBv2TreeVerifyLayout? { nil }
+
     public func updateAndAttendQueryBlocks(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?

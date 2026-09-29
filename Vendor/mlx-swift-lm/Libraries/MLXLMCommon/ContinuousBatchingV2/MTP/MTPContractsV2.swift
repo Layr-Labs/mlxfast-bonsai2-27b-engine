@@ -533,6 +533,69 @@ public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
     ) -> MLXArray?
 }
 
+/// Tree speculative verify (on by default; `MLXFAST_TREE_VERIFY=0` keeps the
+/// chain verify): a drafter round whose block drafter built a proposal tree
+/// verifies the tree's rows in one 16-row window (the ancestor mask on the
+/// attention layers, the tree block on the recurrent ones), accepts the
+/// longest path the target's argmax follows plus its bonus token, and
+/// commits exactly that path.
+public enum CBv2TreeVerify {
+    public static let requested: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_TREE_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Set by the model's load-time bound-tree warm once the tree kernels'
+    /// checks passed and every layer took its tree path.
+    nonisolated(unsafe) public static var modelReady = false
+
+    public static var active: Bool { requested && modelReady }
+
+    /// The accepted path from the host packet: rows root first (row 0, the
+    /// anchor), following at each node the child whose id is the target's
+    /// argmax there. `parents[r]` is -1 for the anchor and padding rows,
+    /// which are never children.
+    public static func acceptedPath(ids: [Int], parents: [Int], targets: [Int]) -> [Int] {
+        var path = [0]
+        var node = 0
+        let rows = min(ids.count, parents.count, targets.count)
+        while true {
+            let wanted = targets[node]
+            var next = -1
+            for r in (node + 1) ..< max(rows, node + 1) where parents[r] == node && ids[r] == wanted {
+                next = r
+                break
+            }
+            if next < 0 { break }
+            path.append(next)
+            node = next
+        }
+        return path
+    }
+}
+
+/// A block drafter's proposal tree, device int32 `[rows]` arrays in the
+/// tree's row order (parents first, row 0 the anchor; a padding row has
+/// parent -1 and ancestor mask 0).
+public struct CBv2MTPProposalTree {
+    public let ids: MLXArray
+    public let parents: MLXArray
+    public let depths: MLXArray
+    public let ancestors: MLXArray
+    public var rows: Int { ids.dim(0) }
+
+    public init(ids: MLXArray, parents: MLXArray, depths: MLXArray, ancestors: MLXArray) {
+        (self.ids, self.parents, self.depths, self.ancestors) = (ids, parents, depths, ancestors)
+    }
+}
+
+/// A block drafter that builds a proposal tree beside its greedy block.
+public protocol CBv2MTPBlockTreeProposing: CBv2MTPBlockDrafter {
+    /// The tree of `requestState`'s newest proposal, or nil.
+    func proposalTree(requestState: any CBv2MTPRequestState) -> CBv2MTPProposalTree?
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.

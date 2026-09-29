@@ -604,6 +604,8 @@ extension EngineLoopV2 {
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         var blockDraftIDs: MLXArray?
+        // The drafter's proposal tree this round verifies (tree verify).
+        var roundTree: CBv2MTPProposalTree?
         if let block = mtp.blockDrafter {
             // ONE propose per round. The block is the row's last committed
             // token followed by k mask tokens, and the drafter's single
@@ -630,13 +632,20 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                    if k == early.depth, batch == 1 { roundTree = early.tree }
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
-                    proposal = CBv2PromptLookupDraft.override(
+                    let parts = CBv2PromptLookupDraft.overrideParts(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
+                    proposal = parts.tokens
                     CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: proposal !== drafted)
+                    if batch == 1 {
+                        roundTree = Self.mtpTreeWindow(
+                            mtpTreeProposal(block, requestState: requestState, id: row.rec.id, depth: k),
+                            parts: parts, depth: k)
+                    }
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
@@ -653,8 +662,14 @@ extension EngineLoopV2 {
                 assistantEvalTargets.append(
                     contentsOf: block.evaluationTargets(for: requestState))
             }
-            let batched =
+            var batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
+            // A tree round's window rows 1...k are the tree's (row 0, the
+            // anchor, is the seed column); the greedy block stays a drafter
+            // output only.
+            if let roundTree {
+                batched = roundTree.ids[1...].reshaped([1, k]).asType(.int32)
+            }
             // The block proposal already has the [B, k] draft-ID layout; keep
             // it instead of re-stacking its columns (terrapinelf `7502085`).
             blockDraftIDs = batched
@@ -742,10 +757,16 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        // A tree round's window layout: row 0 the anchor, rows in the tree's
+        // pop order (parents first), padding rows masked (ancestor mask 0).
+        let verifyTree = roundTree.map {
+            CBv2TreeVerifyLayout(parents: $0.parents, ancestors: $0.ancestors, depths: $0.depths)
+        }
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp,
             stackedTokens: CBv2VerifyTokenStack.tokens(
-                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
+                seed: seedColumn, block: blockDraftIDs, columns: targetColumns),
+            tree: verifyTree)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -755,6 +776,10 @@ extension EngineLoopV2 {
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        // A tree round's rows' parents close the packet (the host walk).
+        if let roundTree {
+            packetParts.append(roundTree.parents.reshaped([-1]).asType(.int32))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -774,7 +799,50 @@ extension EngineLoopV2 {
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.tree = verifyTree
         return result
+    }
+
+    /// A round's window when its block was drafted at the verify build (the
+    /// first round after the seed): nil after a prompt lookup (lookup rounds
+    /// stay chains); where the splice ran, the spliced chain when it fires
+    /// and the tree otherwise, chosen on the device (a chain is a valid tree
+    /// layout). A block drafted at finalize keeps its tree over the splice.
+    static func mtpTreeWindow(
+        _ tree: CBv2MTPProposalTree?, parts: (tokens: MLXArray, lookup: Bool, fire: MLXArray?),
+        depth k: Int
+    ) -> CBv2MTPProposalTree? {
+        guard let tree, !parts.lookup else { return nil }
+        guard let fire = parts.fire else { return tree }
+        let rows = MLXArray(Int32(0) ..< Int32(k + 1))
+        let chainIDs = concatenated(
+            [tree.ids[..<1], parts.tokens.reshaped([k]).asType(.int32)], axis: 0)
+        return CBv2MTPProposalTree(
+            ids: which(fire, chainIDs, tree.ids),
+            parents: which(fire, rows - Int32(1), tree.parents),
+            depths: which(fire, rows, tree.depths),
+            ancestors: which(fire, (Int32(2) << rows) - Int32(1), tree.ancestors))
+    }
+
+    /// The block drafter's proposal tree for `id`'s round when that round can
+    /// verify it (tree verify): one greedy text row whose storage rows are
+    /// contiguous full-attention KV and no observer that refuses a
+    /// tree-masked window; nil keeps the chain.
+    func mtpTreeProposal(
+        _ block: any CBv2MTPBlockDrafter, requestState: any CBv2MTPRequestState,
+        id: CBv2RequestID, depth k: Int
+    ) -> CBv2MTPProposalTree? {
+        guard CBv2TreeVerify.active, let proposing = block as? any CBv2MTPBlockTreeProposing,
+            let tree = proposing.proposalTree(requestState: requestState), tree.rows == k + 1,
+            k + 1 <= CBv2TreeVerifyLayout.maximumRows,
+            logitDiagnostic == nil, attentionMetadata == nil, attentionPacket == nil,
+            !backend.requiresMaterializedSnapshots, let rec = scheduler.record(for: id),
+            rec.request.positionState == nil,
+            rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon,
+            let state = kvStates[id], !state.compactMap({ $0 }).isEmpty,
+            state.compactMap({ $0 }).allSatisfy({ $0 is CBv2FullSequenceKV })
+        else { return nil }
+        return tree
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

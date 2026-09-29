@@ -141,7 +141,9 @@ extension EngineLoopV2 {
         // clipping out of every round that can adopt it.
         var speculation: (id: CBv2RequestID, block: any CBv2MTPSpeculativeBlock,
             drafter: any CBv2MTPBlockSpeculation)?
-        if CBv2MTPDraftBeforeReadback.enabled, verify.rows.count == 1,
+        // A tree round's accept walk is not the positional product the block
+        // before the readback assumes: its next block waits for the host walk.
+        if CBv2MTPDraftBeforeReadback.enabled, verify.rows.count == 1, verify.tree == nil,
             let context = verify.blockContext,
             let speculative = mtp.blockDrafter as? any CBv2MTPBlockSpeculation,
             mtp.config.fixedDraftTokens == k, let metadata = verify.rows.first,
@@ -180,6 +182,9 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            /// A tree round's accepted path (window rows, root first); its
+            /// `targets` are then the path rows' argmaxes.
+            var path: [Int]? = nil
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -207,12 +212,23 @@ extension EngineLoopV2 {
             }
             let rec = scheduler.record(for: id)!
             let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
-            let targets = (0 ..< targetWidth).map {
+            var targets = (0 ..< targetWidth).map {
                 Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
             var accepted = 0
-            while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            var path: [Int]?
+            if verify.tree != nil {
+                // The tree walk (one row; the packet ends with the rows' parents).
+                let parents = (0 ..< targetWidth).map { Int(host[host.count - targetWidth + $0]) }
+                let walked = CBv2TreeVerify.acceptedPath(
+                    ids: [-1] + drafts, parents: parents, targets: targets)
+                accepted = walked.count - 1
+                targets = walked.map { targets[$0] }
+                path = walked
+            } else {
+                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            }
             if CBv2MTPDraftBeforeReadback.dumpsDrafts {
                 FileHandle.standardError.write(
                     Data("dflash2 round drafts=\(drafts) targets=\(targets)\n".utf8))
@@ -233,7 +249,8 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    path: path))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -301,6 +318,19 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
+            // A tree round commits exactly its accepted path: the path rows'
+            // K/V move to the window's first rows; the recurrent tapes are
+            // compacted to them at the commit below.
+            let keptRows: [Int]? = outcome.path.map { Array($0.prefix(confirmed)) }
+            if let keptRows {
+                for sequence in metadata.storageRows {
+                    guard let full = sequence as? CBv2FullSequenceKV else {
+                        preconditionFailure("CBv2 tree verify: storage row is not contiguous full KV")
+                    }
+                    full.compactTreeWindow(windowCount: targetWidth, rows: keptRows)
+                }
+                verify.tree?.acceptedRows = keptRows
+            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -339,7 +369,14 @@ extension EngineLoopV2 {
                 // because the correction token's own position is context for
                 // the next block.
                 let committedHidden: MLXArray
-                if let blockContext = verify.blockContext {
+                if let blockContext = verify.blockContext, let keptRows,
+                    keptRows != Array(0 ..< keptRows.count)
+                {
+                    // A tree path's rows, root first.
+                    committedHidden = take(
+                        blockContext[batchIndex ..< batchIndex + 1],
+                        MLXArray(keptRows.map { Int32($0) }), axis: 1)
+                } else if let blockContext = verify.blockContext {
                     committedHidden = blockContext[
                         batchIndex ..< batchIndex + 1,
                         CBv2MTPBlockContextIndex.confirmedColumns(
@@ -351,12 +388,19 @@ extension EngineLoopV2 {
                         0 ..< committedDraftCount,
                         0...]
                 }
+                // A tree path's draft ids (rows 1...), as the chain's prefix.
+                let committedDrafts =
+                    keptRows.map { rows in
+                        MLXArray(
+                            rows.dropFirst().prefix(committedDraftCount).map {
+                                Int32(host[batchIndex * k + $0 - 1])
+                            }, [1, committedDraftCount])
+                    }
+                    ?? verify.draftIDs[batchIndex ..< batchIndex + 1, 0 ..< committedDraftCount]
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
+                    committedDraftTokens: committedDrafts,
                     committedTargetHidden: committedHidden)
             }
             if rejected > 0 {
@@ -480,9 +524,10 @@ extension EngineLoopV2 {
                 } else if let drafted = proposal {
                     // Same object when no unique prompt span matches. The
                     // drafter graph stays in `drafted` either way.
-                    let tokens = CBv2PromptLookupDraft.override(
+                    let parts = CBv2PromptLookupDraft.overrideParts(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
+                    let tokens = parts.tokens
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
                     let targets = [tokens, drafted] + block.evaluationTargets(for: state)
@@ -492,7 +537,9 @@ extension EngineLoopV2 {
                         asyncEval(targets)
                     }
                     earlyBlock = CBv2MTPEarlyBlockProposal(
-                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset,
+                        tree: parts.lookup
+                            ? nil : mtpTreeProposal(block, requestState: state, id: id, depth: k))
                 }
             }
             // No next block from this finalize (the row finished, or its next
@@ -585,8 +632,10 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                let hiddenColumn =
+                    keptRows?.last
+                    ?? CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears

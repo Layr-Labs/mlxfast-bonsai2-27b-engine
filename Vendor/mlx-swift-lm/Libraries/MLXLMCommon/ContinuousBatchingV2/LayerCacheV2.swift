@@ -71,6 +71,19 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// text rows sharing a rectangular call.
     private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
+    /// The token tree of the verify window this layer attends next, or nil
+    /// (today's causal window). Bound around one verify forward; while bound,
+    /// `updateAndAttend` applies its ancestor mask to the window rows.
+    public private(set) var treeVerify: CBv2TreeVerifyLayout?
+
+    public func bindTreeVerify(_ layout: CBv2TreeVerifyLayout?) {
+        precondition(
+            layout == nil
+                || (kind.sharesKVWithLayer == nil && kind.attention == .full && !kind.isBidirectional),
+            "CBv2LayerCache: a tree layout binds to a storage-owning causal full-attention layer")
+        treeVerify = layout
+    }
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
         attentionSoftcap: Float? = nil
@@ -135,7 +148,11 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         // Refuse the capture BY NAME instead of recording a bad receipt.
         var metadata: CBv2AttentionMetadataObservation?
         var packet: CBv2AttentionPacketObservation?
-        if keepMask == nil {
+        let tree = treeVerify
+        if tree != nil {
+            attentionMetadata?.state.refuse("tree_masked_attention_not_replayable")
+            attentionPacket?.state.refuse("tree_masked_attention_not_replayable")
+        } else if keepMask == nil {
             let spans = boundSpanContexts?.contains(where: { $0 != nil }) ?? false
             metadata = attentionMetadata?.begin(
                 cache: self, queries: queries, keys: keys, values: values, scale: scale,
@@ -153,7 +170,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
-            keepMask: keepMask, metadata: metadata, packet: packet)
+            keepMask: keepMask, metadata: metadata, packet: packet, tree: tree)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         advancePositionOffsets(by: queries.dim(2))
@@ -170,6 +187,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         scale: Float, sinks: MLXArray?
     ) -> [MLXArray]? {
         guard kind.sharesKVWithLayer == nil, attentionMetadata == nil, attentionPacket == nil,
+            treeVerify == nil,
             rows.count == 1, boundSpanContexts?.contains(where: { $0 != nil }) != true,
             let blocks = CBv2AttentionV1.updateAndAttendQueryBlocks(
                 row: rows[0], kind: kind, queries: queries, keys: keys, values: values,
@@ -192,7 +210,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage to commit")
         precondition(
-            !mtpSerializesRectangularAttention,
+            !mtpSerializesRectangularAttention && treeVerify == nil,
             "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,

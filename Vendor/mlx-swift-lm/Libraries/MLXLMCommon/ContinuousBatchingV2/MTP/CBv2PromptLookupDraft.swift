@@ -107,17 +107,27 @@ enum CBv2PromptLookupDraft {
     static func override(
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
+        overrideParts(proposal, history: history, promptLength: promptLength, depth: depth).tokens
+    }
+
+    /// `override` with how it replaced the block: `lookup` (a prompt
+    /// continuation), or `fire` (device bool: the splice changed an id; tree
+    /// verify composes its window from it).
+    static func overrideParts(
+        _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
+    ) -> (tokens: MLXArray, lookup: Bool, fire: MLXArray?) {
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
-        else { return proposal }
+        else { return (proposal, false, nil) }
         if let hit = continuation(history: history, promptLength: promptLength, depth: depth) {
             FileHandle.standardError.write(
                 Data("dflash2 prompt lookup: match=\(hit.match) depth=\(depth)\n".utf8))
-            return MLXArray(hit.ids, [1, depth])
+            return (MLXArray(hit.ids, [1, depth]), true, nil)
         }
-        guard spliceEnabled else { return proposal }
-        return splice(proposal, history: history, promptLength: promptLength, depth: depth)
-            ?? proposal
+        guard spliceEnabled,
+            let spliced = splice(proposal, history: history, promptLength: promptLength, depth: depth)
+        else { return (proposal, false, nil) }
+        return (spliced, false, any(spliced .!= proposal))
     }
 
     /// Integer-only equivalent of the array splice below. Keep the array path
