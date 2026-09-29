@@ -151,6 +151,9 @@ final class CBv2MTPRoundInFlight {
     /// Prompt rows whose first sampled token becomes a round carry at
     /// finalize (block drafters only; see `mtpPrefillCarryEnabled`).
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
+    /// Prompt rows among `prefillCarries` whose context absorb waits for the
+    /// seed token (`CBv2PromptLookupDraft.prefetchOnMissEnabled`).
+    let deferredContextAbsorbs: [CBv2RequestID]
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -169,7 +172,8 @@ final class CBv2MTPRoundInFlight {
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
         committedObservationRows: [CommittedObservationRow],
-        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
+        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = [],
+        deferredContextAbsorbs: [CBv2RequestID] = []
     ) {
         self.verify = verify
         self.seedRows = seedRows
@@ -177,6 +181,7 @@ final class CBv2MTPRoundInFlight {
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
         self.prefillCarries = prefillCarries
+        self.deferredContextAbsorbs = deferredContextAbsorbs
     }
 }
 

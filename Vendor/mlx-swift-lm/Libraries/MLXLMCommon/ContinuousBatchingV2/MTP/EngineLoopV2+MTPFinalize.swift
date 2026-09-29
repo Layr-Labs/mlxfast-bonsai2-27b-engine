@@ -131,6 +131,19 @@ extension EngineLoopV2 {
             mtp.storeCarry(
                 id: carry.id, token: token, hidden: carry.hidden,
                 tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+            // Its context absorb, when it waited for this token: only for a
+            // first round that runs the drafter; on a seed lookup hit the rows
+            // stay pending (`CBv2PromptLookupDraft.prefetchOnMissEnabled`).
+            if round.deferredContextAbsorbs.contains(carry.id), let block = mtp.blockDrafter,
+                let depth = mtp.config.fixedDraftTokens,
+                let observed = round.committedObservationRows.first(where: { $0.id == carry.id }),
+                !CBv2PromptLookupDraft.seedLookupHits(
+                    history: rec.tokens, promptLength: rec.request.promptTokens.count,
+                    depth: depth)
+            {
+                let absorbed = block.prefetchCommittedContext(requestState: observed.assistantState)
+                if !absorbed.isEmpty { asyncEval(absorbed) }
+            }
         }
 
         guard let verify = round.verify else { return }

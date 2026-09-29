@@ -99,7 +99,8 @@ extension EngineLoopV2 {
                 seedHidden: graph.seedHidden,
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                 committedObservationRows: graph.committedObservationRows,
-                prefillCarries: graph.prefillCarries)
+                prefillCarries: graph.prefillCarries,
+                deferredContextAbsorbs: graph.deferredContextAbsorbs)
         }
         step.forwardShapes = shapes
         shapes?.attach()

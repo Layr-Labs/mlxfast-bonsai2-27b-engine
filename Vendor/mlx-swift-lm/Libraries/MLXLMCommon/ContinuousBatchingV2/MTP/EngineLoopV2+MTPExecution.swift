@@ -51,6 +51,9 @@ struct CBv2MTPGraphBuild {
     /// the step's sampled tokens never wait for it: a block drafter's
     /// absorption of a prompt's committed context.
     let lateEvalTargets: [MLXArray]
+    /// Prompt rows whose context absorb waits for the seed token
+    /// (`CBv2PromptLookupDraft.prefetchOnMissEnabled`).
+    let deferredContextAbsorbs: [CBv2RequestID]
 }
 
 /// A prompt row that carries into a block round submits its tapped context
@@ -356,6 +359,7 @@ extension EngineLoopV2 {
         var prefillEvalTargets: [MLXArray] = []
         var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
         var lateEvalTargets: [MLXArray] = []
+        var deferredContextAbsorbs: [CBv2RequestID] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -450,7 +454,8 @@ extension EngineLoopV2 {
                     let observed = committedObservationRows.last, observed.id == rec.id
                 {
                     // The tapped context itself rides the same late
-                    // submission (`CBv2MTPPromptTapLate`), not the step's.
+                    // submission (`CBv2MTPPromptTapLate`), not the step's,
+                    // whether its absorb follows now or at finalize.
                     if CBv2MTPPromptTapLate.enabled,
                         let index = committedObservationEvalTargets.lastIndex(where: {
                             $0 === observedHidden
@@ -459,9 +464,18 @@ extension EngineLoopV2 {
                         committedObservationEvalTargets.remove(at: index)
                         lateEvalTargets.append(observedHidden)
                     }
-                    lateEvalTargets.append(
-                        contentsOf: block.prefetchCommittedContext(
-                            requestState: observed.assistantState))
+                    // A first round that may take its ids from the prompt
+                    // decides at finalize, with the seed token on the host
+                    // (`CBv2PromptLookupDraft.prefetchOnMissEnabled`).
+                    if CBv2PromptLookupDraft.defersPromptAbsorb(
+                        prompt: rec.request.promptTokens, depth: mtp.config.fixedDraftTokens)
+                    {
+                        deferredContextAbsorbs.append(rec.id)
+                    } else {
+                        lateEvalTargets.append(
+                            contentsOf: block.prefetchCommittedContext(
+                                requestState: observed.assistantState))
+                    }
                 }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
@@ -554,7 +568,8 @@ extension EngineLoopV2 {
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
             prefillCarries: prefillCarries,
-            lateEvalTargets: lateEvalTargets)
+            lateEvalTargets: lateEvalTargets,
+            deferredContextAbsorbs: deferredContextAbsorbs)
     }
 
     /// A BLOCK drafter's first block needs only the prompt's tapped context
@@ -685,6 +700,16 @@ extension EngineLoopV2 {
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else if let seeded = CBv2PromptLookupDraft.seedLookup(
+                    history: row.rec.tokens,
+                    promptLength: row.rec.request.promptTokens.count, depth: k)
+                {
+                    // The first round's ids from the prompt: no drafter
+                    // forward; its context rows stay pending for the next
+                    // block that runs, as after a lookup round. A host
+                    // lookup's continuation, as `lookup`'s.
+                    proposal = seeded
+                    CBv2PromptLookupDraft.noteProposal(row.rec.id, fromPrompt: true, host: true)
                 } else {
                     let drafted = try block.proposeBlock(
                         anchor: carry.token, depth: k, requestState: requestState)
