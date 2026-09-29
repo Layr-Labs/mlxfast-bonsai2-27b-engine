@@ -56,6 +56,18 @@
 #       win over the flag, so on a runner the flag is dead argv; on a hand run
 #       it is the only box identity benchd has, and it comes from the
 #       calibration file's own `box`.
+#   21. with RESIDENT_UP_LOG_DIR unset, benchd gets a resident log directory
+#       outside both trees, because the reference workspace is read-only to the
+#       ranked job account.
+#
+# Cases 22-25 pin the live_goldens list. A ranked run measures each live
+# golden, and benchd matches the golden flags by position:
+#   22. every live golden reaches benchd as --golden, --golden-sha256,
+#       --golden-bytes, --control-golden, --control-golden-sha256 and
+#       --control-golden-bytes, one of each per golden, in fixture order.
+#   23. an empty live_goldens list is refused by name.
+#   24. a live golden with no timed_prompt_pool entry is refused by name.
+#   25. a declared depth with no oracle for one live golden is refused by name.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,7 +98,7 @@ cat > "${STUB}" <<'STUBEOF'
 # not a run.
 for arg in "$@"; do
   if [[ "${arg}" == "--help" ]]; then
-    echo "usage: benchd iterate --engine <bin>"
+    echo "usage: benchd iterate --engine <bin> [--control-golden <path>]"
     exit 0
   fi
 done
@@ -217,7 +229,7 @@ cp "${REPO_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json" "${RES_ROOT}/fixtures/"
 
 # THE GOLDEN MATERIAL, SYNTHESIZED INTO THIS SUITE'S OWN COPY OF THE FIXTURE.
 #
-# A freshly stamped track ships an EMPTY live_golden and an EMPTY
+# A freshly stamped track ships an EMPTY live_goldens and an EMPTY
 # timed_prompt_pool: the real tapes are organizer material, published in R2 and
 # staged on the box, and they do not exist for this track yet. The measure
 # script refuses without them, and rightly so -- but that refusal is not what
@@ -236,7 +248,7 @@ import hashlib, json, os, sys
 
 contract_path, golden_dir = sys.argv[1:3]
 contract = json.load(open(contract_path, encoding="utf-8"))
-if not contract.get("live_golden"):
+if not contract.get("live_goldens"):
     track = contract["track_id"]
 
     def stage(name):
@@ -251,10 +263,10 @@ if not contract.get("live_golden"):
         }
 
     live = "synthetic-live"
-    contract["live_golden"] = live
+    contract["live_goldens"] = [live]
     contract["timed_prompt_pool"] = [stage(live)]
     contract["live_golden_speculative"] = {
-        "mtp%d" % depth: stage("%s.mtp%d" % (live, depth))
+        "mtp%d" % depth: {live: stage("%s.mtp%d" % (live, depth))}
         for depth in contract.get("mtp_head", {}).get("permitted_draft_depths", [])
     }
     contract["official_scoring_enabled"] = True
@@ -263,13 +275,18 @@ if not contract.get("live_golden"):
         fh.write("\n")
 SYNTHEOF
 
-# The live golden has to exist under the name the fixture resolves to. When the
+# Each live golden has to exist under the name the fixture resolves to. When the
 # block above staged it, it is already there with the bytes its pin names; when
 # the fixture carried its own pool, an empty object is enough, because the bytes
 # are never read here (benchd re-verifies the pin on a real run).
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden' "${RES_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")"
-[[ -f "${GOLDEN_DIR}/${LIVE_GOLDEN_NAME}.golden.json" ]] \
-  || echo '{}' > "${GOLDEN_DIR}/${LIVE_GOLDEN_NAME}.golden.json"
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '.live_goldens[]' "${RES_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json")
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  [[ -f "${GOLDEN_DIR}/${name}.golden.json" ]] \
+    || echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"
+done
 
 # The stub benchd for these cases: it records whether the resident socket
 # reached its environment, plus its argv, and answers an `iterate --help` probe
@@ -279,12 +296,13 @@ cat > "${MEASURE_STUB}" <<'MEASURESTUBEOF'
 #!/usr/bin/env bash
 for arg in "$@"; do
   if [[ "${arg}" == "--help" ]]; then
-    echo "usage: benchd iterate --engine <bin>"
+    echo "usage: benchd iterate --engine <bin> [--control-golden <path>]"
     exit 0
   fi
 done
 printf '%s\n' "${BENCH_WORKER_RESIDENT_SOCKET-__UNSET__}" > "${STUB_CAPTURE_ENV}"
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
+printf '%s\n' "${RESIDENT_UP_LOG_DIR-__UNSET__}" > "${STUB_CAPTURE_ARGV}.resident-log-dir"
 echo '{}'
 exit 0
 MEASURESTUBEOF
@@ -634,8 +652,110 @@ if [[ -f "${WORK}/case20.argv" ]]; then
   fail "case 20: benchd was spawned with no engine"
 fi
 
+# Case 21: with no RESIDENT_UP_LOG_DIR, benchd gets one outside both trees.
+mkdir -p "${WORK}/case21-tmp"
+run_measure case21 "RESIDENT_UP_LOG_DIR=" "RUNNER_TEMP=" "TMPDIR=${WORK}/case21-tmp"
+case22_dir="$(cat "${WORK}/case21.argv.resident-log-dir" 2>/dev/null)"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 21: the measure script exited ${rc} with RESIDENT_UP_LOG_DIR unset; output: $(cat "${WORK}/case21.out")"
+elif [[ "${case22_dir}" != "${WORK}/case21-tmp/resident-up."* || ! -d "${case22_dir}" ]]; then
+  fail "case 21: benchd got RESIDENT_UP_LOG_DIR '${case22_dir}', not a new directory in the job's temporary directory"
+fi
+
+# ---------------------------------------------------------------------------
+# Cases 22-25: the live_goldens list.
+# ---------------------------------------------------------------------------
+MEASURE_CONTRACT="${RES_ROOT}/fixtures/bonsai2_27b_mlx_v1_track.json"
+
+# argv_values FILE FLAG -- every value that follows FLAG, one per line, in argv
+# order.
+argv_values() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys
+path, flag = sys.argv[1], sys.argv[2]
+args = open(path, encoding="utf-8").read().splitlines()
+for i, arg in enumerate(args):
+    if arg == flag and i + 1 < len(args):
+        print(args[i + 1])
+PYEOF
+}
+
+# pool_pins FIELD -- the timed_prompt_pool FIELD of each live golden, in
+# live_goldens order.
+pool_pins() {
+  jq -r --arg f "$1" '. as $c | .live_goldens[] as $n
+    | first($c.timed_prompt_pool[] | select(.r2_path | endswith("/" + $n + ".golden.json")))[$f]
+    | tostring' "${MEASURE_CONTRACT}"
+}
+
+# Case 22: every live golden reaches benchd as repeated flags, in fixture order.
+run_measure case22
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 22: the measure script exited ${rc}; output: $(cat "${WORK}/case22.out")"
+elif [[ ! -f "${WORK}/case22.argv" ]]; then
+  fail "case 22: benchd was never dispatched; output: $(cat "${WORK}/case22.out")"
+else
+  want_paths="$(printf "${GOLDEN_DIR}/%s.golden.json\n" "${LIVE_GOLDEN_NAMES[@]}")"
+  want_shas="$(pool_pins sha256)"
+  want_bytes="$(pool_pins bytes)"
+  [[ "$(argv_values "${WORK}/case22.argv" --golden)" == "${want_paths}" ]] \
+    || fail "case 22: the --golden values are not the live goldens in fixture order: $(argv_values "${WORK}/case22.argv" --golden | tr '\n' ' ')"
+  [[ "$(argv_values "${WORK}/case22.argv" --golden-sha256)" == "${want_shas}" ]] \
+    || fail "case 22: the --golden-sha256 values are not the live goldens' pins in fixture order"
+  [[ "$(argv_values "${WORK}/case22.argv" --golden-bytes)" == "${want_bytes}" ]] \
+    || fail "case 22: the --golden-bytes values are not the live goldens' pins in fixture order"
+  [[ "$(argv_values "${WORK}/case22.argv" --control-golden)" == "${want_paths}" ]] \
+    || fail "case 22: the --control-golden values are not the live goldens in fixture order: $(argv_values "${WORK}/case22.argv" --control-golden | tr '\n' ' ')"
+  [[ "$(argv_values "${WORK}/case22.argv" --control-golden-sha256)" == "${want_shas}" ]] \
+    || fail "case 22: the --control-golden-sha256 values are not the live goldens' pins in fixture order"
+  [[ "$(argv_values "${WORK}/case22.argv" --control-golden-bytes)" == "${want_bytes}" ]] \
+    || fail "case 22: the --control-golden-bytes values are not the live goldens' pins in fixture order"
+fi
+
+# run_measure_with_contract CASE FILTER [ENV=VAL...] -- run_measure against a
+# copy of the fixture changed by the jq FILTER, then restore the fixture.
+run_measure_with_contract() {
+  local case_name="$1" filter="$2"
+  shift 2
+  cp "${MEASURE_CONTRACT}" "${WORK}/measure-contract.saved"
+  jq "${filter}" "${WORK}/measure-contract.saved" > "${MEASURE_CONTRACT}"
+  run_measure "${case_name}" "$@"
+  cp "${WORK}/measure-contract.saved" "${MEASURE_CONTRACT}"
+}
+
+# expect_measure_refusal CASE NEEDLE -- the run refused, named NEEDLE, and never
+# dispatched benchd.
+expect_measure_refusal() {
+  local case_name="$1" needle="$2"
+  if [[ "${rc}" -eq 0 ]]; then
+    fail "${case_name}: the measure script ran; it must refuse"
+  elif ! grep -qF -- "${needle}" "${WORK}/${case_name}.out"; then
+    fail "${case_name}: the refusal does not name '${needle}'; got: $(cat "${WORK}/${case_name}.out")"
+  fi
+  if [[ -f "${WORK}/${case_name}.argv" ]]; then
+    fail "${case_name}: benchd was dispatched despite the refusal"
+  fi
+}
+
+# Case 23: an empty list is refused by name.
+run_measure_with_contract case23 '.live_goldens = []'
+expect_measure_refusal case23 "fixture declares no live_goldens"
+
+# Case 24: a live golden with no pool entry is refused by name.
+run_measure_with_contract case24 '.live_goldens += ["no-such-prompt"]'
+expect_measure_refusal case24 "live golden 'no-such-prompt' has no timed_prompt_pool entry"
+
+# Case 25: a declared depth with no oracle for one live golden is refused by
+# name. The last live golden loses its mtp3 oracle.
+SPEC_MANIFEST="${WORK}/mtp3.manifest.json"
+printf '{"version":1,"source":"pinned","spec":{"decoder":"mtp","enabled":true,"num_speculative_tokens":3}}\n' > "${SPEC_MANIFEST}"
+LAST_LIVE="${LIVE_GOLDEN_NAMES[${#LIVE_GOLDEN_NAMES[@]}-1]}"
+run_measure_with_contract case25 'del(.live_golden_speculative.mtp3[.live_goldens[-1]])' \
+  "SPEC_DECLARATION_MANIFEST=${SPEC_MANIFEST}"
+expect_measure_refusal case25 "declared spec 'mtp3' has no live_golden_speculative entry for live golden '${LAST_LIVE}'"
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-benchmark-facade-env.sh: all 20 cases passed (trackId=${EXPECTED})"
+  echo "test-benchmark-facade-env.sh: all 25 cases passed (trackId=${EXPECTED})"
   exit 0
 fi
 echo "test-benchmark-facade-env.sh: ${failures} case(s) failed" >&2

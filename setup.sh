@@ -2968,11 +2968,28 @@ build_swift_harness() {
   # .build-worker, each with its own clang module cache, so a
   # participant-code build can never write into the trusted product tree.
   # An explicitly exported CLANG_MODULE_CACHE_PATH wins for both builds.
+  #
+  # Both builds compile editable files, so each build runs through
+  # tools/sandboxed-build.sh. On an official run, that script runs the build
+  # under Seatbelt: the build cannot read the evaluator-only paths, cannot use
+  # the network and can write only its own scratch path. Thus the dependency
+  # fetch runs first, outside the sandbox. It runs the committed manifests and
+  # compiles no editable file.
   mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
+  local swiftpm_sandbox_flags=()
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+    swift package resolve --force-resolved-versions || return 1
+    swift package resolve --force-resolved-versions --scratch-path .build-worker || return 1
+    swiftpm_sandbox_flags=(--disable-sandbox --skip-update --manifest-cache local)
+  fi
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
-    swift build -c release --force-resolved-versions --product mlxfast-swift
+    tools/sandboxed-build.sh --write "${PWD}/.build" -- \
+    swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
+    --product mlxfast-swift || return 1
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
-    swift build -c release --force-resolved-versions --scratch-path .build-worker --product bench-worker
+    tools/sandboxed-build.sh --write "${PWD}/.build-worker" -- \
+    swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
+    --scratch-path .build-worker --product bench-worker || return 1
   if [[ ! -x "${SWIFT_BIN}" ]]; then
     echo "${SETUP_LOG_LABEL}: trusted Swift CLI missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
     return 1
@@ -3391,6 +3408,23 @@ EOF
   fi
 
   parent_dir="$(dirname "${reference_dir}")"
+
+  # A reference that this account cannot change. On a ranked box the operator
+  # stages and stamps the checkpoint, and the job account reads it. The mutex
+  # is a file beside the checkpoint, so this account cannot take it, and it
+  # cannot repair the cache. It verifies the checkpoint and changes nothing.
+  if [[ -d "${reference_dir}" && ! -w "${reference_dir}" && ! -w "${parent_dir}" ]]; then
+    if [[ -f "${reference_dir}/config.json" ]] && reference_cache_lock_is_current "${reference_dir}" \
+        && verify_reference_weights "${reference_dir}"; then
+      echo "${SETUP_LOG_LABEL}: the reference checkpoint at ${reference_dir} is read-only for this account; verified, not changed"
+      ensure_reference_compat_link "${reference_dir}"
+      return $?
+    fi
+    echo "${SETUP_LOG_LABEL}: the reference checkpoint at ${reference_dir} is read-only for this account, and its verification stamp is absent or not current." >&2
+    echo "  This account cannot repair it. The operator must run ./setup.sh with MLXFAST_REFERENCE_DIR=${reference_dir} as the account that owns the checkpoint." >&2
+    return 1
+  fi
+
   mkdir -p "${parent_dir}" || return 1
   acquire_reference_cache_mutation_lock || return 1
 

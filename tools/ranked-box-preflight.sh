@@ -19,8 +19,8 @@
 # comes from the runner process environment under the name
 # tools/bonsai2-27b-measure-and-score.sh already reads:
 #
-#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the 8 timed-pool tapes
-#                                      (the live golden this leg scores over
+#   MLXFAST_QWEN38_GOLDEN_DIR          directory holding the timed-pool tapes
+#                                      (the live goldens the run scores over
 #                                      among them). The name is the FLEET's
 #                                      golden-dir contract, which every box
 #                                      script exports; it is not this track's
@@ -31,11 +31,11 @@
 # and nothing here reaches the network.
 #
 # PAIRED, WITH A PER-BOX BAND (David 2026-09-08). This track scores TWO legs on
-# the same box in the same job, over the ONE live golden: a SERIAL-CONTROL leg
+# the same box in the same job, over each live golden: a SERIAL-CONTROL leg
 # on the organizer-staged reference tree and the CANDIDATE leg on the submission
 # tree at its declared depth. The score is the LIVE ratio. Nothing stores a
 # pair -- not the constants, not the fixture, not the golden. So this preflight
-# verifies the staged pool tapes (and the live golden among them), the fixture
+# verifies the staged pool tapes (and the live goldens among them), the fixture
 # arm state, AND the two names the paired path needs on this box:
 #
 #   MLXFAST_BASELINE_WORKSPACE     the built reference tree, at the fixture's
@@ -207,7 +207,11 @@ if grep -q 'PENDING-ORGANIZER' "${CONTRACT}"; then
 fi
 
 pool_count="$(jq -r '.timed_prompt_pool | length' "${CONTRACT}")"
-[[ "${pool_count}" == "8" ]] || fail "timed_prompt_pool has ${pool_count} entries, expected 8 (the cohort size this track scores)"
+[[ "${pool_count}" =~ ^[1-9][0-9]*$ ]] || fail "timed_prompt_pool has ${pool_count} entries; it must hold at least one"
+for field in sha256 r2_path; do
+  [[ "$(jq -r --arg f "${field}" '[.timed_prompt_pool[][$f]] | unique | length' "${CONTRACT}")" == "${pool_count}" ]] \
+    || fail "timed_prompt_pool has two entries with the same ${field}; pool entries must be distinct"
+done
 
 # A pin is {sha256, bytes} together; neither half alone is one. An entry that
 # fails this is unarmed no matter what it is called.
@@ -230,12 +234,12 @@ printf '%s' "${hidden_sha}" | grep -Eq '^[0-9a-f]{64}$' \
   || fail "hidden_correctness_golden.sha256 is not a 64-hex digest; the token-fidelity oracle is unarmed"
 printf '%s' "${hidden_bytes}" | grep -Eq '^[1-9][0-9]*$' \
   || fail "hidden_correctness_golden.bytes is not a positive integer"
-ok "timed pool armed: 8 pinned tapes + a pinned hidden correctness golden"
+ok "timed pool armed: ${pool_count} pinned tapes + a pinned hidden correctness golden"
 
 # --- 4. the staged tapes match the pins -------------------------------------
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the 8 timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
   || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
 
@@ -261,20 +265,22 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
 done <<EOF
 $(jq -r '.timed_prompt_pool[] | [.r2_path, .sha256, (.bytes | tostring)] | @tsv' "${CONTRACT}")
 EOF
-ok "all 8 staged timed-pool tapes match their contract pins (bytes then sha256)"
+ok "all ${pool_count} staged timed-pool tapes match their contract pins (bytes then sha256)"
 
 # Per-depth oracles (David ruling 2026-09-07): every live_golden_speculative
-# entry must be a well-formed pin AND staged, so a speculative submission never
-# reaches the GPU to find its oracle missing. Absent map = serial-only track.
+# entry (one per depth and live golden) must be a well-formed pin AND staged, so
+# a speculative submission never reaches the GPU to find its oracle missing.
+# Absent map = serial-only track.
 spec_malformed="$(jq -r '
-  (.live_golden_speculative // {})
-  | to_entries
-  | map(select(
-      (.value.r2_path | type != "string" or length == 0)
-      or (.value.sha256 | type != "string" or test("^[0-9a-f]{64}$") | not)
-      or (.value.bytes | type != "number" or . <= 0)
-    ))
-  | map("live_golden_speculative[" + .key + "]")
+  [ (.live_golden_speculative // {})
+    | to_entries[] | .key as $depth
+    | .value | to_entries[]
+    | select(
+        (.value.r2_path | type != "string" or length == 0)
+        or (.value.sha256 | type != "string" or test("^[0-9a-f]{64}$") | not)
+        or (.value.bytes | type != "number" or . <= 0)
+      )
+    | "live_golden_speculative[" + $depth + "][" + .key + "]" ]
   | join(", ")
 ' "${CONTRACT}")"
 [[ -z "${spec_malformed}" ]] || fail "unarmed or malformed per-depth oracle pin(s): ${spec_malformed}"
@@ -290,7 +296,7 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
 "
   fi
   spec_count=$((spec_count + 1))
-done < <(jq -r '(.live_golden_speculative // {}) | to_entries[] | [.value.r2_path, .value.sha256, (.value.bytes|tostring)] | @tsv' "${CONTRACT}")
+done < <(jq -r '(.live_golden_speculative // {})[][] | [.r2_path, .sha256, (.bytes|tostring)] | @tsv' "${CONTRACT}")
 ok "${spec_count} per-depth oracle(s) pinned and staged"
 
 # The staging directory must hold the cohort and NOTHING ELSE.
@@ -321,23 +327,26 @@ else
   ok "MLXFAST_CORRECTNESS_GOLDEN_PATH unset; benchd resolves the oracle from the contract"
 fi
 
-# --- 4b. the live golden the single-leg run scores over is staged -----------
-# Single-leg reads exactly ONE golden: the fixture's live_golden, resolved by
-# tools/bonsai2-27b-measure-and-score.sh as <live_golden>.golden.json. The
-# loop above already pin-verified it AS a pool member; this asserts the
-# fixture's live_golden actually NAMES a pinned pool entry and is staged, so a
-# live_golden rotation that points at a golden absent from the pool -- or a box
-# that staged the pool but not the live golden -- is caught here, pre-GPU,
-# rather than at measure time.
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")"
-[[ -n "${LIVE_GOLDEN_NAME}" ]] \
-  || fail "the fixture declares no live_golden; there is no golden for the single-leg run to score over"
-live_golden_base="${LIVE_GOLDEN_NAME}.golden.json"
-printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
-  || fail "live_golden '${LIVE_GOLDEN_NAME}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
-[[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
-  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the single-leg run scores over"
-ok "live golden ${live_golden_base} is pinned and staged (the single-leg scored golden)"
+# --- 4b. the live goldens the ranked run scores over are staged -------------
+# The ranked run reads the fixture's live_goldens, each resolved by
+# tools/bonsai2-27b-measure-and-score.sh as <name>.golden.json. The loop above
+# already pin-verified each one AS a pool member; this asserts that every name
+# in live_goldens actually NAMES a pinned pool entry and is staged, so a list
+# that points at a golden absent from the pool -- or a box that staged the pool
+# but not a live golden -- is caught here, pre-GPU, rather than at measure
+# time.
+live_count=0
+while IFS= read -r live_name; do
+  live_golden_base="${live_name}.golden.json"
+  printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
+    || fail "live golden '${live_name}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
+  [[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
+    || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; the ranked run scores over it"
+  ok "live golden ${live_golden_base} is pinned and staged"
+  live_count=$((live_count + 1))
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+[[ "${live_count}" -gt 0 ]] \
+  || fail "the fixture declares no live_goldens; there is no golden for the ranked run to score over"
 
 # --- 5. the fixture is armed for official scoring ---------------------------
 # benchd refuses, pre-GPU, to seal an official artifact unless the fixture
@@ -438,6 +447,7 @@ calibration_error="$(
   MLXFAST_CAL_REF_COMMIT="${REFERENCE_COMMIT}" \
   MLXFAST_CAL_REF_DATE="${reference_commit_date}" \
   MLXFAST_CAL_BOX="${RUNNER_NAME:-}" \
+  MLXFAST_CAL_LIVE="$(jq -r '(.live_goldens // [])[]' "${CONTRACT}")" \
   python3 - <<'PYEOF'
 import datetime
 import json
@@ -462,11 +472,29 @@ except (OSError, json.JSONDecodeError) as exc:
 if not isinstance(cal, dict):
     refuse(f"the baseline calibration file is not a JSON object: {path}")
 
-if cal.get("version") != 1:
+# Version 1 holds one prompt at the top level. Version 2 holds one entry for
+# each prompt in `prompts`.
+if cal.get("version") == 1:
+    entries = [cal]
+elif cal.get("version") == 2:
+    entries = cal.get("prompts")
+    if not isinstance(entries, list) or not entries or not all(
+        isinstance(entry, dict) for entry in entries
+    ):
+        refuse("baseline calibration prompts is not a list of one entry for each prompt")
+else:
     refuse(
-        f"baseline calibration version is {cal.get('version')!r}, expected 1; "
+        f"baseline calibration version is {cal.get('version')!r}, expected 1 or 2; "
         "this box's file was written by a different calibrator"
     )
+
+held = [entry.get("prompt") for entry in entries]
+for live in os.environ["MLXFAST_CAL_LIVE"].split():
+    if live not in held:
+        refuse(
+            f"baseline calibration has no entry for live prompt {live!r}; it holds "
+            f"{held!r}, so the control leg on {live!r} would have no health band"
+        )
 
 want_track = os.environ["MLXFAST_CAL_TRACK_ID"]
 if cal.get("track_id") != want_track:
@@ -502,27 +530,28 @@ numeric_fields = (
     "decode_band_low",
     "decode_band_high",
 )
-for field in numeric_fields:
-    value = cal.get(field)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        refuse(f"baseline calibration {field} is {value!r}, which is not a number")
-    if not math.isfinite(value):
-        refuse(f"baseline calibration {field} is {value!r}, which is not finite")
-    if value <= 0:
-        refuse(
-            f"baseline calibration {field} is {value!r}; every measured value and every "
-            "band edge must be positive (a zero CV across repeated passes is a frozen "
-            "clock, not a stable box)"
-        )
+for entry in entries:
+    for field in numeric_fields:
+        value = entry.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            refuse(f"baseline calibration {field} is {value!r}, which is not a number")
+        if not math.isfinite(value):
+            refuse(f"baseline calibration {field} is {value!r}, which is not finite")
+        if value <= 0:
+            refuse(
+                f"baseline calibration {field} is {value!r}; every measured value and every "
+                "band edge must be positive (a zero CV across repeated passes is a frozen "
+                "clock, not a stable box)"
+            )
 
-for axis in ("prefill", "decode"):
-    low = cal[f"{axis}_band_low"]
-    high = cal[f"{axis}_band_high"]
-    if not low < 1 < high:
-        refuse(
-            f"baseline calibration {axis} band is [{low}, {high}]; a band must straddle "
-            "1 (low < 1 < high), or the leg it judges can never be healthy"
-        )
+    for axis in ("prefill", "decode"):
+        low = entry[f"{axis}_band_low"]
+        high = entry[f"{axis}_band_high"]
+        if not low < 1 < high:
+            refuse(
+                f"baseline calibration {axis} band is [{low}, {high}]; a band must straddle "
+                "1 (low < 1 < high), or the leg it judges can never be healthy"
+            )
 
 captured_at = cal.get("captured_at")
 if not isinstance(captured_at, str) or not captured_at:
@@ -547,6 +576,166 @@ if [[ -n "${RUNNER_NAME:-}" ]]; then
   ok "baseline calibration parses and names this track, this box (${RUNNER_NAME}) and the reference commit"
 else
   ok "baseline calibration parses and names this track and the reference commit (RUNNER_NAME unset, so the box name is not checked)"
+fi
+
+# --- 7. the job account boundary (official runs only) ------------------------
+# GHSA-rc55-jfmg-gvc9 and GHSA-2j7x-cjrv-43wv. A ranked job runs participant
+# code as the job account. The box converge makes that account an
+# unprivileged account that can read the evaluator material but cannot change
+# it. This section refuses the run when the box is not in that state, before
+# any participant code runs and before anything loads.
+#
+# The checks run on an official run only: a self-hosted Actions runner
+# (RUNNER_ENVIRONMENT=self-hosted) or MLXFAST_OFFICIAL_BENCHMARK_RUN=1. A hand
+# run by the operator owns these paths by design, and is not checked.
+#
+#   7a. The job account does not own, and cannot write, the evaluator material:
+#       the goldens, the correctness golden, benchd-bin, the reference
+#       workspace, the calibration file, the reference checkpoint, the
+#       temperature reader and the metallib stage. The check is exhaustive:
+#       one python3 walk looks at every item in each tree and at every
+#       directory above each path up to /, because a writable directory above
+#       a path lets the job replace the path. Ownership is read from lstat.
+#       Write access is a real access test (os.access W_OK), so it applies the
+#       mode and the ACL. A writable sticky directory above a path (/tmp) is
+#       accepted only when neither it nor the next item on the path belongs to
+#       the job account. The pass line gives the counts.
+#   7b. The job account has no privilege: its uid is not 0, it is not in the
+#       admin, wheel or sudo group, and `sudo -n true` fails. 7b runs before
+#       7a, because a root account owns every directory above every path and
+#       its 7a refusal would not name the real fault.
+official_run=0
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
+  official_run=1
+fi
+
+# boundary_refuse <check> <message>
+boundary_refuse() {
+  fail "account boundary check $1: $2"
+}
+
+# require_not_job_writable <label> <path> [<label> <path>]...: one walk over
+# every protected tree. For every item in each tree (the path itself, every
+# directory, file and symlink under it) the job account must not own it and a
+# real access test (os.access W_OK, which applies the mode AND the ACL) must
+# say the job account cannot write it. For every directory above each path, up
+# to /, on the path as given and on its resolved path, the job account must not
+# own it and must not be able to write it. One exception: a writable directory
+# with the sticky bit (/tmp) is accepted when neither it nor the next item on
+# the path belongs to the job account, because then the job cannot rename or
+# remove that item.
+require_not_job_writable() {
+  local result
+  result="$(python3 - "${JOB_UID}" "$@" <<'PYEOF'
+import os
+import stat
+import sys
+
+uid = int(sys.argv[1])
+pairs = list(zip(sys.argv[2::2], sys.argv[3::2]))
+
+
+def refuse(message):
+    print(message)
+    sys.exit(1)
+
+
+def walk_error(error):
+    refuse("cannot list %s (%s); every item under it must be checked" % (error.filename, error.strerror))
+
+
+entry_count = 0
+checked_ancestors = set()
+
+
+def check_entry(path, label):
+    global entry_count
+    entry_count += 1
+    if os.lstat(path).st_uid == uid:
+        refuse("the job account (uid %d) owns %s, which is part of %s. The operator account must own it. Run the box converge." % (uid, path, label))
+    if os.access(path, os.W_OK):
+        refuse("the job account can write %s, which is part of %s. Run the box converge." % (path, label))
+
+
+def check_ancestors(path, label, top):
+    child = path
+    parent = os.path.dirname(child)
+    while True:
+        if (parent, child) not in checked_ancestors:
+            checked_ancestors.add((parent, child))
+            info = os.stat(parent)
+            if info.st_uid == uid:
+                refuse("the job account (uid %d) owns %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (uid, parent, label, top, top))
+            if os.access(parent, os.W_OK):
+                sticky = info.st_mode & stat.S_ISVTX
+                if not (sticky and os.lstat(child).st_uid != uid):
+                    refuse("the job account can write %s, a directory above %s (%s), so it can replace %s. Run the box converge." % (parent, label, top, top))
+        if parent == "/":
+            break
+        child, parent = parent, os.path.dirname(parent)
+
+
+for label, path in pairs:
+    if not os.path.lexists(path):
+        refuse("%s does not exist at %s" % (label, path))
+    check_entry(path, label)
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path, onerror=walk_error):
+            for name in dirs + files:
+                check_entry(os.path.join(root, name), label)
+    lexical = os.path.abspath(path)
+    check_ancestors(lexical, label, path)
+    resolved = os.path.realpath(path)
+    if resolved != lexical:
+        check_ancestors(resolved, label, path)
+
+directories = len({parent for parent, _ in checked_ancestors})
+print("checked %d items in %d protected trees (owner, and write access by mode and ACL) and %d directories above them up to /" % (entry_count, len(pairs), directories))
+PYEOF
+)" || boundary_refuse 7a "${result}"
+  printf '%s' "${result}"
+}
+
+if [[ "${official_run}" == "1" ]]; then
+  JOB_UID="$(id -u)"
+  [[ "${JOB_UID}" =~ ^[0-9]+$ ]] || boundary_refuse 7b "cannot read the uid of the job account"
+
+  # 7b
+  [[ "${JOB_UID}" != "0" ]] || boundary_refuse 7b "the job runs as root (uid 0); it must run as the unprivileged runner account"
+  for group in $(id -Gn); do
+    case "${group}" in
+      admin|wheel|sudo)
+        boundary_refuse 7b "the job account is in the ${group} group; it must have no privilege" ;;
+    esac
+  done
+  if command -v sudo >/dev/null 2>&1 && sudo -n true </dev/null >/dev/null 2>&1; then
+    boundary_refuse 7b "sudo -n true succeeds for the job account; it must have no privilege"
+  fi
+  ok "account boundary 7b: the job account is not root, not in admin, wheel or sudo, and has no sudo"
+
+  # 7a
+  for var in BENCHD_BIN_DIR MLXFAST_REFERENCE_DIR; do
+    eval "value=\${${var}:-}"
+    [[ -n "${value}" ]] || boundary_refuse 7a "${var} is not set; an official run needs the runner environment to name it"
+  done
+  protected=(
+    "the golden directory (MLXFAST_QWEN38_GOLDEN_DIR)" "${GOLDEN_DIR}"
+    "benchd-bin (BENCHD_BIN_DIR)" "${BENCHD_BIN_DIR}"
+    "the reference workspace (MLXFAST_BASELINE_WORKSPACE)" "${BASELINE_WORKSPACE}"
+    "the calibration file (MLXFAST_BASELINE_CALIBRATION)" "${BASELINE_CALIBRATION}"
+    "the reference checkpoint (MLXFAST_REFERENCE_DIR)" "${MLXFAST_REFERENCE_DIR}"
+    "the temperature reader (MLXFAST_MACMON)" "${MLXFAST_MACMON}"
+  )
+  if [[ -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+    protected+=("the correctness golden (MLXFAST_CORRECTNESS_GOLDEN_PATH)" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}")
+  fi
+  if [[ -n "${MLXFAST_METALLIB_STAGE:-}" ]]; then
+    protected+=("the metallib stage (MLXFAST_METALLIB_STAGE)" "${MLXFAST_METALLIB_STAGE}")
+  fi
+  walk_summary="$(require_not_job_writable "${protected[@]}")" || exit 1
+  ok "account boundary 7a: the job account (uid ${JOB_UID}) owns none of the evaluator material and cannot write it: ${walk_summary}"
+else
+  ok "account boundary not checked: this is not an official run (RUNNER_ENVIRONMENT is not self-hosted and MLXFAST_OFFICIAL_BENCHMARK_RUN is not 1)"
 fi
 
 echo "ranked-box-preflight: all checks passed"

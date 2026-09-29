@@ -450,19 +450,9 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// length once a round has finalized.
     func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int)
-
-    /// Absorb the committed context rows the state holds into the drafter's
-    /// own cache ahead of the next proposal, when that is worth a separate
-    /// submission (a prompt's worth of rows). Returns the lazy arrays to
-    /// evaluate, or nothing when the rows stay pending for the next block.
-    func prefetchCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
-    public func prefetchCommittedContext(
-        requestState: any CBv2MTPRequestState
-    ) -> [MLXArray] { [] }
-
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
     /// branch never reaches these, so a caller that does has taken the wrong
@@ -483,54 +473,6 @@ extension CBv2MTPBlockDrafter {
     ) -> (tokens: MLXArray, hidden: MLXArray) {
         preconditionFailure("CBv2 block drafter: draftStep is not the block seam")
     }
-}
-
-/// A block drafter whose proposal can hand the GPU its leading layers while
-/// the proposal is still being built. The engine takes this only for the
-/// early block proposal at finalize, where it submits the rest of the
-/// proposal itself after the committed recurrent state
-/// (`EngineLoopV2.earlyDraftLeadingLayers`). The proposal is the same graph
-/// as `proposeBlock`'s; only command-buffer boundaries move.
-public protocol CBv2MTPBlockLeadingSubmission: CBv2MTPBlockDrafter {
-    /// `proposeBlock`, with the drafter's first `leadingLayers` layers (and
-    /// everything they read) submitted as soon as they are built.
-    func proposeBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
-        submittingLeadingLayers leadingLayers: Int
-    ) throws -> MLXArray
-}
-
-/// The next block before the readback (`CBv2MTPBlockSpeculation`).
-public enum CBv2MTPDraftBeforeReadback {
-    /// `BONSAI_DRAFT_BEFORE_READBACK=0` keeps the next block after the readback.
-    public static let enabled = !["0", "false", "no", "off"].contains(
-        ProcessInfo.processInfo.environment["BONSAI_DRAFT_BEFORE_READBACK"]?.lowercased() ?? "")
-    /// Layers submitted before the readback, queued behind the verify: few
-    /// enough to stay within MLX's 10 in-flight buffers (2: ~9 on an M4 Max).
-    public static let leadingLayers = max(
-        0, Int(ProcessInfo.processInfo.environment["BONSAI_DRAFT_BEFORE_READBACK_LAYERS"] ?? "") ?? 2)
-    /// `BONSAI_DRAFT_DUMP=1`: each verified round's draft and target ids on stderr.
-    public static let dumpsDrafts = ProcessInfo.processInfo.environment["BONSAI_DRAFT_DUMP"] == "1"
-}
-
-public protocol CBv2MTPSpeculativeBlock: AnyObject {}
-
-/// Builds the next round's block before the readback from device values; a
-/// round confirming `accepted + 1` columns on the early block path adopts it
-/// (that path's proposal and state, bit for bit), any other drops it.
-public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
-    func speculateBlock(
-        acceptancePacket: MLXArray, depth: Int, verifyContext: MLXArray,
-        requestState: any CBv2MTPRequestState,
-        leadingLayersBeforeReadback: Int
-    ) -> (any CBv2MTPSpeculativeBlock)?
-
-    /// The proposal for `confirmed` columns (state as `finalizeRound` +
-    /// `proposeBlock` leave it), or nil.
-    func adoptSpeculativeBlock(
-        _ block: any CBv2MTPSpeculativeBlock, confirmed: Int,
-        requestState: any CBv2MTPRequestState
-    ) -> MLXArray?
 }
 
 // MARK: - Config

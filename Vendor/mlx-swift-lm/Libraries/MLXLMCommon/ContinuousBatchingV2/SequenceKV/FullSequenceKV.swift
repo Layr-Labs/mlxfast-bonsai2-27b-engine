@@ -93,9 +93,6 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     private var keys: MLXArray?
     private var values: MLXArray?
-    /// Fence of the last append a kernel wrote into `keys`/`values` in place
-    /// (`commitInPlaceAppend`); nil once the storage arrays are ordered after it.
-    private var pendingWrite: MLXArray?
     private var capacity: Int
 
     /// - Parameters:
@@ -152,12 +149,10 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
 
-        orderStorageAfterWrites()
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        let (writtenKeys, writtenValues) = CBv2SqueezedKVUpdate.updates(newKeys, newValues)
-        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = writtenKeys
-        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = writtenValues
+        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
+        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         absoluteOffset += n
 
         return (
@@ -173,16 +168,6 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
                 absoluteOffset
             )
-        }
-        if let fence = pendingWrite {
-            // Views ordered after the last in-place append.
-            let views = depends(
-                inputs: [
-                    keys[.ellipsis, ..<absoluteOffset, 0...],
-                    values[.ellipsis, ..<absoluteOffset, 0...],
-                ],
-                dependencies: [fence])
-            return (views[0], views[1], absoluteOffset)
         }
         return (
             keys[.ellipsis, ..<absoluteOffset, 0...],
@@ -211,56 +196,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values, pendingWrite].compactMap { $0 }
-    }
-
-    // MARK: - Append written in place (`CBv2InPlaceKVAppend`)
-
-    /// The storage an `n`-row append written by a kernel goes into: both
-    /// buffers (grown exactly as `update` grows them), the first row, and
-    /// the previous in-place write's fence (the kernel takes it as an input,
-    /// so writes to this row stay in order), or nil when there is no storage
-    /// yet or it holds other dtypes. The rows `row ..< row + n` are past
-    /// every view this row has handed out at its current offset: the rows
-    /// `update` would assign.
-    func inPlaceAppendDestination(count n: Int, keyDType: DType, valueDType: DType)
-        -> (keys: MLXArray, values: MLXArray, row: Int, previous: MLXArray?)?
-    {
-        guard n > 0, absoluteOffset + n <= maxLength, let keys, let values,
-            keys.dtype == keyDType, values.dtype == valueDType,
-            keys.ndim == 4, values.ndim == 4, keys.dim(0) == 1, values.dim(0) == 1,
-            keys.dim(1) == kvHeads, values.dim(1) == kvHeads
-        else { return nil }
-        if absoluteOffset + n > capacity { orderStorageAfterWrites() }
-        ensureCapacity(absoluteOffset + n, keyTemplate: self.keys!, valueTemplate: self.values!)
-        return (self.keys!, self.values!, absoluteOffset, pendingWrite)
-    }
-
-    /// Adopt the `n` rows a kernel wrote at `inPlaceAppendDestination`'s row
-    /// (`fence` is an output of that kernel): the views `update` returns,
-    /// ordered after the write. The storage arrays stay as they are; the
-    /// fence orders every later reader or writer of them
-    /// (`orderStorageAfterWrites`, the next kernel's input, `snapshot`).
-    func commitInPlaceAppend(count n: Int, fence: MLXArray) -> (MLXArray, MLXArray) {
-        pendingWrite = fence
-        absoluteOffset += n
-        let views = depends(
-            inputs: [
-                keys![.ellipsis, ..<absoluteOffset, 0...],
-                values![.ellipsis, ..<absoluteOffset, 0...],
-            ],
-            dependencies: [fence])
-        return (views[0], views[1])
-    }
-
-    /// The storage arrays themselves ordered after the last in-place write,
-    /// before an operation that reads or copies them whole.
-    private func orderStorageAfterWrites() {
-        guard let fence = pendingWrite, let keys, let values else { return }
-        let ordered = depends(inputs: [keys, values], dependencies: [fence])
-        self.keys = ordered[0]
-        self.values = ordered[1]
-        pendingWrite = nil
+        [keys, values].compactMap { $0 }
     }
 
     // MARK: - Private
@@ -287,51 +223,5 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
         capacity = newCapacity
-    }
-}
-
-/// The KV append's updates with the batch axis squeezed (a view) before the
-/// slice assignment. The assignment drops leading singleton axes itself by a
-/// reshape, and MLX's reshape copies a strided input whose first axis is 1
-/// (`prepare_reshape` keeps that axis when collapsing): the head-transposed
-/// values of a verify window (a column slice of the q|k|v product) took one
-/// copy launch per attention layer before the slice update. The squeeze is a
-/// view and the slice update reads the same elements through their strides.
-/// Checked once, on first use, bit for bit against the unsqueezed assignment
-/// on a head-transposed column slice; `MLXFAST_KV_SQUEEZED_UPDATE=0` keeps the
-/// unsqueezed updates.
-enum CBv2SqueezedKVUpdate {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_KV_SQUEEZED_UPDATE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let verified: Bool = {
-        var same = true
-        for dtype in [DType.float32, .float16, .bfloat16] {
-            let wide = MLXRandom.normal([1, 16, 14336], key: MLXRandom.key(41)).asType(dtype)
-            let update = wide[0..., 0..., 13312...].reshaped(1, 16, 4, 256).transposed(0, 2, 1, 3)
-            var plain = MLXArray.zeros([1, 4, 64, 256], dtype: dtype)
-            var squeezed = MLXArray.zeros([1, 4, 64, 256], dtype: dtype)
-            plain[.ellipsis, 5 ..< 21, 0...] = update
-            squeezed[.ellipsis, 5 ..< 21, 0...] = update.squeezed(axis: 0)
-            let bits = dtype == .float32 ? DType.uint32 : .uint16
-            same = same
-                && all(plain.view(dtype: bits) .== squeezed.view(dtype: bits)).item(Bool.self)
-        }
-        FileHandle.standardError.write(
-            (same
-                ? "mlxfast squeezed KV update: self-test passed (3 dtypes bitwise); squeezed\n"
-                : "mlxfast squeezed KV update: mismatch; unsqueezed updates kept\n")
-                .data(using: .utf8)!)
-        return same
-    }()
-
-    static func updates(_ keys: MLXArray, _ values: MLXArray) -> (MLXArray, MLXArray) {
-        guard enabled, keys.ndim == 4, values.ndim == 4, keys.dim(0) == 1, values.dim(0) == 1,
-            verified
-        else { return (keys, values) }
-        return (keys.squeezed(axis: 0), values.squeezed(axis: 0))
     }
 }

@@ -4,7 +4,7 @@
 # preSubmitCommand entry point for track bonsai2-27b-mlx-v1.
 #
 # It drives `benchd iterate --mode official` -- the SOLE scored path -- against
-# the track's LIVE golden. `iterate --mode official` is timed-first, spawns the
+# the track's LIVE goldens. `iterate --mode official` is timed-first, spawns the
 # sandboxed bench-worker engine, runs the full correctness set, gates on the
 # official floor/bands, and SEALS the artifact itself: it writes score.json in
 # the {score, metrics} shape Yukon's ScoreFileSchema reads, its `.sha256`
@@ -15,7 +15,7 @@
 # inside its own archive.
 #
 # THE RUN IS PAIRED, AND THE PAIR IS PER BOX (David ruling 2026-09-08). A ranked
-# run measures TWO legs on the same box in the same job, over the ONE live
+# run measures TWO legs on the same box in the same job, over each live
 # golden:
 #
 #   1. the SERIAL-CONTROL leg, on the organizer-staged REFERENCE tree
@@ -88,12 +88,14 @@
 # lock itself, because a lock it took would end when it exits, which is not the
 # window.
 #
-# The LIVE golden is read FROM the fixture, never hardcoded: the fixture's
-# `live_golden` names it and its `timed_prompt_pool[]` entry pins it
-# ({sha256, bytes}). A future live_golden rotation is picked up here with no edit
-# to this script. The pins are forwarded to benchd as
-# --golden-sha256/--golden-bytes, which re-verifies the raw bytes BEFORE parse
-# and refuses on any mismatch (the integrity pin). --contract carries the arm
+# The LIVE goldens are read FROM the fixture, never hardcoded: the fixture's
+# `live_goldens` lists them and each name's `timed_prompt_pool[]` entry pins it
+# ({sha256, bytes}). A change to the list is picked up here with no edit to
+# this script. A ranked run measures each live golden once, one pair per
+# golden, and benchd scores the lower-median pair. The pins are forwarded to
+# benchd as --golden-sha256/--golden-bytes, once per golden, and benchd
+# re-verifies the raw bytes BEFORE parse and refuses on any mismatch (the
+# integrity pin). --contract carries the arm
 # gate: benchd refuses, pre-GPU, to seal an official artifact unless the fixture
 # declares official_scoring_enabled: true.
 #
@@ -128,8 +130,8 @@
 #                                     falls outside the band; it never uses the
 #                                     band as a denominator.
 #   MLXFAST_QWEN38_GOLDEN_DIR         Directory holding the staged timed-pool
-#                                     golden files. The LIVE golden is resolved
-#                                     from it as <live_golden>.golden.json (the
+#                                     golden files. Each LIVE golden is resolved
+#                                     from it as <name>.golden.json (the
 #                                     basename of the fixture entry's r2_path).
 #                                     Box-only, staged out of band and
 #                                     pin-verified by tools/ranked-box-preflight.sh.
@@ -187,7 +189,7 @@ for arg in "$@"; do
   esac
 done
 
-# jq is required for reading the fixture (live_golden + pins) and the trackId.
+# jq is required for reading the fixture (live_goldens + pins) and the trackId.
 if ! command -v jq >/dev/null 2>&1; then
   echo "bonsai2-27b-measure-and-score.sh: jq is required (it reads the fixture pins and trackId)." >&2
   exit 1
@@ -246,83 +248,100 @@ fi
 export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 
 # ---------------------------------------------------------------------------
-# THE LIVE GOLDEN + ITS PIN, read FROM the fixture (never hardcoded). The
-# fixture's `live_golden` names the single golden this track scores over; its
-# timed_prompt_pool[] entry -- matched by the basename of its r2_path
-# (<live_golden>.golden.json) -- carries the {sha256, bytes} pin. Resolving the
-# name first and then looking up the pin means a future live_golden rotation
-# needs no edit here.
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden // empty' "${CONTRACT}")"
-if [[ -z "${LIVE_GOLDEN_NAME}" ]]; then
-  echo "bonsai2-27b-measure-and-score.sh: fixture declares no live_golden; there is no golden to score over." >&2
+# THE LIVE GOLDENS + THEIR PINS, read FROM the fixture (never hardcoded). The
+# fixture's `live_goldens` lists the goldens this track scores over, in order.
+# Each name's timed_prompt_pool[] entry -- matched by the basename of its
+# r2_path (<name>.golden.json) -- carries the {sha256, bytes} pin. A change to
+# the list needs no edit here.
+#
+# benchd measures one pair per golden: pair k measures golden (k - 1) mod N,
+# and the score is the lower-median pair. Every golden flag below is repeated
+# once per live golden, in fixture order, and benchd matches the flags by
+# position.
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+if [[ ${#LIVE_GOLDEN_NAMES[@]} -eq 0 ]]; then
+  echo "bonsai2-27b-measure-and-score.sh: fixture declares no live_goldens; there is no golden to score over." >&2
   exit 1
 fi
-
-LIVE_GOLDEN_BASENAME="${LIVE_GOLDEN_NAME}.golden.json"
-# The pool entry whose r2_path ends in /<live_golden>.golden.json. Its pin is the
-# integrity pin forwarded to benchd.
-live_golden_entry="$(jq -c --arg base "/${LIVE_GOLDEN_BASENAME}" \
-  'first(.timed_prompt_pool[] | select(.r2_path | endswith($base)))' "${CONTRACT}")"
-if [[ -z "${live_golden_entry}" || "${live_golden_entry}" == "null" ]]; then
-  echo "bonsai2-27b-measure-and-score.sh: live_golden '${LIVE_GOLDEN_NAME}' has no timed_prompt_pool entry (looked for an r2_path ending in /${LIVE_GOLDEN_BASENAME})." >&2
-  exit 1
-fi
-LIVE_GOLDEN_SHA256="$(printf '%s' "${live_golden_entry}" | jq -r '.sha256 // empty')"
-LIVE_GOLDEN_BYTES="$(printf '%s' "${live_golden_entry}" | jq -r '.bytes // empty')"
-
-# THE SERIAL GOLDEN, kept aside before any per-depth override below. The
-# serial-control leg (leg 1) is serial by construction, so benchd verifies it
-# against THIS tape (--control-golden); the per-depth tape is the candidate
-# leg's oracle only. On the MLX engine the depth-1 tape forks from the serial
-# tape at step 1, so a control leg checked against it dies at step 1.
-SERIAL_GOLDEN_BASENAME="${LIVE_GOLDEN_BASENAME}"
-SERIAL_GOLDEN_SHA256="${LIVE_GOLDEN_SHA256}"
-SERIAL_GOLDEN_BYTES="${LIVE_GOLDEN_BYTES}"
 
 # PER-DEPTH ORACLE (David ruling 2026-09-07, the CUDA track's shape). A window
 # verified in one target forward does not reproduce the serial tape token for
 # token (the kernels differ at M > 1), so a speculative declaration scores
 # against the oracle RECORDED AT THAT DEPTH: fixture live_golden_speculative
-# maps "mtpN" to the pinned <live_golden>.mtpN.golden.json. A declared depth with no
-# authored oracle is refused here rather than scored against the serial tape.
+# maps "mtpN" to one pinned oracle per live golden, keyed by the golden's name.
+# A declared depth with no authored oracle for a live golden is refused below
+# rather than scored against the serial tape.
 SPEC_DESC="$("${SCRIPT_DIR}/tools/spec-declaration.sh" describe)"
-if [[ "${SPEC_DESC}" != "serial" ]]; then
-  spec_entry="$(jq -c --arg k "${SPEC_DESC}" '.live_golden_speculative[$k] // empty' "${CONTRACT}")"
-  if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
-    echo "bonsai2-27b-measure-and-score.sh: declared spec '${SPEC_DESC}' has no live_golden_speculative entry in ${CONTRACT}; no timed oracle is authored for that draft depth. Refusing rather than scoring it against the serial oracle." >&2
-    exit 1
-  fi
-  LIVE_GOLDEN_BASENAME="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
-  LIVE_GOLDEN_BASENAME="${LIVE_GOLDEN_BASENAME##*/}"
-  LIVE_GOLDEN_SHA256="$(printf '%s' "${spec_entry}" | jq -r '.sha256 // empty')"
-  LIVE_GOLDEN_BYTES="$(printf '%s' "${spec_entry}" | jq -r '.bytes // empty')"
-  if [[ -z "${LIVE_GOLDEN_BASENAME}" || "${LIVE_GOLDEN_BASENAME}" != *.golden.json ]]; then
-    echo "bonsai2-27b-measure-and-score.sh: live_golden_speculative['${SPEC_DESC}'] names no *.golden.json (r2_path='${LIVE_GOLDEN_BASENAME}')." >&2
-    exit 1
-  fi
-  echo "bonsai2-27b-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle is ${LIVE_GOLDEN_BASENAME}" >&2
-fi
-if ! printf '%s' "${LIVE_GOLDEN_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
-  || ! printf '%s' "${LIVE_GOLDEN_BYTES}" | grep -Eq '^[1-9][0-9]*$'; then
-  echo "bonsai2-27b-measure-and-score.sh: live_golden '${LIVE_GOLDEN_NAME}' is unarmed or malformed (sha256='${LIVE_GOLDEN_SHA256}', bytes='${LIVE_GOLDEN_BYTES}'); nothing can be pin-verified against it." >&2
-  exit 1
-fi
 
-# The LIVE golden FILE, resolved from the existing box staging convention:
-# MLXFAST_QWEN38_GOLDEN_DIR holds the staged pool, and the live golden is
-# <live_golden>.golden.json within it. The goldens are box-only, staged out of
-# band and pin-verified by tools/ranked-box-preflight.sh.
+# The goldens are box-only, staged out of band into MLXFAST_QWEN38_GOLDEN_DIR
+# and pin-verified by tools/ranked-box-preflight.sh.
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
-LIVE_GOLDEN_PATH=""
-if [[ -n "${GOLDEN_DIR}" ]]; then
-  LIVE_GOLDEN_PATH="${GOLDEN_DIR}/${LIVE_GOLDEN_BASENAME}"
-fi
+
+# For each live golden: the timed oracle the candidate leg verifies against
+# (the serial tape, or the per-depth oracle), and the serial tape the
+# serial-control leg verifies against. The serial-control leg (leg 1) is
+# serial by construction, so benchd verifies it against the serial tape
+# (--control-golden); the per-depth tape is the candidate leg's oracle only. On
+# the MLX engine the depth-1 tape forks from the serial tape at step 1, so a
+# control leg checked against it dies at step 1.
+GOLDEN_BASENAMES=()
+GOLDEN_SHA256S=()
+GOLDEN_BYTES_LIST=()
+SERIAL_GOLDEN_BASENAMES=()
+SERIAL_GOLDEN_SHA256S=()
+SERIAL_GOLDEN_BYTES_LIST=()
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  serial_base="${name}.golden.json"
+  # The pool entry whose r2_path ends in /<name>.golden.json. Its pin is the
+  # integrity pin forwarded to benchd.
+  pool_entry="$(jq -c --arg base "/${serial_base}" \
+    'first(.timed_prompt_pool[] | select(.r2_path | endswith($base)))' "${CONTRACT}")"
+  if [[ -z "${pool_entry}" || "${pool_entry}" == "null" ]]; then
+    echo "bonsai2-27b-measure-and-score.sh: live golden '${name}' has no timed_prompt_pool entry (looked for an r2_path ending in /${serial_base})." >&2
+    exit 1
+  fi
+  serial_sha="$(printf '%s' "${pool_entry}" | jq -r '.sha256 // empty')"
+  serial_bytes="$(printf '%s' "${pool_entry}" | jq -r '.bytes // empty')"
+  timed_base="${serial_base}"
+  timed_sha="${serial_sha}"
+  timed_bytes="${serial_bytes}"
+  if [[ "${SPEC_DESC}" != "serial" ]]; then
+    spec_entry="$(jq -c --arg k "${SPEC_DESC}" --arg n "${name}" '.live_golden_speculative[$k][$n] // empty' "${CONTRACT}")"
+    if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
+      echo "bonsai2-27b-measure-and-score.sh: declared spec '${SPEC_DESC}' has no live_golden_speculative entry for live golden '${name}' in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
+      exit 1
+    fi
+    timed_base="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
+    timed_base="${timed_base##*/}"
+    timed_sha="$(printf '%s' "${spec_entry}" | jq -r '.sha256 // empty')"
+    timed_bytes="$(printf '%s' "${spec_entry}" | jq -r '.bytes // empty')"
+    if [[ -z "${timed_base}" || "${timed_base}" != *.golden.json ]]; then
+      echo "bonsai2-27b-measure-and-score.sh: live_golden_speculative['${SPEC_DESC}']['${name}'] names no *.golden.json (r2_path='${timed_base}')." >&2
+      exit 1
+    fi
+    echo "bonsai2-27b-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle for ${name} is ${timed_base}" >&2
+  fi
+  if ! printf '%s' "${timed_sha}" | grep -Eq '^[0-9a-f]{64}$' \
+    || ! printf '%s' "${timed_bytes}" | grep -Eq '^[1-9][0-9]*$'; then
+    echo "bonsai2-27b-measure-and-score.sh: live golden '${name}' is unarmed or malformed (sha256='${timed_sha}', bytes='${timed_bytes}'); nothing can be pin-verified against it." >&2
+    exit 1
+  fi
+  GOLDEN_BASENAMES+=("${timed_base}")
+  GOLDEN_SHA256S+=("${timed_sha}")
+  GOLDEN_BYTES_LIST+=("${timed_bytes}")
+  SERIAL_GOLDEN_BASENAMES+=("${serial_base}")
+  SERIAL_GOLDEN_SHA256S+=("${serial_sha}")
+  SERIAL_GOLDEN_BYTES_LIST+=("${serial_bytes}")
+done
 
 # ---------------------------------------------------------------------------
 # --preflight-only: a pre-GPU DRY RUN that exercises the arm gate and (when the
-# golden is staged) the integrity pin, WITHOUT spawning the engine or loading the
-# model. No score is written. The full run below enforces both refusals through
-# benchd itself; this is the loud early gate.
+# goldens are staged) the integrity pins, WITHOUT spawning the engine or loading
+# the model. No score is written. The full run below enforces both refusals
+# through benchd itself; this is the loud early gate.
 if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
   # ARM GATE (mirror of benchd's enforce_official_scoring_enabled): an official
   # run refuses unless the fixture declares official_scoring_enabled: true. false
@@ -335,39 +354,53 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
     echo "  benchd refuses to seal an official scoring artifact for an unarmed track; this dry-run mirrors that refusal." >&2
     exit 1
   fi
-  echo "bonsai2-27b-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live_golden ${LIVE_GOLDEN_NAME} (sha256 ${LIVE_GOLDEN_SHA256}, ${LIVE_GOLDEN_BYTES} bytes)" >&2
+  echo "bonsai2-27b-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live goldens ${LIVE_GOLDEN_NAMES[*]}" >&2
 
-  # INTEGRITY PIN: when the live golden is staged, validate-golden re-verifies its
+  # INTEGRITY PIN: for each staged live golden, validate-golden re-verifies its
   # raw bytes against the pin AND load-validates it (reference-model pin from
-  # --contract), with NO engine spawned. When it is not staged (e.g. an off-box
+  # --contract), with NO engine spawned. When one is not staged (e.g. an off-box
   # pre-submit), the pin is still enforced by benchd on the real run.
-  if [[ -n "${LIVE_GOLDEN_PATH}" && -f "${LIVE_GOLDEN_PATH}" ]]; then
-    exec "${BENCHD}" validate-golden \
-      --golden "${LIVE_GOLDEN_PATH}" \
-      --golden-sha256 "${LIVE_GOLDEN_SHA256}" \
-      --golden-bytes "${LIVE_GOLDEN_BYTES}" \
-      --contract "${CONTRACT}"
-  fi
-  echo "bonsai2-27b-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_QWEN38_GOLDEN_DIR unset or ${LIVE_GOLDEN_BASENAME} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
+  for i in "${!GOLDEN_BASENAMES[@]}"; do
+    if [[ -n "${GOLDEN_DIR}" && -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
+      "${BENCHD}" validate-golden \
+        --golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" \
+        --golden-sha256 "${GOLDEN_SHA256S[$i]}" \
+        --golden-bytes "${GOLDEN_BYTES_LIST[$i]}" \
+        --contract "${CONTRACT}"
+    else
+      echo "bonsai2-27b-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_QWEN38_GOLDEN_DIR unset or ${GOLDEN_BASENAMES[$i]} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
+    fi
+  done
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# A REAL RUN needs the staged live golden.
+# A REAL RUN needs every staged live golden.
 if [[ -z "${GOLDEN_DIR}" || ! -d "${GOLDEN_DIR}" ]]; then
   cat >&2 <<EOF
 bonsai2-27b-measure-and-score.sh: MLXFAST_QWEN38_GOLDEN_DIR is unset or missing.
-  The live golden (${LIVE_GOLDEN_BASENAME}) is staged onto the box out of band
+  The live goldens (${GOLDEN_BASENAMES[*]}) are staged onto the box out of band
   (docs/bonsai2-27b-port-notes.md section 5) and this job holds no credential
-  to fetch it. There is nothing this script can do here except refuse.
+  to fetch them. There is nothing this script can do here except refuse.
 EOF
   exit 1
 fi
-if [[ ! -f "${LIVE_GOLDEN_PATH}" ]]; then
-  echo "bonsai2-27b-measure-and-score.sh: live golden not found at ${LIVE_GOLDEN_PATH}" >&2
-  echo "  live_golden is '${LIVE_GOLDEN_NAME}' (fixtures/bonsai2_27b_mlx_v1_track.json); stage ${LIVE_GOLDEN_BASENAME} into MLXFAST_QWEN38_GOLDEN_DIR." >&2
-  exit 1
-fi
+GOLDEN_ARGS=()
+GOLDEN_PIN_ARGS=()
+for i in "${!GOLDEN_BASENAMES[@]}"; do
+  if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
+    echo "bonsai2-27b-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
+    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/bonsai2_27b_mlx_v1_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_QWEN38_GOLDEN_DIR." >&2
+    exit 1
+  fi
+  GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}")
+done
+for sha in "${GOLDEN_SHA256S[@]}"; do
+  GOLDEN_PIN_ARGS+=(--golden-sha256 "${sha}")
+done
+for bytes in "${GOLDEN_BYTES_LIST[@]}"; do
+  GOLDEN_PIN_ARGS+=(--golden-bytes "${bytes}")
+done
 
 # ---------------------------------------------------------------------------
 # THE PAIRED LEG PAIR. Both names are REQUIRED on a real run and neither has a
@@ -465,7 +498,7 @@ SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 
 # ---------------------------------------------------------------------------
 # THE GPU WINDOW. Everything above resolved WITHOUT loading anything: the
-# pinned benchd, the arm gate, the golden and its pin, the engine binary, the
+# pinned benchd, the arm gate, the goldens and their pins, the engine binary, the
 # weights. This is the last point before benchd starts
 # spawning workers, so this is where the window opens.
 #
@@ -544,7 +577,7 @@ os.execv(argv[0], argv)
     "${SCRIPT_DIR}/tools/bonsai2-27b-measure-and-score.sh" "$@"
 fi
 
-# THE SOLE SCORED PATH: benchd iterate --mode official over the live golden.
+# THE SOLE SCORED PATH: benchd iterate --mode official over the live goldens.
 # --baseline-workspace names the reference tree benchd runs the serial-control
 # leg on, and --baseline-calibration names this box's health band for that leg.
 # The score is the composite prefill_gain^0.25 * decode_gain^0.75 over the two
@@ -553,8 +586,9 @@ fi
 # benchmark-integrity sidecar itself; this script does no post-conversion.
 # benchd spawns the bench-worker engine directly via --engine; there is no serve.
 #
-# --golden-sha256/--golden-bytes are the INTEGRITY PIN (benchd re-verifies the
-# raw bytes before parse and refuses on mismatch). --contract carries the ARM
+# --golden-sha256/--golden-bytes are the INTEGRITY PINS, one per --golden and
+# in the same order (benchd re-verifies the raw bytes before parse and refuses
+# on mismatch). --contract carries the ARM
 # GATE (benchd refuses, pre-GPU, unless official_scoring_enabled: true).
 # THE DECLARED DECODER AND DRAFT DEPTH. tools/spec-declaration.sh is the single
 # trusted reader of the participant's mtp-head.manifest.json `spec` block; it
@@ -607,6 +641,18 @@ else
   echo "bonsai2-27b-measure-and-score.sh: the declaration is serial; benchd sends no spec (depth 0)." >&2
 fi
 
+# THE RESIDENT LOG DIRECTORY IS OUTSIDE BOTH TREES. benchd boots each leg's
+# resident with that leg's own tools/resident-up.sh. That script keeps its
+# pidfile, identity file, log and sandbox profile in RESIDENT_UP_LOG_DIR, which
+# is <tree>/.build/resident by default. The ranked job account cannot write the
+# reference workspace, so the control leg must not write there. One directory
+# in this job's temporary directory serves both legs. The legs run one after
+# the other, inside the GPU lock that this script holds.
+if [[ -z "${RESIDENT_UP_LOG_DIR:-}" ]]; then
+  RESIDENT_UP_LOG_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/resident-up.XXXXXX")"
+  export RESIDENT_UP_LOG_DIR
+fi
+
 # --box, AND THE CONDITION IS INVERTED FROM THE OBVIOUS ONE. benchd lets
 # RUNNER_NAME win over the flag, so passing --box on a runner would be dead
 # argv: the flag can never change what benchd checks the calibration band
@@ -630,19 +676,30 @@ if [[ -z "${RUNNER_NAME:-}" ]]; then
 fi
 
 
-# --control-golden: the serial tape for the serial-control leg. A benchd that
-# does not know the flag verifies leg 1 against the candidate's per-depth tape,
-# which is only the same tape at depth 0; a speculative declaration on such a
-# benchd is refused rather than measured against the wrong oracle.
-CONTROL_GOLDEN_PATH="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAME}"
+# --control-golden: the serial tape for the serial-control leg, one per live
+# golden, in the same order as --golden. A benchd that does not know the flag
+# verifies leg 1 against the candidate's per-depth tape, which is only the same
+# tape at depth 0; a speculative declaration on such a benchd is refused rather
+# than measured against the wrong oracle.
 CONTROL_ARGS=()
 if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
-  if [[ ! -f "${CONTROL_GOLDEN_PATH}" ]]; then
-    echo "bonsai2-27b-measure-and-score.sh: serial golden not found at ${CONTROL_GOLDEN_PATH}; the serial-control leg has no tape to verify against." >&2
-    exit 1
-  fi
-  CONTROL_ARGS=(--control-golden "${CONTROL_GOLDEN_PATH}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES}")
-  echo "bonsai2-27b-measure-and-score.sh: serial-control leg verifies against ${SERIAL_GOLDEN_BASENAME} (sha256 ${SERIAL_GOLDEN_SHA256}, ${SERIAL_GOLDEN_BYTES} bytes)" >&2
+  CONTROL_PIN_ARGS=()
+  for i in "${!SERIAL_GOLDEN_BASENAMES[@]}"; do
+    control_path="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
+    if [[ ! -f "${control_path}" ]]; then
+      echo "bonsai2-27b-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
+      exit 1
+    fi
+    CONTROL_ARGS+=(--control-golden "${control_path}")
+    echo "bonsai2-27b-measure-and-score.sh: serial-control leg verifies against ${SERIAL_GOLDEN_BASENAMES[$i]} (sha256 ${SERIAL_GOLDEN_SHA256S[$i]}, ${SERIAL_GOLDEN_BYTES_LIST[$i]} bytes)" >&2
+  done
+  for sha in "${SERIAL_GOLDEN_SHA256S[@]}"; do
+    CONTROL_PIN_ARGS+=(--control-golden-sha256 "${sha}")
+  done
+  for bytes in "${SERIAL_GOLDEN_BYTES_LIST[@]}"; do
+    CONTROL_PIN_ARGS+=(--control-golden-bytes "${bytes}")
+  done
+  CONTROL_ARGS+=("${CONTROL_PIN_ARGS[@]}")
 elif [[ "${SPEC_DESC}" != "serial" ]]; then
   echo "bonsai2-27b-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
   exit 1
@@ -651,13 +708,12 @@ exec "${BENCHD}" iterate \
   --engine "${ENGINE_BIN_REL}" \
   ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --weights "${WEIGHTS_PATH}" \
-  --golden "${LIVE_GOLDEN_PATH}" \
+  "${GOLDEN_ARGS[@]}" \
   --mode official \
   --baseline-workspace "${BASELINE_WORKSPACE}" \
   --baseline-calibration "${BASELINE_CALIBRATION}" \
   ${CONTROL_ARGS[@]+"${CONTROL_ARGS[@]}"} \
   ${BOX_ARGS[@]+"${BOX_ARGS[@]}"} \
   --score-path "${SCORE_PATH}" \
-  --golden-sha256 "${LIVE_GOLDEN_SHA256}" \
-  --golden-bytes "${LIVE_GOLDEN_BYTES}" \
+  "${GOLDEN_PIN_ARGS[@]}" \
   --contract "${CONTRACT}"

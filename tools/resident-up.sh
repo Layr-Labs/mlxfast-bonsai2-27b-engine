@@ -132,6 +132,23 @@
 #                                    (default 5400)
 #   RESIDENT_UP_WIRED_LIMIT_READER   command printing iogpu.wired_limit_mb
 #                                    (default `sysctl -n iogpu.wired_limit_mb`)
+#   RESIDENT_UP_SANDBOX              1 (default) runs the resident under
+#                                    sandbox-exec; 0 runs it bare, for the
+#                                    hermetic stub tests only. 0 is refused on a
+#                                    self-hosted runner (RUNNER_ENVIRONMENT).
+#
+# THE RESIDENT RUNS UNDER sandbox-exec. It executes the tree's own model code,
+# and on the ranked box that is participant code. The profile denies every
+# file write except the resident's socket and a private temporary directory
+# under RESIDENT_UP_LOG_DIR, denies network except its own Unix socket, denies
+# process-fork and every exec but the worker, and denies every read of the
+# evaluator-only paths the runner environment names: MLXFAST_QWEN38_GOLDEN_DIR,
+# MLXFAST_CORRECTNESS_GOLDEN_PATH, MLXFAST_PRIVATE_DIR,
+# MLXFAST_BASELINE_WORKSPACE (unless this tree is that workspace),
+# MLXFAST_BASELINE_CALIBRATION, BENCHD_BIN_DIR, the build cache root
+# (MLXFAST_BUILD_CACHE_DIR, default ~/.cache/mlxfast-engine-build) and the
+# runner registration files. Reads of the weights, the drafter, the worker and
+# its mlx.metallib, and the system paths Metal needs stay allowed.
 #
 # Exit codes: the wrapped command's exit code on a served window; 1 on a boot
 # failure; 2 on a refusal before any load.
@@ -498,6 +515,40 @@ if [[ "${MODE}" == "wrap" ]]; then
 fi
 trap 'exit 130' INT TERM
 
+# --- the resident's sandbox ----------------------------------------------------
+# See the header. The profile and the resident's private TMPDIR live under
+# LOG_DIR, which is inside the checkout's .build tree and goes with it.
+RESIDENT_SANDBOX="${RESIDENT_UP_SANDBOX:-1}"
+case "${RESIDENT_SANDBOX}" in
+  1) : ;;
+  0)
+    if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+      refuse sandbox-required "RESIDENT_UP_SANDBOX=0 is refused on a self-hosted runner; the resident runs participant code and must run under sandbox-exec. Nothing has been loaded."
+    fi
+    log "RESIDENT_UP_SANDBOX=0: the resident runs WITHOUT sandbox-exec (hermetic tests only)"
+    ;;
+  *) refuse bad-argument "RESIDENT_UP_SANDBOX must be 0 or 1 (got '${RESIDENT_SANDBOX}')" ;;
+esac
+RESIDENT_LAUNCH=()
+if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
+  [[ -x /usr/bin/sandbox-exec ]] || refuse sandbox-missing "/usr/bin/sandbox-exec is not available; the resident must run under it. Nothing has been loaded."
+  RESIDENT_TMP_DIR="${LOG_DIR}/tmp.${RUN_TAG}"
+  mkdir -m 700 "${RESIDENT_TMP_DIR}"
+  RESIDENT_PROFILE="${LOG_DIR}/resident.${RUN_TAG}.sb"
+  # The profile rules live in one place, tools/seatbelt-profile.py, which the
+  # transform wrapper (tools/sandboxed-cli.sh) also uses.
+  # On a self-hosted runner the profile is an official profile: the generator
+  # refuses when the environment does not name a path that the profile denies.
+  RESIDENT_PROFILE_MODE=()
+  [[ "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]] || RESIDENT_PROFILE_MODE=(--official)
+  python3 "${SCRIPT_DIR}/tools/seatbelt-profile.py" "${RESIDENT_PROFILE_MODE[@]+"${RESIDENT_PROFILE_MODE[@]}"}" \
+    --exec "${BENCH_WORKER}" --tree "${SCRIPT_DIR}" \
+    --write-subpath "${RESIDENT_TMP_DIR}" --unix-socket "${SOCKET_PATH}" > "${RESIDENT_PROFILE}" \
+    || refuse sandbox-profile "could not write the resident sandbox profile ${RESIDENT_PROFILE}. Nothing has been loaded."
+  RESIDENT_LAUNCH=(/usr/bin/sandbox-exec -f "${RESIDENT_PROFILE}")
+  log "the resident runs under sandbox-exec with ${RESIDENT_PROFILE} (TMPDIR ${RESIDENT_TMP_DIR})"
+fi
+
 # --- boot the one resident ---------------------------------------------------
 # The resident leads its own process group (setsid through python, which macOS
 # has and util-linux setsid it does not), so the halt path can signal the
@@ -507,7 +558,14 @@ if [[ "${MODE}" == "boot" ]]; then
 else
   log "booting the resident: ${BENCH_WORKER} resident --weights ${WEIGHTS_DIR} --drafter ${DRAFTER_DIR}; ONE load for the whole window"
 fi
-python3 - "${BENCH_WORKER}" resident \
+# Under the sandbox the argv is `sandbox-exec -f <profile> <worker> resident ...`;
+# sandbox-exec applies the profile and then execs the worker in the same
+# process, so the pid and the process group stay the resident's.
+RESIDENT_ENV=()
+if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
+  RESIDENT_ENV=(env "TMPDIR=${RESIDENT_TMP_DIR}/")
+fi
+"${RESIDENT_ENV[@]+"${RESIDENT_ENV[@]}"}" python3 - "${RESIDENT_LAUNCH[@]+"${RESIDENT_LAUNCH[@]}"}" "${BENCH_WORKER}" resident \
   --weights "${WEIGHTS_DIR}" \
   --drafter "${DRAFTER_DIR}" \
   --speculative-protocol v1.1 \

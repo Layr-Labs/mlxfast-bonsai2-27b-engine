@@ -194,7 +194,7 @@ c["benchmark_name"] = "${NEW_NAME}"
 c["official_scoring_enabled"] = False
 c.pop("official_baseline", None)
 c["mlx_swift_lm_revision"] = "${FORK_SHA}"
-c["live_golden"] = ""
+c["live_goldens"] = []
 c["timed_prompt_pool"] = []
 c["hidden_correctness_golden"] = {"sha256": "${SENTINEL}", "bytes": 0}
 c["live_golden_speculative"] = {}
