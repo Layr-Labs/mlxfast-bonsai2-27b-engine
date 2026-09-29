@@ -2872,6 +2872,43 @@ enum Qwen35TensorPackedMatmul {
             ensureRowContiguous: true)
     }
 
+    // For a proved bias == -scale, sum(aq * (q - 1)) is an exact integer
+    // affine dot. Center only the ephemeral int8 operand during unpacking;
+    // the published packed words, scales, offsets and plane copy do not change.
+    // Each extracted byte is in 0...3, so adding 127 cannot carry between
+    // bytes; XOR 128 gives the signed bytes -1, 0, 1, 2. Tile traversal,
+    // integer accumulation and group order are the plane kernel's unchanged.
+    // The FP32 epilogue becomes one multiply and one FMA, rather than two
+    // FMAs and a rounded scaled-row-sum subtraction. This reassociation is
+    // deliberately NOT bitwise; promptCenteredSelfTest bounds its error.
+    private static let sourcePromptCentered: String? = {
+        guard var text = sourceStaged8RegPlane else { return nil }
+        var edits: [(String, String)] = []
+        for word in ["lo.x", "lo.y", "lo.z", "lo.w", "hi.x", "hi.y", "hi.z", "hi.w"] {
+            let extract = "(\(word) >> cs) & 0x03030303u"
+            edits.append((extract, "(((\(extract)) + 0x7f7f7f7fu) ^ 0x80808080u)"))
+        }
+        edits += [
+            ("const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);", ""),
+            ("const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);", ""),
+            ("const float rb[4] = {r0.x, r0.y, r1.x, r1.y};", ""),
+            ("acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);",
+             "acc[i] = fma(s * as[mh], float(cT[i]), acc[i]);"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    private static let kernelPromptCentered: MLXFast.MLXFastKernel? = sourcePromptCentered.map {
+        MLXFast.metalKernel(
+            name: "bonsai_prompt_centered_affine_dot",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
     // The plane kernel's forms for the load-time per-shape trial
     // (`PlaneFormTrial`): each simdgroup still runs the plane kernel's
     // 32 x 32 x 128 op over its 32 rows and one 32-column tile, the right
@@ -4160,6 +4197,114 @@ enum Qwen35TensorPackedMatmul {
         return passed
     }
 
+    /// A prompt-only, bounded-error reassociation. The inherited exact plane
+    /// self-tests must pass first; diagnostics/evidence mode cannot enable it.
+    /// Initialized by installIfNeeded at load, never by a timed request.
+    private static let promptCenteredReady: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_CENTERED_DOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""),
+            promptPlaneWeights, kernelPromptCentered != nil
+        else { return false }
+        return promptCenteredSelfTest()
+    }()
+
+    private enum PromptCenteredFailure: Error {
+        case numerical(String)
+    }
+
+    /// Consistent Q8 metadata is essential: scaledSums = scale * sum(codes).
+    /// The older bitwise layout tests intentionally use arbitrary scaledSums
+    /// and cannot validate this algebra. Test 512 rows, all three prompt K
+    /// sizes, both stores, signed/zero scales, large codes and outlier scales.
+    private static func promptCenteredSelfTest() -> Bool {
+        guard let stockKernel = kernelStaged8RegPlane, let centeredKernel = kernelPromptCentered
+        else { return false }
+        var compared = 0
+        var worstRMS: Double = 0
+        var worstPeak: Double = 0
+        do {
+            try withError { error in
+                // Inverse of the existing MPERM producer's 64-row mapping.
+                func position(_ row: Int) -> Int {
+                    ((row >> 4) & 1) * 32 + (row & 7) * 4
+                        + ((row >> 5) & 1) * 2 + ((row >> 3) & 1)
+                }
+                let order = MLXArray((0 ..< 64).sorted { position($0) < position($1) }.map { Int32($0) })
+                for (index, k) in [5120, 6144, 17408].enumerated() {
+                    let m = 512, n = 128, kg = k / 128
+                    let seed = UInt64(12300 + 8 * index)
+                    var codes = MLXRandom.randInt(
+                        Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)).asType(.int8)
+                    let row = MLXArray.arange(m).reshaped(m, 1)
+                    codes = which(row .== 0, MLXArray(Int8(0)), codes)
+                    codes = which(row .== 1, MLXArray(Int8(127)), codes)
+                    codes = which(row .== 2, MLXArray(Int8(-127)), codes)
+                    let weight = MLXRandom.randInt(
+                        Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+                    ).asType(.uint16).view(dtype: .uint32)
+                    let rawScales = MLXRandom.uniform(
+                        Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(seed + 2))
+                    let scalesT = which(
+                        MLXArray.arange(n).reshaped(1, n) .== 0, Float(0), rawScales).asType(.float16)
+                    let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000)))
+                        .view(dtype: .float16)
+                    let scales = exp(MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 3))) * Float(0.01)
+                    let scaledSums = scales * codes.asType(.float32).reshaped(m, kg, 128).sum(axis: -1)
+                    func rowTiled(_ x: MLXArray) -> MLXArray {
+                        x.reshaped(m / 64, 64, kg).take(order, axis: 1).transposed(0, 2, 1)
+                            .contiguous().reshaped(m, kg)
+                    }
+                    let tiled = tileNarrowWeight(weight, n: n, k: k)
+                    let plane = planeWeight(tiled, n: n, k: k)
+                    let inputs = [
+                        codes, plane, scalesT, biasesT, MLXArray.zeros([kg, n]),
+                        rowTiled(scales), rowTiled(scaledSums), dimsArray(k: k, m: m, n: n),
+                    ]
+                    for dtype in [DType.float32, .float16] {
+                        let stock = stockKernel(
+                            inputs, template: [("OutT", dtype)],
+                            grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                            outputShapes: [[m, n]], outputDTypes: [dtype])[0].asType(.float32)
+                        let centered = centeredKernel(
+                            inputs, template: [("OutT", dtype)],
+                            grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                            outputShapes: [[m, n]], outputDTypes: [dtype])[0].asType(.float32)
+                        let delta = centered - stock
+                        let stats = stacked([
+                            (delta * delta).mean(), (stock * stock).mean(),
+                            abs(delta).max(), abs(stock).max(),
+                        ])
+                        let finite = isFinite(stock).all() .&& isFinite(centered).all()
+                        eval(stats, finite)
+                        try error.check()
+                        let values = stats.asArray(Float.self)
+                        let rms = sqrt(Double(values[0]) / max(Double(values[1]), 1e-30))
+                        let peak = Double(values[2]) / max(Double(values[3]), 1e-30)
+                        let rmsLimit = dtype == .float32 ? 4e-6 : 5e-5
+                        let peakLimit = dtype == .float32 ? 4e-6 : 8e-4
+                        guard finite.item(Bool.self), rms.isFinite, peak.isFinite,
+                            rms <= rmsLimit, peak <= peakLimit
+                        else {
+                            throw PromptCenteredFailure.numerical("k \(k) \(dtype) rms \(rms) peak \(peak)")
+                        }
+                        worstRMS = max(worstRMS, rms)
+                        worstPeak = max(worstPeak, peak)
+                        compared += m * n
+                    }
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(Data(
+                "bonsai prompt centered dot: FAILED; exact plane kernel kept (\(error))\n".utf8))
+            return false
+        }
+        FileHandle.standardError.write(Data(
+            ("bonsai prompt centered dot: self-test passed (\(compared) values, "
+                + "relative rms \(worstRMS), peak \(worstPeak)); 512-row default plane only\n").utf8))
+        return true
+    }
+
     /// `[N, K/16]` packed words reordered to `[N/32, K/128, 32, 8]`: for each
     /// 32-column block and 128-group, the 32 columns' 8 words in column order.
     static func tileNarrowWeight(_ weight: MLXArray, n: Int, k: Int) -> MLXArray {
@@ -4975,6 +5120,7 @@ enum Qwen35TensorPackedMatmul {
         guard enabled, !installed else { return }
         installed = true
         guard support != .none else { return }
+        _ = promptCenteredReady
         HadamardQuantizedLinear.tensorPackedMatmulApplies = { rows, n, k in
             rows % 64 == 0 && n % 64 == 0 && k % 512 == 0
         }
@@ -5181,7 +5327,12 @@ enum Qwen35TensorPackedMatmul {
                                 form, codes, plane, scalesT, biasesT, foldedSums, activation.scales,
                                 activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType)
                         }
-                        return planeKernel(
+                        // Only the default plane's arithmetic changes. Keep
+                        // adopted plane forms, verify widths and fallback paths
+                        // exactly as before. All numerical checks ran at load.
+                        let promptKernel = m == 512 && promptCenteredReady
+                            ? (kernelPromptCentered ?? planeKernel) : planeKernel
+                        return promptKernel(
                             [codes, plane, scalesT, biasesT, foldedSums,
                              activation.scales, activation.scaledSums, dimsArray(k: k, m: m, n: n)],
                             template: [("OutT", outputDType)],
