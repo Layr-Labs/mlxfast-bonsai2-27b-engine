@@ -45,9 +45,7 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 }
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
-public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MTPBlockSpeculation,
-    @unchecked Sendable
-{
+public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, @unchecked Sendable {
 
     public let drafter: DFlash2DraftModel
     private let target: Qwen35TextModel
@@ -112,7 +110,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         }
         try drafter.bind(target: text)
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
-        assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
     }
@@ -143,11 +140,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     func warmSpeculativeShapes(serving: (any LanguageModel)? = nil) {
         guard Self.speculativeWarmEnabled else { return }
         warmTargetPrefill()
-        if drafter.prepareTiledWeights(), DFlash2TensorMatmul.trialWanted {
-            // The trial runs in the deferred warm; without it, no copy is read.
-            DFlash2KernelTrial.armed = serving != nil && Self.engineRoundWarmEnabled
-            if !DFlash2KernelTrial.armed { DFlash2TensorMatmul.dropTiledCopies() }
-        }
         warmDrafter()
         if let serving {
             warmEngineRound(serving: serving)
@@ -160,92 +152,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.warmEngineRound(serving: serving)
                 Stream().synchronize()
                 Memory.clearCache()
-                self.runNarrowInSituTrial(serving: serving)
-                self.runNarrowProducerTrial(serving: serving)
-                self.runHeadTopTwoTrial(serving: serving)
-                self.runKernelTrial(serving: serving)
             }
         }
         Stream().synchronize()
-        Memory.clearCache()
-    }
-
-    /// The verify int8 kernels' in-situ trial
-    /// (`Qwen35TensorPackedMatmul.NarrowInSituTrial`), after the full load:
-    /// one engine request long enough for every candidate's timed rounds,
-    /// cancelled once they are in, then the choice, one stderr line, and the
-    /// buffer cache drained. Nothing runs when no trial is armed (no int8
-    /// verify route, one candidate, or
-    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_NARROW_INSITU=off`).
-    private func runNarrowInSituTrial(serving: any LanguageModel) {
-        typealias Trial = Qwen35TensorPackedMatmul.NarrowInSituTrial
-        guard Trial.armed else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded)
-        Stream().synchronize()
-        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
-        Memory.clearCache()
-    }
-
-    /// The fused head top-2 (`Qwen35HeadTopTwo`, OFF by default), after the
-    /// verify kernels' trial so the head's kernel is final: the bitwise
-    /// self-test of that kernel's fused form, then one engine request whose
-    /// real rounds alternate off and on (`Qwen35HeadTopTwo.Trial`), on
-    /// adopted only if its median round is more than 0.5 % faster, and one
-    /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
-    /// `=0` no self-test either). Nothing runs where the head is not on the
-    /// int8 verify route or its fused form fails the self-test.
-    /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
-    /// after the verify kernels' trial, the same way: one engine request,
-    /// cancelled once both arms have their rounds, the choice, one stderr
-    /// line, the buffer cache drained.
-    private func runNarrowProducerTrial(serving: any LanguageModel) {
-        typealias Trial = Qwen35NarrowProducerTrial
-        guard Trial.armed else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded, producerTrial: true)
-        Stream().synchronize()
-        Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
-        Memory.clearCache()
-    }
-
-    private func runHeadTopTwoTrial(serving: any LanguageModel) {
-        typealias Head = Qwen35HeadTopTwo
-        guard Head.forced != false, Qwen35TensorPackedMatmul.prepareHeadTop2() else { return }
-        if let forced = Head.forced {
-            Head.on = forced
-            FileHandle.standardError.write(
-                "bonsai head top-2 trial: skipped, MLXFAST_HEAD_TOP2 forces it on\n".data(using: .utf8)!)
-            return
-        }
-        let start = DispatchTime.now().uptimeNanoseconds
-        warmEngineRound(serving: serving, trialRounds: Head.Trial.roundsNeeded, headTrial: true)
-        Stream().synchronize()
-        Head.Trial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
-        Memory.clearCache()
-    }
-
-    /// The drafter kernel's in-situ trial (`DFlash2KernelTrial`), after the
-    /// verify kernels' own trial, the same way: an engine request for stage 1
-    /// (stored layout, tiled copies, bit-for-bit variants), a second identical
-    /// one for stage 2 (the changed-split variants of the stage-1 pick) when
-    /// the variants are on and one passes its self-test, one stderr line, the
-    /// buffer cache drained. Runs only when the tiled self-test passed and no
-    /// switch forces the kernel (`MLXFAST_DRAFT_TILED`, `MLXFAST_DRAFT_KVAR_FORCE`).
-    private func runKernelTrial(serving: any LanguageModel) {
-        guard DFlash2KernelTrial.armed else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        DFlash2KernelTrial.beginFirstStage()
-        warmEngineRound(
-            serving: serving, trialRounds: DFlash2KernelTrial.requestRounds, kernelTrial: true)
-        Stream().synchronize()
-        if DFlash2KernelTrial.beginSecondStage() {
-            Memory.clearCache()
-            warmEngineRound(
-                serving: serving, trialRounds: DFlash2KernelTrial.requestRounds, kernelTrial: true)
-            Stream().synchronize()
-        }
-        DFlash2KernelTrial.finish(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
         Memory.clearCache()
     }
 
@@ -279,16 +188,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// pattern `warmTargetPrefill` uses, greedy, so nothing depends on any
     /// request's input; the engine is shut down, the tap restored, and
     /// `warmSpeculativeShapes` drains the buffer cache afterwards.
-    ///
-    /// `trialRounds > 0` is the in-situ trial's mode: the request asks for
-    /// enough tokens to reach that many rounds even at full acceptance, the
-    /// trial's round hook is armed for it, and the request is cancelled as
-    /// soon as the trial has its rounds (`headTrial`: the head top-2 trial's
-    /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
-    private func warmEngineRound(
-        serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false, producerTrial: Bool = false
-    ) {
+    private func warmEngineRound(serving: any LanguageModel) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
         let caches: [any CBv2AttendingLayerCache]
@@ -340,32 +240,13 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     maxAutomaticRectangularTokens: 1 + depth,
                     draftTokenCeiling: CBv2MTPConfig.testedMaxBlockDraftTokens))
             released = engine
-            let requestID = CBv2RequestID(1)
             var request = CBv2Request(
-                id: requestID,
+                id: CBv2RequestID(1),
                 promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
-                // Enough budget for rounds that take the speculative block.
-                maxTokens: 1 + Self.warmBlockSize * max(speculationPlan != nil ? 3 : 1, trialRounds))
+                maxTokens: 1 + Self.warmBlockSize)
             request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
             request.stopTokens = []
             let warmRequest = request
-            if trialRounds > 0 {
-                // Called on the engine's thread inside a proposal: cancel
-                // from elsewhere, never re-entering the engine loop's locks.
-                let cancel: () -> Void = { [weak engine] in
-                    guard let engine else { return }
-                    DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
-                }
-                if producerTrial {
-                    Qwen35NarrowProducerTrial.begin(onEnough: cancel)
-                } else if headTrial {
-                    Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
-                } else if kernelTrial {
-                    DFlash2KernelTrial.begin(onEnough: cancel)
-                } else {
-                    Qwen35TensorPackedMatmul.NarrowInSituTrial.begin(onEnough: cancel)
-                }
-            }
             let done = DispatchSemaphore(value: 0)
             Task.detached {
                 if let events = try? engine.submit(warmRequest) {
@@ -375,12 +256,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 done.signal()
             }
             done.wait()
-            if trialRounds > 0 {
-                Qwen35TensorPackedMatmul.NarrowInSituTrial.active = false
-                Qwen35NarrowProducerTrial.active = false
-                Qwen35HeadTopTwo.Trial.active = false
-                DFlash2KernelTrial.active = false
-            }
         }
         // The engine is out of scope here; its last references go as the
         // task above unwinds and its queues drain. Wait (bounded) until it is
@@ -461,111 +336,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         }
         eval(targets)
         try? evaluation.commit()
-        warmTargetVerify(
-            adapter: adapter, caches: bank.layerCaches(rowStates: [rowState]),
-            recurrent: recurrent)
-    }
-
-    /// `MLXFAST_VERIFY_WARM=0` skips `warmTargetVerify`.
-    static let verifyWarmEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_WARM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Runs the ENGINE's capture-verify forward once, at load, on the warm
-    /// prompt's throwaway state, and rolls it back.
-    ///
-    /// The window is a scored round's (one anchor plus the declared depth,
-    /// `warmBlockSize` rows, batch 1), with the tap armed and the caches'
-    /// rectangular-verify policy set as the round sets it, so every
-    /// verify-width kernel is built under the template keys the timed rounds
-    /// use: the GDN prework variants, the composed causal block, the strided
-    /// fused-input rotations and the verify boundary, whose bitwise self-test
-    /// runs here too. benchd serves each phase from a fresh worker whose
-    /// warm-up is prefill-only, so without this the first timed round paid
-    /// those compiles and the self-test's readback. The first-use paths stay
-    /// as the fallback: a process that skips this warm builds and self-tests
-    /// at its first verify, as before. Nothing is committed; the caller
-    /// releases the state and `warmSpeculativeShapes` drains the buffer cache.
-    private func warmTargetVerify(
-        adapter: CBv2SteppableLanguageModelAdapter, caches: [CBv2AttendingLayerCache],
-        recurrent: CBv2RecurrentRequestState
-    ) {
-        guard Self.verifyWarmEnabled, adapter.supportsCapturedVerifyWindow,
-            let evaluation = try? recurrent.bind()
-        else { return }
-        let serializing = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
-        for cache in serializing { cache.mtpSerializesRectangularAttention = true }
-        defer {
-            for cache in serializing { cache.mtpSerializesRectangularAttention = false }
-        }
-        let rows = Self.warmBlockSize
-        let ids = (0 ..< rows).map { Int32(100 + ($0 &* 104_729) % 20_000) }
-        // The round builds its window as the engine's one-column-per-token
-        // concatenation (`EngineLoopV2+MTPTargetVerification`); same ids.
-        let tokens =
-            Self.roundKernelWarmEnabled
-            ? concatenated(ids.map { MLXArray([$0]).reshaped([1, 1]) }, axis: 1)
-            : MLXArray(ids).reshaped([1, rows])
-        let forward = adapter.forwardWithHiddenCaptured(
-            tokens: tokens, caches: caches, recurrentState: [evaluation], positionIds: nil)
-        guard evaluation.isCaptured, let roots = try? evaluation.evaluate() else {
-            try? evaluation.rollback()
-            return
-        }
-        var targets = [argMax(forward.logits, axis: -1), forward.lastHidden] + roots
-        if let tapped = target.dFlash2TappedHidden {
-            targets.append(tapped.asType(drafter.dtype))
-            if Self.roundKernelWarmEnabled {
-                // A one-row committed crossing (`append`) casts through the
-                // small-size copy kernel, not the wide casts' kernel.
-                targets.append(tapped[0..., ..<1, 0...].asType(drafter.dtype))
-            }
-        }
-        if Self.roundKernelWarmEnabled {
-            targets += roundKernelWarmTargets(adapter: adapter, logits: forward.logits)
-        }
-        eval(targets)
-        try? evaluation.rollback()
-    }
-
-    /// `MLXFAST_ROUND_KERNEL_WARM=0` skips the round-kernel additions to
-    /// `warmTargetVerify`.
-    static let roundKernelWarmEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_KERNEL_WARM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Key counts for the verify block's GEMM warm: every alignment state of
-    /// a power-of-two tile up to 128 (529 fills none, 640 fills all), plus
-    /// each residue mod 4, in the range a scored window's attention spans.
-    static let warmVerifyKeyLengths = [529, 530, 531, 532, 536, 544, 560, 576, 640]
-
-    /// The first-use pipelines a timed round still built after the warm
-    /// verify, on throwaway inputs: the policy top-2 over the verify logits
-    /// (as `EngineLoopV2+MTPTargetVerification` reads them) and the composed
-    /// causal block's FP32 GEMMs at the key-count alignments the warm
-    /// verify's own key count does not cover. Every result is evaluated and
-    /// dropped with the warm's; `warmSpeculativeShapes` drains the cache.
-    private func roundKernelWarmTargets(
-        adapter: CBv2SteppableLanguageModelAdapter, logits: MLXArray
-    ) -> [MLXArray] {
-        var targets: [MLXArray] = []
-        if logits.ndim == 3 {
-            let flat = logits.reshaped([1, logits.dim(0) * logits.dim(1), logits.dim(2)])
-            let topTwo = adapter.cbv2MTPTopTwo(flat)
-            targets += [topTwo.ids.asType(.int32), topTwo.values.asType(.float32)]
-        }
-        let configuration = target.configuration
-        let headDim =
-            configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads)
-        targets += CBv2PromptCausalAttention.warmVerifyBlock(
-            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads,
-            headDim: headDim, rows: Self.warmBlockSize, scale: pow(Float(headDim), -0.5),
-            keyLengths: Self.warmVerifyKeyLengths)
-        return targets
     }
 
     private func warmDrafter() {
@@ -619,10 +389,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     public func setBlockContextArmed(_ armed: Bool) throws {
         if armed {
             try target.armDFlash2Tap(layerIds: drafter.config.targetLayerIds)
-            // The engine being built drafts: its prompt forward makes the
-            // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`),
-            // and the target's arrays only the window reads.
-            DFlash2ResidencyPrefetch.arm(drafter, window: target.dFlash2WindowResidencyArrays())
         } else {
             target.dFlash2TapLayerIds = nil
         }
@@ -653,8 +419,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var isReleased = false
-        /// Columns the last round confirmed (the speculative block's row class guess).
-        var lastConfirmed: Int?
 
         init(caches: [any KVCache]) { self.caches = caches }
 
@@ -765,10 +529,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState,
         submittingLeadingLayers leadingLayers: Int
     ) throws -> MLXArray {
-        Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
-        Qwen35NarrowProducerTrial.roundBoundary()
-        Qwen35HeadTopTwo.Trial.roundBoundary()
-        DFlash2KernelTrial.roundBoundary()
         let state = self.state(requestState)
         // A state whose committed rows were all absorbed ahead of this round
         // (`prefetchCommittedContext`) proposes over its cache alone.
@@ -784,7 +544,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
             blockSize: depth + 1, submittingLeadingLayers: leadingLayers)
-        DFlash2KernelTrial.recordProposed(tokens, position: state.observedRows)
         state.absorbPending()
         state.contextPrefetched = false
         state.roots.append(tokens)
@@ -873,7 +632,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     ) {
         let state = self.state(requestState)
         state.roots.removeAll(keepingCapacity: true)
-        state.lastConfirmed = committedTargetHidden.dim(1)
         append(committedTargetHidden, to: requestState)
     }
 
@@ -882,161 +640,5 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
         state(requestState).roots.removeAll(keepingCapacity: true)
-    }
-
-    // MARK: - The next block before the readback
-
-    /// Set at load by `establishSpeculation`. One row class: the block fits
-    /// every count and goes before the readback; otherwise the previous
-    /// round's class is built, submitted after it when the count matches.
-    struct SpeculationPlan {
-        let classes: [Int]
-        var single: Bool { Set(classes.dropFirst()).count == 1 }
-    }
-
-    private(set) var speculationPlan: SpeculationPlan?
-
-    final class Speculation: CBv2MTPSpeculativeBlock {
-        let state: RequestState
-        let block: DFlash2SpeculativeBlock
-        /// The kernel trial's candidate the block was built with.
-        let kernelTag: Int?
-        init(state: RequestState, block: DFlash2SpeculativeBlock, kernelTag: Int?) {
-            (self.state, self.block, self.kernelTag) = (state, block, kernelTag)
-        }
-    }
-
-    /// On the device: `accepted` = the accept walk (cumulative product of
-    /// draft == target), `accepted + 1` columns confirmed, anchor = target id
-    /// at `accepted`. Nothing may be pending: the confirmed columns are then
-    /// exactly today's early block context.
-    public func speculateBlock(
-        acceptancePacket packet: MLXArray, depth k: Int, verifyContext: MLXArray,
-        requestState: any CBv2MTPRequestState,
-        leadingLayersBeforeReadback: Int
-    ) -> (any CBv2MTPSpeculativeBlock)? {
-        let state = self.state(requestState)
-        guard let plan = speculationPlan, k + 2 == plan.classes.count, !state.isReleased,
-            state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
-            packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
-        else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
-        // The block is the next round's: built with that round's kernel.
-        let kernelTag = DFlash2KernelTrial.aheadOfRound()
-        guard
-            let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
-                contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
-                cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
-                submitLead: plan.single)
-        else { return nil }
-        return Speculation(state: state, block: block, kernelTag: kernelTag)
-    }
-
-    public func adoptSpeculativeBlock(
-        _ block: any CBv2MTPSpeculativeBlock, confirmed: Int,
-        requestState: any CBv2MTPRequestState
-    ) -> MLXArray? {
-        let state = self.state(requestState)
-        guard let s = block as? Speculation, let plan = speculationPlan, s.state === state,
-            !state.isReleased, state.pending.isEmpty, (1 ..< plan.classes.count).contains(confirmed),
-            plan.classes[confirmed] == s.block.contextRows
-        else { return nil }
-        Qwen35TensorPackedMatmul.NarrowInSituTrial.roundBoundary()
-        Qwen35NarrowProducerTrial.roundBoundary()
-        Qwen35HeadTopTwo.Trial.roundBoundary()
-        DFlash2KernelTrial.roundBoundary()
-        drafter.adoptSpeculative(s.block, confirmed: confirmed, cache: state.caches)
-        // As `finalizeRound` of the confirmed rows, then `proposeBlock`.
-        state.roots.removeAll(keepingCapacity: true)
-        state.roots.append(s.block.tokens)
-        state.lastConfirmed = confirmed
-        state.observedRows += confirmed
-        state.contextPrefetched = false
-        DFlash2KernelTrial.recordAdopted(s.block.tokens, tag: s.kernelTag, position: state.observedRows)
-        return s.block.tokens
-    }
-
-    /// Load-time proof on throwaway states: for each confirmed count 1...16,
-    /// today's path (`finalizeRound` + `proposeBlock`) against the speculative
-    /// one; proposals, all cached rows and cursors must match bit for bit.
-    func establishSpeculation() {
-        speculationPlan = nil
-        guard CBv2MTPDraftBeforeReadback.enabled else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        let block = Self.warmBlockSize
-        let classes = drafter.contextRowClasses(rows: block)
-        speculationPlan = SpeculationPlan(classes: classes)
-        var failure: String?
-        var compared = 0
-        do {
-            let a = RequestState(caches: try drafter.makeCache())
-            let b = RequestState(caches: try drafter.makeCache())
-            defer { a.clearAll(); b.clearAll() }
-            let width = drafter.config.targetHiddenSize
-            let prompt = MLXRandom.normal([1, Self.warmPromptRows, width], key: MLXRandom.key(11))
-            for state in [a, b] {
-                append(prompt, to: state)
-                eval(prefetchCommittedContext(requestState: state))
-                _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
-                eval(evaluationTargets(for: state))
-            }
-            for c in 1 ... block where failure == nil {
-                let window = MLXRandom.normal([1, block, width], key: MLXRandom.key(UInt64(100 + c)))
-                let targets = (0 ..< block).map { Int32(1000 + ($0 &* 7919 &+ c &* 104_729) % 90_000) }
-                var drafts = Array(targets[..<(block - 1)])
-                if c < block { drafts[c - 1] &+= 1 }
-                finalizeRound(
-                    requestState: a, confirmedInputTokens: c,
-                    committedDraftTokens: MLXArray.zeros([1, 0], dtype: .int32),
-                    committedTargetHidden: window[0..., ..<c, 0...])
-                let expected = try proposeBlock(
-                    anchor: Int(targets[c - 1]), depth: block - 1, requestState: a,
-                    submittingLeadingLayers: 3)
-                b.lastConfirmed = c  // build this count's class
-                guard
-                    let pending = speculateBlock(
-                        acceptancePacket: MLXArray(drafts + targets), depth: block - 1,
-                        verifyContext: window, requestState: b,
-                        leadingLayersBeforeReadback: CBv2MTPDraftBeforeReadback.leadingLayers),
-                    let actual = adoptSpeculativeBlock(pending, confirmed: c, requestState: b)
-                else {
-                    failure = "confirmed \(c): not taken"
-                    break
-                }
-                eval([expected, actual] + evaluationTargets(for: a) + evaluationTargets(for: b))
-                var same = expected.asArray(Int32.self) == actual.asArray(Int32.self)
-                    && a.observedRows == b.observedRows && b.pending.isEmpty
-                for (x, y) in zip(a.caches, b.caches) {
-                    guard let x = x as? DFlash2BlockKVCache, let y = y as? DFlash2BlockKVCache,
-                        let rows = x.inPlaceRows, y.inPlaceRows == rows, x.offset == y.offset
-                    else { same = false; break }
-                    for (u, v) in zip(x.innerState(), y.innerState()) {
-                        let (p, q) = (u[.ellipsis, ..<(rows + block), 0...], v[.ellipsis, ..<(rows + block), 0...])
-                        same = same && p.shape == q.shape && p.dtype.size == 2
-                            && all(p.view(dtype: .uint16) .== q.view(dtype: .uint16)).item(Bool.self)
-                        compared += p.size
-                    }
-                }
-                if !same { failure = "confirmed \(c): proposals, cached rows or cursors differ" }
-            }
-        } catch {
-            failure = "\(error)"
-        }
-        Stream().synchronize()
-        Memory.clearCache()
-        if failure != nil { speculationPlan = nil }
-        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        FileHandle.standardError.write(Data((failure.map {
-            "dflash2 next block before readback: self-test FAILED (\($0)); off; \(ms) ms\n"
-        } ?? ("dflash2 next block before readback: self-test passed (confirmed counts 1-\(block), "
-            + "\(compared) values compared bitwise, 0 mismatches; context row classes "
-            + "\(Array(classes.dropFirst()))); "
-            + (speculationPlan!.single
-                ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
-                : "the previous round's class built before the readback") + "; \(ms) ms\n")).utf8))
     }
 }

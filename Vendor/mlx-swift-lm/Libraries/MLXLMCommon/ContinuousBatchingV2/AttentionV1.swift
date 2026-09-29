@@ -406,17 +406,6 @@ enum CBv2AttentionV1 {
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
-        // A verify window's causal block (fewer rows than the prompt width),
-        // composed as SDPA's fallback composes it (`CBv2PromptCausalAttention`).
-        if keepMask == nil, metadata == nil, packet == nil, sinks == nil, softcap == nil,
-            window(of: kind) == nil, !kind.isBidirectional,
-            L < BonsaiPromptWidth.minimumRows,
-            let composed = CBv2PromptCausalAttention.attend(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                scale: scale, promptRows: L, verify: true)
-        {
-            return composed
-        }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
@@ -641,42 +630,6 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext? = nil,
         keepMask: MLXArray? = nil
     ) -> MLXArray {
-        let outputs = attendQueryBlockList(
-            queries: queries, keys: keys, values: values, newTokenCount: newTokenCount,
-            window: window, scale: scale, sinks: sinks, softcap: softcap, blockSize: blockSize,
-            spanContext: spanContext, keepMask: keepMask)
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
-    }
-
-    /// `updateAndAttendRow` for B == 1 and no keep mask or span overlay,
-    /// when it takes the query-block branch: the same update and the same
-    /// block outputs, returned in query order (not concatenated). Nil, before
-    /// the row is updated, when that branch would not be taken.
-    static func updateAndAttendQueryBlocks(
-        row: CBv2SequenceKV, kind: CBv2LayerKind,
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> [MLXArray]? {
-        let L = queries.dim(2)
-        guard queries.dim(0) == 1, shouldBlockQueries(L), !kind.isBidirectional else {
-            return nil
-        }
-        let effectiveSinks = dispatchSinks(sinks, kind: kind, queries: queries, softcap: softcap)
-        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        return attendQueryBlockList(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, blockSize: queryBlockSize)
-    }
-
-    /// The query blocks' outputs of `attendQueryBlocks`, in query order.
-    private static func attendQueryBlockList(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        newTokenCount: Int, window: Int?, scale: Float,
-        sinks: MLXArray?, softcap: Float?, blockSize: Int,
-        spanContext: CBv2SpanChunkContext? = nil,
-        keepMask: MLXArray? = nil
-    ) -> [MLXArray] {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         precondition(
             keepMask == nil || spanContext == nil,
@@ -753,7 +706,7 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        return outputs
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
@@ -1003,44 +956,9 @@ enum CBv2AttentionV1 {
 /// Nil when any condition does not hold; the caller then runs SDPA as
 /// before. Prompt width only (`BonsaiPromptWidth.minimumRows`);
 /// `BONSAI_PROMPT_CAUSAL_BLOCK=0` disables it.
-///
-/// `verify: true` serves a verify window's block (fewer rows than the prompt
-/// width: 16 queries at depth 15), where SDPA takes the same fallback (more
-/// than 8 queries at head dim 256), in three launches instead of the
-/// fallback's eight: the same composition, exact by the same argument. Its
-/// key count need not be a multiple of 4 while `softmaxKernel` serves it: that
-/// kernel pads a partial last read exactly as MLX's single-row softmax does
-/// (only `maskKernel`, past 4096 keys, needs whole four-column groups).
-/// `BONSAI_VERIFY_CAUSAL_BLOCK=0` disables it.
-package enum CBv2PromptCausalAttention {
+enum CBv2PromptCausalAttention {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_CAUSAL_BLOCK"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    static let verifyEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_CAUSAL_BLOCK"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// On unless explicitly disabled: a verify block's query heads that share
-    /// a KV head go through the two GEMMs as ONE matrix of `repeats * L` rows
-    /// (`[B, kvHeads, repeats * L, D]`, a free view of the contiguous
-    /// `[B, H, L, D]` queries) instead of `kvHeads * repeats` batches of `L`
-    /// rows against a broadcast K/V. At `L = 16` every batch of the latter is
-    /// a single 64-row M tile with 48 padding rows, on both the steel GEMM
-    /// and the NAX GEMM; folded, the 96 rows fill 1.5 tiles, so the scores
-    /// and the output take a third as many tiles and read each K/V tile for
-    /// six heads at once. Bit-identical: both GEMMs reduce every output
-    /// element over K in the same fixed BK / SK steps whatever the element's
-    /// row, tile, alignment class or batch (`gemm_loop`), so moving a query
-    /// row between tiles and batches does not change its value; the scores
-    /// keep the `[..., repeats, L, kL]` row order the softmax indexes by.
-    /// `BONSAI_VERIFY_FOLD_REPEATS=0` restores the broadcast batches.
-    static let verifyFoldRepeats: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_FOLD_REPEATS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -1106,13 +1024,11 @@ package enum CBv2PromptCausalAttention {
                     : Limits<float>::min;
               }
             }
-            // Only initialize unused slots. Active SIMD groups write their
-            // own slots below, so these stores are disjoint and need no barrier.
-            const uint groups = uint((axis_size + 127) / 128);
-            if (simd_group_id == 0 && simd_lane_id >= groups) {
+            if (simd_group_id == 0) {
               local_max[simd_lane_id] = Limits<float>::min;
               local_normalizer[simd_lane_id] = 0;
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Get the max
             float maxval = Limits<float>::finite_min;
@@ -1124,9 +1040,14 @@ package enum CBv2PromptCausalAttention {
               local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Every SIMD group reduces the same 32 ordered partials. This
-            // preserves the reduction tree and avoids a group-zero broadcast.
-            maxval = simd_max(local_max[simd_lane_id]);
+            if (simd_group_id == 0) {
+              maxval = simd_max(local_max[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_max[0] = maxval;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
 
             // Compute exp(x_i - maxval) and store the partial sums in local_normalizer
             float normalizer = 0;
@@ -1140,7 +1061,14 @@ package enum CBv2PromptCausalAttention {
               local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
+            if (simd_group_id == 0) {
+              normalizer = simd_sum(local_normalizer[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_normalizer[0] = normalizer;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
 
             // Normalize and write to the output
             device float* o = out + gid * size_t(axis_size) + lid * N_READS;
@@ -1161,37 +1089,10 @@ package enum CBv2PromptCausalAttention {
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
     private static let softmaxSingleRowLimit = 4096
 
-    /// The verify block's composition once per key count in `keyLengths`, on
-    /// throwaway zeros, for a load-time warm: the two FP32 matmuls pick their
-    /// steel GEMM pipeline by whether the key count fills whole tiles
-    /// (`align_N` for the scores, `align_K` for the output), so a window
-    /// whose key count lands in an alignment class the warm verify did not
-    /// see built that pipeline inside a timed round. Nothing here reads or
-    /// writes a cache; the caller evaluates and drops the results.
-    package static func warmVerifyBlock(
-        heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int]
-    ) -> [MLXArray] {
-        guard verifyEnabled, heads > 0, kvHeads > 0, headDim > 0, rows > 0 else { return [] }
-        var outputs: [MLXArray] = []
-        for keyLength in keyLengths where keyLength >= rows {
-            let queries = MLXArray.zeros([1, heads, rows, headDim], dtype: .float32)
-            let keys = MLXArray.zeros([1, kvHeads, keyLength, headDim], dtype: .float32)
-            let values = MLXArray.zeros([1, kvHeads, keyLength, headDim], dtype: .float32)
-            if let output = attend(
-                queries: queries, keys: keys, values: values, scale: scale, promptRows: rows,
-                verify: true)
-            {
-                outputs.append(output)
-            }
-        }
-        return outputs
-    }
-
     static func attend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
-        verify: Bool = false
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int
     ) -> MLXArray? {
-        guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
+        guard enabled, promptRows >= BonsaiPromptWidth.minimumRows,
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
             scale > 0, scale.isNormal, scale.significandBitPattern == 0
@@ -1204,20 +1105,14 @@ package enum CBv2PromptCausalAttention {
         let kL = keys.dim(2)
         guard L > 8, L < 1024, D == 192 || D == 256, keys.dim(0) == B, values.dim(0) == B,
             keys.dim(3) == D, values.dim(1) == kvHeads, values.dim(2) == kL,
-            kvHeads > 0, H % kvHeads == 0, kL >= L,
-            kL % 4 == 0 || (verify && kL <= softmaxSingleRowLimit),
+            kvHeads > 0, H % kvHeads == 0, kL >= L, kL % 4 == 0,
             B * H * L * kL < Int(Int32.max)
         else { return nil }
         let repeats = H / kvHeads
         var q = queries
         var k = keys
         var v = values
-        if repeats > 1, verify, verifyFoldRepeats {
-            // One kvHeads-batched GEMM over repeats * L rows per KV head (see
-            // `verifyFoldRepeats`): the same buffer in the same row order, so
-            // the scores, the softmax rows and the output keep their layout.
-            q = q.reshaped([B, kvHeads, repeats * L, D])
-        } else if repeats > 1 {
+        if repeats > 1 {
             q = q.reshaped([B, kvHeads, repeats, L, D])
             k = k.expandedDimensions(axis: 2)
             v = v.expandedDimensions(axis: 2)

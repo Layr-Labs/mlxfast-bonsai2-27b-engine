@@ -1,6 +1,5 @@
 // Copyright © 2024 Apple Inc.
 
-import Cmlx
 import Foundation
 import MLX
 import MLXNN
@@ -788,41 +787,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// Kill switch for `writeRows` (default on).
-    /// `DARKBLOOM_DFLASH2_KV_STRIDED_WRITE=0` writes through the subscript
-    /// setter instead.
-    static let stridedWrite: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_KV_STRIDED_WRITE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `buffer[..., start ..< start + rows, :] = update` as the one
-    /// `mlx_slice_update` the subscript setter ends in, with `update` passed
-    /// as is. The setter first drops the update's leading singleton axis and
-    /// then restores it, two reshapes; for the drafter's values, a
-    /// head/sequence transpose of the stacked q|k|v projection (`[1, 8, n,
-    /// 128]`, strides `(..., 128, 6144, 1)`), MLX cannot express the first
-    /// reshape as a view (its stride walk starts at the size-1 axis) and
-    /// materializes it with a copy launch per layer per round. The slice
-    /// update's own copy reads any strides, so the same elements land in the
-    /// same rows with one launch fewer.
-    private static func writeRows(_ buffer: MLXArray, _ update: MLXArray, at start: Int)
-        -> MLXArray
-    {
-        let ndim = buffer.ndim
-        var starts = [Int32](repeating: 0, count: ndim)
-        var ends = buffer.shape.map { Int32($0) }
-        let strides = [Int32](repeating: 1, count: ndim)
-        starts[ndim - 2] = Int32(start)
-        ends[ndim - 2] = Int32(start + update.dim(ndim - 2))
-        var result = mlx_array_new()
-        mlx_slice_update(
-            &result, buffer.ctx, update.ctx, starts, starts.count, ends, ends.count, strides,
-            strides.count, StreamOrDevice.default.ctx)
-        return MLXArray(result)
-    }
-
     /// Context rows held in the buffer (`offset` is absolute and may start
     /// past zero when the prompt was longer than the window).
     private var rows = 0
@@ -864,13 +828,8 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
                 self.values = newV
             }
         }
-        if Self.stridedWrite {
-            self.keys!._updateInternal(Self.writeRows(self.keys!, keys, at: rows))
-            self.values!._updateInternal(Self.writeRows(self.values!, values, at: rows))
-        } else {
-            self.keys![.ellipsis, rows ..< end, 0...] = keys
-            self.values![.ellipsis, rows ..< end, 0...] = values
-        }
+        self.keys![.ellipsis, rows ..< end, 0...] = keys
+        self.values![.ellipsis, rows ..< end, 0...] = values
         rows += contextRows
         idx = rows
         offset += contextRows
@@ -885,37 +844,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
     /// and the window still has room for them).
     public func canAbsorb(contextRows: Int) -> Bool {
         !rotating && contextRows >= 1 && rows + contextRows <= maxCacheSize
-    }
-
-    // Speculative block writes (`DFlash2DraftModel.proposeSpeculative`).
-
-    /// Held context rows; nil once the rotating path owns the state.
-    public var inPlaceRows: Int? { rotating || self.keys == nil ? nil : rows }
-    public var inPlaceCapacity: Int {
-        rotating ? 0 : Swift.min(self.keys?.dim(2) ?? 0, self.values?.dim(2) ?? 0)
-    }
-    public var contextRowLimit: Int { maxCacheSize }
-
-    /// The buffers with `keys`/`values` written at the cursor as `updateBlock`
-    /// writes them, returned uninstalled; the cursor does not move.
-    public func speculativeRows(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)? {
-        guard !rotating, let k = self.keys, let v = self.values, values.dim(2) == keys.dim(2),
-            rows + keys.dim(2) <= Swift.min(k.dim(2), v.dim(2))
-        else { return nil }
-        return (Self.writeRows(k, keys, at: rows), Self.writeRows(v, values, at: rows))
-    }
-
-    public func installSpeculative(keys: MLXArray, values: MLXArray) {
-        self.keys!._updateInternal(keys)
-        self.values!._updateInternal(values)
-    }
-
-    /// Advance the cursor by `contextRows` confirmed rows, as `updateBlock` does.
-    public func commitSpeculativeContext(_ contextRows: Int) {
-        precondition(!rotating && rows + contextRows <= maxCacheSize)
-        rows += contextRows
-        idx = rows
-        offset += contextRows
     }
 
     /// The parent's `updateConcat` expects the held rows as `keys`/`values`
