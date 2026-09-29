@@ -1980,13 +1980,41 @@ extension Qwen35TextModel: CBv2PositionAxisProviding {
 extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
     CBv2PositionedRecurrentEmbeddingForwardable
 {
+    /// The unpositioned recurrent seam projects ONLY the final position when
+    /// the window is wider than one token, and returns `[B, 1, vocab]`.
+    ///
+    /// Every reader of this seam consumes the last position and nothing else:
+    /// the teacher-forced stepper slices `full[0..., -1, 0...]`, the engine's
+    /// unpositioned recurrent forward either narrows or slices `-1` in
+    /// `decodeLogits`, and the KV-type probe only evaluates the output. A
+    /// `[B, L, 248320]` FP32 projection over a 512-token prompt spends about
+    /// 1.3 TFLOP and a 508 MB logits write on rows nobody reads. The trunk --
+    /// every K/V write, every recurrent stage, every layer -- is unchanged; the
+    /// final RMSNorm is row-independent, so norm-after-slice equals
+    /// slice-after-norm for the surviving row. This is the same narrowing
+    /// `cbv2RecurrentPrefill(.lastPositionLogits)` already applies to the
+    /// engine's prompt chunks. Single-token windows keep the plain path.
     public func cbv2Forward(
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        positionedForward(
-            tokens, inputEmbedding: nil, cache: caches,
+        let width = tokens.dim(1)
+        guard width > 1 else {
+            return positionedForward(
+                tokens, inputEmbedding: nil, cache: caches,
+                recurrentState: recurrentState, positionIds: nil)
+        }
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: nil)
+        let last = model.norm(hidden[0..., (width - 1)..., 0...])
+        return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
     }
 
     public func cbv2Forward(
