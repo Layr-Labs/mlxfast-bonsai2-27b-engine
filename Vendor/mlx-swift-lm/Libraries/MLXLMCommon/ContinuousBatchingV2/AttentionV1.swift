@@ -989,6 +989,26 @@ package enum CBv2PromptCausalAttention {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// On unless explicitly disabled: a verify block's query heads that share
+    /// a KV head go through the two GEMMs as ONE matrix of `repeats * L` rows
+    /// (`[B, kvHeads, repeats * L, D]`, a free view of the contiguous
+    /// `[B, H, L, D]` queries) instead of `kvHeads * repeats` batches of `L`
+    /// rows against a broadcast K/V. At `L = 16` every batch of the latter is
+    /// a single 64-row M tile with 48 padding rows, on both the steel GEMM
+    /// and the NAX GEMM; folded, the 96 rows fill 1.5 tiles, so the scores
+    /// and the output take a third as many tiles and read each K/V tile for
+    /// six heads at once. Bit-identical: both GEMMs reduce every output
+    /// element over K in the same fixed BK / SK steps whatever the element's
+    /// row, tile, alignment class or batch (`gemm_loop`), so moving a query
+    /// row between tiles and batches does not change its value; the scores
+    /// keep the `[..., repeats, L, kL]` row order the softmax indexes by.
+    /// `BONSAI_VERIFY_FOLD_REPEATS=0` restores the broadcast batches.
+    static let verifyFoldRepeats: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_FOLD_REPEATS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
     /// per thread (kL % 4 == 0, so they share a row).
     private static let maskKernel = MLXFast.metalKernel(
@@ -1166,7 +1186,12 @@ package enum CBv2PromptCausalAttention {
         var q = queries
         var k = keys
         var v = values
-        if repeats > 1 {
+        if repeats > 1, verify, verifyFoldRepeats {
+            // One kvHeads-batched GEMM over repeats * L rows per KV head (see
+            // `verifyFoldRepeats`): the same buffer in the same row order, so
+            // the scores, the softmax rows and the output keep their layout.
+            q = q.reshaped([B, kvHeads, repeats * L, D])
+        } else if repeats > 1 {
             q = q.reshaped([B, kvHeads, repeats, L, D])
             k = k.expandedDimensions(axis: 2)
             v = v.expandedDimensions(axis: 2)
