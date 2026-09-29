@@ -2742,14 +2742,40 @@ enum Qwen35TensorPackedMatmul {
     // only: signed codes, negated offsets, factored epilogue, row-tiled
     // constants and the tiled word copy. grid (N / 64 * 64, M / 32, 1),
     // threadgroup (64, 1, 1); inputs as `sourceStaged8`. Four-wide stores.
-    private static let sourceStaged8Reg = """
+    //
+    // Tile order (`promptSwizzleWidth`, `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE`):
+    // the grid is walked x fastest, so with the stock map (width 0) every row
+    // tile of the prompt streams the whole word matrix again (the gate|up
+    // words alone are 44.6 MB a pass, more than the last-level cache). The
+    // supertile map keeps the same set of 32 x 64 tiles and the same work per
+    // tile (every output bit is unchanged), but numbers them so that SWZ
+    // column blocks are walked for every row tile before the next SWZ
+    // blocks: the words of those blocks stay cached across the M / 32 row
+    // tiles and the activations of a row tile across its SWZ blocks. The
+    // last supertile may be narrower (N / 64 need not divide by SWZ).
+    private static let sourceStaged8RegBase = """
 
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
-        const int ns = int(threadgroup_position_in_grid.x) * 64 + 32 * int(sg);
+        constexpr int SWZ = __PROMPT_SWZ__;
+        int mtile = int(threadgroup_position_in_grid.y);
+        int cblock = int(threadgroup_position_in_grid.x);
+        if (SWZ > 0) {
+          const int NB = N / 64;
+          const int MT = M / 32;
+          const int fid = mtile * NB + cblock;
+          const int per = SWZ * MT;
+          const int st = fid / per;
+          const int rem = NB - st * SWZ;
+          const int wd = rem < SWZ ? rem : SWZ;
+          const int r = fid - st * per;
+          mtile = r / wd;
+          cblock = st * SWZ + (r - mtile * wd);
+        }
+        const int ms = mtile * 32;
+        const int ns = cblock * 64 + 32 * int(sg);
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
@@ -2823,6 +2849,23 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         """
+
+    /// Column blocks per supertile of the register-weight prompt kernels'
+    /// tile order (see `sourceStaged8RegBase`): the stock x-fastest order (0)
+    /// unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE` names a count
+    /// (e.g. 32). Default off: the box read the timed prefill +1.45% slower on
+    /// every pair with the supertile order on (669f2e4e), against a 0.05% spread.
+    static let promptSwizzleWidth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
+        else { return 0 }
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        guard let value = Int(raw) else { return 32 }
+        return min(max(value, 0), 4096)
+    }()
+
+    private static let sourceStaged8Reg: String = sourceStaged8RegBase.replacingOccurrences(
+        of: "__PROMPT_SWZ__", with: String(promptSwizzleWidth))
 
     private static let kernelStaged8Reg = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_rb",
@@ -3003,6 +3046,47 @@ enum Qwen35TensorPackedMatmul {
         source: sourcePlaneForms,
         header: header,
         ensureRowContiguous: true)
+
+    // PF2 (`PlaneForm` q<QR>x<QC>[b][w<QW>]): the plane kernel's own text with
+    // QR x QC of its 32 x 32 tiles per threadgroup. Simdgroup sg takes row
+    // tile sg / QC and column tile sg % QC of its threadgroup's 32 QR x 32 QC
+    // block and runs the plane kernel's code on it unchanged (the op, the right
+    // operand from its own 32 bytes of the plane copy, the epilogue per element
+    // in ascending group order after the op, the stores), so every output is
+    // the plane kernel's bit for bit with the plane kernel's live registers.
+    // The blocks are numbered in the supertile order over QW block columns (0:
+    // x fastest); QB = 1 adds an execution barrier (no memory scope) at the
+    // top of every group, so the simdgroups sharing an activation slice or a
+    // weight block load it together. Only the tile coordinates and that
+    // barrier change; nil if an anchor is missing (no q form is then offered).
+    // grid (N / (32 QC) * 32 QR QC, M / (32 QR), 1), threadgroup (32 QR QC,
+    // 1, 1); inputs as the plane kernel's.
+    private static let sourcePlaneTiles: String? = {
+        guard var text = sourceStaged8RegPlane else { return nil }
+        let edits: [(String, String)] = [
+            ("constexpr int SWZ = \(promptSwizzleWidth);", "constexpr int SWZ = QW;"),
+            ("const int NB = N / 64;", "const int NB = N / (32 * QC);"),
+            ("const int MT = M / 32;", "const int MT = M / (32 * QR);"),
+            ("const int ms = mtile * 32;", "const int ms = mtile * (32 * QR) + 32 * (int(sg) / QC);"),
+            ("const int ns = cblock * 64 + 32 * int(sg);", "const int ns = cblock * (32 * QC) + 32 * (int(sg) % QC);"),
+            ("load(g); extract();", "if (QB != 0) { threadgroup_barrier(mem_flags::mem_none); }\n  load(g); extract();"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    static let kernelPlaneTiles: MLXFast.MLXFastKernel? = sourcePlaneTiles.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_q8_rpq",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
 
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
@@ -5270,6 +5354,18 @@ extension Qwen35TensorPackedMatmul {
         }
     }
 
+    /// The operands the prompt route binds for `projection`, built ones
+    /// only: under each layout cache it marked, the words it reads (the plane
+    /// copy where marked, the tiled copy otherwise) and tags 1, 2 and 3
+    /// (`Qwen35SeedResidencyTouch`).
+    static func promptResidencyArrays(_ projection: HadamardQuantizedLinear) -> [MLXArray] {
+        projection.tensorRouteLayoutCaches.flatMap { cache -> [MLXArray] in
+            guard cache.residencyMarks & promptReadMark != 0 else { return [] }
+            let words = cache.residencyMarks & promptPlaneMark != 0 ? 6 : 5
+            return cache.existing(tags: [1, 2, 3, words])
+        }
+    }
+
     /// The window-only operands of every recorded site under the kernels
     /// installed now (built ones only; nothing is built here).
     static func windowResidencyArrays() -> [MLXArray] {
@@ -5314,13 +5410,43 @@ extension Qwen35TensorPackedMatmul {
     /// `p4`, `p8t`, `p2c2`). `p2` is the plane kernel's own tiling in the
     /// forms' text (the rows' constants loaded before the op, not after it).
     /// Every form's outputs are the plane kernel's bit for bit.
+    ///
+    /// PF2 (`sourcePlaneTiles`): `q<R>x<C>` R x C of the plane kernel's
+    /// 32 x 32 tiles per threadgroup (R 1, 2, 4; C 1 ... 16; R C <= 16), `b`
+    /// the per-group barrier, `w<W>` the supertile width in threadgroup column
+    /// blocks (default: the plane kernel's supertile columns; `w0` x fastest),
+    /// e.g. `q2x4b`, `q2x2b`, `q1x4`, `q1x2w0` (the plane kernel in the stock order).
+    /// Off with `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS2=0`.
     struct PlaneForm: Hashable, CustomStringConvertible {
         let sgn: Int, ct: Int, at: Int
         let name: String
+        var tiles = false, r = 1, w = 0, bar = 0
 
         init?(name raw: String) {
             let name = raw.trimmingCharacters(in: .whitespaces).lowercased()
             var rest = Substring(name)
+            if rest.hasPrefix("q") {
+                guard PlaneFormTrial.forms2, kernelPlaneTiles != nil else { return nil }
+                rest = rest.dropFirst()
+                func number() -> Int? {
+                    let digits = rest.prefix { $0.isNumber }
+                    rest = rest.dropFirst(digits.count)
+                    return Int(digits)
+                }
+                guard let r = number(), [1, 2, 4].contains(r), rest.hasPrefix("x") else { return nil }
+                rest = rest.dropFirst()
+                guard let c = number(), [1, 2, 4, 8, 16].contains(c), r * c <= 16 else { return nil }
+                if rest.hasPrefix("b") { bar = 1; rest = rest.dropFirst() }
+                w = promptSwizzleWidth > 0 ? max(1, promptSwizzleWidth * 2 / c) : 0
+                if rest.hasPrefix("w") {
+                    rest = rest.dropFirst()
+                    guard let width = number(), width <= 4096 else { return nil }
+                    w = width
+                }
+                guard rest.isEmpty else { return nil }
+                (sgn, ct, at, tiles, self.r, self.name) = (r * c, 1, 0, true, r, name)
+                return
+            }
             guard rest.hasPrefix("p") else { return nil }
             rest = rest.dropFirst()
             let digits = rest.prefix { $0.isNumber }
@@ -5336,8 +5462,8 @@ extension Qwen35TensorPackedMatmul {
 
         var description: String { name }
         /// Columns per threadgroup; a launch needs `n` to be a multiple.
-        var columns: Int { 32 * sgn * ct }
-        func fits(n: Int, m: Int) -> Bool { n % columns == 0 && m % 32 == 0 }
+        var columns: Int { tiles ? 32 * (sgn / r) : 32 * sgn * ct }
+        func fits(n: Int, m: Int) -> Bool { n % columns == 0 && m % (32 * r) == 0 }
     }
 
     /// One launch of a plane form over the plane copy `plane` (same inputs as
@@ -5347,7 +5473,18 @@ extension Qwen35TensorPackedMatmul {
         _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
         k: Int, m: Int, n: Int, outputDType: DType
     ) -> MLXArray {
-        kernelPlaneForms(
+        if form.tiles, let kernel = kernelPlaneTiles {
+            return kernel(
+                [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
+                template: [
+                    ("OutT", outputDType), ("QR", form.r), ("QC", form.sgn / form.r), ("QW", form.w),
+                    ("QB", form.bar),
+                ],
+                grid: (n / form.columns * 32 * form.sgn, m / (32 * form.r), 1),
+                threadGroup: (32 * form.sgn, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernelPlaneForms(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at)],
             grid: (n / form.columns * 32 * form.sgn, m / 32, 1), threadGroup: (32 * form.sgn, 1, 1),
@@ -5420,6 +5557,10 @@ extension Qwen35TensorPackedMatmul {
 
         static let enabled = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS", default: true)
         static let evidence = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_EVIDENCE", default: false)
+        /// PF2: the q forms (`sourcePlaneTiles`) in the pool, and parsed at
+        /// all (so `..._FORCE` / `..._LIST` cannot name one when off). A q
+        /// form that fails a bitwise check at any shape is used at none.
+        static let forms2 = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS2", default: true)
 
         static let forcedName: String? = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_FORCE"]?
@@ -5430,7 +5571,7 @@ extension Qwen35TensorPackedMatmul {
 
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p2,p4,p8,p8t"
+                ?? "p2,p4,p8,p8t" + (forms2 ? ",q2x4b,q2x2b,q1x4,q1x2w0,q1x2w8" : "")
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
@@ -5541,6 +5682,11 @@ extension Qwen35TensorPackedMatmul {
             var checkNanoseconds: UInt64 = 0
             var installedNames: [String] = []
             var acts: [Int: (MLXArray, MLXArray, MLXArray)] = [:]
+            // PF2: shapes each q form passed at, its values compared with the
+            // plane kernel's, and the q forms that failed anywhere (fail-closed).
+            var passed2: [String: Int] = [:]
+            var values2: [String: Int] = [:]
+            var failed2: Set<String> = []
             for key in keys {
                 guard let sets = registry[key], !sets.isEmpty else { continue }
                 let checkStart = DispatchTime.now().uptimeNanoseconds
@@ -5579,7 +5725,9 @@ extension Qwen35TensorPackedMatmul {
                         grid: (key.n / 64 * 128, rows / 64, 1), threadGroup: (128, 1, 1),
                         outputShapes: [[rows, key.n]], outputDTypes: [outputDType])[0]
                 }
-                let pool = (forced.map { [$0] } ?? list.forms).filter { $0.fits(n: key.n, m: rows) }
+                let pool = (forced.map { [$0] } ?? list.forms).filter {
+                    $0.fits(n: key.n, m: rows) && !failed2.contains($0.name)
+                }
                 // Bitwise: each form against the plane kernel and against staged8.
                 let planeRef = launch(nil, sets[0])
                 if let planeRef { eval(planeRef) }
@@ -5594,6 +5742,10 @@ extension Qwen35TensorPackedMatmul {
                     let stagedOK = vsStaged == 0
                     if planeOK && (stagedOK || evidence) {
                         passing.append(form)
+                        if form.tiles {
+                            passed2[form.name, default: 0] += 1
+                            values2[form.name, default: 0] += rows * key.n
+                        }
                         if !stagedOK {
                             notes.append("\(form) = plane bit for bit (\(vsStaged.map { "\($0)" } ?? "?") differ from staged8: evidence mode)")
                         }
@@ -5602,6 +5754,7 @@ extension Qwen35TensorPackedMatmul {
                             ? "did not launch"
                             : "\(vsPlane!) differ from the plane kernel, \(vsStaged!) from staged8"
                         notes.append("\(form) FAILED (\(what))")
+                        if form.tiles { failed2.insert(form.name) }
                     }
                 }
                 checkNanoseconds += DispatchTime.now().uptimeNanoseconds - checkStart
@@ -5683,6 +5836,19 @@ extension Qwen35TensorPackedMatmul {
                     line += " -> plane"
                 }
                 log(line)
+            }
+            // PF2 fail-closed: a q form that failed at any shape is used at none.
+            for (key, form) in adopted where form.tiles && failed2.contains(form.name) {
+                adopted[key] = nil
+                installedNames.removeAll { $0 == "\(key.k)x\(key.n)=\(form)" }
+            }
+            let names2 = (forced.map { [$0] } ?? list.forms).filter(\.tiles).map(\.name)
+            if !names2.isEmpty {
+                log("PF2 q forms bitwise vs the plane kernel" + (evidence ? "" : " and staged8") + ": "
+                    + names2.map { name in
+                        failed2.contains(name) ? "\(name) FAILED (dropped at every shape)"
+                            : "\(name) \(passed2[name] ?? 0)/\(keys.count) shapes, \(values2[name] ?? 0) values"
+                    }.joined(separator: "; "))
             }
             let total = DispatchTime.now().uptimeNanoseconds - start
             log(
