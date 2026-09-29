@@ -241,33 +241,41 @@ enum CBv2PromptLookupDraft {
         for c in 0 ..< candidates {
             for t in 0 ..< depth { table.append(Int32(history[c + 1 + t])) }
         }
-        // The drafter's block read from position j, [depth, depth], with -1
-        // (never a token) past its end, and the first row's run bonus.
-        var shift = [Int32]()
-        var inside = [Bool]()
-        shift.reserveCapacity(depth * depth)
-        inside.reserveCapacity(depth * depth)
-        for j in 0 ..< depth {
-            for t in 0 ..< depth {
-                shift.append(Int32(min(j + t, depth - 1)))
-                inside.append(j + t < depth)
-            }
-        }
-        var firstRow = [Int32](repeating: 0, count: depth)
-        firstRow[0] = 1
-
         let block = drafted.reshaped([depth]).asType(.int32)
         let continuation = MLXArray(table, [1, candidates, depth])
-        let shifted = which(
-            MLXArray(inside, [depth, 1, depth]),
-            take(block, MLXArray(shift, [depth, 1, depth]), axis: 0),
-            MLXArray(Int32(-1)))
-        // Leading agreement of each (j, c): [depth, candidates].
-        let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
-        let score =
-            agree + MLXArray(firstRow, [depth, 1]) * MLXArray(runs, [1, candidates])
-        let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
-        let ranked = which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
+        let runArray = MLXArray(runs, [1, candidates])
+        let ranked: MLXArray
+        if let scores = CBv2SpliceRank.apply(
+            block: block, continuation: continuation, runs: runArray, minimum: minimum)
+        {
+            ranked = scores
+        } else {
+            // The drafter's block read from position j, [depth, depth], with -1
+            // (never a token) past its end, and the first row's run bonus.
+            var shift = [Int32]()
+            var inside = [Bool]()
+            shift.reserveCapacity(depth * depth)
+            inside.reserveCapacity(depth * depth)
+            for j in 0 ..< depth {
+                for t in 0 ..< depth {
+                    shift.append(Int32(min(j + t, depth - 1)))
+                    inside.append(j + t < depth)
+                }
+            }
+            var firstRow = [Int32](repeating: 0, count: depth)
+            firstRow[0] = 1
+
+            let shifted = which(
+                MLXArray(inside, [depth, 1, depth]),
+                take(block, MLXArray(shift, [depth, 1, depth]), axis: 0),
+                MLXArray(Int32(-1)))
+            // Leading agreement of each (j, c): [depth, candidates].
+            let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
+            let score =
+                agree + MLXArray(firstRow, [depth, 1]) * runArray
+            let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
+            ranked = which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
+        }
         let best = argMax(ranked, axis: 0).asType(.int32)
         let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(minimum))
         let j = floorDivide(best, MLXArray(Int32(candidates)))
@@ -363,4 +371,129 @@ public enum CBv2VerifyQueueHint {
         defer { nothingAhead = false }
         return nothingAhead
     }
+}
+
+/// This call's splice scores, computed from current draft and prompt operands.
+/// No request data or output survives the call.
+private enum CBv2SpliceRank {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_RANK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_splice_prefix_rank", inputNames: ["block", "continuation", "runs", "dims"],
+        outputNames: ["ranked"], source: """
+            const uint idx = thread_position_in_grid.x;
+            const int depth = dims[0];
+            const int candidates = dims[1];
+            if (idx >= uint(depth) * uint(candidates)) return;
+            const int j = int(idx) / candidates;
+            const int c = int(idx) % candidates;
+            int agree = 0;
+            for (int t = 0; t < depth; ++t) {
+                const int value = j + t < depth ? block[j + t] : -1;
+                if (value != continuation[c * depth + t]) break;
+                ++agree;
+            }
+            const int score = agree + (j == 0 ? runs[c] : 0);
+            ranked[idx] = agree >= 1 && score >= dims[2] ? score : 0;
+            """, ensureRowContiguous: true)
+
+    private static func launch(
+        block: MLXArray, continuation: MLXArray, runs: MLXArray, minimum: Int
+    ) -> MLXArray {
+        let depth = block.size
+        let candidates = runs.size
+        let size = depth * candidates
+        return kernel(
+            [block, continuation, runs,
+                MLXArray([Int32(depth), Int32(candidates), Int32(minimum)])],
+            grid: ((size + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[size]], outputDTypes: [.int32])[0]
+    }
+
+    static func apply(
+        block: MLXArray, continuation: MLXArray, runs: MLXArray, minimum: Int
+    ) -> MLXArray? {
+        guard enabled, block.ndim == 1, block.dtype == .int32,
+            (2 ... 16).contains(block.size), runs.ndim == 2, runs.dim(0) == 1,
+            runs.dtype == .int32, runs.size >= 2,
+            runs.size <= Int(Int32.max) / block.size,
+            continuation.shape == [1, runs.size, block.size], continuation.dtype == .int32,
+            minimum >= 1, minimum <= Int(Int32.max), verified
+        else { return nil }
+        return launch(block: block, continuation: continuation, runs: runs, minimum: minimum)
+    }
+
+    // The parent's exact tensor ranking computation, used only for the device proof.
+    private static func reference(
+        block: MLXArray, continuation: MLXArray, runs: MLXArray, minimum: Int
+    ) -> MLXArray {
+        let depth = block.size
+        let candidates = runs.size
+        var shift = [Int32]()
+        var inside = [Bool]()
+        for j in 0 ..< depth {
+            for t in 0 ..< depth {
+                shift.append(Int32(min(j + t, depth - 1)))
+                inside.append(j + t < depth)
+            }
+        }
+        var firstRow = [Int32](repeating: 0, count: depth)
+        firstRow[0] = 1
+        let shifted = which(
+            MLXArray(inside, [depth, 1, depth]),
+            take(block, MLXArray(shift, [depth, 1, depth]), axis: 0), MLXArray(Int32(-1)))
+        let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
+        let score = agree + MLXArray(firstRow, [depth, 1]) * runs
+        let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
+        return which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
+    }
+
+    private static let verified: Bool = {
+        guard enabled else { return false }
+        var same = true
+        var cases = 0
+        var elements = 0
+        do {
+            try withError { error in
+                for depth in [2, 8, 16] {
+                    for candidates in [2, 7, 33] {
+                        for pattern in 0 ..< 3 {
+                            let ids = (0 ..< depth).map { Int32(($0 * 7 + 3) % 19) }
+                            var table = (0 ..< candidates * depth).map { Int32(($0 * 13 + 1) % 19) }
+                            for c in 0 ..< candidates {
+                                let j = c % depth
+                                for t in 0 ..< depth {
+                                    if pattern == 1 {
+                                        table[c * depth + t] = j + t < depth ? ids[j + t] : -1
+                                    } else if pattern == 2 { table[c * depth + t] = -1 }
+                                }
+                            }
+                            let block = MLXArray(pattern == 2 ? [Int32](repeating: -1, count: depth) : ids)
+                            let continuation = MLXArray(table, [1, candidates, depth])
+                            let runs = MLXArray((0 ..< candidates).map { Int32($0 % 65) }, [1, candidates])
+                            for minimum in [6, 8, 64] {
+                                let actual = launch(block: block, continuation: continuation, runs: runs, minimum: minimum)
+                                let expected = reference(block: block, continuation: continuation, runs: runs, minimum: minimum)
+                                eval(actual, expected)
+                                try error.check()
+                                if actual.asArray(Int32.self) != expected.asArray(Int32.self) { same = false }
+                                cases += 1
+                                elements += depth * candidates
+                            }
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        FileHandle.standardError.write(
+            ("dflash2 splice rank: " + (same
+                ? "self-test passed: \(cases) cases, \(elements) Int32 scores; no mismatches\n"
+                : "self-test failed; tensor ranking kept\n")).data(using: .utf8)!)
+        return same
+    }()
 }
