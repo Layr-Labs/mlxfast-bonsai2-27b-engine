@@ -522,18 +522,44 @@ public final class CBv2RecurrentRequestState {
         bindingOpen = false
     }
 
+    /// What a commit of the first pending generation installs: the per-layer
+    /// state after `keepPositions`, and the retention it carries. Built by
+    /// `prepareCommit`, installed by `install`; a commit is the two in a row.
+    public final class PreparedCommit {
+        fileprivate let generation: UInt64
+        public let layers: [Int: CBv2RecurrentLayerState]
+        fileprivate let retains: Bool
+        fileprivate let retainedByteCount: Int
+        fileprivate let retainedRoots: [MLXArray]
+
+        fileprivate init(
+            generation: UInt64, layers: [Int: CBv2RecurrentLayerState], retains: Bool,
+            retainedByteCount: Int, retainedRoots: [MLXArray]
+        ) {
+            self.generation = generation
+            self.layers = layers
+            self.retains = retains
+            self.retainedByteCount = retainedByteCount
+            self.retainedRoots = retainedRoots
+        }
+
+        /// True when every layer's SSM is a replay left unbuilt
+        /// (`CBv2DeferredRecurrentReplay`), i.e. installing submits nothing.
+        public var allReplaysPending: Bool {
+            layers.values.allSatisfy { $0.deferredReplay?.isPending == true }
+        }
+    }
+
     fileprivate func commit(generation: UInt64, keepPositions: Int? = nil) throws {
+        try install(prepareCommit(generation: generation, keepPositions: keepPositions))
+    }
+
+    fileprivate func prepareCommit(generation: UInt64, keepPositions: Int?) throws
+        -> PreparedCommit
+    {
         guard !isReleased, let first = pending.first, first.id == generation else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
-        }
-        func clearOlderTransitionRetention() {
-            guard let retainedGeneration = committedTransitionGeneration,
-                generation > retainedGeneration
-            else { return }
-            committedTransitionGeneration = nil
-            committedTransitionRetainedByteCount = 0
-            committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
         }
         if let captured = first.capturedPositions {
             guard let keep = keepPositions, (1 ... captured).contains(keep) else {
@@ -541,8 +567,7 @@ public final class CBv2RecurrentRequestState {
                     "captured commit requires keepPositions in 1...\(captured) "
                         + "(got \(String(describing: keepPositions)))")
             }
-            clearOlderTransitionRetention()
-            committed = first.layers.mapValues { layer in
+            let layers = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
                     ssm: layer.ssm.map { $0[(keep - 1) ..< keep] })
@@ -551,14 +576,18 @@ public final class CBv2RecurrentRequestState {
             // not release the other positions in the captured backing stack.
             // Preserve that obligation through rollback of later work, until
             // a newer committed generation replaces these views or release.
-            if captured > 1 {
-                let (retained, overflow) = byteCount.multipliedReportingOverflow(by: captured - 1)
-                committedTransitionGeneration = generation
-                committedTransitionRetainedByteCount = overflow ? Int.max : retained
-                committedTransitionRetainedRoots = first.layers.values.flatMap {
-                    [$0.conv, $0.ssm].compactMap { $0 }
-                }
+            guard captured > 1 else {
+                return PreparedCommit(
+                    generation: generation, layers: layers, retains: false,
+                    retainedByteCount: 0, retainedRoots: [])
             }
+            let (retained, overflow) = byteCount.multipliedReportingOverflow(by: captured - 1)
+            return PreparedCommit(
+                generation: generation, layers: layers, retains: true,
+                retainedByteCount: overflow ? Int.max : retained,
+                retainedRoots: first.layers.values.flatMap {
+                    [$0.conv, $0.ssm].compactMap { $0 }
+                })
         } else if let replay = first.prefixReplay {
             guard let positions = replay.values.first?.positions,
                   let keep = keepPositions, (1 ... positions).contains(keep)
@@ -566,12 +595,12 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
             }
-            clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
             // A replayed commit may stay deferred (`CBv2DeferredRecurrentReplay`):
             // its builder is exactly the eager expression beside it.
+            let layers: [Int: CBv2RecurrentLayerState]
             if fullAcceptance {
-                committed = replay.mapValues { stage in
+                layers = replay.mapValues { stage in
                     if stage.finalState.ssm == nil,
                         let deferred = stage.deferredState(
                             keep: keep, build: { stage.fullAcceptance?() ?? stage.finalState })
@@ -581,7 +610,7 @@ public final class CBv2RecurrentRequestState {
                     return stage.fullAcceptance?() ?? stage.finalState
                 }
             } else {
-                committed = replay.mapValues { stage in
+                layers = replay.mapValues { stage in
                     stage.deferredState(keep: keep, build: { stage.replay(keep) })
                         ?? stage.replay(keep)
                 }
@@ -600,20 +629,68 @@ public final class CBv2RecurrentRequestState {
                         ? stage.fullAcceptanceRetainedRoots
                         : stage.strictReplayRetainedRoots)
             }
-            if retainedBytes > 0 || !retainedRoots.isEmpty {
-                committedTransitionGeneration = generation
-                committedTransitionRetainedByteCount = retainedBytes
-                committedTransitionRetainedRoots = retainedRoots
-            }
+            return PreparedCommit(
+                generation: generation, layers: layers,
+                retains: retainedBytes > 0 || !retainedRoots.isEmpty,
+                retainedByteCount: retainedBytes, retainedRoots: retainedRoots)
         } else {
             guard keepPositions == nil else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "keepPositions is only valid for captured or prefix replay verify windows")
             }
-            clearOlderTransitionRetention()
-            committed = first.layers
+            return PreparedCommit(
+                generation: generation, layers: first.layers, retains: false,
+                retainedByteCount: 0, retainedRoots: [])
+        }
+    }
+
+    fileprivate func install(_ prepared: PreparedCommit) throws {
+        let generation = prepared.generation
+        guard !isReleased, let first = pending.first, first.id == generation else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "recurrent commits must follow evaluation order")
+        }
+        if let retainedGeneration = committedTransitionGeneration,
+            generation > retainedGeneration
+        {
+            committedTransitionGeneration = nil
+            committedTransitionRetainedByteCount = 0
+            committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
+        }
+        committed = prepared.layers
+        if prepared.retains {
+            committedTransitionGeneration = generation
+            committedTransitionRetainedByteCount = prepared.retainedByteCount
+            committedTransitionRetainedRoots = prepared.retainedRoots
         }
         pending.removeFirst()
+    }
+
+    /// Bind the state a prepared commit of the ONLY pending generation will
+    /// install, before it is installed: the input of a verify window built
+    /// ahead of its round (`CBv2MTPVerifyPrebuild`). The binding is the one
+    /// `bind()` would open right after that commit; the caller installs the
+    /// commit (`CBv2RecurrentStateEvaluation.commit(prepared:)`) before the
+    /// binding evaluates, or abandons the binding.
+    public func bindSpeculative(over prepared: PreparedCommit) throws
+        -> CBv2RecurrentStateEvaluation
+    {
+        guard !isReleased else {
+            throw CBv2RecurrentStateError.lifecycleViolation("bind after release")
+        }
+        guard !bindingOpen else {
+            throw CBv2RecurrentStateError.lifecycleViolation("overlapping recurrent bindings")
+        }
+        guard pending.count == 1, pending[0].id == prepared.generation else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "speculative bind requires exactly the prepared generation pending")
+        }
+        bindingOpen = true
+        let evaluation = CBv2RecurrentStateEvaluation(
+            owner: self, generation: nextGeneration, input: prepared.layers,
+            requiredLayers: Set(spec.modelLayerIndices))
+        nextGeneration &+= 1
+        return evaluation
     }
 
     fileprivate func rollback(generation: UInt64) throws {
@@ -683,7 +760,7 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     deinit {
-        if !evaluated { owner.abandonBinding() }
+        if !evaluated, !finalized { owner.abandonBinding() }
     }
 
     public func inputState(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
@@ -841,6 +918,48 @@ public final class CBv2RecurrentStateEvaluation {
         finalized = true
         staged.removeAll(keepingCapacity: false)
         stagedPrefixReplay.removeAll(keepingCapacity: false)
+    }
+
+    /// The commit `commit(keepPositions:)` would install, built now and
+    /// installed later through `commit(prepared:)` (or never). Building it
+    /// mutates nothing; a replay left unbuilt stays unbuilt.
+    public func prepareCommit(keepPositions: Int) throws
+        -> CBv2RecurrentRequestState.PreparedCommit
+    {
+        guard evaluated, !finalized,
+              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "captured commit on a non-captured recurrent transaction")
+        }
+        return try owner.prepareCommit(generation: generation, keepPositions: keepPositions)
+    }
+
+    /// Finalize a captured verify window with the commit `prepareCommit`
+    /// built for it: the same install, from the same values.
+    public func commit(prepared: CBv2RecurrentRequestState.PreparedCommit) throws {
+        guard evaluated, !finalized, prepared.generation == generation,
+              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "prepared commit does not belong to this recurrent transaction")
+        }
+        try owner.install(prepared)
+        finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
+    }
+
+    /// Close a binding that will not evaluate (a speculative window not
+    /// taken); the owner may bind again afterwards.
+    public func abandon() throws {
+        guard !evaluated, !finalized else {
+            throw CBv2RecurrentStateError.lifecycleViolation("abandon after evaluation")
+        }
+        finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
+        owner.abandonBinding()
     }
 
     public func rollback() throws {

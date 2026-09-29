@@ -453,6 +453,30 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
     }
+
+    public func forwardVerifyPrefix(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix? {
+        guard let forwardable = model as? any CBv2VerifyPrefixForwardable else { return nil }
+        return forwardable.cbv2VerifyPrefix(
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds, layers: layers)
+    }
+
+    public func forwardVerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let forwardable = model as? any CBv2VerifyPrefixForwardable else {
+            preconditionFailure(
+                "CBv2 verify resume: \(type(of: model)) lacks a split verify window")
+        }
+        return forwardable.cbv2VerifyResume(
+            cursor, tokens: tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
 }
 
 

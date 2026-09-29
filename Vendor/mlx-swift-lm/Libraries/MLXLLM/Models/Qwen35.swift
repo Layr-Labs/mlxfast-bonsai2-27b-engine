@@ -3816,11 +3816,15 @@ final class Qwen35GatedDeltaNet: Module {
             let recurrence: (MLXArray, MLXArray?)
             if let pre {
                 if let fused {
-                    recurrence = (fused.y, nil)
+                    recurrence = (fused.y, fused.end)
                 } else if let chunked = Qwen35GatedDeltaChunked.runVerify(
                     q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
                 {
                     recurrence = (chunked.0, chunked.1)
+                } else if B == 1, let ended = Qwen35GDNReplayFused.runFromCommitted(
+                    layer: self, pre: pre, state: ssmState)
+                {
+                    recurrence = (ended.y, ended.end)
                 } else if Qwen35GDNVerifyStateSkip.applies(to: self),
                     let y = Qwen35GatedDeltaV3.runOutputOnly(
                         q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: ssmState)
@@ -3943,6 +3947,11 @@ final class Qwen35GatedDeltaNet: Module {
                                 return replaySlot?.state(keep: S)
                                     ?? self.replayedPrefixState(
                                         tape: tape, committedRows: S, fullWindow: true)
+                            }
+                            // The scan's own end state: conv rows a lazy slice,
+                            // as a deferred replay's (`Qwen35GDNReplayFused`).
+                            if Qwen35GDNReplayFused.endStateActive {
+                                return CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
                             }
                             let detachedConv = finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
@@ -4084,6 +4093,9 @@ final class Qwen35Attention: Module {
             Qwen35AttentionPreworkExplicit.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: mrope.rotaryDim,
                 epsQ: args.rmsNormEps, epsK: args.rmsNormEps, mrope: mrope)
+            Qwen35AttentionPreworkKV.prepare(
+                hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
+                ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
         }
     }
 
@@ -4233,9 +4245,26 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
         var queries: MLXArray
         var keys: MLXArray
-        // The fused prework reads the cache's offsets array as it stands
-        // before the cache advances (the value the copy below captures).
-        if !exactTargetVerify, positionIds == nil,
+        // The prework writing the append into the cache itself, followed by
+        // the attention `updateAndAttend` would run (`Qwen35AttentionPreworkKV`).
+        // The prompt-width row-block route below (the o_proj rotation reads
+        // the attention's query blocks in place) keeps the slice updates; the
+        // in-place append takes the other widths (the verify window).
+        let rowBlockRoute = !exactTargetVerify && B == 1 && L >= BonsaiPromptWidth.minimumRows
+            && Qwen35FusedHadamard.rowBlocksEnabled && oProj is HadamardQuantizedLinear
+        var attendedInPlace: MLXArray? = nil
+        if !exactTargetVerify, positionIds == nil, !narrowsToLastQuery, !rowBlockRoute,
+            let fusedRope,
+            let attended = Qwen35AttentionPreworkKV.attend(
+                q: qSplit[0], k: kProjection.reshaped(B, L, kvHeads, -1),
+                v: vProjection.reshaped(B, L, kvHeads, -1), qNorm: qNorm, kNorm: kNorm,
+                ropeDims: fusedRope.dims, ropeBase: fusedRope.base, cache: cache, scale: scale)
+        {
+            attendedInPlace = attended
+            (queries, keys) = (qSplit[0], kProjection)  // not read
+        } else if !exactTargetVerify, positionIds == nil,
+            // The fused prework reads the cache's offsets array as it stands
+            // before the cache advances (the value the copy below captures).
             let fused = fusedPrework(
                 qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
                 offsets: cache.positionOffsets)
@@ -4282,8 +4311,7 @@ final class Qwen35Attention: Module {
             // are not concatenated; where it declines they are concatenated
             // here exactly as the cache would have.
             var joined: MLXArray? = nil
-            if !exactTargetVerify, B == 1, L >= BonsaiPromptWidth.minimumRows,
-                Qwen35FusedHadamard.rowBlocksEnabled,
+            if attendedInPlace == nil, rowBlockRoute,
                 let packed = oProj as? HadamardQuantizedLinear,
                 let blocks = cache.updateAndAttendQueryBlocks(
                     queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
@@ -4295,9 +4323,10 @@ final class Qwen35Attention: Module {
                 }
                 joined = blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 2)
             }
-            let attended = (joined ?? cache.updateAndAttend(
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: nil))
+            let attended = (attendedInPlace ?? joined
+                ?? cache.updateAndAttend(
+                    queries: queries, keys: keys, values: values,
+                    scale: scale, sinks: nil))
                 .transposed(0, 2, 1, 3)
             // Prompt width on the tensor route: the gate producer reads the
             // head-transposed output and the gate half of each q|gate head
@@ -5446,6 +5475,47 @@ public class Qwen35TextModelInner: Module {
 
     private func tapLayerIdsForNarrowing() -> [Int]? { dFlash2Tap.layerIds }
 
+    /// A capture-verify trunk split at a layer boundary: the layers before it
+    /// built ahead of the round (`CBv2MTPVerifyPrebuild`), the rest resumed
+    /// when the round launches, through the same loop. It carries the loop's
+    /// state in the loop's own terms, and the boundary submissions the prefix
+    /// recorded instead of issuing.
+    public final class TrunkCursor {
+        public let prefixLayers: Int
+        /// 0 while the prefix is being built, then the layers it built.
+        public private(set) var completedLayers = 0
+        /// Boundary submissions the prefix recorded, in plan order. The
+        /// caller issues them (one `asyncEval` each, in order) when it takes
+        /// the window, which partitions the work exactly as the plan does.
+        public private(set) var deferredSubmissions: [[MLXArray]] = []
+        fileprivate var hiddenStates: MLXArray?
+        fileprivate var pending: MLXArray?
+        fileprivate var pendingTapSlot: Int?
+        fileprivate var tapped: [MLXArray?] = []
+        fileprivate var attentionIndex = 0
+
+        public init(prefixLayers: Int) { self.prefixLayers = prefixLayers }
+
+        fileprivate var isPrefix: Bool { completedLayers == 0 }
+
+        fileprivate func record(_ targets: [MLXArray]) { deferredSubmissions.append(targets) }
+
+        fileprivate func suspend(
+            hiddenStates: MLXArray, pending: MLXArray?, pendingTapSlot: Int?,
+            tapped: [MLXArray?], attentionIndex: Int, completedLayers: Int
+        ) {
+            self.hiddenStates = hiddenStates
+            self.pending = pending
+            self.pendingTapSlot = pendingTapSlot
+            self.tapped = tapped
+            self.attentionIndex = attentionIndex
+            self.completedLayers = completedLayers
+        }
+
+        /// The prefix's last layer output, the resumed call's `inputEmbeddings`.
+        public var prefixHidden: MLXArray? { hiddenStates }
+    }
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -5453,7 +5523,8 @@ public class Qwen35TextModelInner: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        lastRowOnly: Bool = false
+        lastRowOnly: Bool = false,
+        cursor: TrunkCursor? = nil
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -5535,7 +5606,21 @@ public class Qwen35TextModelInner: Module {
                 ? submission
                 : Qwen35TrunkSubmission.fusedPromptPlan(rows: hiddenStates.dim(1), caches: caches))
             : nil
+        // A split window (`TrunkCursor`): the prefix stops after its layers
+        // and records its boundary submissions; the resumed call starts where
+        // the prefix stopped, from the state the prefix left.
+        var startLayer = 0
+        let prefix = cursor?.isPrefix == true ? cursor : nil
+        if let cursor, !cursor.isPrefix {
+            hiddenStates = cursor.hiddenStates!
+            pending = cursor.pending
+            pendingTapSlot = cursor.pendingTapSlot
+            tapped = cursor.tapped
+            attentionIndex = cursor.attentionIndex
+            startLayer = cursor.completedLayers
+        }
         for (modelLayerIndex, layer) in layers.enumerated() {
+            if modelLayerIndex < startLayer { continue }
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
                 attentionCache = nil
@@ -5577,7 +5662,8 @@ public class Qwen35TextModelInner: Module {
                     fusedSubmission.submits(after: modelLayerIndex + 1, of: layers.count)
                 {
                     if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
-                    asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
+                    let targets = out.f.map { [out.h, $0] } ?? [out.h]
+                    if let prefix { prefix.record(targets) } else { asyncEval(targets) }
                     // Behind the layers just submitted: the drafter's weights
                     // for a request that will draft (`DFlash2ResidencyPrefetch`).
                     if promptPrefetch {
@@ -5589,6 +5675,13 @@ public class Qwen35TextModelInner: Module {
                         Qwen35PromptEmbeddingHostGather.touch(embedTokens)
                         embeddingTouchDue = false
                     }
+                }
+                if let prefix, modelLayerIndex + 1 == prefix.prefixLayers {
+                    prefix.suspend(
+                        hiddenStates: hiddenStates, pending: pending,
+                        pendingTapSlot: pendingTapSlot, tapped: tapped,
+                        attentionIndex: attentionIndex, completedLayers: modelLayerIndex + 1)
+                    return hiddenStates
                 }
                 continue
             }
@@ -5613,7 +5706,7 @@ public class Qwen35TextModelInner: Module {
                 submission.submits(after: modelLayerIndex + 1, of: layers.count)
             {
                 if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
-                asyncEval([hiddenStates])
+                if let prefix { prefix.record([hiddenStates]) } else { asyncEval([hiddenStates]) }
                 if promptPrefetch {
                     DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
                 }
@@ -5623,6 +5716,13 @@ public class Qwen35TextModelInner: Module {
                     Qwen35PromptEmbeddingHostGather.touch(embedTokens)
                     embeddingTouchDue = false
                 }
+            }
+            if let prefix, modelLayerIndex + 1 == prefix.prefixLayers {
+                prefix.suspend(
+                    hiddenStates: hiddenStates, pending: pending,
+                    pendingTapSlot: pendingTapSlot, tapped: tapped,
+                    attentionIndex: attentionIndex, completedLayers: modelLayerIndex + 1)
+                return hiddenStates
             }
         }
         if promptPrefetch {
@@ -6062,7 +6162,7 @@ enum Qwen35GDNPrework {
         return text
     }()
 
-    private static let freshStridedKernel = MLXFast.metalKernel(
+    static let freshStridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
@@ -6103,6 +6203,14 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
+        if strided,
+            let split = freshSplit(
+                qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
+                normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
+                headKDim: headKDim, headVDim: headVDim)
+        {
+            return split
+        }
         if strided, B == 1, S % rowTile == 0,
             rowTileVerified(
                 keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
@@ -6272,7 +6380,7 @@ enum Qwen35AttentionPrework {
             offsets: offsets, ropeDims: ropeDims, ropeBase: ropeBase)
     }
 
-    private static func runUnchecked(
+    static func runUnchecked(
         q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
         offsets: MLXArray, ropeDims: Int, ropeBase: Float
     ) -> (MLXArray, MLXArray)? {
@@ -6311,6 +6419,11 @@ enum Qwen35AttentionPrework {
 
     private static func verified(_ geometry: Geometry) -> Bool {
         lock.withLock { verdicts[geometry] ?? false }
+    }
+
+    /// Whether `run` takes this geometry (`Qwen35AttentionPreworkKV` mirrors it).
+    static func verified(hq: Int, hk: Int, d: Int, rd: Int, dtype: DType) -> Bool {
+        verified(Geometry(hq: hq, hk: hk, d: d, rd: rd, dtype: "\(dtype)"))
     }
 
     /// Compile the kernel and check it bit for bit against the op chain for one
@@ -9637,6 +9750,10 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
             captureRecurrentWindow: true)
+        return (capturedVerifyLogits(hidden), hidden)
+    }
+
+    private func capturedVerifyLogits(_ hidden: MLXArray) -> MLXArray {
         let normalized = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
@@ -9652,7 +9769,53 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
         } else {
             logits = model.embedTokens.asLinear(normalized)
         }
-        return (logits, hidden)
+        return logits
+    }
+
+    private func attendingCaches(_ caches: [KVCache]) -> [any CBv2AttendingLayerCache] {
+        caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+    }
+
+    /// The first `layers` trunk layers of a capture-verify window, built
+    /// ahead of its round (`CBv2MTPVerifyPrebuild`) with its boundary
+    /// submissions recorded rather than issued; nil when the window is not
+    /// split. `cbv2VerifyResume` finishes it as `cbv2ForwardWithHiddenCaptured`
+    /// would have.
+    public func cbv2VerifyPrefix(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix? {
+        guard layers >= 1, layers < model.layers.count else { return nil }
+        let cursor = Qwen35TextModelInner.TrunkCursor(prefixLayers: layers)
+        _ = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attendingCaches(caches),
+            recurrentState: recurrentState, positionIds: positionIds,
+            captureRecurrentWindow: true, cursor: cursor)
+        return CBv2VerifyPrefix(cursor: cursor, deferredSubmissions: cursor.deferredSubmissions)
+    }
+
+    public func cbv2VerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let cursor = cursor as? Qwen35TextModelInner.TrunkCursor,
+            let prefixHidden = cursor.prefixHidden
+        else {
+            preconditionFailure("Qwen35 CBv2 verify resume without a prefix cursor")
+        }
+        // The prefix's own last output stands in for the embedding, so the
+        // resumed call takes nothing from `tokens` but its shape.
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: prefixHidden, caches: attendingCaches(caches),
+            recurrentState: recurrentState, positionIds: positionIds,
+            captureRecurrentWindow: true, cursor: cursor)
+        return (capturedVerifyLogits(hidden), hidden)
     }
 }
 
@@ -9738,6 +9901,28 @@ extension Qwen35TextModel: DFlash2TapTarget {
             arrays = [reading.weight]
         }
         return arrays + Qwen35TensorPackedMatmul.windowResidencyArrays()
+    }
+}
+
+extension Qwen35TextModel {
+    /// The arrays the seed's first prompt layer binds, for
+    /// `Qwen35SeedResidencyTouch`: layer 0's parameters, except that a packed
+    /// projection is read through its prompt-route operands where the prompt
+    /// tensor route is on (it never binds the stored words and constants).
+    func seedFirstLayerResidencyArrays() -> [MLXArray] {
+        guard let layer = model.layers.first else { return [] }
+        let tensorRoute = HadamardQuantizedLinear.tensorRouteTakesPromptRows(512)
+        var arrays: [MLXArray] = []
+        var replaced = Set<ObjectIdentifier>()
+        for (_, module) in layer.namedModules() {
+            guard tensorRoute, let projection = module as? HadamardQuantizedLinear else { continue }
+            arrays += Qwen35TensorPackedMatmul.promptResidencyArrays(projection)
+            for stored in [projection.weight, projection.scales] + (projection.biases.map { [$0] } ?? []) {
+                replaced.insert(ObjectIdentifier(stored))
+            }
+        }
+        return arrays
+            + layer.parameters().flattened().map(\.1).filter { !replaced.contains(ObjectIdentifier($0)) }
     }
 }
 
@@ -9998,6 +10183,27 @@ extension Qwen35Model: CBv2RecurrentCaptureMTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         languageModel.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2VerifyPrefixForwardable {
+    public func cbv2VerifyPrefix(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix? {
+        languageModel.cbv2VerifyPrefix(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, layers: layers)
+    }
+
+    public func cbv2VerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2VerifyResume(
+            cursor, tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
     }
 }

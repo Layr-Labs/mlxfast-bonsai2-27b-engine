@@ -98,6 +98,9 @@ extension EngineLoopV2 {
 
             if let k = mtp.roundMark(for: id) {
                 if demoteAllRounds {
+                    // A verify prefix built for the round this step demotes
+                    // is dropped before the row runs anything else.
+                    mtp.discardVerifyPrebuild(for: id)
                     if count == 1 + k { scheduler.rollbackComputed(id: id, tokens: k) }
                     count = 1
                     if mtp.tracksPersistentHistory {
@@ -547,6 +550,15 @@ extension EngineLoopV2 {
         var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
         captures.reserveCapacity(batch)
         captured.reserveCapacity(2 * batch)
+        // A single row's verify prefix built ahead of this round rides its
+        // carry (`CBv2MTPVerifyPrebuild`); any other row set drops what it holds.
+        let prebuild: CBv2MTPVerifyPrebuild?
+        if verifyRows.count == 1 {
+            prebuild = verifyRows[0].carry?.verifyPrebuild
+        } else {
+            prebuild = nil
+            for row in verifyRows { row.carry?.verifyPrebuild?.discard() }
+        }
 
         for row in verifyRows {
             let state = kvStates[row.rec.id]!
@@ -572,6 +584,18 @@ extension EngineLoopV2 {
                         anchor: fullRow.absoluteOffset))
                 captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
                 captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+            } else if let prebuild, prebuild === carry.verifyPrebuild {
+                // The prefix already wrote its attention layers' columns, so
+                // those rows sit one window past the anchor.
+                precondition(
+                    prebuild.k == k && prebuild.anchorOffset == carry.kvOffset
+                        && prebuild.confirmedIfHit.last == carry.token
+                        && carry.earlyBlock?.tokens === prebuild.earlyTokens
+                        && state.compactMap { $0 }.allSatisfy {
+                            $0.absoluteOffset == carry.kvOffset
+                                || $0.absoluteOffset == carry.kvOffset + 1 + k
+                        },
+                    "CBv2 request-stateful MTP target KV is not aligned with its verify prefix")
             } else {
                 precondition(
                     state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
@@ -745,7 +769,8 @@ extension EngineLoopV2 {
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp,
             stackedTokens: CBv2VerifyTokenStack.tokens(
-                seed: seedColumn, block: blockDraftIDs, columns: targetColumns))
+                seed: seedColumn, block: blockDraftIDs, columns: targetColumns),
+            prebuild: prebuild)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {

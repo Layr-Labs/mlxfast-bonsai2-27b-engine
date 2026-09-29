@@ -4863,6 +4863,18 @@ extension Qwen35TensorPackedMatmul {
         }
     }
 
+    /// The operands the prompt route binds for `projection`, built ones
+    /// only: under each layout cache it marked, the words it reads (the plane
+    /// copy where marked, the tiled copy otherwise) and tags 1, 2 and 3
+    /// (`Qwen35SeedResidencyTouch`).
+    static func promptResidencyArrays(_ projection: HadamardQuantizedLinear) -> [MLXArray] {
+        projection.tensorRouteLayoutCaches.flatMap { cache -> [MLXArray] in
+            guard cache.residencyMarks & promptReadMark != 0 else { return [] }
+            let words = cache.residencyMarks & promptPlaneMark != 0 ? 6 : 5
+            return cache.existing(tags: [1, 2, 3, words])
+        }
+    }
+
     /// The window-only operands of every recorded site under the kernels
     /// installed now (built ones only; nothing is built here).
     static func windowResidencyArrays() -> [MLXArray] {
