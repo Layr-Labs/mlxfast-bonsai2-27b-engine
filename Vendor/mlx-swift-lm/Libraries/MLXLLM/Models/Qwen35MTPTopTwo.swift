@@ -2422,13 +2422,48 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
-    private static let kernelNarrowRB: MLXFast.MLXFastKernel? = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_i8rb",
-        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowInt8RB,
-        header: header,
-        ensureRowContiguous: true)
+    private static let kernelNarrowRB: MLXFast.MLXFastKernel? = {
+        let prefetched = narrowRBPrefetch ? sourceNarrowInt8RBPrefetched : nil
+        return MLXFast.metalKernel(
+            name: prefetched != nil ? "bonsai_tensor_packed_matmul_m16_i8rbf" : "bonsai_tensor_packed_matmul_m16_i8rb",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"],
+            source: prefetched ?? sourceNarrowInt8RB,
+            header: header,
+            ensureRowContiguous: true)
+    }()
+
+    /// On unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_RB_PREFETCH=0`: the RB
+    /// body issues the next group's two plane loads before building this
+    /// group's operand and running its op, so their latency overlaps the op
+    /// and the epilogue (a 13-round drafter-driven local window measured
+    /// 370.3/370.3 ms against 373.5/374.3 ms without it, on the same
+    /// register-built plane body). The same loads, values and arithmetic in
+    /// the same order: the body stays bitwise the stock one and is checked
+    /// against it at load exactly as RB is.
+    static let narrowRBPrefetch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_RB_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `sourceNarrowInt8RB` with its plane loads one group ahead: `build`
+    /// takes the loaded words, and the loop loads group g + 1's words before
+    /// building group g's operand. Nil if an anchor is missing (RB as is).
+    private static let sourceNarrowInt8RBPrefetched: String? = {
+        var text = sourceNarrowInt8RB
+        let edits: [(String, String)] = [
+            ("auto build = [&](int g) {\n  const device uint4* src = wpl + (size_t)g * 64;\n  const uint4 lo = src[0]; const uint4 hi = src[1];\n",
+             "auto build = [&](const uint4 lo, const uint4 hi) {\n"),
+            ("for (int g = g0; g < g0 + gper; g++) {\n  build(g);\n",
+             "uint4 nlo = wpl[(size_t)g0 * 64]; uint4 nhi = wpl[(size_t)g0 * 64 + 1];\nfor (int g = g0; g < g0 + gper; g++) {\n  const uint4 clo = nlo; const uint4 chi = nhi;\n  if (g + 1 < g0 + gper) { nlo = wpl[(size_t)(g + 1) * 64]; nhi = wpl[(size_t)(g + 1) * 64 + 1]; }\n  build(clo, chi);\n"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
 
     /// The plane copy (`planeWeight`) of a synthetic operand set's tiled
     /// words for the load-time checks of the RB body (one per words object,
@@ -4699,15 +4734,27 @@ enum Qwen35TensorPackedMatmul {
                 }
 
                 // A per-shape BASE over the record's pick (`..._TZOO_BASE`, the
-                // per-shape force map's syntax; default k32pd2 on the five tower
-                // shapes, the head left to the record): a same-box reading of
-                // sarthakagrawal927's b497a150, which forced exactly this map, put
-                // its window 1.85% under the trial's own picks with identical
-                // acceptance. Unlike the force map the trial still runs, over this
-                // base; each body passes FP16, and FP32 on a wide shape, or the
-                // record's pick is kept. `..._TZOO_BASE=0` keeps the record's pick.
+                // per-shape force map's syntax; default k32pd1 on the five tower
+                // shapes and the head): a same-box reading of sarthakagrawal927's
+                // b497a150, which forced k32pd2 on the five tower shapes, put its
+                // window 1.85% under the trial's own picks with identical
+                // acceptance. k32pd1 is the same body with a one-group word
+                // ring: timed as a verify round runs it (dependent launches back
+                // to back, each over its own weights, 2.4 GB of copies so every
+                // launch streams from DRAM), it is ahead of k32pd2 on all five
+                // shapes on M5 Max (down 52.2 vs 54.1 us, gate|up 100.7 vs
+                // 104.5, qkv|z 56.2 vs 57.7, attn 49.7 vs 51.6, o 26.0 vs 27.5);
+                // the load-time trial's burst of independent launches over a few
+                // cached sets ranks the two the other way. The head had been
+                // left to the record's pick, which that trial makes among the
+                // record's bodies (v0, pd1, their FP32-scale forms): v0 runs the
+                // 16 x 248320 head in 761 us, k32pd1 in 621 (the words' plain
+                // read takes 568). Unlike the force map the trial still runs,
+                // over this base; each body passes FP16, and FP32 on a wide
+                // shape, or the record's pick is kept. `..._TZOO_BASE=0` keeps
+                // the record's pick.
                 let baseValue = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_BASE")
-                    ?? "attn=k32pd2,qkvz=k32pd2,gateup=k32pd2,o=k32pd2,down=k32pd2"
+                    ?? "attn=k32pd1,qkvz=k32pd1,gateup=k32pd1,o=k32pd1,down=k32pd1,head=k32pd1"
                 if narrowZoo, baseValue.contains("=") {
                     let names = NarrowInSituTrial.perShapeNames.map { $0.replacingOccurrences(of: "|", with: "") } + ["head"]
                     let keys = NarrowInSituTrial.perShapeKeys + [NarrowInSituTrial.headKey]
