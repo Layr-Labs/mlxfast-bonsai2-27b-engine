@@ -2742,14 +2742,40 @@ enum Qwen35TensorPackedMatmul {
     // only: signed codes, negated offsets, factored epilogue, row-tiled
     // constants and the tiled word copy. grid (N / 64 * 64, M / 32, 1),
     // threadgroup (64, 1, 1); inputs as `sourceStaged8`. Four-wide stores.
-    private static let sourceStaged8Reg = """
+    //
+    // Tile order (`promptSwizzleWidth`, `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE`):
+    // the grid is walked x fastest, so with the stock map (width 0) every row
+    // tile of the prompt streams the whole word matrix again (the gate|up
+    // words alone are 44.6 MB a pass, more than the last-level cache). The
+    // supertile map keeps the same set of 32 x 64 tiles and the same work per
+    // tile (every output bit is unchanged), but numbers them so that SWZ
+    // column blocks are walked for every row tile before the next SWZ
+    // blocks: the words of those blocks stay cached across the M / 32 row
+    // tiles and the activations of a row tile across its SWZ blocks. The
+    // last supertile may be narrower (N / 64 need not divide by SWZ).
+    private static let sourceStaged8RegBase = """
 
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
-        const int ns = int(threadgroup_position_in_grid.x) * 64 + 32 * int(sg);
+        constexpr int SWZ = __PROMPT_SWZ__;
+        int mtile = int(threadgroup_position_in_grid.y);
+        int cblock = int(threadgroup_position_in_grid.x);
+        if (SWZ > 0) {
+          const int NB = N / 64;
+          const int MT = M / 32;
+          const int fid = mtile * NB + cblock;
+          const int per = SWZ * MT;
+          const int st = fid / per;
+          const int rem = NB - st * SWZ;
+          const int wd = rem < SWZ ? rem : SWZ;
+          const int r = fid - st * per;
+          mtile = r / wd;
+          cblock = st * SWZ + (r - mtile * wd);
+        }
+        const int ms = mtile * 32;
+        const int ns = cblock * 64 + 32 * int(sg);
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
@@ -2823,6 +2849,22 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         """
+
+    /// Column blocks per supertile of the register-weight prompt kernels'
+    /// tile order (see `sourceStaged8RegBase`): 32 unless
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE` names another count;
+    /// `0` (or off) keeps the stock x-fastest order.
+    static let promptSwizzleWidth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
+        else { return 32 }
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        guard let value = Int(raw) else { return 32 }
+        return min(max(value, 0), 4096)
+    }()
+
+    private static let sourceStaged8Reg: String = sourceStaged8RegBase.replacingOccurrences(
+        of: "__PROMPT_SWZ__", with: String(promptSwizzleWidth))
 
     private static let kernelStaged8Reg = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_rb",
@@ -5267,6 +5309,18 @@ extension Qwen35TensorPackedMatmul {
             cache.residencyMarks |= mark
             verifySites.append(
                 VerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType))
+        }
+    }
+
+    /// The operands the prompt route binds for `projection`, built ones
+    /// only: under each layout cache it marked, the words it reads (the plane
+    /// copy where marked, the tiled copy otherwise) and tags 1, 2 and 3
+    /// (`Qwen35SeedResidencyTouch`).
+    static func promptResidencyArrays(_ projection: HadamardQuantizedLinear) -> [MLXArray] {
+        projection.tensorRouteLayoutCaches.flatMap { cache -> [MLXArray] in
+            guard cache.residencyMarks & promptReadMark != 0 else { return [] }
+            let words = cache.residencyMarks & promptPlaneMark != 0 ? 6 : 5
+            return cache.existing(tags: [1, 2, 3, words])
         }
     }
 

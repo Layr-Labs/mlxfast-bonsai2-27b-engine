@@ -487,11 +487,16 @@ extension EngineLoopV2 {
                     let tokens = CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
+                    // The splice's flag is evaluated with the block, so the
+                    // next finalize reads it without waiting for the verify.
+                    let span = CBv2PromptLookupDraft.lastSpliceFound
                     CBv2PromptLookupDraft.noteProposal(
                         id, fromPrompt: tokens !== drafted,
-                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup)
+                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup, span: span)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
-                    let targets = [tokens, drafted] + block.evaluationTargets(for: state)
+                    let targets =
+                        [tokens, drafted] + (span.map { [$0] } ?? [])
+                        + block.evaluationTargets(for: state)
                     if leading != nil {
                         deferredDraftTargets = targets
                     } else {

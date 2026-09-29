@@ -691,9 +691,11 @@ extension EngineLoopV2 {
                     proposal = CBv2PromptLookupDraft.override(
                         drafted, history: row.rec.tokens,
                         promptLength: row.rec.request.promptTokens.count, depth: k)
+                    let span = CBv2PromptLookupDraft.lastSpliceFound
                     CBv2PromptLookupDraft.noteProposal(
                         row.rec.id, fromPrompt: proposal !== drafted,
-                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup)
+                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup, span: span)
+                    if let span { assistantEvalTargets.append(span) }
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.
