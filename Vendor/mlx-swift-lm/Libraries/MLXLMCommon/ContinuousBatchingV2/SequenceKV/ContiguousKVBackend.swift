@@ -27,22 +27,6 @@ public struct CBv2ContiguousBackendConfig: Sendable {
     }
 }
 
-/// A request's engine is assembled first (`free_decode_begin` builds one
-/// before its seed forward), and a GPU left idle starts its first command
-/// buffer late: on an M4 Max after a 20 s idle, 13-15 ms after the commit
-/// (0.5 ms warm). One scalar add committed as the assembly begins starts that
-/// wake-up before the ~4 ms of assembly and graph building ahead of the first
-/// real submission. Nothing reads it. `MLXFAST_GPU_WAKE=0` turns it off.
-enum CBv2GPUWake {
-    static let enabled = !["0", "false", "no", "off"].contains(
-        ProcessInfo.processInfo.environment["MLXFAST_GPU_WAKE"]?.lowercased() ?? "")
-
-    static func now() {
-        guard enabled else { return }
-        asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1)))
-    }
-}
-
 /// Factory + accounting for per-sequence contiguous KV state.
 ///
 /// Thread-safe: the live-row registry is lock-protected (`makeSequenceState`
@@ -77,7 +61,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     private var liveBytesCapacity: Int
 
     public init(config: CBv2ContiguousBackendConfig) {
-        CBv2GPUWake.now()
         self.config = config
         self.liveBytesCapacity = config.bytesCapacity
     }
