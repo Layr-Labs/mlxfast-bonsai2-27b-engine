@@ -450,9 +450,19 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// length once a round has finalized.
     func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int)
+
+    /// Absorb the committed context rows the state holds into the drafter's
+    /// own cache ahead of the next proposal, when that is worth a separate
+    /// submission (a prompt's worth of rows). Returns the lazy arrays to
+    /// evaluate, or nothing when the rows stay pending for the next block.
+    func prefetchCommittedContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
+    public func prefetchCommittedContext(
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] { [] }
+
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
     /// branch never reaches these, so a caller that does has taken the wrong

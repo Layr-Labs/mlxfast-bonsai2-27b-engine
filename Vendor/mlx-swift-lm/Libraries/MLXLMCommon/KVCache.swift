@@ -804,7 +804,10 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         guard !rotating else { return nil }
         let total = keys.dim(2)
         let blockRows = total - contextRows
-        guard contextRows >= 1, blockRows >= 0, values.dim(2) == total,
+        // `contextRows == 0` is a block over context the cache already holds
+        // (the drafter absorbed it ahead of the first proposal): the block's
+        // rows are written past the held rows and nothing is committed.
+        guard contextRows >= 0, total >= 1, blockRows >= 0, values.dim(2) == total,
             rows + contextRows <= maxCacheSize
         else {
             handOverToRotation()
@@ -834,6 +837,13 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
             self.keys![.ellipsis, ..<end, 0...],
             self.values![.ellipsis, ..<end, 0...]
         )
+    }
+
+    /// True when `updateBlock` can take `contextRows` more context rows on the
+    /// in-place path (the parent's rotating path does not own the state yet
+    /// and the window still has room for them).
+    public func canAbsorb(contextRows: Int) -> Bool {
+        !rotating && contextRows >= 1 && rows + contextRows <= maxCacheSize
     }
 
     /// The parent's `updateConcat` expects the held rows as `keys`/`values`
