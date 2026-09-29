@@ -721,10 +721,15 @@ enum Qwen35WideNMatmul {
     private static let reduceSource = """
         const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
-        if (i >= uint(M * N)) { return; }
-        float v = 0.0f;
-        for (int s = 0; s < KS; s++) { v += part[(size_t)s * M * N + i]; }
-        out[i] = v;
+        // apply admits rows divisible by 64 and N divisible by 32. Each
+        // FP32 chunk plane is therefore aligned and has no four-wide tail.
+        const size_t vectors = size_t(M) * size_t(N) / 4;
+        if (size_t(i) >= vectors) { return; }
+        const device float4* p4 = reinterpret_cast<const device float4*>(part);
+        device float4* o4 = reinterpret_cast<device float4*>(out);
+        float4 v = float4(0.0f);
+        for (int s = 0; s < KS; s++) { v += p4[size_t(s) * vectors + i]; }
+        o4[i] = v;
         """
 
     private static let partialKernel = MLXFast.metalKernel(
@@ -750,7 +755,7 @@ enum Qwen35WideNMatmul {
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         let y = reduceKernel(
             [part, dims], template: [("KC", chunk)],
-            grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            grid: ((rows * n / 4 + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])
     }

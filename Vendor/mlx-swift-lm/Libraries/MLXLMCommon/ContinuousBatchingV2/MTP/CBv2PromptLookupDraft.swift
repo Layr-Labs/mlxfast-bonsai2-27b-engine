@@ -17,12 +17,10 @@ import Foundation
 import MLX
 
 enum CBv2PromptLookupDraft {
-    /// `MLXFAST_DFLASH_LOOKUP=0` keeps the drafter's block.
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_LOOKUP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
+    /// Keep proposals from the pinned drafter. Prompt-span replacement and
+    /// splicing are outside this candidate's kernel-only optimization scope.
+    /// All proposal/skip entry points below are guarded by this switch.
+    static let enabled = false
 
     /// `MLXFAST_DFLASH_LOOKUP_MIN` sets the shortest suffix that may replace a
     /// block. 16 is the floor: long enough that an accidental repeat is rare,
