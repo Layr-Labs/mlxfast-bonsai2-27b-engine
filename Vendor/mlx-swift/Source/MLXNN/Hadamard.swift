@@ -458,6 +458,11 @@ public final class HadamardConstantLayoutCache {
         }
     }
 
+    /// Every array built so far under one of `tags`; never builds.
+    public func existing(tags: Set<Int>) -> [MLXArray] {
+        lock.withLock { entries.filter { tags.contains($0.tag) }.map(\.derived) }
+    }
+
     /// Bits the model file's residency bookkeeping sets once per route that
     /// reads this cache's constants (a plain flag, so the per-call check is a
     /// load, not a lock). Nothing here reads it.
@@ -508,6 +513,11 @@ private final class HadamardMatrixRouteOperands {
 
     /// The stacked operand for exactly these siblings, built on first use and
     /// rebuilt only when a sibling or its weight object changes.
+    /// The built sibling stack's layout cache, or nil; never builds.
+    var fusedLayoutCache: HadamardConstantLayoutCache? {
+        lock.withLock { fusedSiblings?.operands.layoutCache }
+    }
+
     func fusedSiblings(for siblings: [HadamardQuantizedLinear]) -> HadamardFusedSiblings {
         lock.withLock {
             if let fusedSiblings, fusedSiblings.matches(siblings) {
@@ -743,6 +753,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     private let matrixRoute = HadamardMatrixRouteOperands()
+
+    /// The layout caches the tensor route reads this projection's derived
+    /// constants from: its own, then its sibling stack's where it leads one.
+    public var tensorRouteLayoutCaches: [HadamardConstantLayoutCache] {
+        [matrixRoute.layoutCache] + (matrixRoute.fusedLayoutCache.map { [$0] } ?? [])
+    }
 
     /// The leading-rows module of `leadingRows(_:)`, held off the module tree
     /// (a plain class, as `matrixRoute` is), so it is never loaded, updated or
