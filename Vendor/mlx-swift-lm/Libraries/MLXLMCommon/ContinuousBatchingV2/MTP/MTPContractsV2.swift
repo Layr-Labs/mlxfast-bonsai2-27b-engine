@@ -500,6 +500,39 @@ public protocol CBv2MTPBlockLeadingSubmission: CBv2MTPBlockDrafter {
     ) throws -> MLXArray
 }
 
+/// The next block before the readback (`CBv2MTPBlockSpeculation`).
+public enum CBv2MTPDraftBeforeReadback {
+    /// `BONSAI_DRAFT_BEFORE_READBACK=0` keeps the next block after the readback.
+    public static let enabled = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["BONSAI_DRAFT_BEFORE_READBACK"]?.lowercased() ?? "")
+    /// Layers submitted before the readback, queued behind the verify: few
+    /// enough to stay within MLX's 10 in-flight buffers (2: ~9 on an M4 Max).
+    public static let leadingLayers = max(
+        0, Int(ProcessInfo.processInfo.environment["BONSAI_DRAFT_BEFORE_READBACK_LAYERS"] ?? "") ?? 2)
+    /// `BONSAI_DRAFT_DUMP=1`: each verified round's draft and target ids on stderr.
+    public static let dumpsDrafts = ProcessInfo.processInfo.environment["BONSAI_DRAFT_DUMP"] == "1"
+}
+
+public protocol CBv2MTPSpeculativeBlock: AnyObject {}
+
+/// Builds the next round's block before the readback from device values; a
+/// round confirming `accepted + 1` columns on the early block path adopts it
+/// (that path's proposal and state, bit for bit), any other drops it.
+public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
+    func speculateBlock(
+        acceptancePacket: MLXArray, depth: Int, verifyContext: MLXArray,
+        requestState: any CBv2MTPRequestState,
+        leadingLayersBeforeReadback: Int
+    ) -> (any CBv2MTPSpeculativeBlock)?
+
+    /// The proposal for `confirmed` columns (state as `finalizeRound` +
+    /// `proposeBlock` leave it), or nil.
+    func adoptSpeculativeBlock(
+        _ block: any CBv2MTPSpeculativeBlock, confirmed: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> MLXArray?
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.

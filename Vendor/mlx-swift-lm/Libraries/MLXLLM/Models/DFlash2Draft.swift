@@ -689,6 +689,45 @@ extension DFlash2Attention {
             .transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
+
+    var speculativeCapable: Bool {
+        dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
+            && qkv.applies(q: qProj, k: kProj, v: vProj)
+    }
+
+    /// The block forward for a device-valued confirmed count `c`: `base`
+    /// (projected verify context, then zero rows) with the block written at
+    /// row `c` puts every row of today's `[context; block]` matmul at its row;
+    /// all `2L` key/value rows go to the cursor, the queries are rows `c..<c+L`
+    /// and the key tail past `held + c + L` is masked (exact zeros).
+    func speculative(
+        _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)? {
+        let (B, L, n) = (x.dim(0), x.dim(1), base.dim(1))
+        guard B == 1, n == 2 * L, let held = cache.inPlaceRows else { return nil }
+        let start = confirmed.reshaped([1])
+        let rows = dynamicSliceUpdate(base, update: x, start: start, axes: [1])
+        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
+        else { return nil }
+        let blockRows = dynamicSlice(
+            y, start: start, axes: [1], sliceSize: [Int32(B), Int32(L), Int32(y.dim(2))])
+        let queries = rope(
+            qNorm(blockRows[.ellipsis, ..<qEnd].reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3),
+            offset: queryOffset)
+        let allKeys = rope(
+            kNorm(y[.ellipsis, qEnd ..< kEnd].reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+            offset: cache.offset)
+        let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+        guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
+        else { return nil }
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys[.ellipsis, ..<(held + n), 0...],
+            values: values[.ellipsis, ..<(held + n), 0...], scale: scale, mask: keyMask)
+        return (
+            DFlash2TensorMatmul.linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1)),
+            keys, values)
+    }
 }
 
 /// The q, k and v projections' weights stacked along the output axis, as
@@ -760,6 +799,16 @@ private final class DFlash2QKVStack {
 
     /// The row count at or below which `applyContext` keeps the full stack.
     static let kvOnlyMinimumRows = 256
+
+    func applies(q: Linear, k: Linear, v: Linear) -> Bool { stacked(q: q, k: k, v: v) != nil }
+
+    /// `apply`'s matmul, unsliced, with its q and k column ends.
+    func applyStacked(
+        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
+    ) -> (y: MLXArray, qEnd: Int, kEnd: Int)? {
+        guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
+        return (matmul(rows, weight.T), qEnd, kEnd)
+    }
 
     /// `(q(rows[-blockRows...]), k(rows), v(rows))` from one matmul, or nil
     /// when the stack does not apply.
@@ -1029,6 +1078,15 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
 /// FP32-accumulated product in a different summation order, rounded to BF16.
 /// The drafter only proposes. `DARKBLOOM_DFLASH2_TENSOR_MATMUL=0` keeps the
 /// core's GEMM.
+///
+/// `TILED` (tiling idea from Subflatus3 bb781255's verify int8 copy): the
+/// kernel reads a tiled copy of the weight (`tile`), in which each 32-column
+/// block's 256-wide K step is one contiguous 16 KB tile, so a simdgroup's
+/// K slab of its column block is one contiguous run instead of 32 row pieces
+/// a row stride apart. The tensor op, its operands' values, the K order and
+/// the reduction are unchanged; only the slice's base and row stride move,
+/// so the output is bitwise the stored layout's (self-tested at load on
+/// every copy; the in-situ trial then decides, see `DFlash2TiledTrial`).
 enum DFlash2TensorMatmul {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_TENSOR_MATMUL"]
@@ -1061,16 +1119,20 @@ enum DFlash2TensorMatmul {
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> A((device bfloat*)x, dextents<int, 2>(K, M));
-        tensor<device bfloat, dextents<int, 2>, tensor_inline> B((device bfloat*)w, dextents<int, 2>(K, N));
+        // TILED: `w` is `[N/32, K/256, 32, 256]`, viewed as rows of 256: column
+        // block n0 / 32's K step k / 256 is the 32 rows from tb + (k / 256) * 32.
+        const int tb = (n0 / 32) * (K / 256) * 32;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> B((device bfloat*)w,
+            TILED ? dextents<int, 2>(256, (N / 32) * (K / 256) * 32) : dextents<int, 2>(K, N));
         auto tA0 = A.template slice<256, 16>(0, 0);
-        auto tB0 = B.template slice<256, 32>(0, n0);
+        auto tB0 = B.template slice<256, 32>(0, TILED ? tb : n0);
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, float>();
         #pragma clang loop unroll(full)
         for (int i = 0; i < 16; i++) { cT[i] = 0.0f; }
         for (int k = k0; k < k0 + kq; k += 256) {
           auto tA = A.template slice<256, 16>(k, 0);
-          auto tB = B.template slice<256, 32>(k, n0);
+          auto tB = B.template slice<256, 32>(TILED ? 0 : k, TILED ? tb + (k / 256) * 32 : n0);
           op.run(tA, tB, cT);
         }
         // Destination layout: element i -> n = n0 + fn + (i & 3) + 16 * ((i >> 3) & 1),
@@ -1133,17 +1195,133 @@ enum DFlash2TensorMatmul {
             a = concatenated(
                 [a, MLXArray.zeros([rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
         }
+        let tiled = tiledActive ? tiledCopy(weight) : nil
+        let y = launch(a, tiled ?? weight, k: k, n: n, tiled: tiled != nil, outputDType: .bfloat16)
+        let rowsOut = rows < rowsPerTile ? y[0 ..< rows] : y
+        return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+
+    /// The kernel over a 16-row `a` and `w` (the stored `[N, K]` weight, or
+    /// its tiled copy when `tiled`).
+    private static func launch(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, tiled: Bool, outputDType: DType
+    ) -> MLXArray {
         // Wide projections expose enough output tiles to use fewer K partitions.
         // Keep the accepted four-way route for the smaller projections.
         let splits = n >= 16384 ? 2 : 4
         let threads = splits * 32
-        let y = kernel(
-            [a, weight, dimsArray(k: k, n: n)],
-            template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
+        return kernel(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", tiled ? 1 : 0)],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
-            outputShapes: [[rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
-        let rowsOut = rows < rowsPerTile ? y[0 ..< rows] : y
-        return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    // MARK: Tiled weights
+
+    /// `MLXFAST_DRAFT_TILED=1` / `0` forces the tiled / stored layout (a
+    /// forced `1` still needs the self-test); unset, the in-situ trial picks.
+    static let tiledSetting: Bool? = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_TILED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["1", "true", "yes", "on"].contains(raw ?? "") { return true }
+        if ["0", "false", "no", "off"].contains(raw ?? "") { return false }
+        return nil
+    }()
+
+    /// Whether `apply` reads the tiled copies. Set at load (forced), by the
+    /// in-situ trial's round boundaries, and once by its verdict; read when a
+    /// drafter graph is built.
+    nonisolated(unsafe) static var tiledActive = false
+
+    private static let tiledLock = NSLock()
+    /// Each stored weight (held, so its identity is never reused) with its copy.
+    nonisolated(unsafe) private static var tiledCopies:
+        [ObjectIdentifier: (source: MLXArray, tiled: MLXArray)] = [:]
+
+    private static func tiledCopy(_ weight: MLXArray) -> MLXArray? {
+        tiledLock.withLock { tiledCopies[ObjectIdentifier(weight)]?.tiled }
+    }
+
+    /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
+    /// for each 32-column block and 256-wide K step, the 32 columns' 256
+    /// values in column order. Only positions change.
+    static func tile(_ w: MLXArray) -> MLXArray {
+        let n = w.dim(0)
+        let k = w.dim(1)
+        return w.reshaped([n / 32, 32, k / 256, 256]).transposed(0, 2, 1, 3).contiguous()
+            .reshaped([n, k])
+    }
+
+    /// Frees the copies (the trial kept the stored layout).
+    static func dropTiledCopies() {
+        tiledLock.withLock { tiledCopies.removeAll() }
+    }
+
+    /// Builds the tiled copy of each of `weights` the kernel serves, then
+    /// runs the kernel on every copy (TILED) and on its stored weight against
+    /// the same random 16-row BF16 input, FP32 and BF16 outputs, and compares
+    /// every output bit. Registers the copies and returns true only when all
+    /// match; one stderr line either way. Nothing runs when the kernel is off,
+    /// the toolchain has no tensor operands, or `MLXFAST_DRAFT_TILED=0`.
+    static func prepareTiled(_ weights: [MLXArray]) -> Bool {
+        dropTiledCopies()
+        tiledActive = false
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false
+        else { return false }
+        let eligible = weights.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        guard !eligible.isEmpty else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var copies: [(source: MLXArray, tiled: MLXArray)] = []
+        var bytes = 0
+        for w in eligible {
+            let t = tile(w)
+            eval(t)
+            copies.append((w, t))
+            bytes += w.nbytes
+        }
+        var inputs: [Int: MLXArray] = [:]
+        var differing: [MLXArray] = []
+        var values = 0
+        for (index, (w, t)) in copies.enumerated() {
+            let k = w.dim(1)
+            let n = w.dim(0)
+            let a = inputs[k] ?? MLXRandom.normal(
+                [rowsPerTile, k], key: MLXRandom.key(UInt64(8101 + index))
+            ).asType(.bfloat16)
+            inputs[k] = a
+            for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                let stored = launch(a, w, k: k, n: n, tiled: false, outputDType: outputDType)
+                let copy = launch(a, t, k: k, n: n, tiled: true, outputDType: outputDType)
+                differing.append(
+                    (stored.view(dtype: bits) .!= copy.view(dtype: bits)).asType(.int32).sum())
+                values += rowsPerTile * n
+            }
+        }
+        let mismatches = stacked(differing).sum().item(Int.self)
+        let passed = mismatches == 0
+        if passed {
+            tiledLock.withLock {
+                for (w, t) in copies { tiledCopies[ObjectIdentifier(w)] = (w, t) }
+            }
+            tiledActive = tiledSetting == true
+        }
+        let verdict =
+            !passed
+            ? "stored layout kept"
+            : tiledSetting == true
+                ? "tiled forced on by MLXFAST_DRAFT_TILED=1" : "the in-situ trial decides"
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 tiled weights: self-test \(passed ? "passed" : "FAILED") "
+                    + "(\(copies.count) weights, "
+                    + String(format: "%.2f GB, ", Double(bytes) / 1e9)
+                    + "\(values) values bitwise, \(mismatches) mismatches); \(verdict); "
+                    + String(format: "%.0f ms\n", elapsed)).utf8))
+        return passed
     }
 
     /// `layer(x)` through the tensor kernel when it applies (no bias).
@@ -1152,6 +1330,98 @@ enum DFlash2TensorMatmul {
             return y
         }
         return layer(x)
+    }
+}
+
+/// The tiled drafter weights' in-situ trial, in the load-time warm
+/// (`Qwen35DFlash2Assistant`), modelled on the verify int8 kernels'
+/// `NarrowInSituTrial`: one engine request whose rounds alternate the stored
+/// and the tiled layout, `roundsPerSetting` timed rounds each; the tiled
+/// layout is adopted only when its median round (outliers above 1.5x the
+/// median dropped) beats the stored one's by more than `adoptMargin`. Both
+/// layouts give the same bits (self-tested), so the rounds and their tokens
+/// do not depend on the choice. `roundBoundary()` runs at the top of every
+/// block proposal: a round's time is the host time from its proposal to the
+/// next, and the layout set at a boundary is what that proposal's graph
+/// reads. The first round is discarded.
+enum DFlash2TiledTrial {
+    nonisolated(unsafe) static var armed = false
+    nonisolated(unsafe) static var active = false
+    nonisolated(unsafe) private static var roundTimes: [[UInt64]] = [[], []]
+    nonisolated(unsafe) private static var roundIndex = 0
+    nonisolated(unsafe) private static var lastBoundary: UInt64 = 0
+    nonisolated(unsafe) private static var onEnough: (() -> Void)?
+
+    static let roundsPerSetting = 12
+    static let adoptMargin = 0.005
+    static let outlierFactor = 1.5
+    /// The discarded round, the seed-side boundary, then both settings' rounds.
+    static var roundsNeeded: Int { 2 + 2 * roundsPerSetting }
+
+    @inline(__always) static func roundBoundary() {
+        guard active else { return }
+        boundary()
+    }
+
+    private static func boundary() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if roundIndex >= 2 { roundTimes[(roundIndex - 1) % 2].append(now - lastBoundary) }
+        lastBoundary = now
+        DFlash2TensorMatmul.tiledActive = roundIndex % 2 == 1
+        roundIndex += 1
+        if roundIndex >= roundsNeeded {
+            active = false
+            let enough = onEnough
+            onEnough = nil
+            enough?()
+        }
+    }
+
+    static func begin(onEnough: @escaping () -> Void) {
+        guard armed else { return }
+        roundTimes = [[], []]
+        roundIndex = 0
+        lastBoundary = 0
+        self.onEnough = onEnough
+        active = true
+    }
+
+    private static func median(_ values: [UInt64]) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 1
+            ? Double(sorted[mid]) : (Double(sorted[mid - 1]) + Double(sorted[mid])) / 2
+    }
+
+    /// Installs the verdict (the stored layout unless the tiled one won, whose
+    /// copies are then freed), logs one line and disarms. Safe when nothing ran.
+    static func finish(elapsedNanoseconds: UInt64) {
+        active = false
+        onEnough = nil
+        guard armed else { return }
+        armed = false
+        let medians: [(Double?, Int, Int)] = roundTimes.map { times in
+            guard let first = median(times) else { return (nil, 0, 0) }
+            let kept = times.filter { Double($0) <= outlierFactor * first }
+            return (median(kept), kept.count, times.count)
+        }
+        var adopt = false
+        if let off = medians[0].0, let on = medians[1].0 { adopt = on < off * (1 - adoptMargin) }
+        DFlash2TensorMatmul.tiledActive = adopt
+        if !adopt { DFlash2TensorMatmul.dropTiledCopies() }
+        func ms(_ entry: (Double?, Int, Int)) -> String {
+            (entry.0.map { String(format: "%.2f", $0 / 1e6) } ?? "-") + " ms (\(entry.1)/\(entry.2))"
+        }
+        var log = "dflash2 tiled weights trial: off \(ms(medians[0])), on \(ms(medians[1])), adopted "
+            + (adopt ? "on" : "off")
+        if let off = medians[0].0, let on = medians[1].0 {
+            log += String(format: " (%+.2f%%)", (on / off - 1) * 100)
+        }
+        log += "; \(roundIndex) proposals; "
+            + String(format: "%.0f ms\n", Double(elapsedNanoseconds) / 1e6)
+        FileHandle.standardError.write(Data(log.utf8))
+        roundTimes = [[], []]
     }
 }
 
@@ -1169,8 +1439,9 @@ private final class DFlash2GateUpStack {
         boundary = 0
     }
 
-    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
-    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
+    /// The stacked weight, concatenated on first use, or nil when the stack
+    /// does not apply.
+    func stacked(gate: Linear, up: Linear) -> MLXArray? {
         guard Self.enabled, gate.bias == nil, up.bias == nil,
             gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
             gate.weight.ndim == 2, up.weight.ndim == 2
@@ -1179,7 +1450,13 @@ private final class DFlash2GateUpStack {
             weight = concatenated([gate.weight, up.weight], axis: 0)
             boundary = gate.weight.dim(0)
         }
-        let y = DFlash2TensorMatmul.apply(x, weight: weight!) ?? matmul(x, weight!.T)
+        return weight
+    }
+
+    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
+    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
+        guard let weight = stacked(gate: gate, up: up) else { return nil }
+        let y = DFlash2TensorMatmul.apply(x, weight: weight) ?? matmul(x, weight.T)
         return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
     }
 }
@@ -1204,6 +1481,12 @@ private final class DFlash2MLP: Module, UnaryLayer {
         gateUp.clear()
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    /// The weights a block-width forward reads through `DFlash2TensorMatmul`.
+    func tensorWeights() -> [MLXArray] {
+        (gateUp.stacked(gate: gate, up: up).map { [$0] } ?? [])
+            + (down.bias == nil ? [down.weight] : [])
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -1245,6 +1528,10 @@ private final class DFlash2DecoderLayer: Module {
         selfAttn.absorbContext(context, rope: rope, cache: cache)
     }
 
+    func tensorWeights() -> [MLXArray] {
+        (selfAttn.oProj.bias == nil ? [selfAttn.oProj.weight] : []) + mlp.tensorWeights()
+    }
+
     func callAsFunction(
         _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
         masks: DFlash2SlidingMaskMemo
@@ -1257,6 +1544,22 @@ private final class DFlash2DecoderLayer: Module {
             projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
+    }
+
+    /// `callAsFunction` through `DFlash2Attention.speculative`.
+    func speculative(
+        _ x: MLXArray, base: MLXArray, confirmed: MLXArray, queryOffset: MLXArray,
+        rope: RoPELayer, cache: DFlash2BlockKVCache, keyMask: MLXArray
+    ) -> (hidden: MLXArray, keys: MLXArray, values: MLXArray)? {
+        let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
+        guard
+            let a = selfAttn.speculative(
+                attentionInput, base: base, confirmed: confirmed, queryOffset: queryOffset,
+                rope: rope, cache: cache, keyMask: keyMask)
+        else { return nil }
+        let attended = attentionConv.finish(a.output, projection: attentionTaps, residual: x)
+        let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
+        return (mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended), a.keys, a.values)
     }
 }
 
@@ -1353,6 +1656,14 @@ enum DFlash2TopK {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Four-wide loads when a chunk length is a multiple of four.
+    /// `MLXFAST_DFLASH_TOPK_VEC=0` reads one logit at a time.
+    static let vectorScan: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let chunks = 8
     private static let threads = 128
 
@@ -1366,8 +1677,11 @@ enum DFlash2TopK {
             vocabularySize < Int(Int32.max)
         else { return nil }
         let flat = logits.reshaped([rows, vocabularySize])
+        let vector = vectorScan && vocabularySize % (chunks * 4) == 0
         let template: [(String, any KernelTemplateArg)] = [
             ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
+            ("VEC", vector ? 1 : 0),
+            ("HALF", logits.dtype == .float16 ? 1 : 0),
         ]
         let parts = chunkKernel(
             [flat], template: template,
@@ -1390,6 +1704,20 @@ enum DFlash2TopK {
                 if (isnan(x)) return 0xffffffffu;
                 uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
                 return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+            }
+            // Insert one (key, index). The caller offers indices in increasing
+            // order, so an equal key keeps the higher index.
+            template <int KK>
+            inline void mlxfast_topk_consider(thread uint (&k)[KK], thread uint (&id)[KK],
+                                               uint kx, uint ix) {
+                if (kx >= k[KK - 1]) {
+                    for (int j = 0; j < KK; j++) {
+                        bool sw = kx >= k[j];
+                        uint tk = k[j], ti = id[j];
+                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
+                        kx = sw ? tk : kx; ix = sw ? ti : ix;
+                    }
+                }
             }
             // Entries rank by (key, idx): the stable ascending sort keeps equal values in
             // index order, so among ties the higher index ranks higher.
@@ -1431,16 +1759,26 @@ enum DFlash2TopK {
             auto x = logits + size_t(row) * NV;
             uint k[KK], id[KK];
             for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            for (uint v = lo + t; v < hi; v += TPG) {
-                uint kx = mlxfast_topk_key(x[v]);
-                if (kx >= k[KK - 1]) {   // this thread visits indices in increasing order
-                    uint ix = v;
-                    for (int j = 0; j < KK; j++) {
-                        bool sw = kx >= k[j];
-                        uint tk = k[j], ti = id[j];
-                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
-                        kx = sw ? tk : kx; ix = sw ? ti : ix;
+            if (VEC && (CH % 4u) == 0u) {
+                // Increasing indices, four-wide. CH % 4 covers the chunk.
+                for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                    if (HALF) {
+                        const half4 q = *(const device half4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[0])), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[1])), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[2])), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(q[3])), v + 3u);
+                    } else {
+                        const float4 q = *(const device float4*)(x + v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[0]), v);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[1]), v + 1u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[2]), v + 2u);
+                        mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(q[3]), v + 3u);
                     }
+                }
+            } else {
+                for (uint v = lo + t; v < hi; v += TPG) {
+                    mlxfast_topk_consider<KK>(k, id, mlxfast_topk_key(float(x[v])), v);
                 }
             }
             uint ok = 0u, oi = 0u;
@@ -1508,6 +1846,15 @@ enum DFlash2GreedyWalk {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Four-wide loads of the rank-256 dot. Each product is still added in
+    /// increasing index order, so the edge equals the scalar chain.
+    /// `MLXFAST_DFLASH_WALK_VEC=0` reads one rank element at a time.
+    static let vectorRank: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static func select(
         candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
@@ -1533,7 +1880,10 @@ enum DFlash2GreedyWalk {
         let candidateIds = c.asType(.uint32).reshaped([-1])
         let path = kernel(
             [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
-            template: [("L", length), ("K", k), ("R", rank)],
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
@@ -1559,9 +1909,21 @@ enum DFlash2GreedyWalk {
                     const device float* proj_ptr = projected + i * R;
                     const device float* succ_ptr = next + succ_base;
                     float edge = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (uint d = 0; d < R; d++) {
-                        edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                    if (WALKVEC && (R % 4u) == 0u) {
+                        for (uint d = 0; d < R; d += 4u) {
+                            const float4 pd = *(const device float4*)(pred_ptr + d);
+                            const float4 qd = *(const device float4*)(proj_ptr + d);
+                            const float4 sd = *(const device float4*)(succ_ptr + d);
+                            edge += (pd[0] * qd[0]) * sd[0];
+                            edge += (pd[1] * qd[1]) * sd[1];
+                            edge += (pd[2] * qd[2]) * sd[2];
+                            edge += (pd[3] * qd[3]) * sd[3];
+                        }
+                    } else {
+                        #pragma clang loop unroll(full)
+                        for (uint d = 0; d < R; d++) {
+                            edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                        }
                     }
                     score = unary[i * K + c] + edge;
                 }
@@ -1637,6 +1999,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             MLXArray([Int32(config.maskTokenId)], [1, 1]))
         eval(maskEmbedding)
         self.maskTokenEmbedding = maskEmbedding
+    }
+
+    /// Builds and self-tests the tiled copies of the weights the block
+    /// forward reads through `DFlash2TensorMatmul` (every layer's o_proj,
+    /// stacked gate|up and down_proj). `fc` keeps its stored layout: the
+    /// prompt's context rows read it through the core's GEMM in the seed, so
+    /// a copy only the rounds read would be one more array to make GPU-
+    /// resident again at each decode window's first round.
+    func prepareTiledWeights() -> Bool {
+        DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
     }
 
     // MARK: The cache
@@ -1726,25 +2098,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // one-row case unchanged.
         let embeddedInputs: MLXArray
         if inputs.dim(1) > 1 {
-            let anchorEmbedding = target.embedTokensForDFlash2(inputs[0..., ..<1])
-            guard let maskEmbedding = maskTokenEmbedding else { throw DFlash2Error.notBound }
-            let batch = inputs.dim(0)
-            let cols = inputs.dim(1) - 1
-            let repeatedMasks: MLXArray
-            if batch == 1,
-                let cached = cachedMaskEmbeddingBlock,
-                cached.cols == cols
-            {
-                repeatedMasks = cached.array
-            } else {
-                repeatedMasks = broadcast(
-                    maskEmbedding, to: [batch, cols, config.hiddenSize])
-                if batch == 1 {
-                    eval(repeatedMasks)
-                    cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
-                }
-            }
-            embeddedInputs = concatenated([anchorEmbedding, repeatedMasks], axis: 1)
+            embeddedInputs = try blockEmbedding(
+                anchorIDs: inputs[0..., ..<1], maskColumns: inputs.dim(1) - 1)
         } else {
             embeddedInputs = target.embedTokensForDFlash2(inputs)
         }
@@ -1752,9 +2107,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = targetHidden.map {
-            hiddenNorm(DFlash2TensorMatmul.linear(fc, $0.asType(dtype)))
-        }
+        let context = targetHidden.map { contextProjection($0) }
 
         let submitAfter = DFlash2DraftSubmission.layers
         let leadAt = leadingLayers > 0 ? min(leadingLayers, layers.count) : 0
@@ -1774,6 +2127,44 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return norm(h)
+    }
+
+    /// `[anchor; masks]` embedded (the anchor `[B, 1]`, host or device ids).
+    func blockEmbedding(anchorIDs: MLXArray, maskColumns cols: Int) throws -> MLXArray {
+        guard let target, let maskEmbedding = maskTokenEmbedding else {
+            throw DFlash2Error.notBound
+        }
+        let anchorEmbedding = target.embedTokensForDFlash2(anchorIDs)
+        let batch = anchorIDs.dim(0)
+        let repeatedMasks: MLXArray
+        if batch == 1,
+            let cached = cachedMaskEmbeddingBlock,
+            cached.cols == cols
+        {
+            repeatedMasks = cached.array
+        } else {
+            repeatedMasks = broadcast(
+                maskEmbedding, to: [batch, cols, config.hiddenSize])
+            if batch == 1 {
+                eval(repeatedMasks)
+                cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
+            }
+        }
+        return concatenated([anchorEmbedding, repeatedMasks], axis: 1)
+    }
+
+    /// `hiddenNorm(fc(rows))`. `BONSAI_DRAFT_CONTEXT_PAD16=1` (validation aid)
+    /// pads to 16 rows, as the tensor kernel does, so MLX's matmul (kernel by
+    /// row count) gets the tensor route's row independence.
+    func contextProjection(_ targetHidden: MLXArray) -> MLXArray {
+        let rows = targetHidden.asType(dtype)
+        if DFlash2ContextPadding.enabled, rows.ndim == 3, rows.dim(1) < 16 {
+            let padded = concatenated(
+                [rows, MLXArray.zeros([rows.dim(0), 16 - rows.dim(1), rows.dim(2)], dtype: rows.dtype)],
+                axis: 1)
+            return hiddenNorm(DFlash2TensorMatmul.linear(fc, padded)[0..., ..<rows.dim(1), 0...])
+        }
+        return hiddenNorm(DFlash2TensorMatmul.linear(fc, rows))
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
@@ -1854,6 +2245,108 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return true
     }
 
+    // MARK: The next block before the readback
+
+    /// `(held rows, offset)` of every layer when a speculative block fits
+    /// (today's block in place and unmasked for every count, room for 2x rows).
+    public func speculativeGeometry(cache: [KVCache], blockSize: Int) -> (rows: Int, offset: Int)? {
+        guard target != nil, cache.count == layers.count, dflash2NoMaskEnabled,
+            !config.isCausal, let window = config.slidingWindow,
+            config.layerTypes.allSatisfy({ $0 == .slidingAttention }),
+            layers.allSatisfy({ $0.selfAttn.speculativeCapable })
+        else { return nil }
+        var geometry: (rows: Int, offset: Int)?
+        for c in cache {
+            guard let block = c as? DFlash2BlockKVCache, let rows = block.inPlaceRows,
+                rows + blockSize <= block.contextRowLimit, rows + 2 * blockSize <= window,
+                rows + 2 * blockSize <= block.inPlaceCapacity,
+                geometry == nil || (geometry!.rows == rows && geometry!.offset == block.offset)
+            else { return nil }
+            geometry = (rows, block.offset)
+        }
+        return geometry
+    }
+
+    /// The next block from a device confirmed count and anchor over the whole
+    /// verify context (its leading `contextRows` projected). No cursor moves;
+    /// with `submitLead` the leading layers' writes are installed (donating
+    /// their buffers) and those layers submitted; otherwise the whole block is
+    /// submitted with the round's other drafter work after adoption.
+    public func proposeSpeculative(
+        anchor: MLXArray, confirmed: MLXArray, verifyContext: MLXArray, contextRows: Int,
+        cache: [KVCache], blockSize: Int, leadingLayers: Int, submitLead: Bool
+    ) throws -> DFlash2SpeculativeBlock? {
+        guard let geometry = speculativeGeometry(cache: cache, blockSize: blockSize),
+            anchor.size == 1, confirmed.size == 1,
+            verifyContext.shape == [1, blockSize, config.targetHiddenSize],
+            (1 ... blockSize).contains(contextRows)
+        else { return nil }
+        let caches = cache.map { $0 as! DFlash2BlockKVCache }
+        let n = 2 * blockSize
+        var h = try blockEmbedding(anchorIDs: anchor.reshaped([1, 1]), maskColumns: blockSize - 1)
+            .asType(dtype)
+        if config.dflash.inputEmbeddingScale != 1 {
+            h = h * config.dflash.inputEmbeddingScale
+        }
+        let context = contextProjection(verifyContext[0..., ..<contextRows, 0...])
+        let base = concatenated(
+            [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
+            axis: 1)
+        let c = confirmed.reshaped([]).asType(.int32)
+        let queryOffset = MLXArray(Int32(geometry.offset)) + c
+        let keys = geometry.rows + n
+        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+            .reshaped([1, keys])
+        let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
+        var writes: [(keys: MLXArray, values: MLXArray)] = []
+        var lead: MLXArray?
+        for (index, layer) in layers.enumerated() {
+            guard
+                let out = layer.speculative(
+                    h, base: base, confirmed: c, queryOffset: queryOffset, rope: rope,
+                    cache: caches[index], keyMask: keyMask)
+            else { preconditionFailure("DFlash 2: a checked layer refused its speculative block") }
+            h = out.hidden
+            writes.append((out.keys, out.values))
+            if index + 1 == leadAt { lead = h }
+        }
+        let hidden = norm(h[0..., 1..., 0...])
+        let tokens = candidateSelector.selectGreedy(
+            hidden: hidden, logits: try logits(hidden), anchor: anchor.reshaped([1]))
+        if let lead {
+            for i in 0 ..< leadAt { caches[i].installSpeculative(keys: writes[i].keys, values: writes[i].values) }
+            asyncEval([lead])
+        }
+        return DFlash2SpeculativeBlock(
+            tokens: tokens, writes: writes, installedLayers: leadAt, contextRows: contextRows)
+    }
+
+    /// Install the remaining writes; cursors advance as today's block's do.
+    public func adoptSpeculative(_ block: DFlash2SpeculativeBlock, confirmed: Int, cache: [KVCache]) {
+        for (index, c) in cache.enumerated() {
+            let blockCache = c as! DFlash2BlockKVCache
+            if index >= block.installedLayers {
+                blockCache.installSpeculative(keys: block.writes[index].keys, values: block.writes[index].values)
+            }
+            blockCache.commitSpeculativeContext(confirmed)
+        }
+    }
+
+    /// Per confirmed count `c`, the largest `m >= c` whose projection of `m`
+    /// rows gives the projection of `c` rows bit for bit (MLX's matmul picks
+    /// gemv, wide gemv or split-K by row count; the tensor kernel does not).
+    public func contextRowClasses(rows: Int) -> [Int] {
+        let probe = MLXRandom.normal([1, rows, config.targetHiddenSize], key: MLXRandom.key(0x5eed))
+            .asType(dtype)
+        let outputs = (1 ... rows).map { contextProjection(probe[0..., ..<$0, 0...]) }
+        eval(outputs)
+        let bits = outputs.map { $0.asType(.float32).asArray(Float.self).map(\.bitPattern) }
+        let width = config.hiddenSize
+        return [0] + (1 ... rows).map { c in
+            stride(from: rows, to: c, by: -1).first { Array(bits[$0 - 1][..<(c * width)]) == bits[c - 1] } ?? c
+        }
+    }
+
     // MARK: Loading
 
     public static func isDFlash2Directory(_ directory: URL) -> Bool {
@@ -1902,6 +2395,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         eval(drafter)
         return drafter
     }
+}
+
+/// A block proposed before its round's readback.
+public final class DFlash2SpeculativeBlock {
+    public let tokens: MLXArray
+    let writes: [(keys: MLXArray, values: MLXArray)]
+    let installedLayers: Int
+    public let contextRows: Int  // its row class
+
+    init(tokens: MLXArray, writes: [(keys: MLXArray, values: MLXArray)], installedLayers: Int, contextRows: Int) {
+        (self.tokens, self.writes, self.installedLayers, self.contextRows) =
+            (tokens, writes, installedLayers, contextRows)
+    }
+}
+
+enum DFlash2ContextPadding {
+    static let enabled = ProcessInfo.processInfo.environment["BONSAI_DRAFT_CONTEXT_PAD16"] == "1"
 }
 
 /// Layer counts after which the drafter trunk `asyncEval`s its hidden state.
