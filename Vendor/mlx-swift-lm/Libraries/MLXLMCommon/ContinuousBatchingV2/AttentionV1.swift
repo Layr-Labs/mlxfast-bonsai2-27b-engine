@@ -385,8 +385,25 @@ enum CBv2AttentionV1 {
         metadata: CBv2AttentionMetadataObservation? = nil,
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
-        let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return attendRowAfterUpdate(
+            kind: kind, queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
+            scale: scale, sinks: sinks, softcap: softcap, spanContext: spanContext,
+            keepMask: keepMask, metadata: metadata, packet: packet)
+    }
+
+    /// `updateAndAttendRow` after the row's update: the same attention over
+    /// the views the update returned. Also the attention of an append that a
+    /// kernel wrote in place (`CBv2LayerCache.attendAfterInPlaceAppend`).
+    @inline(__always)
+    static func attendRowAfterUpdate(
+        kind: CBv2LayerKind, queries: MLXArray, cachedKeys: MLXArray, cachedValues: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?, keepMask: MLXArray? = nil,
+        metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
+    ) -> MLXArray {
+        let L = queries.dim(2)
         if let keepMask {
             precondition(
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),

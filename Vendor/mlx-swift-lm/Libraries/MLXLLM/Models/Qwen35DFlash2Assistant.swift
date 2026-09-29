@@ -151,6 +151,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         warmDrafter()
         if let serving {
             warmEngineRound(serving: serving)
+            runVerifyLeadingTrial(serving: serving)
             // Once more after the runner has adopted the model, at the
             // resident's boot warm: locally the load-time engine round left
             // part of the first timed round's cost in place in some processes,
@@ -249,6 +250,46 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         Memory.clearCache()
     }
 
+    /// The next verify's leading layers before the readback of a lookup
+    /// round (`CBv2VerifyLeading`): the bitwise self-test on this target
+    /// (its first layers alone, then its real capture-verify forward with the
+    /// drafter's tap armed, adopted against off), then one engine request over
+    /// a periodic prompt, whose output quotes it, so every round is a
+    /// full-acceptance lookup round; its rounds interleave the record's path
+    /// and 1, 2 and 3 speculated layers, and a count is adopted only if its
+    /// median round is at most 0.99x the record's. One stderr line; off on
+    /// any failure.
+    private func runVerifyLeadingTrial(serving: any LanguageModel) {
+        guard CBv2VerifyLeading.forced != 0 else { return }
+        let test = Qwen35VerifyLeading.selfTest(target, tap: drafter.config.targetLayerIds)
+        Qwen35VerifyLeading.verdict = test.passed
+        Stream().synchronize()
+        Memory.clearCache()
+        let label = "qwen35 verify leading layers before readback"
+        guard test.passed else {
+            FileHandle.standardError.write(
+                "\(label): self-test FAILED (\(test.detail)); the record's path\n".data(using: .utf8)!)
+            return
+        }
+        if let forced = CBv2VerifyLeading.forced {
+            CBv2VerifyLeading.layers = forced
+            FileHandle.standardError.write(
+                "\(label): \(test.detail); forced \(forced) layers, no trial\n".data(using: .utf8)!)
+            return
+        }
+        guard Self.engineRoundWarmEnabled else { return }
+        CBv2VerifyLeading.beginTrial()
+        warmEngineRound(
+            serving: serving, trialRounds: CBv2VerifyLeading.trialRoundsNeeded, leadingTrial: true)
+        Stream().synchronize()
+        let trial = CBv2VerifyLeading.finishTrial()
+        CBv2VerifyLeading.layers = trial.layers
+        FileHandle.standardError.write(
+            ("\(label): \(test.detail); trial \(trial.detail); "
+                + (trial.layers > 0 ? "on, \(trial.layers) layers\n" : "off\n")).data(using: .utf8)!)
+        Memory.clearCache()
+    }
+
     /// `MLXFAST_ENGINE_ROUND_WARM=0` skips `warmEngineRound`.
     static let engineRoundWarmEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_ENGINE_ROUND_WARM"]?
@@ -287,7 +328,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false, producerTrial: Bool = false
+        kernelTrial: Bool = false, producerTrial: Bool = false, leadingTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -343,13 +384,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             let requestID = CBv2RequestID(1)
             var request = CBv2Request(
                 id: requestID,
-                promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
+                promptTokens: (0 ..< rows).map {
+                    100 + ((leadingTrial ? $0 % 32 : $0) &* 7919) % 20_000
+                },
                 // Enough budget for rounds that take the speculative block.
                 maxTokens: 1 + Self.warmBlockSize * max(speculationPlan != nil ? 3 : 1, trialRounds))
             request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
             request.stopTokens = []
             let warmRequest = request
-            if trialRounds > 0 {
+            if trialRounds > 0, !leadingTrial {
                 // Called on the engine's thread inside a proposal: cancel
                 // from elsewhere, never re-entering the engine loop's locks.
                 let cancel: () -> Void = { [weak engine] in
@@ -855,8 +898,30 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
+        if Self.rootsOnlyTargets, !state.roots.isEmpty { return state.roots }
         return state.caches.flatMap { $0.innerState() } + state.roots
     }
+
+    /// With a proposal pending, `evaluationTargets` is the proposal alone
+    /// (default on; `MLXFAST_DFLASH_ROOT_TARGETS=0` adds the cache arrays).
+    ///
+    /// Every cache array a proposal wrote is an input of that proposal (the
+    /// attention reads the written rows), so evaluating the proposal
+    /// evaluates them; naming them too changes no value. It does change
+    /// their lifetime: the verify build appends these targets to the verify
+    /// forward's `eval`, whose completion handler holds the buffer of every
+    /// named array until the verify finishes on the GPU. The block built
+    /// before the readback (`speculateBlock`) writes its leading layers' K
+    /// and V rows while that verify is still running, so MLX could not
+    /// donate those layers' cache buffers and copied each whole buffer
+    /// ([1, 8, 2047, 128] BF16, 4 MB) before writing 32 rows: four such
+    /// copies per round. Without the extra hold the rows are written in
+    /// place, as the other layers' already are.
+    static let rootsOnlyTargets: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ROOT_TARGETS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// A round's confirmed columns become the next block's context.
     ///
@@ -970,6 +1035,35 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let block = Self.warmBlockSize
         let classes = drafter.contextRowClasses(rows: block)
         speculationPlan = SpeculationPlan(classes: classes)
+        drafter.prepareSpeculativeFront(blockSize: block)
+        var (failure, compared) = speculationCheck(block: block)
+        // The front's one-launch forms passed their own self-tests; should the
+        // whole block still differ, the composed front is proven instead of
+        // losing the block before the readback.
+        var frontNote = DFlash2SpeculativeFront.active ? "; one-launch front" : ""
+        if failure != nil, DFlash2SpeculativeFront.active {
+            DFlash2SpeculativeFront.deactivate()
+            frontNote = "; one-launch front FAILED (\(failure!)), composed front kept"
+            speculationPlan = SpeculationPlan(classes: classes)
+            (failure, compared) = speculationCheck(block: block)
+        }
+        Stream().synchronize()
+        Memory.clearCache()
+        if failure != nil { speculationPlan = nil }
+        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        FileHandle.standardError.write(Data((failure.map {
+            "dflash2 next block before readback: self-test FAILED (\($0)); off; \(ms) ms\n"
+        } ?? ("dflash2 next block before readback: self-test passed (confirmed counts 1-\(block), "
+            + "\(compared) values compared bitwise, 0 mismatches; context row classes "
+            + "\(Array(classes.dropFirst()))); "
+            + (speculationPlan!.single
+                ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
+                : "the previous round's class built before the readback") + frontNote + "; \(ms) ms\n")).utf8))
+    }
+
+    /// `establishSpeculation`'s comparison: the failure, if any, and the
+    /// number of values compared.
+    private func speculationCheck(block: Int) -> (String?, Int) {
         var failure: String?
         var compared = 0
         do {
@@ -1026,17 +1120,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         } catch {
             failure = "\(error)"
         }
-        Stream().synchronize()
-        Memory.clearCache()
-        if failure != nil { speculationPlan = nil }
-        let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        FileHandle.standardError.write(Data((failure.map {
-            "dflash2 next block before readback: self-test FAILED (\($0)); off; \(ms) ms\n"
-        } ?? ("dflash2 next block before readback: self-test passed (confirmed counts 1-\(block), "
-            + "\(compared) values compared bitwise, 0 mismatches; context row classes "
-            + "\(Array(classes.dropFirst()))); "
-            + (speculationPlan!.single
-                ? "one block, \(CBv2MTPDraftBeforeReadback.leadingLayers) layers submitted before the readback"
-                : "the previous round's class built before the readback") + "; \(ms) ms\n")).utf8))
+        return (failure, compared)
     }
 }

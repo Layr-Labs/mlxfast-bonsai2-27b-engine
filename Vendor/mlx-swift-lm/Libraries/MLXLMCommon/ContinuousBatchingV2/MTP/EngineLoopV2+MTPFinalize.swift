@@ -158,6 +158,9 @@ extension EngineLoopV2 {
         {
             speculation = (metadata.id, block, speculative)
         }
+        // A round whose ids came from a host lookup: the next verify's
+        // leading layers, for full acceptance (`CBv2VerifyLeading`).
+        speculateVerifyLeadingBeforeReadback(verify, step: step)
         // Host readbacks of the MTP round, each counted: an MTP-round
         // finalize adds up to three syncs to the step's one (seed policy
         // margin above, acceptance packet, verify policy margin). Serial
@@ -167,6 +170,7 @@ extension EngineLoopV2 {
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
+        let readbackNanos = CBv2VerifyLeading.noteReadback()
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
@@ -437,6 +441,7 @@ extension EngineLoopV2 {
             // state is built and submitted while they run, and the rest of
             // the proposal is submitted after it, still inside this finalize.
             var earlyBlock: CBv2MTPEarlyBlockProposal?
+            var leadingLookup: MLXArray?
             var deferredDraftTargets: [MLXArray] = []
             if finishReason == nil, confirmed > 0, let block = mtp.blockDrafter,
                 let state = metadata.assistantState,
@@ -472,6 +477,7 @@ extension EngineLoopV2 {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
                 }
+                leadingLookup = promptProposal
                 if let tokens = promptProposal {
                     CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
                     CBv2VerifyQueueHint.markNothingAhead()
@@ -498,6 +504,10 @@ extension EngineLoopV2 {
             // No next block from this finalize (the row finished, or its next
             // round is not a fixed-depth block): its next proposal starts over.
             if earlyBlock == nil { CBv2PromptLookupDraft.noteProposal(id, fromPrompt: false) }
+            settleVerifyLeading(
+                id: id, accepted: accepted, confirmed: confirmed, k: k, targets: outcome.targets,
+                finished: finishReason != nil || earlyBlock == nil, lookup: leadingLookup,
+                tokensCount: rec.tokens.count, readbackNanos: readbackNanos)
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
