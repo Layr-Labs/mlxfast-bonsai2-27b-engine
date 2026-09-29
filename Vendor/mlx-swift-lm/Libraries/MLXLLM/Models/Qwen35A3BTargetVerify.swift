@@ -586,8 +586,8 @@ enum Qwen35GDNReplayFused {
     static func launch(
         tape: ArraysCache.PrefixReplayTape, keep: Int, aLog: MLXArray, dtBias: MLXArray,
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
-        staged: Bool? = nil
-    ) -> (y: MLXArray, state: MLXArray)? {
+        staged: Bool? = nil, storeFinal: Bool = false
+    ) -> (y: MLXArray, state: MLXArray, final: MLXArray?)? {
         guard let kernel, Qwen35GatedDeltaV3.enabled, let ps = tape.ssmPre, tape.mask == nil,
             k.ndim == 4, v.ndim == 4
         else { return nil }
@@ -625,31 +625,93 @@ enum Qwen35GDNReplayFused {
         let useStaged =
             (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
             && P <= stagedRows
-        let out = (useStaged ? stagedKernel : kernel)(
-            [q, k, v, g, beta, MLXArray(Int32(T))] + previous
-                + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))],
-            template: [
-                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", dvpl),
-            ],
+        let inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
+            + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
+            ("DVPL", dvpl),
+        ]
+        if useStaged {
+            // The committed state, and (`storeFinal`) the window's final state.
+            let out = stagedKernel(
+                inputs, template: template + [("SC", true), ("SF", storeFinal)],
+                grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
+                outputShapes: [[1, T, Hv, Dv], ps.shape, storeFinal ? ps.shape : [1]],
+                outputDTypes: [.float32, .float32, .float32])
+            return (out[0], out[1], storeFinal ? out[2] : nil)
+        }
+        let out = kernel(
+            inputs, template: template,
             grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1, T, Hv, Dv], ps.shape],
             outputDTypes: [.float32, .float32])
-        return (out[0], out[1])
+        return (out[0], out[1], nil)
+    }
+
+    /// `BONSAI_GDN_PLAIN_STAGED=0` keeps the stock output-only scan for a
+    /// verify from a committed (not deferred) state that stores nothing.
+    static let plainStagedEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PLAIN_STAGED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// This verify's rows from a committed (not deferred) `state` (and, with
+    /// `storeFinal`, the window's final state): the staged kernel without the
+    /// replay (`KP` 0) and without the committed-state store. The same step
+    /// arithmetic as `Qwen35GatedDeltaV3.run` / `runOutputOnly`, whose rows
+    /// and final state it matches bit for bit (`Qwen35GDNFullAcceptStore`'s
+    /// self-test). Nil when it does not fit (the caller takes the stock path).
+    static func plainScan(
+        pre: Qwen35GDNPrework.Outputs, state: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        storeFinal: Bool = true
+    ) -> (y: MLXArray, final: MLXArray?)? {
+        let (q, k, v, g, beta) = (pre.q, pre.k, pre.v, pre.g, pre.beta)
+        guard stagedActive, Qwen35GatedDeltaV3.enabled, k.ndim == 4, v.ndim == 4 else {
+            return nil
+        }
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        guard [q, k, v, g, beta, state, aLog, dtBias].allSatisfy({ $0.dtype == .float32 }),
+            Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0,
+            T >= stagedRows / 2, T <= stagedRows,
+            q.shape == [1, T, Hk, Dk], k.shape == q.shape, v.shape == [1, T, Hv, Dv],
+            g.shape == [1, T, Hv], beta.shape == [1, T, Hv], state.shape == [1, Hv, Dv, Dk],
+            aLog.shape == [Hv], dtBias.shape == [Hv],
+            Qwen35GDNReplayBatch.rowContiguousAfterLeading(state),
+            aLog.strides == [1], dtBias.strides == [1]
+        else { return nil }
+        // KP = 0: the replay inputs are never read; any float arrays bind.
+        let out = stagedKernel(
+            [q, k, v, g, beta, MLXArray(Int32(T)), state, k, v, g, beta, aLog, dtBias,
+             MLXArray([Int32(Hv), Int32(Hv)]), MLXArray(Int32(0))],
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
+                ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
+            ],
+            grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[1, T, Hv, Dv], [1], storeFinal ? state.shape : [1]],
+            outputDTypes: [.float32, .float32, .float32])
+        return (out[0], storeFinal ? out[2] : nil)
     }
 
     /// The fused scan of a single-row verify whose input SSM is `layer`'s
     /// pending deferred replay, which it resolves with the committed state.
     static func run(
         layer: Qwen35GatedDeltaNet, input: CBv2RecurrentLayerState?,
-        pre: Qwen35GDNPrework.Outputs
-    ) -> (y: MLXArray, state: MLXArray)? {
+        pre: Qwen35GDNPrework.Outputs, storeFinal: Bool = false
+    ) -> (y: MLXArray, state: MLXArray, final: MLXArray?)? {
         guard let deferred = input?.deferredReplay, deferred.isPending,
             let inputs = deferred.inputs as? Inputs, inputs.layer == ObjectIdentifier(layer),
             applies(to: layer),
             let fused = launch(
                 tape: inputs.tape, keep: deferred.keep, aLog: layer.aLog,
-                dtBias: layer.dtBias, q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta),
+                dtBias: layer.dtBias, q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                storeFinal: storeFinal),
             deferred.resolve(fused.state)
         else { return nil }
         return fused
@@ -984,12 +1046,14 @@ extension Qwen35GDNReplayFused {
           }
         }
 
-        // The committed state.
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
+        // The committed state (SC; the plain scan of a committed state skips it).
+        if (SC) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          for (int d = 0; d < DVPL; ++d) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; ++i) {
+              state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+            }
           }
         }
 
@@ -1084,6 +1148,17 @@ extension Qwen35GDNReplayFused {
             y_ += Hv * Dv;
           }
         }
+
+        // The window's final state (SF: a full-accept store).
+        if (SF) {
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; ++i) {
+              state_final[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+            }
+          }
+        }
         """
 
     static let stagedKernel = MLXFast.metalKernel(
@@ -1092,10 +1167,223 @@ extension Qwen35GDNReplayFused {
             "q", "k", "v", "g", "beta", "T", "ps", "pk", "pv", "pa", "pb", "alog", "dtb",
             "ab_rows", "KP",
         ],
-        outputNames: ["y", "state_out"],
+        outputNames: ["y", "state_out", "state_final"],
         source: stagedSource,
         header: stagedHeader,
         ensureRowContiguous: false)
+}
+
+/// The full-accept state store (`BONSAI_GDN_FULLACCEPT_STORE=0` keeps the
+/// state skip in every round).
+///
+/// The verify stores no final state (`Qwen35GDNVerifyStateSkip`): a fully
+/// accepted window's committed state is replayed from its tape by the next
+/// verify (`Qwen35GDNReplayFused`, phase 1 over all 16 rows, then the
+/// committed-state store). While the output quotes the prompt, nearly every
+/// round accepts its whole window, so that replay runs in almost every round.
+/// In a round whose proposal is a host lookup's continuation (ids read from
+/// the prompt on the host, whether the drafter was skipped or overridden:
+/// `CBv2VerifyRoundHint.proposalFromPrompt`, set by the engine around the
+/// single-row verify build; a device-side splice does not count, since the
+/// host cannot tell whether it took the prompt's ids), the verify stores the
+/// window's final state
+/// instead: the staged kernel's `SF` store after its output loop, or, from a
+/// committed (not deferred) state, the staged kernel without the replay and
+/// without the committed-state store (`plainScan`). That state is the prefix
+/// replay stage's `finalSSM`: a fully accepted window commits it directly (no
+/// replay, no committed-state store in the next verify); any other outcome
+/// commits the deferred replay from the pre-verify state exactly as before,
+/// and the stored state is dropped with the stage (it is its own buffer and
+/// never aliases the pre-verify state the replay reads). The committed conv
+/// rows of a stored full acceptance stay the window's slice of the conv input,
+/// as a deferred commit keeps them (no detaching copy). Drafter rounds, the
+/// seed, and every load-time trial round (their proposals are the drafter's,
+/// and a running trial turns the store off) keep today's path, except that a
+/// verify from a committed (not deferred) state, which ran the stock
+/// output-only scan, takes the staged kernel's plain form without a store
+/// (`BONSAI_GDN_PLAIN_STAGED=0` keeps the stock scan).
+///
+/// The stored state is the replay's, bit for bit: the verify's gates (the
+/// prework's `exp(decay * softplus(a + dt_bias))` and `sigmoid(b)`, decay
+/// from `Qwen35GDNDerived`) and the replay's in-kernel gates agree bit for bit
+/// (the state skip's own self-test compares the stored final state of
+/// `Qwen35GatedDeltaV3.run` with the full-window replay, special gate inputs
+/// included). At model construction this self-test checks, on four synthetic
+/// verify windows from the verify prework, that the plain scan's rows and
+/// final state equal `Qwen35GatedDeltaV3.run`'s and the full-window replay's,
+/// and that the fused kernel's final state after 0, 7 and 16 replayed rows
+/// equals `Qwen35GatedDeltaV3.run` from its committed state; every value is
+/// compared as an unsigned integer. A mismatch, or a failed state-skip or
+/// fused-replay check, keeps the store off.
+enum Qwen35GDNFullAcceptStore {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_FULLACCEPT_STORE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, cd: Int, ks: Int, dvpl: Int
+    }
+
+    private static func geometry(_ layer: Qwen35GatedDeltaNet) -> Geometry {
+        Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            cd: layer.convDim, ks: layer.convKernelSize, dvpl: Qwen35GatedDeltaV3.rowsPerLane)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    /// Whether this verify of `layer` stores its window's final state.
+    static func wanted(layer: Qwen35GatedDeltaNet) -> Bool {
+        guard enabled, CBv2VerifyRoundHint.proposalFromPrompt,
+            !Qwen35NarrowProducerTrial.active, !Qwen35TensorPackedMatmul.NarrowInSituTrial.active,
+            !Qwen35HeadTopTwo.Trial.active, !DFlash2KernelTrial.active,
+            Qwen35GDNReplayFused.stagedActive, Qwen35GDNVerifyStateSkip.applies(to: layer),
+            Qwen35GDNReplayFused.applies(to: layer)
+        else { return false }
+        let key = geometry(layer)
+        return lock.withLock { verdicts[key] ?? false }
+    }
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    /// Once per geometry at model construction, after the state skip's and
+    /// the fused replay's checks.
+    static func prepare(layer: Qwen35GatedDeltaNet) {
+        guard enabled, Qwen35GDNReplayFused.stagedActive,
+            Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer)
+        else { return }
+        let key = geometry(layer)
+        lock.lock()
+        defer { lock.unlock() }
+        guard verdicts[key] == nil else { return }
+        let (passed, detail) = selfTest(layer: layer)
+        verdicts[key] = passed
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN full-accept state store: self-test " + (passed ? "passed" : "FAILED")
+                + " (" + detail + ")"
+                + (passed
+                    ? "; prompt rounds store the window's final state\n"
+                    : "; the state skip stays on\n")).data(using: .utf8)!)
+    }
+
+    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+        let G = 4
+        let S = Qwen35GDNVerifyStateSkip.selfTestRows
+        let Hk = layer.numKHeads
+        let Dk = layer.headKDim
+        let Hv = layer.numVHeads
+        let Dv = layer.headVDim
+        let CD = layer.convDim
+        let KS = layer.convKernelSize
+        let NK = KS - 1
+        guard KS == 4, Dk == 128, Dv == 128, Hv % Hk == 0, CD == 2 * Hk * Dk + Hv * Dv else {
+            return (false, "geometry outside the verify prework")
+        }
+        let derived = Qwen35GDNDerived()
+        let keys = MLXRandom.split(key: MLXRandom.key(0x4641_5354), into: 8 * G)
+        var comparisons = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                var differ: [MLXArray] = []
+                func compare(_ a: MLXArray?, _ b: MLXArray?, _ what: String) throws {
+                    guard let a, let b, a.shape == b.shape, a.dtype == .float32,
+                        b.dtype == .float32
+                    else { throw SelfTestFailure.message("\(what): shape or dtype mismatch") }
+                    differ.append(
+                        (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
+                    values += a.size
+                    comparisons += 1
+                }
+                for j in 0 ..< G {
+                    func key(_ i: Int) -> MLXArray { keys[8 * j + i] }
+                    let qkvz = MLXRandom.normal([1, S, CD + Hv * Dv], key: key(0))
+                    let qkv = qkvz[0..., 0..., ..<CD]
+                    let convState = MLXRandom.normal([1, NK, CD], key: key(1))
+                    let convWeight = MLXRandom.normal([CD, KS, 1], key: key(2)) * 0.5
+                    var gatePair = MLXRandom.normal([1, S, 2 * Hv], key: key(3)) * 4
+                    let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+                    let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+                    let rowMask = MLXArray((0 ..< S).map { $0 == j % 3 ? Float(1) : 0 })
+                        .reshaped([1, S, 1])
+                    gatePair = MLX.where(rowMask .> 0, marks.reshaped([1, 1, 2 * Hv]), gatePair)
+                    let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(4)))
+                    let dtBias = MLXRandom.normal([Hv], key: key(5))
+                    let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(6)))
+                    let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(7)) * spread * 0.05
+                    eval(qkvz, convState, convWeight, gatePair, aLog, dtBias, ssmPre)
+                    let b = gatePair[0..., 0..., ..<Hv]
+                    let a = gatePair[0..., 0..., Hv...]
+                    guard
+                        let pre = Qwen35GDNPrework.run(
+                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                            aDecay: derived.decay(aLog), dtBias: dtBias,
+                            normScales: derived.normScales(headKDim: Dk, dtype: .float32),
+                            keyHeads: Hk, valueHeads: Hv, headKDim: Dk, headVDim: Dv,
+                            writeConvInput: true,
+                            stridedReads: Qwen35GDNPrework.verifyStridedReads),
+                        let convInput = pre.convInput
+                    else { throw SelfTestFailure.message("no verify prework") }
+                    guard
+                        let (yStored, finalStored) = Qwen35GatedDeltaV3.run(
+                            q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                            state: ssmPre),
+                        let plain = Qwen35GDNReplayFused.plainScan(
+                            pre: pre, state: ssmPre, aLog: aLog, dtBias: dtBias),
+                        let plainFinal = plain.final,
+                        let plainRows = Qwen35GDNReplayFused.plainScan(
+                            pre: pre, state: ssmPre, aLog: aLog, dtBias: dtBias,
+                            storeFinal: false)
+                    else { throw SelfTestFailure.message("no plain scan") }
+                    let tape = ArraysCache.PrefixReplayTape(
+                        convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                    guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
+                    else { throw SelfTestFailure.message("tape rejected") }
+                    let replayed = layer.replayedPrefixState(
+                        tape: tape, committedRows: S, aLog: aLog, dtBias: dtBias,
+                        fullWindow: true)
+                    try compare(plain.y, yStored, "plain rows")
+                    try compare(plainFinal, finalStored, "plain final state")
+                    try compare(plainFinal, replayed.ssm, "plain final state vs replay")
+                    try compare(plainRows.y, yStored, "plain rows without the store")
+                    // The fused kernel with the store: this window replayed as
+                    // the previous tape (0, 7, 16 rows), then its rows again.
+                    for keep in [0, 7, S] {
+                        guard
+                            let fused = Qwen35GDNReplayFused.launch(
+                                tape: tape, keep: keep, aLog: aLog, dtBias: dtBias,
+                                q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                                storeFinal: true),
+                            let final = fused.final,
+                            let reference = Qwen35GatedDeltaV3.run(
+                                q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                                state: fused.state)
+                        else { throw SelfTestFailure.message("no fused store at \(keep) rows") }
+                        try compare(final, reference.1, "fused final state at \(keep) rows")
+                    }
+                }
+                let count = stacked(differ).sum()
+                eval(count)
+                try error.check()
+                mismatches += Int(count.item(Int32.self))
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let passed = mismatches == 0 && comparisons == G * 7
+        return (
+            passed,
+            "\(G) windows of \(S) rows, \(comparisons) comparisons, \(values) values, "
+                + "\(mismatches) mismatches")
+    }
 }
 
 // MARK: - Row-tiled fresh strided GDN prompt prework (znan2)
@@ -2683,5 +2971,1064 @@ enum Qwen35PreworkSplit {
         FileHandle.standardError.write(
             ("qwen35 GDN verify prework, value threadgroups apart: self-test "
                 + report.joined(separator: "; ") + "\n").data(using: .utf8)!)
+    }
+}
+
+/// The fused verify boundary (`Qwen35FusedBoundaryQ8`) at verify width with one
+/// threadgroup per (row, 1024-block) instead of one per row: 80 threadgroups of
+/// 256 threads for a 16-row window instead of 16 of 1024 (a 40-core GPU leaves
+/// 24 cores idle under the stock grid). Each threadgroup recomputes its row's
+/// sum of squares with `rms_looped`'s lane structure: the 1024 lanes are
+/// virtual, lane vl = tid + 256 m accumulates p = 0, 1 and i = 0 ... 3 in the
+/// stock order, a real `simd_sum` over each m-accumulator is that virtual
+/// simdgroup's (same 32 lane positions), and every simdgroup takes the second
+/// `simd_sum` of the 32 partials in order and `precise::rsqrt` itself (one
+/// barrier, as the one-barrier boundary does). It normalizes, rotates
+/// and quantizes only its own block: `w * (h * inv)` and the signs on the
+/// thread's four elements (gain and signs read before the reduction), the
+/// transform's butterfly levels in the stock order (strides 1 and 2 in
+/// registers, 4 ... 64 across the simdgroup by `simd_shuffle_xor`, each pair
+/// still `a + b` / `a - b` with `a` the lower element, 128 ... 512 as a radix-8
+/// in threadgroup memory), and the stock quantization per 128-group (lane l
+/// holds elements 4l .. 4l + 3). Every output is bit-identical.
+///
+/// The fused boundary's 16-row self-test runs through this kernel (bitwise
+/// against the composed ops, the reference the stock kernel is verified
+/// against); on a mismatch the stock kernel is retested and kept.
+/// `BONSAI_BOUNDARY_Q8_BLOCKS=0` keeps the stock kernel.
+enum Qwen35BoundaryBlocks {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_BOUNDARY_Q8_BLOCKS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Cleared when the 16-row self-test fails through this kernel.
+    nonisolated(unsafe) static var live = true
+    static var active: Bool { enabled && live }
+
+    private static let threads = 256
+
+    private static let header = """
+        #define BONSAI_UNROLL _Pragma("clang loop unroll(full)")
+
+        // Thread-local Hadamard butterfly for 2^R values, as in
+        // mlx/backend/metal/kernels/hadamard.h (radix_func).
+        template <short R>
+        inline void bonsai_hadamard_radix(thread float* x) {
+          constexpr short logR = __builtin_ctz(R);
+          short h = 1;
+          BONSAI_UNROLL for (short s = 0; s < logR; s++) {
+            BONSAI_UNROLL for (short i = 0; i < R / 2; i++) {
+              short k = i & (h - 1);
+              short j = ((i - k) << 1) + k;
+              float a = x[j];
+              float b = x[j + h];
+              x[j] = a + b;
+              x[j + h] = a - b;
+            }
+            h <<= 1;
+          }
+        }
+
+        """
+
+    // grid (256 * rows * W / 1024, 1, 1), threadgroup (256, 1, 1). Inputs and
+    // outputs as `Qwen35FusedBoundaryQ8`'s kernel.
+    private static let source = """
+        constexpr uint NR = 4;
+        constexpr uint LS = 1024;
+        constexpr uint BT = 256;
+        constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+        constexpr uint NB = uint(W) / 1024;
+        constexpr uint NG = uint(W) / 128;
+        constexpr uint VM = LS / BT;
+        static_assert(W % 1024 == 0 && W > 4096 && W <= 7168, "rms_looped width with 1024-blocks");
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.x / NB;
+        const uint blk = threadgroup_position_in_grid.x % NB;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const size_t base = size_t(row) * size_t(W);
+
+        threadgroup float buf[1024];
+        threadgroup float local_sums[32];
+
+        // Gain and signs of this thread's four block elements, read early.
+        const uint el = 4 * tid;
+        const uint ec = blk * 1024 + el;
+        const float4 wv = *(const device float4*)(w + ec);
+        float4 sv = float4(1.0f);
+        if (!PRESIGNED) {
+          sv = *(const device float4*)(signs + ec);
+        }
+
+        // The FP16 residual add and rms_looped's per-lane sum of squares for
+        // virtual lanes vl = tid + BT * m; this block's four elements are kept.
+        float acc[VM];
+        float hb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        BONSAI_UNROLL for (uint m = 0; m < VM; m++) {
+          acc[m] = 0;
+        }
+        BONSAI_UNROLL for (uint m = 0; m < VM; m++) {
+          const uint vl = tid + BT * m;
+          BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+            const uint r0 = p * LS * NR;
+            if (r0 + vl * NR + NR <= uint(W)) {
+              const uint e0 = r0 + vl * NR;
+              const half4 hs = *(const device half4*)(xa + base + e0)
+                  + *(const device half4*)(xb + base + e0);
+              const bool mine = (e0 / 1024) == blk;
+              if (mine) {
+                *(device half4*)(hout + base + e0) = hs;
+              }
+              BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                const float hvf = float(hs[i]);
+                acc[m] += hvf * hvf;
+                if (mine) {
+                  hb[i] = hvf;
+                }
+              }
+            }
+          }
+        }
+        BONSAI_UNROLL for (uint m = 0; m < VM; m++) {
+          const float s = simd_sum(acc[m]);
+          if (lane == 0) {
+            local_sums[sg + (BT / 32) * m] = s;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Every simdgroup forms the same simd_sum of the same 32 partials in
+        // the same lanes and the same rsqrt (the one-barrier reduction).
+        const float t = simd_sum(local_sums[lane]);
+        const float inv = metal::precise::rsqrt(t / axis_size + eps);
+
+        // rms_looped's output `w * (x * inv)`, then the signs.
+        float x[4];
+        {
+          const float n0 = wv[0] * (hb[0] * inv);
+          const float n1 = wv[1] * (hb[1] * inv);
+          const float n2 = wv[2] * (hb[2] * inv);
+          const float n3 = wv[3] * (hb[3] * inv);
+          x[0] = n0;
+          x[1] = n1;
+          x[2] = n2;
+          x[3] = n3;
+          if (!PRESIGNED) {
+            x[0] = n0 * sv[0];
+            x[1] = n1 * sv[1];
+            x[2] = n2 * sv[2];
+            x[3] = n3 * sv[3];
+          }
+          BONSAI_STORE_NORMED(ec + 0, n0);
+          BONSAI_STORE_NORMED(ec + 1, n1);
+          BONSAI_STORE_NORMED(ec + 2, n2);
+          BONSAI_STORE_NORMED(ec + 3, n3);
+        }
+
+        // hadamard_n<float, 1024, 16, 4>'s levels in its order: strides 1, 2
+        // in registers, 4 ... 64 across the simdgroup, 128 ... 512 in memory.
+        bonsai_hadamard_radix<4>(x);
+        BONSAI_UNROLL for (ushort s = 1; s < 32; s <<= 1) {
+          const bool upper = (lane & s) != 0;
+          BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+            const float o = simd_shuffle_xor(x[r], s);
+            x[r] = upper ? (o - x[r]) : (x[r] + o);
+          }
+        }
+        BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+          buf[el + r] = x[r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 128) {
+          float y8[8];
+          BONSAI_UNROLL for (short k = 0; k < 8; k++) {
+            y8[k] = buf[tid + 128 * k];
+          }
+          bonsai_hadamard_radix<8>(y8);
+          BONSAI_UNROLL for (short k = 0; k < 8; k++) {
+            buf[tid + 128 * k] = y8[k];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The quantizing rotation's tail, one 128-group per simdgroup.
+        {
+          const uint g = blk * 8 + sg;
+          const uint g0 = sg * 128 + lane * 4;
+          float v[4];
+          float amax = 0.0f;
+          BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+            v[r] = buf[g0 + r] * 0.03125f;
+            amax = max(amax, fabs(v[r]));
+          }
+          amax = simd_max(amax);
+          const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+          const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
+          float part = 0.0f;
+          BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+            const float q = rint(v[r] * iqs);
+            part += q;
+            const uint kk = lane * 4 + uint(r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (SIGNED) { codes[base + size_t(g) * 128 + kp] = int8_t(q); } else { codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128); }
+          }
+          part = simd_sum(part);
+          if (lane == 0) {
+            const uint ml = row & 63u;
+            const size_t qidx = MPERM
+              ? (size_t(row >> 6) * size_t(NG) * 64 + size_t(g) * 64
+                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (size_t(row) * NG + g);
+            qscale[qidx] = qs;
+            qsum[qidx] = qs * part;
+          }
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_boundary_q8_blocks",
+        inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
+        outputNames: ["hout", "codes", "qscale", "qsum"],
+        source: "#define BONSAI_STORE_NORMED(e, n)\n" + source,
+        header: header,
+        ensureRowContiguous: true)
+
+    private static let kernelNormed = MLXFast.metalKernel(
+        name: "bonsai_boundary_q8_blocks_normed",
+        inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
+        outputNames: ["hout", "codes", "qscale", "qsum", "nout"],
+        source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + source,
+        header: header,
+        ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(Qwen35FusedBoundaryQ8.width))
+
+    /// `Qwen35FusedBoundaryQ8`'s outputs for a verify-width window (fewer than
+    /// `BonsaiPromptWidth.minimumRows` rows), or nil when this kernel is off.
+    static func launch(
+        _ x: MLXArray, _ r: MLXArray, gain: MLXArray, signs: MLXArray, eps: Float,
+        gainSigned: Bool, writeNormed: Bool, perm: Bool
+    ) -> Qwen35FusedBoundaryQ8.Output? {
+        let width = Qwen35FusedBoundaryQ8.width
+        guard active, width % 1024 == 0, width > 4096, width <= 7168, x.size % width == 0
+        else { return nil }
+        let rows = x.size / width
+        guard rows > 0, rows < BonsaiPromptWidth.minimumRows else { return nil }
+        let codesShape = [rows, width]
+        let groupShape = [rows, width / 128]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("W", width), ("PRESIGNED", gainSigned), ("PERM", perm),
+            ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && rows % 64 == 0),
+            ("SIGNED", Qwen35TensorPackedMatmul.signedCodes),
+        ]
+        let inputs = [x, r, gain, signs, MLXArray(eps), axisSize]
+        let grid = (threads * rows * (width / 1024), 1, 1)
+        if writeNormed {
+            let outs = kernelNormed(
+                inputs, template: template, grid: grid, threadGroup: (threads, 1, 1),
+                outputShapes: [x.shape, codesShape, groupShape, groupShape, x.shape],
+                outputDTypes: [
+                    .float16, Qwen35TensorPackedMatmul.codesDType, .float32, .float32, .float32,
+                ])
+            return Qwen35FusedBoundaryQ8.Output(
+                h: outs[0], normed: outs[4],
+                activation: SignedBlockHadamard.Int8Activation(
+                    codes: outs[1], scales: outs[2], scaledSums: outs[3]))
+        }
+        let outs = kernel(
+            inputs, template: template, grid: grid, threadGroup: (threads, 1, 1),
+            outputShapes: [x.shape, codesShape, groupShape, groupShape],
+            outputDTypes: [.float16, Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
+        return Qwen35FusedBoundaryQ8.Output(
+            h: outs[0], normed: nil,
+            activation: SignedBlockHadamard.Int8Activation(
+                codes: outs[1], scales: outs[2], scaledSums: outs[3]))
+    }
+}
+
+/// The producer form of the quantizing rotation (`bonsai_signed_hadamard_1024_q8p`
+/// / its vector-read twin `_q8pv`: SwiGLU, the attention output gate or the
+/// GDN gated norm formed in the rotation's read) at verify width, with the
+/// per-block layout of `Qwen35RotationQ8Blocks`: 256 threads per 1024-block
+/// (at most 128 blocks) or 128. Thread t reads its four (or eight) block
+/// elements as the vector-read form reads four consecutive columns (the same
+/// source columns, operand strides and FP32 producer expressions, times the
+/// signs); for the gated norm (256 threads) simdgroup s holds head s of the
+/// block with lane l on its elements 4l .. 4l + 3, the stock RMS pass's lanes
+/// and elements, so the head's sum of squares (r = 0 .. 3), `simd_sum` and
+/// `precise::rsqrt` are the same operations on the same values. Then the
+/// butterflies and the quantization of `Qwen35RotationQ8Blocks`, so every code,
+/// scale and scaled sum is the stock producer rotation's, bit for bit.
+///
+/// Each template form is compared bit for bit with the stock producer kernel
+/// at its first use (outside any timed round: the verify graph's first build),
+/// on that call's operands and on two synthetic operand sets with the same
+/// shapes, strides and dtypes (wide magnitude spreads, a zero stretch); a
+/// mismatch or an MLX error keeps the stock kernel for that form.
+/// `BONSAI_ROTATION_Q8P_BLOCKS=0` keeps the stock kernel everywhere.
+extension Qwen35RotationQ8Blocks {
+    static let producerEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_ROTATION_Q8P_BLOCKS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The gated-norm producer (PROD 3: the GDN output into the quantizing
+    /// rotation of its output projection) takes this kernel at prompt width
+    /// too: 256 threads per 1024-block, each lane's four elements consecutive,
+    /// the butterflies up to stride 64 by `simd_shuffle_xor` (no threadgroup
+    /// passes), the per-head sum of squares from the same lanes and elements
+    /// as the stock kernel's. Measured on the M4 (6144 wide): -8% on the
+    /// kernel alone with cold operands, -3 us per call (about -4%) in the
+    /// one-op census of the prompt forward; the SwiGLU and attention-gate
+    /// producers stay on the stock kernel there (the SwiGLU one read 19%
+    /// slower).
+    /// Self-tested at the prompt-width form (its own `ProducerForm`, MPERM on)
+    /// against the stock kernel before first use; a failure keeps the stock
+    /// kernel. `BONSAI_ROTATION_Q8P_BLOCKS_PROMPT=0` keeps the stock kernel at
+    /// prompt width.
+    static let producerPromptGatedNorm: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_ROTATION_Q8P_BLOCKS_PROMPT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Set while a form's self-test runs: the stock kernel it compares with
+    /// can run its own first-use self-test through the production closure,
+    /// which must not come back here (the lock is held).
+    nonisolated(unsafe) private static var producerVerifying = false
+
+    private static let producerHeader = """
+        // MLX `Sigmoid` (unary_ops.h), verbatim.
+        METAL_FUNC float bonsai_sigmoid(float x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+
+        // Thread-local Hadamard butterfly for 2^R values, as in
+        // mlx/backend/metal/kernels/hadamard.h (radix_func).
+        template <short R>
+        inline void bonsai_hadamard_radix(thread float* x) {
+          constexpr short logR = __builtin_ctz(R);
+          short h = 1;
+          #pragma clang loop unroll(full)
+          for (short s = 0; s < logR; s++) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < R / 2; i++) {
+              short k = i & (h - 1);
+              short j = ((i - k) << 1) + k;
+              float a = x[j];
+              float b = x[j + h];
+              x[j] = a + b;
+              x[j + h] = a - b;
+            }
+            h <<= 1;
+          }
+        }
+
+        // The producer rotation's operand addressing and four-wide reads,
+        // verbatim (`Qwen35FusedHadamard` headerProducer / producerVecHeader).
+        template <int HD>
+        inline int64_t bonsai_q8p_row(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return int64_t(row) * st[0];
+          }
+          const uint L = uint(shape[1]);
+          return int64_t(row / L) * st[0] + int64_t(row % L) * st[1];
+        }
+        template <int HD>
+        inline int64_t bonsai_q8p_col(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return int64_t(c) * st[1];
+          }
+          return int64_t(c / uint(HD)) * st[2] + int64_t(c % uint(HD)) * st[3];
+        }
+        inline float4 bonsai_ld4(const device float* p) {
+          return *(const device float4*)p;
+        }
+        inline float4 bonsai_ld4(const device half* p) {
+          return float4(*(const device half4*)p);
+        }
+        template <typename T>
+        inline float4 bonsai_ld4(const device T* p) {
+          return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
+        }
+        template <int HD, typename T>
+        inline float4 bonsai_q8p_ld4(
+            const device T* p, int64_t rowoff, const constant int64_t* st, uint c, bool vec) {
+          if (vec) {
+            return bonsai_ld4(p + rowoff + bonsai_q8p_col<HD>(st, c));
+          }
+          float4 v;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            v[r] = float(p[rowoff + bonsai_q8p_col<HD>(st, c + uint(r))]);
+          }
+          return v;
+        }
+
+        """
+
+    // grid (TPB * rows * BPR, 1, 1), threadgroup (TPB, 1, 1); the stock
+    // producer kernel's template plus TPB.
+    private static let producerSource = """
+        constexpr short N = 1024;
+        constexpr uint EPT = uint(N) / uint(TPB);
+        static_assert(TPB == 128 || TPB == 256, "threads per block");
+        static_assert(GR == 1 || GD % 4 == 0, "four-column runs share a head");
+        static_assert(PROD != 3 || (GD == 128 && TPB == 256), "one head per simdgroup");
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint row = blk / uint(BPR);
+        const uint bcol = (blk % uint(BPR)) * uint(N);
+        const size_t rowbase = size_t(row) * size_t(W);
+        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
+        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const bool AV = (AHD == 0 ? a_strides[1] : a_strides[3]) == 1;
+        const bool BV = (BHD == 0 ? b_strides[1] : b_strides[3]) == 1;
+        threadgroup float buf[N];
+        float x[EPT];
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < EPT / 4; u++) {
+          const uint index = EPT * tid + 4 * u;
+          const uint col = bcol + index;
+          uint src = col;
+          if (GR > 1) {
+            const uint d = col % uint(GD);
+            const uint hr = col / uint(GD);
+            const uint h = hr / uint(GR);
+            const uint rr = hr % uint(GR);
+            src = (rr * uint(GKH) + h) * uint(GD) + d;
+          }
+          const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
+          const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
+          const float4 s4 = bonsai_ld4(signs + col);
+          float inv = 0.0f;
+          if (PROD == 3) {
+            float acc = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < 4; r++) {
+              const float tx = a4[r];
+              acc += tx * tx;
+            }
+            acc = simd_sum(acc);
+            inv = metal::precise::rsqrt(acc / float(GD) + eps[0]);
+          }
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const float av = a4[r];
+            const float bv = b4[r];
+            float v;
+            if (PROD == 1) {
+              v = (av * bonsai_sigmoid(av)) * bv;
+            } else if (PROD == 2) {
+              v = av * bonsai_sigmoid(bv);
+            } else {
+              const float xn = w[src % uint(GD) + uint(r)] * (av * inv);
+              v = (bv * bonsai_sigmoid(bv)) * xn;
+            }
+            x[4 * u + uint(r)] = v * s4[r];
+          }
+        }
+        bonsai_hadamard_radix<short(EPT)>(x);
+        #pragma clang loop unroll(full)
+        for (ushort s = 1; s < 32; s <<= 1) {
+          const bool upper = (lane & s) != 0;
+          #pragma clang loop unroll(full)
+          for (uint r = 0; r < EPT; r++) {
+            const float o = simd_shuffle_xor(x[r], s);
+            x[r] = upper ? (o - x[r]) : (x[r] + o);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < EPT; r++) {
+          buf[EPT * tid + r] = x[r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (TPB == 256) {
+          if (tid < 128) {
+            float y[8];
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 8; k++) {
+              y[k] = buf[tid + 128 * k];
+            }
+            bonsai_hadamard_radix<8>(y);
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 8; k++) {
+              buf[tid + 128 * k] = y[k];
+            }
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (uint u = 0; u < 2; u++) {
+            const uint e = tid + 128 * u;
+            float y[4];
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 4; k++) {
+              y[k] = buf[e + 256 * k];
+            }
+            bonsai_hadamard_radix<4>(y);
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < 4; k++) {
+              buf[e + 256 * k] = y[k];
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint gi = sg; gi < 8; gi += uint(TPB) / 32) {
+          const short index = short(gi * 128 + 4 * lane);
+          float v[4];
+          float amax = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            v[r] = buf[index + r] * 0.03125f;
+            amax = max(amax, fabs(v[r]));
+          }
+          amax = simd_max(amax);
+          const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+          const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
+          float part = 0.0f;
+          #pragma clang loop unroll(full)
+          for (short r = 0; r < 4; r++) {
+            const float q = rint(v[r] * iqs);
+            part += q;
+            const uint kk = uint(index + r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+          }
+          part = simd_sum(part);
+          if (lane == 0) {
+            const size_t g = size_t(bcol / 128) + size_t(gi);
+            const uint ml = row & 63u;
+            const size_t qidx = MPERM
+              ? (size_t(row >> 6) * size_t(W / 128) * 64 + g * 64
+                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (size_t(row) * size_t(W / 128) + g);
+            qscale[qidx] = qs;
+            qsum[qidx] = qs * part;
+          }
+        }
+        """
+
+    private static let producerKernel = MLXFast.metalKernel(
+        name: "bonsai_signed_hadamard_1024_q8p_blocks",
+        inputNames: ["a", "b", "w", "eps", "signs"],
+        outputNames: ["out", "qscale", "qsum"],
+        source: producerSource,
+        header: producerHeader,
+        ensureRowContiguous: false)
+
+    private struct ProducerForm: Hashable {
+        let width: Int, prod: Int, gr: Int, gkh: Int, gd: Int, ahd: Int, bhd: Int
+        let perm: Int, mperm: Int, signed: Int, adtype: String, bdtype: String, tpb: Int
+    }
+
+    private static let producerLock = NSLock()
+    nonisolated(unsafe) private static var producerVerdicts: [ProducerForm: Bool] = [:]
+
+    /// The stock producer kernel's outputs for these operands from this
+    /// kernel, or nil (off, not a verify-width launch, or a form that failed
+    /// or cannot take its self-test). `stock` launches the stock producer
+    /// kernel with the same template on given operands.
+    static func launchProducer(
+        a: MLXArray, b: MLXArray, w: MLXArray, eps: MLXArray, signs: MLXArray,
+        template: [(String, any KernelTemplateArg)], rows: Int, width: Int,
+        outShape: [Int], groupShape: [Int], codesDType: DType,
+        stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+    ) -> SignedBlockHadamard.Int8Activation? {
+        guard producerEnabled, rows > 0, width % 1024 == 0, !producerVerifying else { return nil }
+        func value(_ name: String) -> Int? {
+            guard let arg = template.first(where: { $0.0 == name })?.1 else { return nil }
+            if let v = arg as? Int { return v }
+            if let v = arg as? Bool { return v ? 1 : 0 }
+            return nil
+        }
+        guard let prod = value("PROD"), let gr = value("GR"), let gkh = value("GKH"),
+            let gd = value("GD"), let ahd = value("AHD"), let bhd = value("BHD"),
+            let perm = value("PERM"), let mperm = value("MPERM"), let signed = value("SIGNED")
+        else { return nil }
+        guard rows < BonsaiPromptWidth.minimumRows || (prod == 3 && producerPromptGatedNorm)
+        else { return nil }
+        let blocks = rows * (width / 1024)
+        let tpb = threads(blocks: blocks)
+        guard (1 ... 3).contains(prod), gr == 1 || gd % 4 == 0,
+            prod != 3 || (gd == 128 && tpb == 256)
+        else { return nil }
+        let form = ProducerForm(
+            width: width, prod: prod, gr: gr, gkh: gkh, gd: gd, ahd: ahd, bhd: bhd, perm: perm,
+            mperm: mperm, signed: signed, adtype: "\(a.dtype)", bdtype: "\(b.dtype)", tpb: tpb)
+        let tmpl = template + [("TPB", tpb)]
+        func run(_ inputs: [MLXArray]) -> [MLXArray] {
+            producerKernel(
+                inputs, template: tmpl,
+                grid: (tpb * blocks, 1, 1), threadGroup: (tpb, 1, 1),
+                outputShapes: [outShape, groupShape, groupShape],
+                outputDTypes: [codesDType, .float32, .float32])
+        }
+        guard producerVerified(form, a: a, b: b, w: w, eps: eps, signs: signs,
+            template: template, run: run, stock: stock)
+        else { return nil }
+        let outs = run([a, b, w, eps, signs])
+        return SignedBlockHadamard.Int8Activation(codes: outs[0], scales: outs[1], scaledSums: outs[2])
+    }
+
+    /// A synthetic operand with `like`'s shape, strides and dtype: a fresh
+    /// base covering its strided extent (wide magnitude spreads; `zeros`
+    /// clears the first eighth of the base), viewed through the same strides.
+    private static func synthetic(like x: MLXArray, seed: UInt64, zeros: Bool) -> MLXArray {
+        let shape = x.shape
+        let strides = x.strides
+        var extent = 1
+        for (n, s) in zip(shape, strides) where n > 1 { extent += (n - 1) * max(s, 0) }
+        let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 2)
+        var base = MLXRandom.normal([extent], key: keys[0])
+            * exp(MLXRandom.normal([extent], key: keys[1]) * Float(1.5))
+        if zeros {
+            base = which(MLXArray(0 ..< extent) .< MLXArray(Int32(max(extent / 8, 1))), Float(0), base)
+        }
+        return asStrided(base.asType(x.dtype), shape, strides: strides, offset: 0)
+    }
+
+    private static func producerVerified(
+        _ form: ProducerForm, a: MLXArray, b: MLXArray, w: MLXArray, eps: MLXArray,
+        signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        run: ([MLXArray]) -> [MLXArray],
+        stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+    ) -> Bool {
+        producerLock.lock()
+        defer { producerLock.unlock() }
+        if let verdict = producerVerdicts[form] { return verdict }
+        producerVerifying = true
+        defer { producerVerifying = false }
+        var values = 0
+        var mismatches = 0
+        var detail = ""
+        do {
+            try withError { error in
+                // The first call's operands (evaluated here once, at the verify
+                // graph's first build), then two synthetic sets in their layout.
+                eval(a, b, w, eps, signs)
+                let sets: [[MLXArray]] = [
+                    [a, b, w, eps, signs],
+                    [synthetic(like: a, seed: 61, zeros: false), synthetic(like: b, seed: 62, zeros: false),
+                     w, eps, signs],
+                    [synthetic(like: a, seed: 63, zeros: true), synthetic(like: b, seed: 64, zeros: true),
+                     w, eps, signs],
+                ]
+                for inputs in sets {
+                    let p = stock(inputs, template)
+                    let q = run(inputs)
+                    guard p.count == 3, q.count == 3 else { throw SelfTestFailure.message("output count") }
+                    var differ: [MLXArray] = []
+                    for (x, y) in zip(p, q) {
+                        guard x.shape == y.shape, x.dtype == y.dtype else {
+                            throw SelfTestFailure.message("shape or dtype mismatch")
+                        }
+                        let bits: DType = x.dtype == .float32 ? .uint32 : x.dtype
+                        differ.append((x.view(dtype: bits) .!= y.view(dtype: bits)).asType(.int32).sum())
+                        values += x.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            detail = " (\(error))"
+            mismatches = max(mismatches, 1)
+        }
+        let passed = mismatches == 0
+        producerVerdicts[form] = passed
+        FileHandle.standardError.write(
+            ("bonsai producer rotation q8 per block (prod \(form.prod), width \(form.width), "
+                + "\(form.tpb) threads, a \(form.adtype)/\(form.ahd), b \(form.bdtype)/\(form.bhd)): "
+                + "self-test " + (passed ? "passed" : "FAILED") + ": \(values) values, "
+                + "\(mismatches) mismatches" + detail + (passed ? "\n" : "; stock kernel kept\n"))
+                .data(using: .utf8)!)
+        return passed
+    }
+}
+
+// MARK: - Chunked GDN fresh scan: exact forms and a load-time trial
+
+/// Exact forms of the prompt-width fresh scan (`freshChunks`' kernel), and a
+/// load-time trial that keeps the fastest on this device. Every form runs the
+/// record's text (its prefetch staging when active) with the same
+/// `simdgroup_multiply_accumulate` sequence into every accumulator and the
+/// same elementwise operations; what changes:
+/// - `kt`: each chunk's K is also staged transposed (`KTsh[Dk][9]`), written
+///   from the registers that stage `Ksh`, so the state update's K^T tiles are
+///   plain `simdgroup_load`s holding the same 64 values the stock transposed
+///   load of `Ksh` returns; and the staging reads and per-chunk v / y / gf
+///   pointers use 32-bit offsets (the same elements; taken only when every
+///   offset is below 2^31).
+/// - `/8`: eight 8-row state blocks per threadgroup instead of four (each
+///   simdgroup still owns the same 8 rows; only how many share a chunk's
+///   staging changes).
+/// Which form is fastest depends on the GPU (cores; registers and threadgroup
+/// memory per core; the K^T tile adds 4.6 KB per threadgroup). M4 Max, 32
+/// cores, 48 value heads (192 threadgroups of 4, 6 per core): record 324 us,
+/// `kt/4` 300 us (-8%), `kt/8` 289 us (-11%); the per-core load of a 40-core
+/// part (40 heads on 32 cores, 5 threadgroups of 4 per core): record 264 us,
+/// `kt/4` 250 us (-6%), `kt/8` 287 us (+9%). So each form is checked bit for
+/// bit against the stock scan (`chunks` from a zero state; outputs and final
+/// state; 8, 9, 64 and 65 chunks) at model construction, the passing forms are
+/// timed against the record's launch on this device (serialized launches in
+/// interleaved rounds, the median ratio), and the fastest is installed only
+/// when it beats the record by `scanTrialMargin` and a confirmation run
+/// agrees; otherwise the record's launch stays. Double-buffered staging (one
+/// barrier per chunk) and v / decay-factor prefetch were measured and lose
+/// (M4 Max: +28% and +0-7%), so they are not offered. `BONSAI_GDN_SCAN_FORMS=0`
+/// keeps the record's launch; `BONSAI_GDN_SCAN_FORM=<name>` installs that form
+/// after its bitwise check, without timing.
+extension Qwen35GatedDeltaChunked {
+    static let scanFormsEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_SCAN_FORMS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let scanFormForced: String? = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_SCAN_FORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return (value?.isEmpty ?? true) ? nil : value
+    }()
+
+    /// The installed form's kernel, simdgroups per threadgroup and checked
+    /// geometry [Hk, Dk, Hv, Dv] (set once, at model construction, before any
+    /// forward); nil keeps the record's launch.
+    nonisolated(unsafe) static var installedScanForm:
+        (kernel: MLXFast.MLXFastKernel, simdgroups: Int, geometry: [Int])? = nil
+
+    /// Relative gain a form needs over the record's launch to be installed.
+    private static let scanTrialMargin = 0.02
+
+    /// `text` with K also staged transposed and 32-bit offsets (`kt`), by
+    /// checked replacements on the record's fresh scan text, prefetch staging
+    /// (`prefetch`) or stock; nil when a target moved.
+    private static func ktSource(_ text: String, prefetch: Bool) -> String? {
+        var text = text
+        let kStore = prefetch
+            ? "*(threadgroup float4*)(Ksh + row * LK + c4) = pk_[i];"
+            : "*(threadgroup float4*)(Ksh + row * LK + c4) = *(const device float4*)(kbase + src);"
+        let kValue = prefetch ? "pk_[i]" : "kv4"
+        let kStaged = (prefetch ? "" : "const float4 kv4 = *(const device float4*)(kbase + src);\n")
+            + "*(threadgroup float4*)(Ksh + row * LK + c4) = \(kValue);\n"
+            + "KTsh[(c4 + 0) * LT + row] = \(kValue).x;\n"
+            + "KTsh[(c4 + 1) * LT + row] = \(kValue).y;\n"
+            + "KTsh[(c4 + 2) * LT + row] = \(kValue).z;\n"
+            + "KTsh[(c4 + 3) * LT + row] = \(kValue).w;"
+        let t = prefetch ? "tt0" : "t0"
+        let n = prefetch ? "nn" : "n"
+        for (target, replacement) in [
+            ("threadgroup float Ksh[C * LK];",
+             "threadgroup float Ksh[C * LK];\nconstexpr int LT = 9;\nthreadgroup float KTsh[Dk * LT];"),
+            (kStore, kStaged),
+            ("simdgroup_load(kt, Ksh + (ti * 8) * LK + d * 8, LK, ulong2(0, 0), true);",
+             "simdgroup_load(kt, KTsh + (d * 8) * LT + ti * 8, LT);"),
+            ("const size_t src = (size_t)(\(t) + row) * ks + c4;",
+             "const int src = (\(t) + row) * ks + c4;"),
+            ("(which == 0 ? tbase : pbase) + (size_t)\(n) * C * C;",
+             "(which == 0 ? tbase : pbase) + \(n) * C * C;"),
+            ("const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;",
+             "const device float* v_ = vb0 + t0 * vs;"),
+            ("device float* y_ = y + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;",
+             "device float* y_ = yb0 + t0 * vs;"),
+            ("const device float* gf_ = gf + ((size_t)bh * NC + n) * 2 * C;",
+             "const device float* gf_ = gfb0 + n * 2 * C;"),
+            ("simdgroup_float8x8 St[DT];",
+             "const device float* vb0 = v + ((size_t)b_idx * T_) * vs + hv * Dv + r0;\n"
+                + "device float* yb0 = y + ((size_t)b_idx * T_) * vs + hv * Dv + r0;\n"
+                + "const device float* gfb0 = gf + (size_t)bh * NC * 2 * C;\n"
+                + "simdgroup_float8x8 St[DT];"),
+        ] {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        return text
+    }
+
+    private static let ktKernel: MLXFast.MLXFastKernel? = {
+        let prefetch = scanPrefetchActive && scanFreshPrefetchSource != nil
+        guard let text = ktSource(
+            prefetch ? scanFreshPrefetchSource! : scanFreshSource, prefetch: prefetch)
+        else {
+            FileHandle.standardError.write(
+                "qwen35: chunked GDN scan forms: the scan text moved; the record's launch kept\n"
+                    .data(using: .utf8)!)
+            return nil
+        }
+        return MLXFast.metalKernel(
+            name: prefetch ? "bonsai_gated_delta_chunk_scan_fresh_pf_kt"
+                : "bonsai_gated_delta_chunk_scan_fresh_kt",
+            inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+            outputNames: ["y", "state_out"],
+            source: text)
+    }()
+
+    private struct ScanForm {
+        let name: String
+        let kernel: MLXFast.MLXFastKernel
+        let simdgroups: Int
+    }
+
+    private static func scanFormLaunch(
+        _ form: ScanForm, q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray],
+        stateShape: [Int]
+    ) -> (MLXArray, MLXArray) {
+        let (B, T, Hk, Dk, Hv, Dv) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3), v.dim(2), v.dim(3))
+        let outputs = form.kernel(
+            [q, k, v, prepared[0], prepared[1], prepared[2], MLXArray(Int32(T))],
+            template: [
+                ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("NS", form.simdgroups),
+            ],
+            grid: (32, Dv / 8, B * Hv),
+            threadGroup: (32, form.simdgroups, 1),
+            outputShapes: [[B, T, Hv, Dv], stateShape],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    /// Check the forms, time the passing ones, install the fastest (see the
+    /// type's notes). Called by `prepareFresh` once its verdict passed.
+    static func prepareScanForms(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard scanFormsEnabled, installedScanForm == nil, chunk == 8, dk == 128,
+            dv % 64 == 0, 520 * max(hk * dk, hv * dv) < Int(Int32.max)
+        else { return }
+        let record = recordFreshScanKernel
+        var forms = [ScanForm(name: "record/4", kernel: record, simdgroups: scanSimdgroups)]
+        if let ktKernel {
+            forms += [
+                ScanForm(name: "kt/4", kernel: ktKernel, simdgroups: 4),
+                ScanForm(name: "kt/8", kernel: ktKernel, simdgroups: 8),
+            ]
+        }
+        forms = forms.filter { (dv / 8) % $0.simdgroups == 0 }
+        guard forms.count > 1, forms[0].simdgroups == 4 else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6b74_7363), into: 8)
+        var passing = [0]
+        var failed: [String] = []
+        var timingSet: (q: MLXArray, k: MLXArray, v: MLXArray, p: [MLXArray], s: [Int])? = nil
+        do {
+            try withError { error in
+                var verdict = [Bool](repeating: true, count: forms.count)
+                for T in [64, 72, 512, 520] {
+                    // The fresh check's operands: a wide magnitude spread, rows
+                    // 8..15 with g == 0 (the prep's underflow mask), rows 16..23
+                    // with a subnormal g.
+                    func spread(_ shape: [Int], _ i: Int) -> MLXArray {
+                        MLXRandom.normal(shape, key: keys[i])
+                            * exp(MLXRandom.normal(shape, key: keys[i + 3]))
+                    }
+                    let q = spread([1, T, hk, dk], 0) * 0.1
+                    let k = spread([1, T, hk, dk], 1) * 0.1
+                    let v = spread([1, T, hv, dv], 2)
+                    let rowIndex = MLXArray.arange(T).reshaped(1, T, 1)
+                    let g0 = MLXRandom.uniform(0.5 ..< 1.0, [1, T, hv], key: keys[6])
+                    let g = which(
+                        (rowIndex .>= 8) .&& (rowIndex .< 16), Float(0),
+                        which((rowIndex .>= 16) .&& (rowIndex .< 24), Float(1e-39), g0))
+                    let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[7])
+                    let stateShape = [1, hv, dv, dk]
+                    let (yRef, sRef) = chunks(
+                        q: q, k: k, v: v, g: g, beta: beta,
+                        state: MLXArray.zeros(stateShape, dtype: .float32))
+                    let p = prep(q: q, k: k, g: g, beta: beta)
+                    eval([yRef, sRef] + p)
+                    try error.check()
+                    for f in 1 ..< forms.count where verdict[f] {
+                        let (y, s) = scanFormLaunch(
+                            forms[f], q: q, k: k, v: v, prepared: p, stateShape: stateShape)
+                        let differ = (yRef.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                            + (sRef.view(dtype: .uint32) .!= s.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                        eval(differ)
+                        try error.check()
+                        if differ.item(Int32.self) != 0 { verdict[f] = false }
+                    }
+                    if T == 512 { timingSet = (q, k, v, p, stateShape) }
+                }
+                for f in 1 ..< forms.count {
+                    if verdict[f] { passing.append(f) } else { failed.append(forms[f].name) }
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(
+                "qwen35 GDN scan forms: self-test error (\(error)); the record's launch kept\n"
+                    .data(using: .utf8)!)
+            return
+        }
+        var line = "qwen35 GDN scan forms: bitwise vs the stock scan (8, 9, 64, 65 chunks): "
+            + "passed [" + passing.dropFirst().map { forms[$0].name }.joined(separator: " ") + "]"
+            + (failed.isEmpty ? "" : " FAILED [" + failed.joined(separator: " ") + "]")
+        func finish(_ text: String) {
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+            FileHandle.standardError.write(
+                (line + "; " + text + String(format: " (%.0f ms)\n", ms)).data(using: .utf8)!)
+        }
+        if let forced = scanFormForced {
+            if let f = passing.first(where: { forms[$0].name == forced }), f != 0 {
+                installedScanForm = (forms[f].kernel, forms[f].simdgroups, [hk, dk, hv, dv])
+                finish("forced \(forced), installed")
+            } else {
+                finish("forced \(forced) not available; the record's launch kept")
+            }
+            return
+        }
+        guard passing.count > 1, let set = timingSet else {
+            finish("the record's launch kept")
+            return
+        }
+        // Interleaved rounds of bursts (the first round warms up and is not
+        // kept); each form's score is its median time ratio to the record's.
+        // A burst's launches are serialized as in the forward (each takes the
+        // previous launch's output rows as its v): independent launches would
+        // overlap on the GPU and time throughput instead of latency.
+        func sample(_ f: Int, burst: Int) -> Double {
+            var outputs: [MLXArray] = []
+            var rows = set.v
+            for _ in 0 ..< burst {
+                let (y, s) = scanFormLaunch(
+                    forms[f], q: set.q, k: set.k, v: rows, prepared: set.p, stateShape: set.s)
+                outputs.append(s)
+                rows = y
+            }
+            outputs.append(rows)
+            let begin = DispatchTime.now().uptimeNanoseconds
+            eval(outputs)
+            return Double(DispatchTime.now().uptimeNanoseconds - begin) / Double(burst)
+        }
+        let burst = 6
+        var times = [[Double]](repeating: [], count: forms.count)
+        for round in 0 ..< 6 {
+            for j in passing.indices {
+                let f = passing[(j + round) % passing.count]
+                let t = sample(f, burst: burst)
+                if round > 0 { times[f].append(t) }
+            }
+        }
+        func median(_ x: [Double]) -> Double {
+            let s = x.sorted()
+            return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+        }
+        func score(_ f: Int) -> Double {
+            median(zip(times[f], times[0]).map { $0 / $1 }) - 1
+        }
+        line += String(format: "; record/4 %.1f us", median(times[0]) / 1e3)
+        var best = passing[1]
+        for f in passing.dropFirst() {
+            line += " | \(forms[f].name) " + String(format: "%+.1f%%", score(f) * 100)
+            if score(f) < score(best) { best = f }
+        }
+        guard score(best) < -scanTrialMargin else {
+            finish("the record's launch kept")
+            return
+        }
+        // Confirmation: alternating pairs, the same median ratio over all rounds.
+        for round in 0 ..< 6 {
+            let first = round % 2 == 0 ? 0 : best
+            let a = sample(first, burst: burst)
+            let b = sample(first == 0 ? best : 0, burst: burst)
+            times[0].append(first == 0 ? a : b)
+            times[best].append(first == 0 ? b : a)
+        }
+        let confirmed = score(best)
+        if confirmed < -scanTrialMargin {
+            installedScanForm = (forms[best].kernel, forms[best].simdgroups, [hk, dk, hv, dv])
+            finish("\(forms[best].name) confirmed " + String(format: "%+.1f%%", confirmed * 100)
+                + ", installed")
+        } else {
+            finish("\(forms[best].name) not confirmed " + String(format: "(%+.1f%%)", confirmed * 100)
+                + "; the record's launch kept")
+        }
+    }
+}
+
+
+// MARK: - The prompt embedding: host ids for the stepper, built early for the seed
+
+/// Two exact extensions of `Qwen35PromptEmbeddingHostGather` (the prompt's
+/// packed embedding rows gathered on the host, so the prompt forward's first
+/// command buffer never binds the 358 MB table with nothing queued ahead).
+///
+/// LAZY IDS (the timed prefill). The teacher-forced stepper hands the model its
+/// prompt ids as a lazy reshape of a host array, and the host gather reads
+/// only arrays already on the host, so the timed prefill kept the GPU gather
+/// and its first command buffer bound the whole table right after the phase's
+/// idle gate. The ids are evaluated first (a reshape of a host array: no
+/// kernel, one empty command buffer's round trip, which after an idle is the
+/// GPU's wake-up that the first real buffer would otherwise pay), then the same
+/// host gather, the same dequantization and the same unfold run on them.
+/// `BONSAI_PROMPT_EMBED_LAZY_IDS=0` leaves lazy ids to the GPU gather.
+///
+/// EARLY (the seed). The engine builds and submits the prompt's embedding at
+/// the top of the round graph (`cbv2PrefetchPromptEmbedding`), before the
+/// prompt row's cache and state binds and the model entry, so the seed's first
+/// command buffer (and with it the GPU's wake-up) goes out that much sooner.
+/// The forward then takes the embedding it would have built: the same ids
+/// (compared element for element), the same array. Switched by the engine
+/// (`MLXFAST_PROMPT_EMBED_EARLY`).
+enum Qwen35PromptEmbeddingEarly {
+    static let lazyIdsEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_EMBED_LAZY_IDS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Makes `inputs` host-readable when it is a lazy array (the stepper's
+    /// reshaped ids).
+    static func makeHostAvailable(_ inputs: MLXArray) {
+        guard lazyIdsEnabled, Qwen35PromptEmbeddingHostGather.hostBytes(inputs) == nil else { return }
+        eval(inputs)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var slot: (ids: [Int32], embedding: MLXArray)?
+
+    /// Builds and submits the embedding of `ids` (`[1, rows]`, host int32) now,
+    /// for the prompt forward that follows to take.
+    static func prefetch(_ module: Embedding, _ ids: MLXArray) {
+        lock.withLock { slot = nil }
+        guard let embedding = Qwen35PromptEmbeddingHostGather.embed(module, ids),
+            let bytes = Qwen35PromptEmbeddingHostGather.hostBytes(ids)
+        else { return }
+        asyncEval([embedding])
+        let copy = Array(UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: Int32.self), count: ids.size))
+        lock.withLock { slot = (copy, embedding) }
+    }
+
+    /// The prefetched embedding when `inputs` holds exactly its ids; the slot
+    /// is emptied either way.
+    static func take(_ inputs: MLXArray) -> MLXArray? {
+        guard let held = lock.withLock({ () -> (ids: [Int32], embedding: MLXArray)? in
+            defer { slot = nil }
+            return slot
+        }), held.ids.count == inputs.size,
+            let bytes = Qwen35PromptEmbeddingHostGather.hostBytes(inputs)
+        else { return nil }
+        let same = held.ids.withUnsafeBytes { memcmp($0.baseAddress!, bytes, $0.count) == 0 }
+        return same ? held.embedding : nil
+    }
+}
+
+extension Qwen35TextModel: CBv2PromptEmbeddingPrefetching {
+    public func cbv2PrefetchPromptEmbedding(_ tokens: MLXArray) {
+        Qwen35PromptEmbeddingEarly.prefetch(model.embedTokens, tokens)
+    }
+}
+
+extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
+    public func cbv2PrefetchPromptEmbedding(_ tokens: MLXArray) {
+        languageModel.cbv2PrefetchPromptEmbedding(tokens)
     }
 }
