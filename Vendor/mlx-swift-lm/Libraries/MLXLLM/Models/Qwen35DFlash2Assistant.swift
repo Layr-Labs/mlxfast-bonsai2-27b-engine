@@ -601,6 +601,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     public func setBlockContextArmed(_ armed: Bool) throws {
         if armed {
             try target.armDFlash2Tap(layerIds: drafter.config.targetLayerIds)
+            // The engine being built drafts: its prompt forward makes the
+            // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`).
+            DFlash2ResidencyPrefetch.arm(drafter)
         } else {
             target.dFlash2TapLayerIds = nil
         }

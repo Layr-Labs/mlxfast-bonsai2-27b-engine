@@ -5208,6 +5208,12 @@ public class Qwen35TextModelInner: Module {
                 && Qwen35FusedBoundaryQ8.mayApply(rows: hiddenStates.dim(0) * hiddenStates.dim(1)))
         var pending: MLXArray? = nil
         var pendingTapSlot: Int? = nil
+        // A prompt-width forward with the drafter's tap armed binds the
+        // drafter's weights behind its own early submissions when an engine
+        // build that drafts armed the prefetch (`DFlash2ResidencyPrefetch`).
+        let promptPrefetch =
+            tapLayerIds != nil && !captureRecurrentWindow
+            && hiddenStates.dim(1) >= Qwen35TrunkSubmission.promptMinimumRows
         // The pending path's early-submission plan: the verify plan for a
         // verify window, its own prompt plan at prompt width.
         let fusedSubmission =
@@ -5259,6 +5265,11 @@ public class Qwen35TextModelInner: Module {
                 {
                     if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                     asyncEval(out.f.map { [out.h, $0] } ?? [out.h])
+                    // Behind the layers just submitted: the drafter's weights
+                    // for a request that will draft (`DFlash2ResidencyPrefetch`).
+                    if promptPrefetch {
+                        DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
+                    }
                 }
                 continue
             }
@@ -5284,7 +5295,13 @@ public class Qwen35TextModelInner: Module {
             {
                 if promptForward { CBv2EngineWorkInterval.promptSubmitted() }
                 asyncEval([hiddenStates])
+                if promptPrefetch {
+                    DFlash2ResidencyPrefetch.submitDue(completedLayers: modelLayerIndex + 1)
+                }
             }
+        }
+        if promptPrefetch {
+            DFlash2ResidencyPrefetch.submitRemaining()
         }
         if let p = pending {
             hiddenStates = hiddenStates + p
