@@ -308,13 +308,14 @@ enum Qwen35TrunkSubmission {
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
         // 24..63 while the GPU runs 8..23. A third boundary after layer 40
-        // tests whether submitting the tail sooner hides more host work; it
-        // also adds a command-buffer handoff that can cost more than it saves.
+        // measured as a gain on the ranked box; a fourth after layer 56 tests
+        // whether one more early submission of the tail still pays for its
+        // command-buffer handoff.
         // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
         // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40, 56]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -330,7 +331,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
+            verify.explicit == [8, 24, 40, 56] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40, 56]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
