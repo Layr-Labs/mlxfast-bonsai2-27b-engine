@@ -1,4 +1,6 @@
+import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// Exact M1 arithmetic over a short verify window without rereading each W4
@@ -482,4 +484,1235 @@ func qwen35A3BExactTimewiseProjection(
     _ linear: Linear, _ input: MLXArray
 ) -> MLXArray {
     qwen35A3BTimewiseProjection(input) { linear($0) }
+}
+
+/// The strict-prefix commit replay fused into the next verify's scan
+/// (`BONSAI_GDN_REPLAY_FUSED=0` keeps the replay).
+///
+/// The replay (`Qwen35GDNReplayBatch`) reads each GDN layer's pre-verify state
+/// and writes the committed state, which the next verify's scan reads again:
+/// 3.1 MB per layer each way. For a single row the commit stays deferred
+/// (`CBv2DeferredRecurrentReplay`, its conv rows a lazy slice of the tape),
+/// and the next verify runs one launch per layer: phase 1 is the replay's step
+/// loop over the kept rows (the batched replay's text, no output) from the
+/// previous pre-verify state, then the stock store writes the committed state
+/// (this round's pre-verify state), then phase 2 is the output-only verify's
+/// step loop, text and template unchanged, over this round's rows. Between the
+/// phases the state stays in registers, where an FP32 store and reload would
+/// give the same bits. Any other reader of a deferred state builds the replay.
+///
+/// At model construction a self-test compares the output rows and the
+/// committed state, as unsigned integers, with the per-layer replay followed by
+/// `runOutputOnly`, and the state with the batched replay, for 0, 1, 7 and 16
+/// kept rows of four synthetic tapes; a mismatch or MLX error keeps the replay.
+/// (A Qwen35.swift verify kernel, kept here: that file is near its byte cap.)
+enum Qwen35GDNReplayFused {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_REPLAY_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// A deferred commit's replay inputs: the verify tape and its layer.
+    final class Inputs {
+        let layer: ObjectIdentifier
+        let tape: ArraysCache.PrefixReplayTape
+        init(layer: Qwen35GatedDeltaNet, tape: ArraysCache.PrefixReplayTape) {
+            self.layer = ObjectIdentifier(layer)
+            self.tape = tape
+        }
+    }
+
+    /// `Qwen35GatedDeltaV3.source` loading the previous pre-verify state `ps`,
+    /// with a nested block before its step loop: that loop over the previous
+    /// tape's `KP` rows with the batched replay's replacements and
+    /// `OUTPUT_NEEDED` false, then the stock state store.
+    static let source: String? = {
+        guard let parts = Qwen35GatedDeltaV3.sourceParts else { return nil }
+        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        guard parts.head.components(separatedBy: load).count == 2 else { return nil }
+        let head = parts.head.replacingOccurrences(
+            of: load, with: "state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];")
+        var replay = parts.loop
+        for (target, replacement) in [
+            ("for (int t = 0; t < T; ++t) {", "for (int t = 0; t < KP; ++t) {"),
+            (
+                "const float gt = g_[0];",
+                "const float g_sp = qwen35_replay_logaddexp(a_[0] + g_dtb, 0.0f);\n"
+                    + "const float gt = metal::precise::exp(g_nexp * g_sp);"
+            ),
+            ("const float bt = beta_[0];", "const float bt = qwen35_replay_sigmoid(b_[0]);"),
+            (
+                "k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;",
+                "k_ += Hk * Dk; v_ += Hv * Dv; a_ += a_rs; b_ += b_rs;"
+            ),
+        ] {
+            guard replay.components(separatedBy: target).count == 2 else { return nil }
+            replay = replay.replacingOccurrences(of: target, with: replacement)
+        }
+        replay = replay.replacingOccurrences(of: "OUTPUT_NEEDED", with: "false")
+        guard !replay.contains("g_["), !replay.contains("beta_"), !head.contains("state_in")
+        else { return nil }
+        return head + """
+            {
+              const device float* k_ = pk + hk_idx * Dk + dk0;
+              const device float* v_ = pv + hv_idx * Dv + dvbase;
+              const device float* a_ = pa + hv_idx;
+              const device float* b_ = pb + hv_idx;
+              const int a_rs = ab_rows[0];
+              const int b_rs = ab_rows[1];
+              const float g_nexp = -metal::precise::exp(alog[hv_idx]);
+              const float g_dtb = dtb[hv_idx];
+
+            """ + replay + "\n}\n" + parts.store + "\n" + parts.loop + "\n"
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = source.map {
+        MLXFast.metalKernel(
+            name: "qwen35_gdn_replay_fused",
+            inputNames: [
+                "q", "k", "v", "g", "beta", "T", "ps", "pk", "pv", "pa", "pb", "alog", "dtb",
+                "ab_rows", "KP",
+            ],
+            outputNames: ["y", "state_out"],
+            source: $0,
+            header: Qwen35GDNReplayBatch.header,
+            ensureRowContiguous: false)
+    }
+
+    /// One row's `(y, committed state)`: `keep` rows of the previous `tape`
+    /// from its pre-verify state, then this verify's rows (`q` ... `beta`,
+    /// the prework's row-contiguous FP32 outputs). Nil when it does not fit.
+    static func launch(
+        tape: ArraysCache.PrefixReplayTape, keep: Int, aLog: MLXArray, dtBias: MLXArray,
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray
+    ) -> (y: MLXArray, state: MLXArray)? {
+        guard let kernel, Qwen35GatedDeltaV3.enabled, let ps = tape.ssmPre, tape.mask == nil,
+            k.ndim == 4, v.ndim == 4
+        else { return nil }
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Dk = k.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        let P = tape.rowCount
+        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let previous = [ps, tape.k, tape.v, tape.a, tape.b, aLog, dtBias]
+        // The replay's own routing: from `minRows` kept rows it is chunked.
+        guard ([q, k, v, g, beta] + previous).allSatisfy({ $0.dtype == .float32 }),
+            !(Qwen35GatedDeltaChunked.enabled && keep >= Qwen35GatedDeltaChunked.minRows
+                && keep >= Qwen35GatedDeltaChunked.chunk),
+            Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0, keep >= 0, keep <= P,
+            q.shape == [1, T, Hk, Dk], k.shape == q.shape, v.shape == [1, T, Hv, Dv],
+            g.shape == [1, T, Hv], beta.shape == [1, T, Hv], ps.shape == [1, Hv, Dv, Dk],
+            tape.k.shape == [1, P, Hk, Dk], tape.v.shape == [1, P, Hv, Dv],
+            tape.a.shape == [1, P, Hv], tape.b.shape == [1, P, Hv],
+            aLog.shape == [Hv], dtBias.shape == [Hv]
+        else { return nil }
+        // Read in place, as the batched replay reads them: evaluated with
+        // their verify, so this wait is a no-op.
+        eval(previous)
+        guard Qwen35GDNReplayBatch.rowContiguousAfterLeading(ps),
+            Qwen35GDNReplayBatch.rowContiguousAfterLeading(tape.k),
+            Qwen35GDNReplayBatch.rowContiguousAfterLeading(tape.v),
+            aLog.strides == [1], dtBias.strides == [1],
+            let aRows = Qwen35GDNReplayBatch.gateRowStride(tape.a),
+            let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
+        else { return nil }
+        let out = kernel(
+            [q, k, v, g, beta, MLXArray(Int32(T))] + previous
+                + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))],
+            template: [
+                ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
+                ("DVPL", dvpl),
+            ],
+            grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[1, T, Hv, Dv], ps.shape],
+            outputDTypes: [.float32, .float32])
+        return (out[0], out[1])
+    }
+
+    /// The fused scan of a single-row verify whose input SSM is `layer`'s
+    /// pending deferred replay, which it resolves with the committed state.
+    static func run(
+        layer: Qwen35GatedDeltaNet, input: CBv2RecurrentLayerState?,
+        pre: Qwen35GDNPrework.Outputs
+    ) -> (y: MLXArray, state: MLXArray)? {
+        guard let deferred = input?.deferredReplay, deferred.isPending,
+            let inputs = deferred.inputs as? Inputs, inputs.layer == ObjectIdentifier(layer),
+            applies(to: layer),
+            let fused = launch(
+                tape: inputs.tape, keep: deferred.keep, aLog: layer.aLog,
+                dtBias: layer.dtBias, q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta),
+            deferred.resolve(fused.state)
+        else { return nil }
+        return fused
+    }
+
+    private struct Geometry: Hashable {
+        let hk: Int, dk: Int, hv: Int, dv: Int, dvpl: Int
+    }
+
+    private static func geometry(_ layer: Qwen35GatedDeltaNet) -> Geometry {
+        Geometry(
+            hk: layer.numKHeads, dk: layer.headKDim, hv: layer.numVHeads, dv: layer.headVDim,
+            dvpl: Qwen35GatedDeltaV3.rowsPerLane)
+    }
+
+    private static let verdictLock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+
+    /// Whether `layer`'s verify takes the output-only scan this kernel extends
+    /// (state skip on, chunked verify off) and its self-test passed.
+    static func applies(to layer: Qwen35GatedDeltaNet) -> Bool {
+        guard enabled, !Qwen35GatedDeltaChunked.verifyEnabled,
+            Qwen35GDNVerifyStateSkip.applies(to: layer)
+        else { return false }
+        let key = geometry(layer)
+        return verdictLock.withLock { verdicts[key] ?? false }
+    }
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
+
+    /// Run the bitwise self-test once per geometry at model construction,
+    /// after `Qwen35GDNVerifyStateSkip.prepare` (compiling the kernel).
+    static func prepare(layer: Qwen35GatedDeltaNet) {
+        guard enabled, Qwen35GatedDeltaV3.enabled else { return }
+        let key = geometry(layer)
+        verdictLock.lock()
+        defer { verdictLock.unlock() }
+        guard verdicts[key] == nil else { return }
+        let (passed, detail) = selfTest(layer: layer)
+        verdicts[key] = passed
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 GDN replay fused: self-test " + (passed ? "passed" : "FAILED") + " ("
+                + detail + ")"
+                + (passed ? "; the next verify replays the committed prefix\n" : "; replay kept\n"))
+                .data(using: .utf8)!)
+    }
+
+    /// The batch self-test's tapes (a/b column slices of one product, one row
+    /// of saturating and infinite gate inputs) and a following window whose
+    /// gates `Qwen35FusedElementwise.gatedDeltaGates` forms from such inputs.
+    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+        let G = Qwen35GDNReplayBatch.layersPerLaunch
+        let S = Qwen35GDNReplayBatch.selfTestRows
+        let Hk = layer.numKHeads
+        let Dk = layer.headKDim
+        let Hv = layer.numVHeads
+        let Dv = layer.headVDim
+        let NK = layer.convKernelSize - 1
+        let batched = Qwen35GDNReplayBatch.isVerified(layer: layer)
+        let keys = MLXRandom.split(key: MLXRandom.key(0x4644_5250), into: 16 * G)
+        let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+        let marks = MLXArray((0 ..< (2 * Hv)).map { specials[$0 % specials.count] })
+            .reshaped([1, 1, 2 * Hv])
+        var comparisons = 0
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                var differ: [MLXArray] = []
+                func compare(_ a: MLXArray?, _ b: MLXArray?) throws {
+                    guard let a, let b, a.shape == b.shape, a.dtype == .float32,
+                        b.dtype == .float32
+                    else { throw SelfTestFailure.message("shape or dtype mismatch") }
+                    differ.append(
+                        (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
+                    values += a.size
+                    comparisons += 1
+                }
+                var operands: [Qwen35GDNReplayBatch.Operand] = []
+                var windows: [[MLXArray]] = []
+                for j in 0 ..< G {
+                    func key(_ i: Int) -> MLXArray { keys[16 * j + i] }
+                    func gatePair(_ i: Int) -> MLXArray {
+                        let row = MLXArray((0 ..< S).map { $0 == (j + i) % 3 ? Float(1) : 0 })
+                        return MLX.where(
+                            row.reshaped([1, S, 1]) .> 0, marks,
+                            MLXRandom.normal([1, S, 2 * Hv], key: key(i)) * 4)
+                    }
+                    let spread = exp(MLXRandom.normal([1, Hv, Dv, Dk], key: key(0)))
+                    let ssmPre = MLXRandom.normal([1, Hv, Dv, Dk], key: key(1)) * spread * 0.05
+                    let pair = gatePair(2)
+                    let next = gatePair(3)
+                    func rows(_ i: Int, _ h: Int, _ d: Int, _ s: Float) -> MLXArray {
+                        MLXRandom.normal([1, S, h, d], key: key(i)) * s
+                    }
+                    let v = rows(4, Hv, Dv, 1) * exp(rows(5, Hv, Dv, 1))
+                    let nextV = rows(6, Hv, Dv, 1) * exp(rows(7, Hv, Dv, 1))
+                    let convInput = MLXRandom.normal([1, NK + S, layer.convDim], key: key(8))
+                    let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [Hv], key: key(9)))
+                    let dtBias = MLXRandom.normal([Hv], key: key(10))
+                    let gates = Qwen35FusedElementwise.gatedDeltaGates(
+                        [next[0..., 0..., Hv...], next[0..., 0..., ..<Hv], aLog, dtBias])
+                    let window = [
+                        rows(11, Hk, Dk, 0.09), rows(12, Hk, Dk, 0.09), nextV, gates[0], gates[1],
+                    ]
+                    let tape = ArraysCache.PrefixReplayTape(
+                        convInput: convInput, q: rows(13, Hk, Dk, 0.09), k: rows(14, Hk, Dk, 0.09),
+                        v: v, a: pair[0..., 0..., Hv...], b: pair[0..., 0..., ..<Hv],
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                    eval(window + [ssmPre, convInput, tape.q, tape.k, v, tape.a, tape.b, aLog, dtBias])
+                    operands.append(
+                        Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
+                    windows.append(window)
+                }
+                for keep in [0, 1, 7, S] {
+                    let states =
+                        batched && keep > 0
+                        ? Qwen35GDNReplayBatch.launch(
+                            operands, keep: keep,
+                            alog: concatenated(operands.map(\.aLog), axis: 0),
+                            dtb: concatenated(operands.map(\.dtBias), axis: 0),
+                            verifiedOnly: false)
+                        : nil
+                    if batched && keep > 0 && states == nil {
+                        throw SelfTestFailure.message("no batched replay at \(keep) rows")
+                    }
+                    for (j, operand) in operands.enumerated() {
+                        let w = windows[j]
+                        let committed =
+                            keep == 0
+                            ? operand.tape.ssmPre
+                            : layer.replayedPrefixState(
+                                tape: operand.tape, committedRows: keep, aLog: operand.aLog,
+                                dtBias: operand.dtBias, fullWindow: true
+                            ).ssm
+                        guard let committed,
+                            let y = Qwen35GatedDeltaV3.runOutputOnly(
+                                q: w[0], k: w[1], v: w[2], g: w[3], beta: w[4], state: committed),
+                            let fused = launch(
+                                tape: operand.tape, keep: keep, aLog: operand.aLog,
+                                dtBias: operand.dtBias, q: w[0], k: w[1], v: w[2], g: w[3],
+                                beta: w[4])
+                        else { throw SelfTestFailure.message("no launch at \(keep) rows") }
+                        try compare(fused.y, y)
+                        try compare(fused.state, committed)
+                        if let states { try compare(fused.state, states[j].ssm) }
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                    differ.removeAll()
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let expected = 4 * G * 2 + (batched ? 3 * G : 0)
+        let passed = mismatches == 0 && comparisons == expected
+        return (
+            passed,
+            "\(G) tapes at 0, 1, 7 and \(S) kept rows, \(comparisons) comparisons, "
+                + "\(values) values, \(mismatches) mismatches"
+                + (batched ? ", batched replay included" : ""))
+    }
+}
+
+// MARK: - Row-tiled fresh strided GDN prompt prework (znan2)
+
+/// Kept beside the verify helpers so `Qwen35.swift` stays under the
+/// per-file size cap; `Qwen35GDNPrework.runFreshState` calls it.
+extension Qwen35GDNPrework {
+    // MARK: Row-tiled fresh strided prework
+
+    /// `BONSAI_GDN_PREWORK_ROWS=0` keeps `freshStridedKernel` (one row per
+    /// threadgroup) for every prompt chunk.
+    static let rowTiledEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Rows per threadgroup of `freshStridedRowsKernel`: one fixed value, not
+    /// chosen per chip or at run time. A chunk whose row count it does not
+    /// divide takes `freshStridedKernel`.
+    static let rowTile = 4
+
+    /// `freshStridedSource` with one threadgroup per (key head, `RW`
+    /// consecutive rows) instead of per (key head, row). The stock launch reads
+    /// every chunk element from the threadgroups of four neighbouring rows and
+    /// a column's conv taps from every row's threadgroup; here each column's
+    /// `RW + NK` chunk rows and `KS` taps are read once per threadgroup.
+    /// Thread c still owns channel c, so every simdgroup holds the same
+    /// channels in the same lanes and `simd_sum` sees the same operands; row
+    /// t0 + i accumulates the same taps in the same order (`fma` over
+    /// j = 0..KS-1 on chunk row t0 + i + j - NK, the stock kernel's r); each
+    /// row's norms reduce through the same `(r0 + r1) + (r2 + r3)` tree. Every
+    /// formula (the chunk-row load, the tap load and `fma`, SiLU, the norms,
+    /// the gates, the tail) is cut from `freshStridedSource` by checked spans,
+    /// so the arithmetic is the stock kernel's text and follows it; only the
+    /// row bookkeeping around it is new. Checked bit for bit against the stock
+    /// launch at model construction (`prepare`).
+    private static let freshStridedRowsSource: String = {
+        let src = freshStridedSource
+        func fail(_ what: String) -> Never {
+            preconditionFailure(
+                "Qwen35 GDN prework rows: the strided fresh source no longer matches (\(what))")
+        }
+        func occurrences(_ s: String, in text: String) -> Int {
+            text.components(separatedBy: s).count - 1
+        }
+        func once(_ s: String) -> String {
+            if occurrences(s, in: src) != 1 { fail(s) }
+            return s
+        }
+        // The text of `src` from the unique `start` through the first `end` after it.
+        func span(_ start: String, through end: String) -> String {
+            let head = src.range(of: once(start))!
+            guard let stop = src.range(of: end, range: head.upperBound ..< src.endIndex)
+            else { fail(end) }
+            return String(src[head.lowerBound ..< stop.upperBound])
+        }
+        func replacing(
+            _ text: String, _ target: String, _ replacement: String, count: Int = 1
+        ) -> String {
+            if occurrences(target, in: text) != count { fail(target) }
+            return text.replacingOccurrences(of: target, with: replacement)
+        }
+
+        // Constants, thread ids, strides; the row id becomes the tile's first
+        // row and the row-dependent a/b bases move into the gates' row scope.
+        let abBase = span("const int64_t ab = ", through: ";")
+        let bBase = span("const int64_t bbase = ", through: ";")
+        var header = span("constexpr int GRP", through: "threadgroup float red[8];")
+        header = replacing(
+            header, "const uint t = threadgroup_position_in_grid.y;",
+            "const uint t0 = threadgroup_position_in_grid.y * uint(RW);")
+        header = replacing(header, abBase, "")
+        header = replacing(header, bBase, "")
+        header = replacing(header, "threadgroup float red[8];", "threadgroup float red[8 * RW];")
+        if header.range(of: "\\bt\\b", options: .regularExpression) != nil { fail("row id") }
+
+        let silu = span("// MLX's silu", through: "return acc * sig;")
+        let chunkLoad = span("const float xv = (r < 0)", through: ";")
+        let tap = span("acc = fma(xv, ", through: ";")
+        guard tap.hasSuffix(", acc);") else { fail(tap) }
+        let tapWeight = String(tap.dropFirst("acc = fma(xv, ".count).dropLast(", acc);".count))
+        let tapFma = replacing(tap, tapWeight, "wt[j]")
+
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        var normPartial = span("float sq = simd_sum(xq * xq);", through: barrier)
+        normPartial = replacing(String(normPartial.dropLast(barrier.count)), "red[", "rd[", count: 2)
+        let normApply = replacing(
+            span("sq = (red[0]", through: "* wk[c];"), "red[", "rd[", count: 8)
+
+        let vStore = replacing(
+            once("v[vrow * size_t(DV) + c] = conv_silu(colv);"), "conv_silu(colv)", "xvs[ri]")
+        let tailMarker = once("// Next convolution tail")
+        let tail = String(src[src.range(of: tailMarker)!.lowerBound...])
+
+        var text = """
+            @HEADER@
+
+            auto silu = [&](float acc) -> float {
+              @SILU@
+            };
+
+            // Column `col` for rows t0 .. t0+RW-1: window element m is chunk row
+            // t0 + m - NK (the stock kernel's r), row t0 + i takes tap j on
+            // window element i + j.
+            auto conv_silu_rows = [&](uint col, thread float* out) {
+              float wt[KS];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) {
+                wt[j] = @TAPWEIGHT@;
+              }
+              float xw[RW + NK];
+              #pragma clang loop unroll(full)
+              for (int m = 0; m < RW + NK; m++) {
+                const int r = int(t0) + m - NK;
+                @CHUNKLOAD@
+                xw[m] = xv;
+              }
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < RW; i++) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < KS; j++) {
+                  const float xv = xw[i + j];
+                  @TAPFMA@
+                }
+                out[i] = silu(acc);
+              }
+            };
+
+            // q and k channel c of key head h, rows t0 .. t0+RW-1.
+            @COLQ@
+            @COLK@
+            float xqs[RW];
+            float xks[RW];
+            conv_silu_rows(colq, xqs);
+            conv_silu_rows(colk, xks);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              @NORMPARTIAL@
+            }
+
+            // The GRP value heads of this key head (they do not read the norms).
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GRP; i++) {
+              @VHEAD@
+              @COLV@
+              float xvs[RW];
+              conv_silu_rows(colv, xvs);
+              #pragma clang loop unroll(full)
+              for (int ri = 0; ri < RW; ri++) {
+                const uint t = t0 + uint(ri);
+                @VROW@
+                @VSTORE@
+              }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              const float xq = xqs[ri];
+              const float xk = xks[ri];
+              threadgroup float* rd = red + 8 * ri;
+              float sq;
+              float sk;
+              @NORMAPPLY@
+            }
+
+            // Gates: thread c < GRP * RW takes row t0 + c / GRP, value head c % GRP.
+            if (c < uint(GRP * RW)) {
+              const uint t = t0 + c / uint(GRP);
+              const uint hv = h * GRP + c % uint(GRP);
+              @ABBASE@
+              @BBASE@
+              @GROW@
+              @GATES@
+            }
+
+            #pragma clang loop unroll(full)
+            for (int ri = 0; ri < RW; ri++) {
+              const uint t = t0 + uint(ri);
+              @TAIL@
+            }
+            """
+        for (placeholder, piece) in [
+            ("@HEADER@", header),
+            ("@SILU@", silu),
+            ("@TAPWEIGHT@", tapWeight),
+            ("@CHUNKLOAD@", chunkLoad),
+            ("@TAPFMA@", tapFma),
+            ("@COLQ@", span("const uint colq = ", through: ";")),
+            ("@COLK@", span("const uint colk = ", through: ";")),
+            ("@NORMPARTIAL@", normPartial),
+            ("@VHEAD@", once("const uint hv = h * GRP + uint(i);")),
+            ("@COLV@", once("const uint colv = VOFF + hv * DV + c;")),
+            ("@VROW@", span("const size_t vrow = ", through: ";")),
+            ("@VSTORE@", vStore),
+            ("@NORMAPPLY@", normApply),
+            ("@ABBASE@", abBase),
+            ("@BBASE@", bBase),
+            ("@GROW@", span("const size_t grow = ", through: ";")),
+            ("@GATES@", span(
+                "// g = exp(-exp(A_log)",
+                through: "beta[grow] = (bv < 0.0f) ? by : 1.0f - by;")),
+            ("@TAIL@", tail),
+        ] {
+            text = replacing(text, placeholder, piece)
+        }
+        if text.contains("@") || text.contains("conv_silu(") || text.contains("red[sg]") {
+            fail("assembly")
+        }
+        return text
+    }()
+
+    private static let freshStridedRowsKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_strided_rows",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: freshStridedRowsSource,
+        ensureRowContiguous: false)
+
+    /// `BONSAI_GDN_PREWORK_NARROW=0` keeps 64-bit offsets in the row-tiled launch.
+    static let narrowOffsetsEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_NARROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `BONSAI_GDN_PREWORK_FUSED_PREP=0` keeps the chunked scan's prep launch.
+    static let fusedPrepEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_FUSED_PREP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `BONSAI_GDN_PREWORK_SPLIT=0` keeps the value columns in the q/k launch.
+    static let splitValuesEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `freshStridedRowsSource` with 32-bit element offsets. The row-tiled
+    /// launch is bound by its index arithmetic (every load and store forms
+    /// 64-bit products; M4 Max, 48 back-to-back layers: 135 -> 108 us). Here
+    /// the strides are read as `int` and every `int64_t` / `size_t` index is
+    /// `int` / `uint`: the same elements are read and written, and no
+    /// arithmetic on values changes. Taken only where every offset fits in 31
+    /// bits (`narrowFits`).
+    private static let narrowRowsSource: String = {
+        var text = freshStridedRowsSource
+        for name in ["qkv", "w", "a", "b"] {
+            let target = "\(name)_strides["
+            precondition(
+                text.contains(target) && !text.contains("(int)" + target),
+                "Qwen35 GDN prework rows: the narrow source no longer matches")
+            text = text.replacingOccurrences(of: target, with: "(int)" + target)
+        }
+        return text.replacingOccurrences(of: "int64_t", with: "int")
+            .replacingOccurrences(of: "size_t", with: "uint")
+    }()
+
+    /// The value columns' span of `narrowRowsSource` (the GRP value heads'
+    /// conv, SiLU and store), which reads no norm and nothing the q/k block
+    /// writes.
+    private static func valueSpan(_ text: String) -> Range<String.Index> {
+        let marker = "// The GRP value heads of this key head"
+        guard text.components(separatedBy: marker).count == 2,
+            let start = text.range(of: marker),
+            let end = text.range(
+                of: "threadgroup_barrier(mem_flags::mem_threadgroup);",
+                range: start.upperBound ..< text.endIndex)
+        else { preconditionFailure("Qwen35 GDN prework split: the row source no longer matches") }
+        return start.lowerBound ..< end.lowerBound
+    }
+
+    /// `narrowRowsSource` without its value span: q, k, the gates and the tail.
+    private static let splitQKSource: String = {
+        var text = narrowRowsSource
+        text.removeSubrange(valueSpan(text))
+        precondition(!text.contains("v[vrow"))
+        return text
+    }()
+
+    /// The value span alone behind the header and conv helpers (the text
+    /// before the q/k block), one launch of the same grid. The q/k launch's
+    /// consumer (the chunk prep) is enqueued before it, so the two overlap.
+    private static let splitValueSource: String = {
+        let text = narrowRowsSource
+        guard let qk = text.range(of: "// q and k channel c of key head h") else {
+            preconditionFailure("Qwen35 GDN prework split: the row source no longer matches")
+        }
+        let value = String(text[..<qk.lowerBound]) + String(text[valueSpan(text)])
+        precondition(!value.contains("q[qkrow") && !value.contains("tail[") && !value.contains("g[grow"))
+        return value
+    }()
+
+    /// `splitQKSource` launched one chunk per threadgroup (RW = C) with the
+    /// chunked scan's prep (`Qwen35GatedDeltaChunked.prepSource`, verbatim
+    /// but for the (b, key head) id and its three barriers, which only its own
+    /// simdgroup's lanes cross) run by simdgroup 0 behind a device barrier:
+    /// it reads the chunk's q, k, g and beta this threadgroup just stored,
+    /// the values its own launch would have read. Saves the prep launch and
+    /// its latency (M4 Max, 48 dependent layers: -20 us per layer).
+    private static let fusedPrepSource: String = {
+        var prep = Qwen35GatedDeltaChunked.prepSource
+        for (target, replacement, count) in [
+            ("const int bk = int(thread_position_in_grid.z);",
+             "const int bk = int(bb) * Hk + int(h);", 1),
+            ("threadgroup_barrier(mem_flags::mem_threadgroup);",
+             "simdgroup_barrier(mem_flags::mem_threadgroup);", 3),
+        ] {
+            precondition(
+                prep.components(separatedBy: target).count == count + 1,
+                "Qwen35 GDN prework fused prep: the prep source no longer matches")
+            prep = prep.replacingOccurrences(of: target, with: replacement)
+        }
+        precondition(!prep.contains("threadgroup_barrier"))
+        return splitQKSource + """
+
+            threadgroup_barrier(mem_flags::mem_device);
+            if (simdgroup_index_in_threadgroup == 0) {
+            constexpr int C = RW;
+            constexpr int Dk = DK;
+            constexpr int Hk = HK;
+            constexpr int Hv = HV;
+            const int T = Sn;
+            \(prep)
+            }
+
+            """
+    }()
+
+    private static let fusedPrepKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_rows_qk_prep",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "g", "beta", "tail", "tp", "pm", "gf"],
+        source: fusedPrepSource, ensureRowContiguous: false)
+
+    private static let narrowRowsKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_strided_rows_n",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail"],
+        source: narrowRowsSource, ensureRowContiguous: false)
+
+    private static let splitQKKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_rows_qk",
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "g", "beta", "tail"],
+        source: splitQKSource, ensureRowContiguous: false)
+
+    private static let splitValueKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_fresh_rows_v",
+        inputNames: ["qkv", "w", "S"], outputNames: ["v"],
+        source: splitValueSource, ensureRowContiguous: false)
+
+    /// Every element offset below 2^31 with each input row at most 4 * CD
+    /// elements apart (`qkv`, `a` and `b` are column slices of the qkv|z and
+    /// b|a stacks, or of one stack of all four, each narrower; a lazy slice
+    /// does not report its parent's strides before it is evaluated). Every
+    /// output has at most B * S * CD elements.
+    static func narrowFits(batch: Int, rows: Int, convDim: Int) -> Bool {
+        batch * max(rows, 4) * 4 * convDim < Int(Int32.max)
+    }
+
+    /// The row-tiled launch on `runFreshState`'s arguments (after its guards
+    /// and dtype conversions), `rows` rows per threadgroup; `rows` must divide
+    /// the chunk. The outputs have `freshStridedKernel`'s shapes and dtypes.
+    /// `form` 0 is the row-tiled kernel, 1 its narrow offsets, 2 those as a
+    /// q/k launch and a value launch, 3 that with the chunked scan's prep in
+    /// the q/k launch (`Outputs.prepared`); nil takes the verified form.
+    static func freshStridedRows(
+        qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, rows: Int,
+        form: Int? = nil
+    ) -> Outputs {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        precondition(
+            headKDim == 128 && rows > 0 && S % rows == 0
+                && (valueHeads / keyHeads) * rows <= headKDim,
+            "Qwen35 GDN prework rows: unsupported launch")
+        let form =
+            form
+            ?? (narrowFits(batch: B, rows: S, convDim: CD)
+                ? rowForm(
+                    RowTileGeometry(
+                        hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, dtype: "\(qkv.dtype)"))
+                : 0)
+        if form >= 2 {
+            let C = Qwen35GatedDeltaChunked.chunk
+            let fused = form >= 3 && S % C == 0 && (valueHeads / keyHeads) * C <= headKDim
+            let qkRows = fused ? C : rows
+            let qk = (fused ? fusedPrepKernel : splitQKKernel)(
+                [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
+                 MLXArray(Int32(S))],
+                template: [
+                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                    ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", qkRows),
+                ],
+                grid: (128 * keyHeads, S / qkRows, B), threadGroup: (128, 1, 1),
+                outputShapes: [
+                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                    [B, S, valueHeads], [B, S, valueHeads], [B, KS - 1, CD],
+                ] + (fused
+                    ? [[B, valueHeads, S / C, C, C], [B, valueHeads, S / C, C, C],
+                       [B, valueHeads, S / C, 2, C]] : []),
+                outputDTypes: [DType](repeating: .float32, count: fused ? 8 : 5))
+            let v = splitValueKernel(
+                [qkv, convWeight, MLXArray(Int32(S))],
+                template: [
+                    ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                    ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+                ],
+                grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
+                outputShapes: [[B, S, valueHeads, headVDim]], outputDTypes: [.float32])
+            return Outputs(
+                q: qk[0], k: qk[1], v: v[0], g: qk[2], beta: qk[3], tail: qk[4],
+                prepared: fused ? Array(qk[5 ..< 8]) : nil)
+        }
+        let outputs = (form == 1 ? narrowRowsKernel : freshStridedRowsKernel)(
+            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+            ],
+            grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5])
+    }
+
+    private struct RowTileGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
+    }
+
+    private static let rowTileLock = NSLock()
+    nonisolated(unsafe) private static var rowTileVerdicts: [RowTileGeometry: Bool] = [:]
+    /// The highest `freshStridedRows` form that matched, per geometry and dtype.
+    nonisolated(unsafe) private static var rowFormVerdicts: [RowTileGeometry: Int] = [:]
+    private static var rowForms: Int {
+        !narrowOffsetsEnabled ? 1 : !splitValuesEnabled ? 2 : !fusedPrepEnabled ? 3 : 4
+    }
+
+    private static func rowForm(_ geometry: RowTileGeometry) -> Int {
+        min(rowTileLock.withLock { rowFormVerdicts[geometry] ?? 0 }, rowForms - 1)
+    }
+
+    /// Verdict lookup only (the check runs in `prepare`, never inside a
+    /// forward); a geometry or qkv dtype that was not prepared, or failed its
+    /// check, keeps the stock kernel.
+    static func rowTileVerified(
+        keyHeads: Int, valueHeads: Int, convDim: Int, taps: Int, dtype: DType
+    ) -> Bool {
+        guard rowTiledEnabled else { return false }
+        let geometry = RowTileGeometry(
+            hk: keyHeads, hv: valueHeads, cd: convDim, ks: taps, dtype: "\(dtype)")
+        return rowTileLock.withLock { rowTileVerdicts[geometry] ?? false }
+    }
+
+    /// Compile the row-tiled kernel for this geometry and check it bit for bit
+    /// against the stock launch (`runFreshState` itself, which takes the stock
+    /// kernel while no verdict exists), once per process, at model
+    /// construction, for every qkv dtype `runFreshState` accepts. A mismatch
+    /// prints one line and keeps the stock kernel. Called from the layer's init.
+    static func prepare(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard enabled, freshStridedReads, rowTiledEnabled, dk == 128, dv == 128, hk > 0,
+            hv % hk == 0, (hv / hk) * rowTile <= dk, ks > 1
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            if rowTileLock.withLock({ rowTileVerdicts[geometry] != nil }) { continue }
+            let passed = rowTileSelfCheck(
+                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype, forms: rowForms)
+            let verdict = passed > 0
+            let recorded = rowTileLock.withLock { () -> Bool in
+                guard rowTileVerdicts[geometry] == nil else { return false }
+                rowTileVerdicts[geometry] = verdict
+                rowFormVerdicts[geometry] = max(passed - 1, 0)
+                return true
+            }
+            if recorded && verdict && rowForms > 1 {
+                FileHandle.standardError.write(
+                    "qwen35 GDN prompt prework (\(dtype)): \(passed - 1) of \(rowForms - 1) forms (narrow offsets, split value launch, fused chunk prep) match the row-tiled kernel bit for bit\n"
+                        .data(using: .utf8)!)
+            }
+            if recorded && !verdict {
+                FileHandle.standardError.write(
+                    "qwen35: GDN row-tiled prework kernel disagrees with the stock kernel on this device (\(dtype)); using the stock kernel\n"
+                        .data(using: .utf8)!)
+            }
+        }
+    }
+
+    /// How many of the first `forms` launch forms match the stock launch bit
+    /// for bit, stopping at the first that does not (0: the row-tiled kernel
+    /// does not).
+    private static func rowTileSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType, forms: Int
+    ) -> Int {
+        var passed = forms
+        let cd = 2 * hk * dk + hv * dv
+        // qkv is a column slice of a wider stack, as the model's qkv|z product.
+        let width = cd + hv * dv
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7277_7469), into: 8)
+        for T in [64, 512] where T % rowTile == 0 {
+            // A wide magnitude spread; rows 0..<ks of key head 0's q channels
+            // are zero, so those rows' q norm reduces exact zeros (eps only).
+            let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+            let zero = (MLXArray.arange(T).reshaped(1, T, 1) .< ks)
+                .&& (MLXArray.arange(width).reshaped(1, 1, width) .< dk)
+            let stack = which(zero, Float(0), spread).asType(dtype)
+            let qkv = stack[.ellipsis, ..<cd]
+            let ba = MLXRandom.normal([1, T, 2 * hv], key: keys[2]) * 2
+            let b = ba[.ellipsis, ..<hv]
+            let a = ba[.ellipsis, hv...]
+            let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[3]) * 0.5
+            // The layer's decay coefficient, formed as the layer forms it.
+            let aDecay = Qwen35GDNDerived().decay(MLXRandom.normal([hv], key: keys[4]) * 0.5)
+            let dtBias = MLXRandom.normal([hv], key: keys[5])
+            let normScales = (
+                q: MLXRandom.normal([dk], key: keys[6]), k: MLXRandom.normal([dk], key: keys[7])
+            )
+            guard
+                let stock = runFreshState(
+                    qkv: qkv, convStateShape: [1, ks - 1, cd], convWeight: convWeight,
+                    a: a, b: b, aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                    keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv)
+            else { return 0 }
+            for form in 0 ..< passed {
+                let tiled = freshStridedRows(
+                    qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
+                    normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                    headVDim: dv, rows: rowTile, form: form)
+                var pairs = [
+                    (stock.q, tiled.q), (stock.k, tiled.k), (stock.v, tiled.v),
+                    (stock.g, tiled.g), (stock.beta, tiled.beta), (stock.tail, tiled.tail),
+                ]
+                if form == 3 {
+                    guard let fused = tiled.prepared, fused.count == 3 else { passed = form; break }
+                    let prep = Qwen35GatedDeltaChunked.prep(
+                        q: stock.q, k: stock.k, g: stock.g, beta: stock.beta)
+                    pairs += zip(prep, fused).map { ($0, $1) }
+                }
+                var same = MLXArray(true)
+                for (x, y) in pairs {
+                    same = same .&& all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
+                }
+                if !same.item(Bool.self) {
+                    passed = form
+                    break
+                }
+            }
+            if passed == 0 { return 0 }
+        }
+        return passed
+    }
+}
+
+// MARK: - Verify-window GDN prework, every read first
+
+/// The verify window's GDN prework (`qwen35_gdn_prework_ci_strided`) with
+/// every device read issued before any store. The stock kernel stores q and
+/// k, then reads the v columns' taps; stores v, then reads the gate inputs;
+/// then re-reads this row's qkv columns for the conv input and, for the last
+/// NK rows, again for the conv tail. Here each thread reads its q, k and v
+/// columns' taps and weights, the norm scales and the gate inputs up front,
+/// computes, and stores last. The conv input is written from the tap values
+/// (row NK + t is tap NK; at t == 0, rows r < NK are taps r, the state's
+/// rows), and the conv tail, which the verify never reads, is not stored: it
+/// is returned as the conv input's last NK rows (the same rows). Every
+/// formula is the stock kernel's, in its order, so the outputs are the same
+/// bits; checked against the stock launch at model construction
+/// (`prepareVerify`). `BONSAI_PREWORK_VERIFY_LF=0` keeps the stock kernel.
+extension Qwen35GDNPrework {
+    static let verifyLoadsFirstEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_VERIFY_LF"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // grid (128 * HK, S, B), threadgroup (128, 1, 1); inputs and template as
+    // `stridedSource`; outputs q, k, v, g, beta and ci (`[B, KS - 1 + S, CD]`).
+    // Not private: `Qwen35SplitKFold` derives its reads-first variant from it.
+    static let verifyLoadsFirstSource = """
+        constexpr int GRP = HV / HK;
+        constexpr int KEY = HK * DK;
+        constexpr int VOFF = 2 * KEY;
+        constexpr int NK = KS - 1;
+        constexpr int NC = 2 + GRP;
+        const uint c = thread_position_in_threadgroup.x;
+        const uint h = threadgroup_position_in_grid.x;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint bb = threadgroup_position_in_grid.z;
+        const int Sn = S;
+        const int64_t qb = int64_t(bb) * qkv_strides[0];
+        const int64_t qs1 = qkv_strides[1];
+        const int64_t qs2 = qkv_strides[2];
+        const int64_t cb = int64_t(bb) * cs_strides[0];
+        const int64_t cs1 = cs_strides[1];
+        const int64_t cs2 = cs_strides[2];
+        threadgroup float red[8];
+        uint col[NC];
+        col[0] = h * DK + c;
+        col[1] = KEY + h * DK + c;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GRP; i++) { col[2 + i] = VOFF + (h * GRP + uint(i)) * DV + c; }
+
+        // Reads: the KS taps and weights of the q, k and v columns, the norm
+        // scales, and (c < GRP) the gate inputs.
+        float xt[NC][KS];
+        float wt[NC][KS];
+        #pragma clang loop unroll(full)
+        for (int n = 0; n < NC; n++) {
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < KS; j++) {
+            const int r = int(t) + j - NK;
+            xt[n][j] = (r < 0)
+                ? cs[cb + int64_t(r + NK) * cs1 + int64_t(col[n]) * cs2]
+                : float(qkv[qb + int64_t(r) * qs1 + int64_t(col[n]) * qs2]);
+            wt[n][j] = w[int64_t(col[n]) * w_strides[0] + int64_t(j) * w_strides[1]];
+          }
+        }
+        const float wqc = wq[int64_t(c) * wq_strides[0]];
+        const float wkc = wk[int64_t(c) * wk_strides[0]];
+        const bool gate = c < uint(GRP);
+        const uint hv = h * GRP + (gate ? c : 0u);
+        float av = 0.0f;
+        float bv = 0.0f;
+        float dcy = 0.0f;
+        if (gate) {
+          const int64_t ab = int64_t(bb) * a_strides[0] + int64_t(t) * a_strides[1];
+          const int64_t bbase = int64_t(bb) * b_strides[0] + int64_t(t) * b_strides[1];
+          av = a[ab + int64_t(hv) * a_strides[2]] + dtb[int64_t(hv) * dtb_strides[0]];
+          bv = b[bbase + int64_t(hv) * b_strides[2]];
+          dcy = decay[int64_t(hv) * decay_strides[0]];
+        }
+
+        // Conv + SiLU of each column (the stock `conv_silu`).
+        float xs[NC];
+        #pragma clang loop unroll(full)
+        for (int n = 0; n < NC; n++) {
+          float acc = 0.0f;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < KS; j++) {
+            acc = fma(xt[n][j], wt[n][j], acc);
+          }
+          const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+          const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+          xs[n] = acc * sig;
+        }
+        const float xq = xs[0];
+        const float xk = xs[1];
+        float sq = simd_sum(xq * xq);
+        float sk = simd_sum(xk * xk);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        if (lane == 0) {
+          red[sg] = sq;
+          red[4 + sg] = sk;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sq = (red[0] + red[1]) + (red[2] + red[3]);
+        sk = (red[4] + red[5]) + (red[6] + red[7]);
+        const float invq = metal::precise::rsqrt(sq / float(DK) + 1e-6f);
+        const float invk = metal::precise::rsqrt(sk / float(DK) + 1e-6f);
+        float gv = 0.0f;
+        float betav = 0.0f;
+        if (gate) {
+          const float mx = metal::max(av, 0.0f);
+          const float mn = metal::min(av, 0.0f);
+          const float sp = mx + log1p(metal::exp(mn - mx));
+          gv = metal::precise::exp(dcy * sp);
+          const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
+          betav = (bv < 0.0f) ? by : 1.0f - by;
+        }
+
+        // Stores.
+        const size_t qkrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HK) + size_t(h);
+        q[qkrow * size_t(DK) + c] = (xq * invq) * wqc;
+        k[qkrow * size_t(DK) + c] = (xk * invk) * wkc;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GRP; i++) {
+          const size_t vrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV)
+              + size_t(h * GRP + uint(i));
+          v[vrow * size_t(DV) + c] = xs[2 + i];
+        }
+        if (gate) {
+          const size_t grow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV) + size_t(hv);
+          g[grow] = gv;
+          beta[grow] = betav;
+        }
+        const size_t cirow = (size_t(bb) * size_t(Sn + NK) + size_t(NK) + size_t(t)) * size_t(CD);
+        #pragma clang loop unroll(full)
+        for (int n = 0; n < NC; n++) { ci[cirow + col[n]] = xt[n][NK]; }
+        if (t == 0) {
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < NK; r++) {
+            const size_t cirow0 = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+            #pragma clang loop unroll(full)
+            for (int n = 0; n < NC; n++) { ci[cirow0 + col[n]] = xt[n][r]; }
+          }
+        }
+        """
+
+    private static let verifyLoadsFirstKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_verify_lf",
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        outputNames: ["q", "k", "v", "g", "beta", "ci"],
+        source: verifyLoadsFirstSource,
+        ensureRowContiguous: false)
+
+    private struct LoadsFirstGeometry: Hashable {
+        let hk: Int, hv: Int, cd: Int, ks: Int, dtype: String
+    }
+
+    private static let loadsFirstLock = NSLock()
+    nonisolated(unsafe) private static var loadsFirstVerdicts: [LoadsFirstGeometry: Bool] = [:]
+
+    /// Whether `run(..., writeConvInput: true, stridedReads: true)` takes the
+    /// loads-first kernel for this geometry and qkv dtype (the switch on and
+    /// the verdict recorded by `prepareVerify`). `Qwen35SplitKFold` mirrors
+    /// the pick so its folded launch is derived from the kernel the verify
+    /// path takes.
+    static func verifyLoadsFirstVerified(
+        keyHeads: Int, valueHeads: Int, cd: Int, ks: Int, dtype: DType
+    ) -> Bool {
+        guard verifyLoadsFirstEnabled else { return false }
+        let geometry = LoadsFirstGeometry(
+            hk: keyHeads, hv: valueHeads, cd: cd, ks: ks, dtype: "\(dtype)")
+        return loadsFirstLock.withLock { loadsFirstVerdicts[geometry] ?? false }
+    }
+
+    /// `run(..., writeConvInput: true, stridedReads: true)` by the loads-first
+    /// kernel, or nil when this geometry and dtype were not verified (the
+    /// check runs in `prepareVerify`, never inside a forward).
+    static func verifyLoadsFirst(
+        qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aDecay: MLXArray, dtb: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int
+    ) -> Outputs? {
+        guard verifyLoadsFirstEnabled else { return nil }
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        let geometry = LoadsFirstGeometry(
+            hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, dtype: "\(qkv.dtype)")
+        guard loadsFirstLock.withLock({ loadsFirstVerdicts[geometry] ?? false }) else {
+            return nil
+        }
+        let outputs = verifyLoadsFirstKernel(
+            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS),
+            ],
+            grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+            outputShapes: [
+                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                [B, KS - 1 + S, CD],
+            ],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: outputs[5][0..., S..., 0...], convInput: outputs[5])
+    }
+
+    /// Check the loads-first kernel bit for bit against the stock verify
+    /// launch (`run` itself, which takes the stock kernel while no verdict
+    /// exists) for each qkv dtype the verify window passes, once per process,
+    /// at model construction. A mismatch or MLX error keeps the stock kernel.
+    static func prepareVerify(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard enabled, verifyStridedReads, verifyLoadsFirstEnabled, dk == 128, dv == 128,
+            hk > 0, hv % hk == 0, ks > 1
+        else { return }
+        let cd = 2 * hk * dk + hv * dv
+        for dtype in [DType.float32, .float16] {
+            let geometry = LoadsFirstGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
+            if loadsFirstLock.withLock({ loadsFirstVerdicts[geometry] != nil }) { continue }
+            let (verdict, detail) = loadsFirstSelfCheck(
+                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype)
+            let recorded = loadsFirstLock.withLock { () -> Bool in
+                guard loadsFirstVerdicts[geometry] == nil else { return false }
+                loadsFirstVerdicts[geometry] = verdict
+                return true
+            }
+            if recorded {
+                FileHandle.standardError.write(
+                    ("qwen35 GDN verify prework (reads first, \(dtype)): self-test "
+                        + (verdict ? "passed" : "FAILED") + " (" + detail + ")"
+                        + (verdict ? "\n" : "; stock kernel kept\n")).data(using: .utf8)!)
+            }
+        }
+    }
+
+    private static func loadsFirstSelfCheck(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType
+    ) -> (Bool, String) {
+        let cd = 2 * hk * dk + hv * dv
+        let nk = ks - 1
+        // qkv a column slice of a wider stack (the qkv|z product), a and b
+        // column slices of one product, the conv state a row slice.
+        let width = cd + hv * dv
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6C66_7672), into: 10)
+        let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+        var values = 0
+        var mismatches = 0
+        do {
+            try withError { error in
+                for T in [16, 5] {
+                    let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                        * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+                    // Key head 0's q channels are zero in row 1: an eps-only norm.
+                    let zero = (MLXArray.arange(T).reshaped(1, T, 1) .== 1)
+                        .&& (MLXArray.arange(width).reshaped(1, 1, width) .< dk)
+                    let stack = which(zero, Float(0), spread).asType(dtype)
+                    let qkv = stack[.ellipsis, ..<cd]
+                    let states = MLXRandom.normal([1, nk + 2, cd], key: keys[2])
+                    let convState = states[0..., 1 ..< (nk + 1), 0...]
+                    var ba = MLXRandom.normal([1, T, 2 * hv], key: keys[3]) * 4
+                    let marks = MLXArray((0 ..< (2 * hv)).map { specials[$0 % specials.count] })
+                    ba = MLX.where(
+                        (MLXArray.arange(T) .== 2).reshaped([1, T, 1]),
+                        marks.reshaped([1, 1, 2 * hv]), ba)
+                    let b = ba[.ellipsis, ..<hv]
+                    let a = ba[.ellipsis, hv...]
+                    let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[4]) * 0.5
+                    let aDecay = Qwen35GDNDerived().decay(
+                        MLXRandom.normal([hv], key: keys[5]) * 0.5)
+                    let dtBias = MLXRandom.normal([hv], key: keys[6])
+                    let normScales = (
+                        q: MLXRandom.normal([dk], key: keys[7]),
+                        k: MLXRandom.normal([dk], key: keys[8])
+                    )
+                    eval(qkv, convState, a, b, convWeight, aDecay, dtBias, normScales.q,
+                        normScales.k)
+                    guard
+                        let stock = run(
+                            qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                            aDecay: aDecay, dtBias: dtBias, normScales: normScales,
+                            keyHeads: hk, valueHeads: hv, headKDim: dk, headVDim: dv,
+                            writeConvInput: true, stridedReads: true),
+                        let stockCI = stock.convInput
+                    else { throw SelfTestFailure.message("no stock launch") }
+                    let lf = verifyLoadsFirstKernel(
+                        [qkv, convState, convWeight, a, b, aDecay, dtBias, normScales.q,
+                         normScales.k, MLXArray(Int32(T))],
+                        template: [
+                            ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
+                            ("CD", cd), ("KS", ks),
+                        ],
+                        grid: (128 * hk, T, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [
+                            [1, T, hk, dk], [1, T, hk, dk], [1, T, hv, dv], [1, T, hv], [1, T, hv],
+                            [1, nk + T, cd],
+                        ],
+                        outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+                    var differ: [MLXArray] = []
+                    for (x, y) in [
+                        (stock.q, lf[0]), (stock.k, lf[1]), (stock.v, lf[2]), (stock.g, lf[3]),
+                        (stock.beta, lf[4]), (stockCI, lf[5]), (stock.tail, lf[5][0..., T..., 0...]),
+                    ] {
+                        guard x.shape == y.shape else {
+                            throw SelfTestFailure.message("shape mismatch")
+                        }
+                        differ.append(
+                            (x.view(dtype: .uint32) .!= y.view(dtype: .uint32)).asType(.int32).sum())
+                        values += x.size
+                    }
+                    let count = stacked(differ).sum()
+                    eval(count)
+                    try error.check()
+                    mismatches += Int(count.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        return (mismatches == 0, "rows 16 and 5, \(values) values, \(mismatches) mismatches")
+    }
+
+    private enum SelfTestFailure: Error {
+        case message(String)
+    }
 }
