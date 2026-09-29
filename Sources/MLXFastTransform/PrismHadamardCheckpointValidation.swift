@@ -2,7 +2,6 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Quantization expectations parsed from the pinned Ternary Bonsai 2 27B
 /// pack's `quantization` block.
 ///
 /// The pack is UNIFORM: MLX affine, 2 bits, group size 128, and the contract
