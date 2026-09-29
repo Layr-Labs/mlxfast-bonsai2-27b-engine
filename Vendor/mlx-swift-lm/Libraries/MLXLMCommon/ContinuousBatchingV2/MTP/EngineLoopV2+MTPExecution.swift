@@ -623,13 +623,30 @@ extension EngineLoopV2 {
                     // A fixed-depth leg plans that same depth; a smaller
                     // plan (never taken while the early gate holds) reads a
                     // prefix of the block, which is still only a proposal.
+                    // Lookup, when it fired, already replaced these ids.
                     precondition(
                         k <= early.depth,
                         "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
                     proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
                 } else {
-                    proposal = try block.proposeBlock(
-                        anchor: carry.token, depth: k, requestState: requestState)
+                    // A unique prompt span decides the ids on the host; the
+                    // drafter then only absorbs this round's context rows
+                    // (`absorbLookupRound`, as the early block path does).
+                    let lookup = CBv2PromptLookupDraft.proposal(
+                        history: row.rec.tokens,
+                        promptLength: row.rec.request.promptTokens.count, depth: k)
+                    if let lookup, let absorbed = block.absorbLookupRound(requestState: requestState) {
+                        proposal = lookup
+                        assistantEvalTargets.append(contentsOf: absorbed)
+                    } else {
+                        let drafted = try block.proposeBlock(
+                            anchor: carry.token, depth: k, requestState: requestState)
+                        proposal = lookup ?? drafted
+                        // The replacement does not depend on the drafter graph.
+                        // Keep that graph live so the cache writes are not dropped.
+                        assistantEvalTargets.append(drafted)
+                    }
+                    block.noteLookupRound(lookup != nil, requestState: requestState)
                     // Align the drafter's context cache with the TARGET's
                     // committed length, exactly where the reference does it:
                     // after the proposal absorbed this round's context rows.

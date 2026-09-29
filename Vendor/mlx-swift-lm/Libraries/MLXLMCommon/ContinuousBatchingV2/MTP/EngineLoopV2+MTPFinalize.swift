@@ -445,9 +445,20 @@ extension EngineLoopV2 {
                 let leading =
                     Self.earlyDraftLeadingLayers > 0
                     ? block as? any CBv2MTPBlockLeadingSubmission : nil
+                // A unique prompt span decides this block's ids on the host.
+                // Without an adopted block the drafter then only absorbs the
+                // confirmed rows (`absorbLookupRound`) instead of running a
+                // block forward whose ids the lookup would replace.
+                let lookup = CBv2PromptLookupDraft.proposal(
+                    history: rec.tokens, promptLength: rec.request.promptTokens.count, depth: k)
+                let lookupContext =
+                    adoptedProposal == nil && lookup != nil
+                    ? block.absorbLookupRound(requestState: state) : nil
                 let proposal: MLXArray?
                 if let adoptedProposal {
                     proposal = adoptedProposal
+                } else if lookupContext != nil, let lookup {
+                    proposal = lookup
                 } else if let leading {
                     proposal = try? leading.proposeBlock(
                         anchor: anchor, depth: k, requestState: state,
@@ -456,9 +467,15 @@ extension EngineLoopV2 {
                     proposal = try? block.proposeBlock(
                         anchor: anchor, depth: k, requestState: state)
                 }
-                if let tokens = proposal {
+                if let drafted = proposal {
+                    // The looked-up ids when a unique prompt span matches. The
+                    // drafter graph, or the absorbed rows, stay live either way.
+                    let tokens = lookup ?? drafted
+                    block.noteLookupRound(lookup != nil, requestState: state)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
-                    let targets = [tokens] + block.evaluationTargets(for: state)
+                    let targets =
+                        [tokens, drafted] + (lookupContext ?? [])
+                        + block.evaluationTargets(for: state)
                     if leading != nil {
                         deferredDraftTargets = targets
                     } else {

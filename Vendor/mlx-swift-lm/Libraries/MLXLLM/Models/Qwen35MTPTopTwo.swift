@@ -181,13 +181,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Same fold as the scalar loop; store four consecutive columns as
+          // float4/half4. Layout: i groups of 4 share mh,nq with c=0..3.
+          // Alignment: fn in {0,4,8,12}, n0 multiple of TN, N multiple of 32.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < SG - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < SG - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -247,8 +264,13 @@ enum Qwen35TensorPackedMatmul {
 
     /// 32-column blocks per threadgroup (`DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB`,
     /// 1 to 8) and simdgroups splitting K per block (`..._HEAD_KS`, 2 or 4).
+    /// Default 1: each threadgroup is one 32-column block (two K-split
+    /// simdgroups). Every block's arithmetic is the same at any CB (a block
+    /// never reads another's partials), so the output is bitwise the CB = 4
+    /// one; on the drafter's 16 x 100,352 head one block per threadgroup runs
+    /// about 4% faster on M5 Max (460 vs 482 us, standalone).
     private static let headColumnBlocks: Int = {
-        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 4
+        let value = Int(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_HEAD_CB"] ?? "") ?? 1
         return min(max(value, 1), 8)
     }()
     private static let headKSplit: Int = {
@@ -2411,6 +2433,111 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // The prompt-width int8 kernel with the weight operand in registers
+    // (`promptRegisterWeights`): a 32 x 64 output tile per threadgroup of
+    // two simdgroups, each running its own 32 x 32 x 128 op
+    // (`execution_simdgroup`) whose right operand is a cooperative tensor
+    // the simdgroup builds from the tiled 2-bit words directly: lane l holds
+    // columns nl + 8c (c = 0..3) and the k-quad kq of every 16-block of the
+    // group, which is plane kq of the column's word for that block ((w >> 2 kq)
+    // & 0x03030303, the staged8 kernel's K order). No threadgroup memory, no
+    // staging stores, no barriers. Same integer product per 128-group (exact),
+    // the same FP32 epilogue per element in ascending group order and the same
+    // conversion at the store, so every output is bitwise the staged8
+    // kernel's (checked at load, `promptRegisterSelfTest`). Hot configuration
+    // only: signed codes, negated offsets, factored epilogue, row-tiled
+    // constants and the tiled word copy. grid (N / 64 * 64, M / 32, 1),
+    // threadgroup (64, 1, 1); inputs as `sourceStaged8`. Four-wide stores.
+    private static let sourceStaged8Reg = """
+
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int ms = int(threadgroup_position_in_grid.y) * 32;
+        const int ns = int(threadgroup_position_in_grid.x) * 64 + 32 * int(sg);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        thread uint32_t* bw = (thread uint32_t*)&bT;
+        auto tA0 = A.template slice<128, 32>(0, ms);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = ns + fn;
+        const int mb = ms + fm;
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+        const uint kq = (lane & 1) + 2 * ((lane >> 3) & 1);
+        const device uint4* wcol = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256 + (size_t)nl * 8);
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 16);
+        const int NQ = N / 4;
+        const size_t tb0 = (size_t)(ms / 64) * (size_t)Kg * 64 + (size_t)(fm * 4) + (size_t)((ms & 32) >> 4);
+        const size_t tb1 = tb0 + 32;
+        const uint sh = 2 * kq;
+        uint4 wv[8];
+        auto load = [&](int g) {
+          const device uint4* src = wcol + (size_t)g * 64;
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * 16]; wv[2 * c + 1] = src[c * 16 + 1]; }
+        };
+        auto extract = [&]() {
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) {
+            const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];
+            bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;
+            bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;
+            bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;
+            bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;
+          }
+        };
+        auto epi = [&](int g) {
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float2 a0 = *(const device float2*)(ascale + tb0 + (size_t)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tb1 + (size_t)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);
+          const float as[4] = {a0.x, a0.y, a1.x, a1.y};
+          const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            acc[i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[i]);
+          }
+        };
+        for (int g = 0; g < Kg; g++) {
+          load(g); extract();
+          auto tA = A.template slice<128, 32>(g * 128, ms);
+          op.run(tA, bT, cT);
+          epi(g);
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+          const size_t base = (size_t)mm * N + nb + 16 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          } else {
+            *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
+          }
+        }
+        """
+
+    private static let kernelStaged8Reg = MLXFast.metalKernel(
+        name: "bonsai_tensor_packed_matmul_q8_rb",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: sourceStaged8Reg,
+        header: header,
+        ensureRowContiguous: true)
+
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -3248,6 +3375,18 @@ enum Qwen35TensorPackedMatmul {
         _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
         k: Int, n: Int, outputDType: DType, materialize: Bool
     ) -> NarrowKernel {
+        let choice = narrowChoice(cache, scales, biases, k: k, n: n, outputDType: outputDType)
+        if choice.form == .negativeBiasF32Scales {
+            _ = narrowScalesF32(cache, scales, materialize: materialize)
+        }
+        return choice
+    }
+
+    /// `narrowKernel` without building the FP32 scales.
+    static func narrowChoice(
+        _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
+        k: Int, n: Int, outputDType: DType
+    ) -> NarrowKernel {
         let choice = narrowByShape[[k, n]] ?? narrowDefault
         if n % choice.variant.tn != 0 { return .original }
         // zoo 3a: only on the production shapes its self-test ran (not the head)
@@ -3266,9 +3405,6 @@ enum Qwen35TensorPackedMatmul {
         }
         guard choice.form != .base else { return choice }
         guard cache.biasesAreNegativeScales(scales, biases) else { return .original }
-        if choice.form == .negativeBiasF32Scales {
-            _ = narrowScalesF32(cache, scales, materialize: materialize)
-        }
         return choice
     }
 
@@ -3345,6 +3481,89 @@ enum Qwen35TensorPackedMatmul {
                     + (same ? "passed; both routes read the tiled copy\n"
                         : "FAILED; the stored layout is kept\n")).utf8))
         return same
+    }
+
+    /// The prompt-width int8 kernel with the weight operand built in
+    /// registers (`sourceStaged8Reg`) in place of the staged8 kernel, for the
+    /// hot configuration (signed codes, factored epilogue, row-tiled
+    /// constants, the tiled word copy; per projection: negated offsets). On
+    /// unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_REG=0`, and only after its
+    /// bitwise self-test against the staged8 kernel (`promptRegisterSelfTest`).
+    static let promptRegisterWeights: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_REG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""), support == .staged8,
+            signedCodes, factoredPromptEpilogue, rowTiledConstants, narrowTiled
+        else { return false }
+        return promptRegisterSelfTest()
+    }()
+
+    /// The projections the register-weight kernel takes: all of them (the
+    /// 6144 x 5120 output projections too, measured faster in the engine).
+    static func promptRegisterTakes(k: Int, n: Int) -> Bool { true }
+
+    nonisolated(unsafe) private static var promptRegisterFailed = false
+    nonisolated(unsafe) static var promptRegisterAnnounced = false
+
+    /// `sourceStaged8Reg` against `sourceStaged8` (TILED, the hot template) on
+    /// synthetic operands: three shapes (1, 2 and 3 row tiles; 8, 20 and 12
+    /// groups), FP32 and FP16 outputs, every output bit compared. A compile or
+    /// run error counts as a failure.
+    private static func promptRegisterSelfTest() -> Bool {
+        var same = true
+        var compared = 0
+        promptRegisterFailed = false
+        withErrorHandler({ _ in Qwen35TensorPackedMatmul.promptRegisterFailed = true }) {
+            for (index, (m, k, n)) in [(128, 1024, 192), (64, 2560, 128), (192, 1536, 320)].enumerated() {
+                let kg = k / 128
+                let seed = UInt64(91 + 8 * index)
+                let codes = MLXRandom.randInt(
+                    Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(seed)
+                ).asType(.int8)
+                let weight = MLXRandom.randInt(
+                    Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(seed + 1)
+                ).asType(.uint16).view(dtype: .uint32)
+                var s = MLXRandom.uniform(
+                    Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(seed + 2))
+                let pick = MLXRandom.randInt(Int32(0) ..< Int32(64), [kg, n], key: MLXRandom.key(seed + 3))
+                s = which(pick .== MLXArray(Int32(0)), MLXArray(Float(0)), s)
+                s = which(pick .== MLXArray(Int32(1)), MLXArray(Float(-0.0)), s)
+                let scalesT = s.asType(.float16)
+                let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                let folded = MLXRandom.normal([kg, n], key: MLXRandom.key(seed + 4))
+                let ascale = MLXRandom.uniform(
+                    Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(seed + 5))
+                let asums = MLXRandom.normal([m, kg], key: MLXRandom.key(seed + 6)) * Float(50)
+                let tiled = tileNarrowWeight(weight, n: n, k: k)
+                let inputs = [codes, tiled, scalesT, biasesT, folded, ascale, asums, dimsArray(k: k, m: m, n: n)]
+                for outputDType in [DType.float32, .float16] {
+                    let stock = kernelStaged8(
+                        inputs,
+                        template: [
+                            ("OutT", outputDType), ("MPERM", 1), ("SIGNED", 1),
+                            ("NEGATIVE_SCALE_BIAS", 1), ("FACTORED", 1), ("TILED", 1),
+                        ],
+                        grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let reg = kernelStaged8Reg(
+                        inputs, template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    let bits: DType = outputDType == .float32 ? .uint32 : .uint16
+                    let equal = (stock.view(dtype: bits) .== reg.view(dtype: bits)).all()
+                    eval(equal)
+                    if !equal.item(Bool.self) { same = false }
+                    compared += m * n
+                }
+            }
+        }
+        let passed = same && !promptRegisterFailed
+        FileHandle.standardError.write(
+            Data(
+                ("bonsai prompt register-weight kernel: self-test "
+                    + (passed ? "passed (\(compared) values bitwise, 0 mismatches)\n"
+                        : "FAILED; the staged8 kernel is kept\n")).utf8))
+        return passed
     }
 
     /// `[N, K/16]` packed words reordered to `[N/32, K/128, 32, 8]`: for each
@@ -4058,6 +4277,7 @@ enum Qwen35TensorPackedMatmul {
                     activation.scaledSums.shape == [m, k / 128],
                     scales.shape == [n, k / 128], biases.shape == [n, k / 128]
                 else { return nil }
+                recordVerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType)
                 let choice = narrowKernel(
                     cache, scales, biases, k: k, n: n, outputDType: outputDType, materialize: false)
                 let scalesT: MLXArray
@@ -4155,6 +4375,7 @@ enum Qwen35TensorPackedMatmul {
             // built here, at the first prompt forward (the load-time warm), so
             // no verify round pays the readback or the widening.
             prepareNarrowOperands(cache, weight, scales, biases)
+            cache.residencyMarks |= promptReadMark
             let scalesT = cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
             let biasesT = cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() }
             let foldedSums = cache.derived(scales, tag: 3) { s in
@@ -4170,8 +4391,25 @@ enum Qwen35TensorPackedMatmul {
             case .native2b: packedKernel = kernel
             case .staged8:
                 packedKernel = kernelStaged8
-                template.append(("NEGATIVE_SCALE_BIAS",
-                    cache.biasesAreNegativeScales(scales, biases) ? 1 : 0))
+                let negative = cache.biasesAreNegativeScales(scales, biases)
+                // The register-weight form of the same kernel (hot template,
+                // self-tested bitwise at load): same inputs, same grid.
+                if negative, promptRegisterTakes(k: k, n: n), promptRegisterWeights {
+                    if !promptRegisterAnnounced {
+                        promptRegisterAnnounced = true
+                        FileHandle.standardError.write(
+                            "bonsai prompt register-weight kernel: in use (m \(m), k \(k), n \(n), \(outputDType))\n"
+                                .data(using: .utf8)!)
+                    }
+                    let words = narrowTiledWeight(cache, weight, materialize: true)
+                    return kernelStaged8Reg(
+                        [codes, words, scalesT, biasesT, foldedSums, activation.scales,
+                         activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                        template: [("OutT", outputDType)],
+                        grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                        outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                }
+                template.append(("NEGATIVE_SCALE_BIAS", negative ? 1 : 0))
                 template.append(("FACTORED", factoredPromptEpilogue ? 1 : 0))
                 template.append(("TILED", narrowTiled ? 1 : 0))
             default: packedKernel = kernelStaged
@@ -4188,6 +4426,88 @@ enum Qwen35TensorPackedMatmul {
                 grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
+    }
+}
+
+// MARK: - Window-only verify operands (DFlash2ResidencyPrefetch)
+
+/// The verify int8 operands a decode window reads that its seed's prompt
+/// route does not, for `DFlash2ResidencyPrefetch` to make GPU-resident behind
+/// the seed. The prompt route binds each projection's words (the tiled copy
+/// where tiled), FP16 scales and offsets transposed (tags 1, 2) and folded
+/// sums (tag 3); the verify route binds the same words and, by the kernel
+/// chosen for the shape (the load-time pick, its in-situ trial, the zoo
+/// trials), tags 1 and 2, tag 1 alone, or the FP32-widened scales (tag 4),
+/// which nothing else reads. So a projection the prompt route reads adds only
+/// its tag 4 when its chosen form reads it; one it never reads (the head, the
+/// last layer's narrowed rows) adds every operand of its chosen kernel.
+extension Qwen35TensorPackedMatmul {
+    /// `HadamardConstantLayoutCache.residencyMarks` bits.
+    static let promptReadMark = 4
+
+    /// A verify int8 call site, held weakly: its layout cache and constants.
+    private final class VerifySite {
+        weak var cache: HadamardConstantLayoutCache?
+        weak var weight: MLXArray?
+        weak var scales: MLXArray?
+        weak var biases: MLXArray?
+        let k: Int, n: Int, outputDType: DType
+
+        init(
+            _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, _ scales: MLXArray,
+            _ biases: MLXArray, k: Int, n: Int, outputDType: DType
+        ) {
+            (self.cache, self.weight, self.scales, self.biases) = (cache, weight, scales, biases)
+            (self.k, self.n, self.outputDType) = (k, n, outputDType)
+        }
+    }
+
+    private static let siteLock = NSLock()
+    nonisolated(unsafe) private static var verifySites: [VerifySite] = []
+
+    /// Records a verify int8 site at its first graph build per output dtype
+    /// (a mark on its cache; later calls check the mark only).
+    static func recordVerifySite(
+        _ cache: HadamardConstantLayoutCache, _ weight: MLXArray, _ scales: MLXArray,
+        _ biases: MLXArray, k: Int, n: Int, outputDType: DType
+    ) {
+        let mark = outputDType == .float32 ? 2 : 1
+        guard cache.residencyMarks & mark == 0 else { return }
+        siteLock.withLock {
+            guard cache.residencyMarks & mark == 0 else { return }
+            cache.residencyMarks |= mark
+            verifySites.append(
+                VerifySite(cache, weight, scales, biases, k: k, n: n, outputDType: outputDType))
+        }
+    }
+
+    /// The window-only operands of every recorded site under the kernels
+    /// installed now (built ones only; nothing is built here).
+    static func windowResidencyArrays() -> [MLXArray] {
+        let sites = siteLock.withLock { verifySites }
+        var arrays: [MLXArray] = []
+        for site in sites {
+            guard let cache = site.cache, let weight = site.weight, let scales = site.scales,
+                let biases = site.biases
+            else { continue }
+            let choice = narrowChoice(
+                cache, scales, biases, k: site.k, n: site.n, outputDType: site.outputDType)
+            let promptRead = cache.residencyMarks & promptReadMark != 0
+            var reads: [MLXArray?] = []
+            if !promptRead { reads.append(narrowTiled ? cache.existing(weight, tag: 5) : weight) }
+            switch choice.form {
+            case .negativeBiasF32Scales:
+                reads.append(cache.existing(scales, tag: 4))
+            case .negativeBias:
+                if !promptRead { reads.append(cache.existing(scales, tag: 1)) }
+            case .base:
+                if !promptRead {
+                    reads += [cache.existing(scales, tag: 1), cache.existing(biases, tag: 2)]
+                }
+            }
+            arrays += reads.compactMap { $0 }
+        }
+        return arrays
     }
 }
 

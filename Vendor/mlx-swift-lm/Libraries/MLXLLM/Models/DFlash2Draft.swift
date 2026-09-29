@@ -466,6 +466,80 @@ final class DFlash2SlidingMaskMemo {
 
 // MARK: - Attention
 
+/// The speculative block's attention (16 queries over the held keys) through
+/// MLX's NAX attention, whose one-query-block case (at most 16 query rows, no
+/// causal mask, no sinks) now pipelines the key blocks over the 64-row
+/// tile's four simdgroups (`steel_attention_nax`): each round, simdgroup s
+/// scores key block 4j + s (the loop's loads, mma chain, scale and masks),
+/// every simdgroup runs the running-max chain over the round's blocks,
+/// simdgroup s forms its block's exp2(S - m) and rescale factor, and every
+/// simdgroup then folds the four blocks in key order into its own pair of
+/// O's head-dim fragments with the loop's own statements (l *= factor, the
+/// probabilities' row_reduce, O *= factor, O += P V). Before, simdgroup 0
+/// alone ran the whole chain while the other three repeated it over empty
+/// rows; the scores of four blocks are now computed at once (about 2.5x
+/// faster at 1,000 keys). Every output element is the same operations on
+/// the same operands. `verify` checks it at bind against the untouched path
+/// (the same queries plus one row, 17 rows, which the pipeline does not
+/// take; rows are independent) on the drafter's geometry, every output bit;
+/// on a mismatch the block's queries go in with one zero row appended (the
+/// untouched path) and the extra output row is dropped.
+enum DFlash2AttentionPipeline {
+    nonisolated(unsafe) static var padQueries = false
+    nonisolated(unsafe) private static var verified = false
+
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXArray?
+    ) -> MLXArray {
+        let rows = queries.dim(2)
+        if padQueries, rows <= 16, queries.ndim == 4 {
+            let padded = concatenated(
+                [queries, MLXArray.zeros([queries.dim(0), queries.dim(1), 17 - rows, queries.dim(3)],
+                    dtype: queries.dtype)], axis: 2)
+            return MLXFast.scaledDotProductAttention(
+                queries: padded, keys: keys, values: values, scale: scale, mask: mask)[
+                    0..., 0..., ..<rows, 0...]
+        }
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+    }
+
+    static func verify(dtype: DType, heads: Int, kvHeads: Int, headDim: Int) {
+        guard !verified else { return }
+        verified = true
+        var same = true
+        var compared = 0
+        do {
+            try withError { error in
+                for (seed, keysLength) in [(0, 48), (1, 545), (2, 1000), (3, 2080)] {
+                    func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x5d9a + seed * 8 + salt)) }
+                    let q = (MLXRandom.normal([1, heads, 17, headDim], key: key(0)) * 2).asType(dtype)
+                    let k = (MLXRandom.normal([1, kvHeads, keysLength, headDim], key: key(1)) * 2).asType(dtype)
+                    let v = MLXRandom.normal([1, kvHeads, keysLength, headDim], key: key(2)).asType(dtype)
+                    let mask = (MLXArray(Int32(0) ..< Int32(keysLength)) .< MLXArray(Int32(keysLength - 7 * seed - 3)))
+                        .reshaped([1, keysLength])
+                    let scale = 1 / Float(headDim).squareRoot()
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: q, keys: k, values: v, scale: scale, mask: mask)[0..., 0..., ..<16, 0...]
+                    let split = MLXFast.scaledDotProductAttention(
+                        queries: q[0..., 0..., ..<16, 0...], keys: k, values: v, scale: scale, mask: mask)
+                    same = same && split.shape == reference.shape
+                        && all(split.view(dtype: .uint16) .== reference.view(dtype: .uint16)).item(Bool.self)
+                    compared += reference.size
+                }
+                try error.check()
+            }
+        } catch {
+            same = false
+        }
+        padQueries = !same
+        FileHandle.standardError.write(
+            ("dflash2 block attention key pipeline: "
+                + (same ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; pipelined\n"
+                    : "self-test failed; queries padded to 17 rows (untouched path)\n")).data(using: .utf8)!)
+    }
+}
+
 private final class DFlash2Attention: Module {
     let layerType: DFlash2LayerType
     let slidingWindow: Int?
@@ -728,6 +802,9 @@ extension DFlash2Attention {
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 
+    /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
+    func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
+
     var speculativeCapable: Bool {
         dflash2KVConcatEnabled && !isCausal && slidingWindow != nil
             && qkv.applies(q: qProj, k: kProj, v: vProj)
@@ -759,7 +836,7 @@ extension DFlash2Attention {
         let allValues = y[.ellipsis, kEnd...].reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
         guard case let (keys, values)? = cache.speculativeRows(keys: allKeys, values: allValues)
         else { return nil }
-        let output = MLXFast.scaledDotProductAttention(
+        let output = DFlash2AttentionPipeline.attend(
             queries: queries, keys: keys[.ellipsis, ..<(held + n), 0...],
             values: values[.ellipsis, ..<(held + n), 0...], scale: scale, mask: keyMask)
         return (
@@ -845,6 +922,9 @@ private final class DFlash2QKVStack {
     static let kvOnlyMinimumRows = 256
 
     func applies(q: Linear, k: Linear, v: Linear) -> Bool { stacked(q: q, k: k, v: v) != nil }
+
+    /// The stacked weight (built on first use), or nil when the stack does not apply.
+    func stackWeight(q: Linear, k: Linear, v: Linear) -> MLXArray? { stacked(q: q, k: k, v: v) }
 
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
@@ -1428,6 +1508,168 @@ enum DFlash2TensorMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    /// `sourceSwapped` (on after its load-time self-test; `MLXFAST_DRAFT_SWAP=0`
+    /// keeps `source`): the same product with the operands' roles swapped.
+    /// Each simdgroup loads its 32-column weight slice for one KT-wide K
+    /// step (KT = 128) into a cooperative left operand (`[32, KT]`, K
+    /// contiguous as stored) and multiplies it by the transposed 16-row input
+    /// slice, so the op is `32 x 16 x KT` into a `[32 columns, 16 rows]` FP32
+    /// accumulator. The weight read is a plain cooperative load issued ahead
+    /// of the op instead of the op's own operand fetch. Each output element is
+    /// still the FP32 sum of the same BF16 products over each simdgroup's K
+    /// partition, accumulated in K order, and the partitions (`SPLITS`, the
+    /// same `K / SPLITS` slabs) are added in the same order as `source`, so
+    /// the output is bitwise `source`'s: `prepareSwapped` compares every
+    /// weight's output bit for bit at load and keeps `source` on any
+    /// mismatch. Stored layout only (no tiled copy is read).
+    private static let sourceSwapped = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          auto tX = X.template slice<KT, 16>(k, 0);
+          lw.load(tW);
+          op.run(lw, tX, cT);
+        }
+        threadgroup float red[SPLITS - 1][16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT.is_valid_element(i)) continue;
+            float v;
+            if constexpr (SPLITS == 2) {
+              v = cT[i] + red[0][i * 32 + lane];
+            } else {
+              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            }
+            // Destination coordinates: [0] the input row, [1] the column in the block.
+            auto idx = cT.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+          }
+        }
+        """
+
+    private static let kernelSwapped = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m16s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// `source32` in `sourceSwapped`'s form: one cooperative `[32, KT]`
+    /// weight slice per K step, multiplied by the input's rows 0-15 and
+    /// 16-31 (two `32 x 16 x KT` ops into two accumulators), the same K
+    /// partitions and the same partial order as `source32`, so its bits
+    /// (`prepareSwapped` compares them at load).
+    private static let sourceSwapped32 = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT0.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          auto tW = W.template slice<KT, 32>(k, n0);
+          lw.load(tW);
+          auto tXlo = X.template slice<KT, 16>(k, 0);
+          op.run(lw, tXlo, cT0);
+          auto tXhi = X.template slice<KT, 16>(k, 16);
+          op.run(lw, tXhi, cT1);
+        }
+        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT0.is_valid_element(i)) continue;
+            float v0, v1;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
+                  + red[2][(16 + i) * 32 + lane];
+            }
+            auto idx = cT0.get_multidimensional_index(i);
+            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+          }
+        }
+        """
+
+    private static let kernelSwapped32 = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_m32s",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwapped32,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// Whether 17-32-row launches take `sourceSwapped32` (set by `prepareSwapped`).
+    nonisolated(unsafe) static var swapped32Active = false
+
+    /// The K step of `sourceSwapped` (`MLXFAST_DRAFT_SWAP_KT`: 64 or 128, default 128).
+    private static let swappedKT: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_KT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw == "64" ? 64 : 128
+    }()
+
+    /// `MLXFAST_DRAFT_SWAP=0` keeps `source` for the stored layout.
+    private static let swappedSetting: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// Whether stored-layout launches take `sourceSwapped`: set once by
+    /// `prepareSwapped` when every weight's output matched bit for bit.
+    nonisolated(unsafe) static var swappedActive = false
+
     // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
     // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
     // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
@@ -1572,13 +1814,7 @@ enum DFlash2TensorMatmul {
                 a = concatenated(
                     [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
             }
-            let splits = n >= 16384 ? 2 : 4
-            let threads = splits * 32
-            let y = kernel32(
-                [a, weight, dimsArray(k: k, n: n)],
-                template: [("OutT", DType.bfloat16), ("SPLITS", splits)],
-                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
-                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [.bfloat16])[0]
+            let y = launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
             let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
             return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
         }
@@ -1588,7 +1824,10 @@ enum DFlash2TensorMatmul {
         }
         let chosen = current
         let y: MLXArray
-        if chosen.tiled, let tiled = tiledCopy(weight) {
+        if swappedActive {
+            // The swapped kernel reads the stored weight (no copy exists while it is on).
+            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+        } else if chosen.tiled, let tiled = tiledCopy(weight) {
             y = chosen.variant(n: n)
                 ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
                 : launch(a, tiled, k: k, n: n, tiled: true, outputDType: .bfloat16)
@@ -1626,11 +1865,130 @@ enum DFlash2TensorMatmul {
         // Keep the accepted four-way route for the smaller projections.
         let splits = Kernel.stockSplits(n: n)
         let threads = splits * 32
+        if !tiled && swappedActive {
+            return launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+        }
         return kernel(
             [a, w, dimsArray(k: k, n: n)],
             template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", tiled ? 1 : 0)],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `source32` (or `sourceSwapped32` when `swapped`) over a 32-row `a`.
+    private static func launch32(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, swapped: Bool, outputDType: DType
+    ) -> MLXArray {
+        let splits = n >= 16384 ? 2 : 4
+        let threads = splits * 32
+        if swapped {
+            return kernelSwapped32(
+                [a, w, dimsArray(k: k, n: n)],
+                template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernel32(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `sourceSwapped` over a 16-row `a` and the stored `[N, K]` weight, with
+    /// the stock kernel's K split.
+    private static func launchSwapped(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, splits: Int, outputDType: DType
+    ) -> MLXArray {
+        let threads = splits * 32
+        return kernelSwapped(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+            grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// Runs `sourceSwapped` and the stock kernel on every one of `weights`
+    /// (stored layout) against the same random 16-row BF16 input, FP32 and
+    /// BF16 outputs, and compares every output bit; `swappedActive` only when
+    /// all match. One stderr line either way. Nothing runs when the kernel is
+    /// off, the toolchain has no tensor operands, or `MLXFAST_DRAFT_SWAP=0`.
+    static func prepareSwapped(_ weights: [MLXArray], rows32 weights32: [MLXArray] = []) -> Bool {
+        swappedActive = false
+        swapped32Active = false
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, swappedSetting else {
+            return false
+        }
+        let eligible = weights.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        guard !eligible.isEmpty else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var inputs: [Int: MLXArray] = [:]
+        var differing: [MLXArray] = []
+        var values = 0
+        for (index, w) in eligible.enumerated() {
+            let k = w.dim(1)
+            let n = w.dim(0)
+            let splits = n >= 16384 ? 2 : 4
+            let a = inputs[k] ?? MLXRandom.normal(
+                [rowsPerTile, k], key: MLXRandom.key(UInt64(9203 + index))
+            ).asType(.bfloat16)
+            inputs[k] = a
+            for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                let stock = kernel(
+                    [a, w, dimsArray(k: k, n: n)],
+                    template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", 0)],
+                    grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+                    outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+                let swapped = launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+                differing.append(
+                    (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                values += rowsPerTile * n
+            }
+            if differing.count >= 16 {
+                let partial = stacked(differing).sum()
+                eval(partial)
+                differing = [partial]
+            }
+        }
+        let mismatches = stacked(differing).sum().item(Int.self)
+        swappedActive = mismatches == 0
+        // The 32-row form, only while the 16-row one is on.
+        var mismatches32 = 0
+        var values32 = 0
+        let eligible32 = weights32.filter {
+            $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
+        }
+        if swappedActive, rows32Enabled, !eligible32.isEmpty {
+            var differing32: [MLXArray] = []
+            for (index, w) in eligible32.enumerated() {
+                let k = w.dim(1)
+                let n = w.dim(0)
+                let a = MLXRandom.normal(
+                    [2 * rowsPerTile, k], key: MLXRandom.key(UInt64(9403 + index))
+                ).asType(.bfloat16)
+                for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                    let stock = launch32(a, w, k: k, n: n, swapped: false, outputDType: outputDType)
+                    let swapped = launch32(a, w, k: k, n: n, swapped: true, outputDType: outputDType)
+                    differing32.append(
+                        (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
+                    values32 += 2 * rowsPerTile * n
+                }
+            }
+            mismatches32 = stacked(differing32).sum().item(Int.self)
+            swapped32Active = mismatches32 == 0
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 swapped m16 kernel: self-test \(swappedActive ? "passed" : "FAILED") "
+                    + "(\(eligible.count) weights, \(values) values bitwise, \(mismatches) mismatches); "
+                    + (swappedActive ? "on, K step \(swappedKT)" : "stock kept")
+                    + "; 32-row form \(eligible32.count) weights, \(values32) values, "
+                    + "\(mismatches32) mismatches, " + (swapped32Active ? "on" : "off")
+                    + String(format: "; %.0f ms\n", elapsed)).utf8))
+        return swappedActive
     }
 
     // MARK: Tiled weights
@@ -1823,10 +2181,10 @@ enum DFlash2TensorMatmul {
     }
 
     /// The array `apply` reads for `weight` at block width: its tiled copy
-    /// while the chosen kernel reads the tiled layout (`current.tiled`), the
-    /// weight itself otherwise.
+    /// while `current` reads the tiled copies (`tiled` and every variant),
+    /// the weight itself otherwise (`stock`, or a weight without a copy).
     static func readWeight(_ weight: MLXArray) -> MLXArray {
-        (current.tiled ? tiledCopy(weight) : nil) ?? weight
+        (current.tiled && !swappedActive ? tiledCopy(weight) : nil) ?? weight
     }
 
     /// `[N, K]` reordered to `[N/32, K/256, 32, 256]` (returned as `[N, K]`):
@@ -1864,7 +2222,9 @@ enum DFlash2TensorMatmul {
         dropTiledCopies()
         current = .stock
         passedBitwiseVariants = []
-        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false
+        // The swapped kernel reads the stored layout: no copy, no kernel trial.
+        guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, tiledSetting != false,
+            !swappedActive
         else { return false }
         let eligible = weights.filter {
             $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && $0.dim(0) % 32 == 0
@@ -2396,6 +2756,12 @@ private final class DFlash2DecoderLayer: Module {
         return (attention.read + feedForward.read + rest, replaced)
     }
 
+    /// The two convolutions' tap projections (16-row tensor kernel too).
+    func projectionWeights() -> [MLXArray] {
+        [attentionConv.kernelProjection, mlpConv.kernelProjection]
+            .filter { $0.bias == nil }.map { $0.weight }
+    }
+
     func callAsFunction(
         _ x: MLXArray, context: MLXArray?, rope: RoPELayer, cache: KVCache,
         masks: DFlash2SlidingMaskMemo
@@ -2551,7 +2917,7 @@ enum DFlash2TopK {
             ("VEC", vector ? 1 : 0),
             ("HALF", logits.dtype == .float16 ? 1 : 0),
         ]
-        let parts = chunkKernel(
+        let parts = (vector && k % (threads / 32) == 0 && thresholdActive ? thresholdChunkKernel : chunkKernel)(
             [flat], template: template,
             grid: (threads * chunks, rows, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, chunks, k], [rows, chunks, k]],
@@ -2652,6 +3018,160 @@ enum DFlash2TopK {
             uint ok = 0u, oi = 0u;
             mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
             constexpr uint NSG = TPG / 32;
+            threadgroup uint sk[NSG * KK], si[NSG * KK];
+            if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+                if (lane < NSG) {
+                    for (int j = 0; j < KK; j++) { k[j] = sk[lane * KK + j]; id[j] = si[lane * KK + j]; }
+                }
+                mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+                if (lane < uint(KK)) {
+                    size_t o = (size_t(row) * S + chunk) * KK + lane;
+                    part_key[o] = ok; part_idx[o] = oi;
+                }
+            }
+            """,
+        header: header)
+
+    /// `MLXFAST_DFLASH_TOPK_THRESHOLD=0` keeps the one-pass chunk scan.
+    static let thresholdSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_THRESHOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether the chunk pass takes `thresholdChunkKernel`: set once by
+    /// `prepareThreshold` (at bind) when its lists matched the stock pass's.
+    nonisolated(unsafe) static var thresholdActive = false
+    nonisolated(unsafe) private static var thresholdChecked = false
+
+    /// Runs `select` with the one-pass and the two-pass chunk kernels on the
+    /// same logits (FP16 and FP32; random rows, rows with a few large values,
+    /// rows of heavy ties, NaN and signed zeros) and compares every candidate
+    /// id and every gathered value bit for bit; the two-pass scan is used only
+    /// when all match. One stderr line.
+    static func prepareThreshold(vocabularySize: Int, k: Int) {
+        guard !thresholdChecked else { return }
+        thresholdChecked = true
+        guard enabled, thresholdSetting, vocabularySize % (chunks * 4) == 0, k % (threads / 32) == 0
+        else { return }
+        var same = true
+        var values = 0
+        do {
+            try withError { error in
+                for (seed, dtype) in [(0, DType.float16), (1, .float16), (2, .float32), (3, .float16)] {
+                    let rows = 16
+                    var logits = MLXRandom.normal([1, rows, vocabularySize], key: MLXRandom.key(UInt64(0x70c + seed))) * 3
+                    let ids = MLXArray(0 ..< Int32(vocabularySize)).reshaped([1, 1, vocabularySize])
+                    let row = MLXArray(0 ..< Int32(rows)).reshaped([1, rows, 1])
+                    // heavy ties on every fourth row, a few large values elsewhere
+                    logits = MLX.where((row % 4) .== 1, (ids % 5).asType(.float32), logits)
+                    logits = MLX.where(((ids * 7 + row * 131) % 2503) .== 0, logits + 12, logits)
+                    if seed == 3 {
+                        logits = MLX.where(ids .== 777, MLXArray(Float.nan), logits)
+                        logits = MLX.where(ids .== 99999 % vocabularySize, MLXArray(Float(-0.0)), logits)
+                    }
+                    let input = logits.asType(dtype)
+                    thresholdActive = false
+                    guard let stock = select(input, k: k) else { same = false; return }
+                    thresholdActive = true
+                    guard let fast = select(input, k: k) else { same = false; return }
+                    thresholdActive = false
+                    same = same && all(stock.0 .== fast.0).item(Bool.self)
+                        && all(stock.1.view(dtype: .uint32) .== fast.1.view(dtype: .uint32)).item(Bool.self)
+                    values += rows * k
+                }
+                try error.check()
+            }
+        } catch {
+            same = false
+        }
+        thresholdActive = same
+        FileHandle.standardError.write(
+            ("dflash2 top-k threshold scan: "
+                + (same ? "self-test passed: \(values) candidates and values identical; on\n"
+                    : "self-test failed; one-pass scan kept\n")).data(using: .utf8)!)
+    }
+
+    /// `chunkKernel` in two passes. Pass 1 bounds the chunk's KK-th largest
+    /// key from below: each of the NSG simdgroups takes the (KK / NSG)-th
+    /// largest of its lanes' maxima, and T is the smallest of those, so at
+    /// least KK chunk elements have a key >= T and no element below T can rank
+    /// in the chunk's top KK. Pass 2 is the stock scan (same threads, same
+    /// increasing indices, same insertion) offering only keys >= T, then the
+    /// stock merges. The stock scan offers every logit to a 16-slot insertion
+    /// that nearly every simdgroup step takes (some lane's list is still
+    /// filling or beaten); here it is offered a handful per chunk.
+    private static let thresholdChunkKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_topk_chunk_threshold",
+        inputNames: ["logits"],
+        outputNames: ["part_key", "part_idx"],
+        source: """
+            constexpr int KK = KTOP;
+            constexpr uint NSG = TPG / 32;
+            static_assert(TPG % 32 == 0 && NSG <= 32 && KK <= 32 && (KK % NSG) == 0 && VEC, "shape");
+            constexpr int PER = KK / NSG;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr uint CH = (NV + S - 1) / S;
+            static_assert((CH % 4u) == 0u, "four-wide");
+            const uint lo = chunk * CH;
+            const uint hi = min(lo + CH, uint(NV));
+            auto x = logits + size_t(row) * NV;
+            uint mx = 0u;
+            for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                uint k0, k1, k2, k3;
+                if (HALF) {
+                    const half4 q = *(const device half4*)(x + v);
+                    k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                    k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                } else {
+                    const float4 q = *(const device float4*)(x + v);
+                    k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                    k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                }
+                mx = max(mx, max(max(k0, k1), max(k2, k3)));
+            }
+            uint m = mx;
+            uint thr = 0u;
+            for (int r = 0; r < PER; r++) {
+                const uint top = simd_max(m);
+                thr = top;
+                const uint who = simd_min(m == top ? lane : 0xffffffffu);
+                if (lane == who) m = 0u;
+            }
+            threadgroup uint sthr[NSG];
+            if (lane == 0) sthr[sg] = thr;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint T = 0xffffffffu;
+            for (uint j = 0; j < NSG; j++) T = min(T, sthr[j]);
+            uint k[KK], id[KK];
+            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+            for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                uint k0, k1, k2, k3;
+                if (HALF) {
+                    const half4 q = *(const device half4*)(x + v);
+                    k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                    k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                } else {
+                    const float4 q = *(const device float4*)(x + v);
+                    k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                    k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                }
+                if (max(max(k0, k1), max(k2, k3)) >= T) {
+                    if (k0 >= T) mlxfast_topk_consider<KK>(k, id, k0, v);
+                    if (k1 >= T) mlxfast_topk_consider<KK>(k, id, k1, v + 1u);
+                    if (k2 >= T) mlxfast_topk_consider<KK>(k, id, k2, v + 2u);
+                    if (k3 >= T) mlxfast_topk_consider<KK>(k, id, k3, v + 3u);
+                }
+            }
+            uint ok = 0u, oi = 0u;
+            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
             threadgroup uint sk[NSG * KK], si[NSG * KK];
             if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2771,8 +3291,19 @@ enum DFlash2GreedyWalk {
         let projectedRows = projected[0].asType(.float32).reshaped([-1])
         let scores = unary[0].asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
-        let path = kernel(
-            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+        let operands = [anchorPredecessor, previous, next, projectedRows, scores, candidateIds]
+        let path =
+            parallelActive
+            ? walkParallel(operands, length: length, k: k, rank: rank)
+            : walkSerial(operands, length: length, k: k, rank: rank)
+        return path.reshaped([1, length])
+    }
+
+    /// The recorded walk: one simdgroup scores each position's candidates
+    /// against the previous pick and advances, position by position.
+    private static func walkSerial(_ operands: [MLXArray], length: Int, k: Int, rank: Int) -> MLXArray {
+        kernel(
+            operands,
             template: [
                 ("L", length), ("K", k), ("R", rank),
                 ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
@@ -2781,8 +3312,167 @@ enum DFlash2GreedyWalk {
             threadGroup: (32, 1, 1),
             outputShapes: [[length]],
             outputDTypes: [.int32])[0]
-        return path.reshaped([1, length])
     }
+
+    /// The same walk with every edge scored up front: one thread per edge
+    /// (position 0's K anchor edges, then each later position's K x K
+    /// predecessor-slot x candidate edges) runs the walk kernel's own chain
+    /// over the rank in the same order, so each edge is the value the walk
+    /// computes for that pair; then one simdgroup walks the table, adding the
+    /// same unary score and taking the same first maximum. The serial walk
+    /// computes 15 x 16 of these edges one position after the other, each
+    /// waiting on the previous pick; here all 3,600 run at once (about 80 us
+    /// -> 13 us per proposal). Self-tested at bind against `walkSerial`
+    /// (`parallelVerified`), every path id compared; `MLXFAST_DFLASH_WALK_PARALLEL=0`
+    /// keeps the serial walk.
+    private static func walkParallel(_ operands: [MLXArray], length: Int, k: Int, rank: Int) -> MLXArray {
+        let edges = length >= 1 ? k + (length - 1) * k * k : 0
+        let table = edgeKernel(
+            operands,
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
+            grid: (edges, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[edges]],
+            outputDTypes: [.float32])[0]
+        return tableKernel(
+            [table, operands[4], operands[5]],
+            template: [("L", length), ("K", k)],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+    }
+
+    static let parallelSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_PARALLEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Whether the widened walk takes `walkParallel`: set once by
+    /// `parallelVerified` (at bind) when every compared path matched.
+    nonisolated(unsafe) static var parallelActive = false
+    nonisolated(unsafe) private static var parallelChecked = false
+
+    /// Runs `walkSerial` and `walkParallel` on the same random FP32 operands
+    /// (the widened walk's; 64 walks of 15 positions over 16 candidates at
+    /// rank 256, a third of them with tied unary scores and a third with small
+    /// projections so edges tie too) and compares every path id; the parallel
+    /// walk is used only when all match. One stderr line.
+    static func parallelVerified() -> Bool {
+        narrowLock.withLock {
+            if parallelChecked { return parallelActive }
+            parallelChecked = true
+            guard enabled, parallelSetting else { return false }
+            var same = true
+            var walks = 0
+            do {
+                try withError { error in
+                    let (vocab, length, k, rank) = (4096, 15, 16, 256)
+                    for seed in 0 ..< 64 {
+                        func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x3a1f + seed * 8 + salt)) }
+                        let pred = MLXRandom.normal([vocab, rank], key: key(0)).asType(.bfloat16)
+                        let succ = MLXRandom.normal([vocab, rank], key: key(1)).asType(.bfloat16)
+                        var proj = MLXRandom.normal([length, rank], key: key(2))
+                        if seed % 3 == 1 { proj = proj * 0.001 }
+                        var una = (MLXRandom.normal([length, k], key: key(3)) * 4).asType(.float16)
+                        if seed % 3 == 2 { una = MLX.floor(una) }
+                        let cand = MLXRandom.randInt(Int32(0) ..< Int32(vocab), [length, k], key: key(4))
+                            .asType(.uint32)
+                        let anchor = MLXArray([Int32(seed * 97 % vocab)])
+                        let operands = [
+                            take(pred, anchor, axis: 0).asType(.float32).reshaped([-1]),
+                            take(pred, cand[0 ..< (length - 1)], axis: 0).asType(.float32).reshaped([-1]),
+                            take(succ, cand, axis: 0).asType(.float32).reshaped([-1]),
+                            proj.asType(.bfloat16).asType(.float32).reshaped([-1]),
+                            una.asType(.float32).reshaped([-1]),
+                            cand.reshaped([-1]),
+                        ]
+                        let serial = walkSerial(operands, length: length, k: k, rank: rank)
+                        let parallel = walkParallel(operands, length: length, k: k, rank: rank)
+                        same = same && all(serial .== parallel).item(Bool.self)
+                        walks += 1
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            parallelActive = same
+            FileHandle.standardError.write(
+                ("dflash2 greedy walk parallel edges: "
+                    + (same
+                        ? "self-test passed: \(walks) walks of 15 ids identical; on\n"
+                        : "self-test failed; serial walk kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+
+    private static let edgeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_edges",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
+        outputNames: ["edges"],
+        source: """
+            // One thread per edge: gid < K scores position 0's candidate gid
+            // against the anchor; the rest are position i >= 1's
+            // (predecessor slot p, candidate c) pairs. The chain is
+            // `kernel`'s, statement for statement (no unrolling hint, so the
+            // compiler sees the same loop).
+            const uint gid = thread_position_in_grid.x;
+            if (gid >= uint(K + (L - 1) * K * K)) return;
+            uint i, p, c;
+            if (gid < uint(K)) { i = 0; p = 0; c = gid; }
+            else { const uint e = gid - K; i = 1 + e / (K * K); p = (e / K) % K; c = e % K; }
+            const uint pred_base = i == 0 ? 0 : ((i - 1) * K + p) * R;
+            const uint succ_base = (i * K + c) * R;
+            const device float* pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+            const device float* proj_ptr = projected + i * R;
+            const device float* succ_ptr = next + succ_base;
+            float edge = 0.0f;
+            if (WALKVEC && (R % 4u) == 0u) {
+                for (uint d = 0; d < R; d += 4u) {
+                    const float4 pd = *(const device float4*)(pred_ptr + d);
+                    const float4 qd = *(const device float4*)(proj_ptr + d);
+                    const float4 sd = *(const device float4*)(succ_ptr + d);
+                    edge += (pd[0] * qd[0]) * sd[0];
+                    edge += (pd[1] * qd[1]) * sd[1];
+                    edge += (pd[2] * qd[2]) * sd[2];
+                    edge += (pd[3] * qd[3]) * sd[3];
+                }
+            } else {
+                #pragma clang loop unroll(full)
+                for (uint d = 0; d < R; d++) {
+                    edge += (pred_ptr[d] * proj_ptr[d]) * succ_ptr[d];
+                }
+            }
+            edges[gid] = edge;
+            """)
+
+    private static let tableKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_table",
+        inputNames: ["edges", "unary", "cand"],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            uint previous_slot = 0;
+            for (uint i = 0; i < L; i++) {
+                float score = -INFINITY;
+                if (c < K) {
+                    const float edge = i == 0
+                        ? edges[c] : edges[K + ((i - 1) * K + previous_slot) * K + c];
+                    score = unary[i * K + c] + edge;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                previous_slot = sel;
+                if (c == 0) path[i] = int(cand[i * K + sel]);
+            }
+            """)
 
     /// The walk reading its operands as they are: the batch axis squeezed
     /// (a view) where `[0]` gathered a copy of candidates, scores and
@@ -2824,6 +3514,7 @@ enum DFlash2GreedyWalk {
 
     /// Runs the narrow walk's self-test for these dtypes now (load time).
     static func prepare(codebook: DType, projected: DType, unary: DType) {
+        _ = parallelVerified()
         guard enabled, narrowOperands else { return }
         _ = narrowVerified(codebook: codebook, projected: projected, unary: unary)
     }
@@ -2952,37 +3643,60 @@ enum DFlash2GreedyWalk {
 /// One command buffer that binds a group of arrays: a single thread reads the
 /// first element of each input. It exists for the buffers it binds, not for
 /// its output (see `DFlash2ResidencyPrefetch`).
+///
+/// Every launch has `inputs` inputs of one dtype (a group's arrays by dtype,
+/// the last launch of a dtype repeating its last array), so the kernels a
+/// seed can meet are one per dtype, all compiled by `prewarm` at the first
+/// arming (the load-time engine warm): which arrays are due depends on the
+/// kernels the load-time trials adopt, and a new mix must not JIT in a seed.
 private enum DFlash2ResidencyTouch {
     /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
-    static let maximumInputs = 24
+    static let inputs = 24
 
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let kernel: MLXFast.MLXFastKernel = {
+        let names = (0 ..< inputs).map { "w\($0)" }
+        let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }.joined(separator: "\n")
+        return MLXFast.metalKernel(
+            name: "dflash2_residency_touch", inputNames: names, outputNames: ["out"],
+            source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
+            ensureRowContiguous: false)
+    }()
 
-    private static func kernel(inputs count: Int) -> MLXFast.MLXFastKernel {
-        lock.withLock {
-            if let kernel = kernels[count] { return kernel }
-            let names = (0 ..< count).map { "w\($0)" }
-            let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }
-                .joined(separator: "\n")
-            let kernel = MLXFast.metalKernel(
-                name: "dflash2_residency_touch_\(count)", inputNames: names,
-                outputNames: ["out"],
-                source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
-                ensureRowContiguous: false)
-            kernels[count] = kernel
-            return kernel
+    private static func launch(_ chunk: [MLXArray]) -> MLXArray {
+        kernel(
+            chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[1]], outputDTypes: [.float32])[0]
+    }
+
+    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
+    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+        var order: [DType] = []
+        var byType: [DType: [MLXArray]] = [:]
+        for array in arrays {
+            if byType[array.dtype] == nil { order.append(array.dtype) }
+            byType[array.dtype, default: []].append(array)
+        }
+        return order.flatMap { dtype -> [MLXArray] in
+            let same = byType[dtype]!
+            return stride(from: 0, to: same.count, by: inputs).map { start in
+                var chunk = Array(same[start ..< min(start + inputs, same.count)])
+                chunk += Array(repeating: chunk[chunk.count - 1], count: inputs - chunk.count)
+                return launch(chunk)
+            }
         }
     }
 
-    /// One touch per `maximumInputs` arrays of `arrays`.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
-        stride(from: 0, to: arrays.count, by: maximumInputs).map { start in
-            let chunk = Array(arrays[start ..< min(start + maximumInputs, arrays.count)])
-            return kernel(inputs: chunk.count)(
-                chunk, grid: (1, 1, 1), threadGroup: (1, 1, 1),
-                outputShapes: [[1]], outputDTypes: [.float32])[0]
-        }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var warmed = false
+
+    /// Compiles the touch for every dtype a weight can have, once.
+    static func prewarm() {
+        guard lock.withLock({ () -> Bool in
+            defer { warmed = true }
+            return !warmed
+        }) else { return }
+        let types: [DType] = [.bfloat16, .float16, .float32, .uint32, .uint16, .uint8, .int8, .int32]
+        eval(types.map { launch(Array(repeating: MLXArray.zeros([1], dtype: $0), count: inputs)) })
     }
 }
 
@@ -3011,6 +3725,18 @@ private enum DFlash2ResidencyTouch {
 /// submission at layer 8, 16, 32 and 48 (`Qwen35TrunkSubmission.promptFused`).
 /// Any group still due at the end of the forward is bound there.
 ///
+/// The same holds for any array only the window reads, so the list goes on
+/// with the target's (`arm`'s `window`): the head rows the drafter scores,
+/// stored words and constants the seed's own head read (the verify route's
+/// tiled copy) never binds, and the verify int8 operands that the kernels the
+/// load-time trials adopted read and the prompt route does not (the
+/// FP32-widened scales of a form that reads them, every operand of a
+/// projection the prompt route never runs). The drafter's own list follows the
+/// adopted drafter kernel: its tiled copies while `DFlash2TensorMatmul.current`
+/// reads them (the tiled kernel or any variant), the stored weights otherwise.
+/// Kernel outputs (the cross-threadgroup bodies' partial planes included) are
+/// fresh allocations in every round, not arrays to bind ahead.
+///
 /// Each group costs one single-thread kernel per 24 arrays on the GPU. No
 /// value of either model is read into any result, and nothing about the
 /// arithmetic changes. `DARKBLOOM_DFLASH2_RESIDENCY_PREFETCH=0` turns it off.
@@ -3029,10 +3755,16 @@ public enum DFlash2ResidencyPrefetch {
     nonisolated(unsafe) private static var nextGroup = 0
 
     /// Arms the prefetch for the next prompt forward: called when an engine
-    /// that drafts with `drafter` is built.
-    static func arm(_ drafter: DFlash2DraftModel) {
+    /// that drafts with `drafter` is built. `window`: the target's arrays the
+    /// window reads and the seed does not (the drafter's head rows, the verify
+    /// kernels' window-only operands), after the drafter's own.
+    static func arm(_ drafter: DFlash2DraftModel, window: @autoclosure () -> [MLXArray] = []) {
         guard enabled else { return }
-        let arrays = drafter.residencyArrays()
+        DFlash2ResidencyTouch.prewarm()
+        var seen = Set<ObjectIdentifier>()
+        let arrays = (drafter.residencyArrays() + window()).filter {
+            seen.insert(ObjectIdentifier($0)).inserted
+        }
         let total = arrays.reduce(0) { $0 + $1.nbytes }
         let share = max(1, total / dueAfterLayers.count)
         var built: [[MLXArray]] = []
@@ -3156,6 +3888,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         DFlash2QKPrework.prepare(
             rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
+        DFlash2AttentionPipeline.verify(
+            dtype: dtype, heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
+        DFlash2TopK.prepareThreshold(vocabularySize: Qwen35TextModel.drafterVocabularyRows > 0
+            ? min(Qwen35TextModel.drafterVocabularyRows, config.vocabularySize) : config.vocabularySize,
+            k: candidateSelector.topK)
         DFlash2GreedyWalk.prepare(
             codebook: candidateSelector.predecessorCodebook.dtype,
             projected: candidateSelector.hiddenProjection.weight.dtype, unary: .float32)
@@ -3169,7 +3906,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// a copy only the rounds read would be one more array to make GPU-
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
-        DFlash2TensorMatmul.prepareTiled(layers.flatMap { $0.tensorWeights() })
+        let layerWeights = layers.flatMap { $0.tensorWeights() }
+        _ = DFlash2TensorMatmul.prepareSwapped(
+            layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : []),
+            rows32: layers.compactMap { $0.selfAttn.stackedQKVWeight() })
+        return DFlash2TensorMatmul.prepareTiled(layerWeights)
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
@@ -3432,6 +4173,37 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             DFlash2SlidingMask.contextSkip(contextLength: rows, slidingWindow: slidingWindow) == 0
         else { return false }
         let context = hiddenNorm(DFlash2TensorMatmul.linear(fc, targetHidden.asType(dtype)))
+        for (index, layer) in layers.enumerated() {
+            let absorbed = layer.absorbContext(context, rope: rope, cache: cache[index])
+            precondition(absorbed, "DFlash 2: a checked cache refused its context rows")
+        }
+        return true
+    }
+
+    /// At most one block of committed rows (a prompt-lookup round's, see
+    /// `Qwen35DFlash2Assistant.absorbLookupRound`) entered as the next block's
+    /// forward would enter them: projected by `contextProjection`, the block
+    /// path's own `fc`, and keyed by each layer's `absorbContext`, whose
+    /// up-to-16-row projection takes the block forward's row-count-independent
+    /// tensor kernel. Returns false, having written nothing, when a layer's
+    /// cache cannot take the rows in place.
+    public func absorbBlockContext(targetHidden: MLXArray, cache: [KVCache]) throws -> Bool {
+        guard target != nil else { throw DFlash2Error.notBound }
+        guard cache.count == layers.count else {
+            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
+        }
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+            throw DFlash2Error.targetHiddenSizeMismatch(
+                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
+        }
+        let rows = targetHidden.dim(1)
+        guard (1 ... 16).contains(rows),
+            cache.allSatisfy({ ($0 as? DFlash2BlockKVCache)?.canAbsorb(contextRows: rows) ?? false }),
+            config.layerTypes.allSatisfy({ $0 == .slidingAttention }),
+            let slidingWindow = config.slidingWindow,
+            DFlash2SlidingMask.contextSkip(contextLength: rows, slidingWindow: slidingWindow) == 0
+        else { return false }
+        let context = contextProjection(targetHidden)
         for (index, layer) in layers.enumerated() {
             let absorbed = layer.absorbContext(context, rope: rope, cache: cache[index])
             precondition(absorbed, "DFlash 2: a checked cache refused its context rows")
