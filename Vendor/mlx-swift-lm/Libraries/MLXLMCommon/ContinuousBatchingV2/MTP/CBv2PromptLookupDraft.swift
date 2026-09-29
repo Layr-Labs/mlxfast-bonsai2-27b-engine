@@ -372,59 +372,40 @@ enum CBv2PromptLookupDraft {
     /// The continuation has to lie entirely inside the prompt. Two prompt
     /// spans of the same length with different continuations are ambiguous,
     /// and this length is skipped rather than guessed.
+    // Each continuation endpoint contributes its longest matching suffix.
+    // Shorter suffixes add endpoints but cannot remove existing ambiguity:
+    // if two maximal matches have different continuations, every shorter
+    // length retains both. Thus only the global longest match needs selection.
     static func continuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
-        let minimum = minimumMatch
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
-        guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
+        guard depth >= 1, prompt >= minimumMatch + depth, count >= minimumMatch else { return nil }
         let longest = min(64, count - depth, prompt - depth)
-        guard longest >= minimum else { return nil }
-        // Every longer eligible match contains this suffix and leaves the
-        // same continuation inside the prompt. Prove a miss in one scan
-        // before scanning all longer lengths; ambiguous hits still use the
-        // original longest-match selection below.
-        let minimumSuffix = history[(count - minimum) ..< count]
-        let lastMinimumStart = prompt - minimum - depth
-        guard (0 ... lastMinimumStart).contains(where: { start in
-            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
-        }) else { return nil }
-        for length in stride(from: longest, through: minimum, by: -1) {
-            let suffix = count - length
-            let lastStart = prompt - length - depth
-            if lastStart < 0 { continue }
-            var chosen: [Int]?
-            var ambiguous = false
-            var start = lastStart
-            while start >= 0 {
-                if history[start] == history[suffix],
-                    history[start + length - 1] == history[count - 1]
-                {
-                    var same = true
-                    var offset = 1
-                    while offset < length - 1 {
-                        if history[start + offset] != history[suffix + offset] {
-                            same = false
-                            break
-                        }
-                        offset += 1
-                    }
-                    if same {
-                        let from = start + length
-                        let ids = Array(history[from ..< (from + depth)])
-                        if let chosen, chosen != ids {
-                            ambiguous = true
-                            break
-                        }
-                        chosen = ids
-                    }
-                }
-                start -= 1
+        guard longest >= minimumMatch else { return nil }
+        var best = minimumMatch - 1
+        var chosenEnd: Int? = nil
+        var ambiguous = false
+        for end in minimumMatch ... (prompt - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
             }
-            if let chosen, !ambiguous {
-                return Hit(match: length, ids: chosen)
+            guard length >= minimumMatch, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
             }
         }
-        return nil
+        guard let chosenEnd, !ambiguous else { return nil }
+        return Hit(match: best, ids: Array(history[chosenEnd ..< chosenEnd + depth]))
     }
 }
 
