@@ -15,6 +15,65 @@ extension EngineLoopV2 {
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
+    /// Each verify row's audit record and tokens go out as soon as its
+    /// tokens, KV and scheduler accounting are final: before the next round's
+    /// early block proposal is built and submitted, not after it. That
+    /// submission waits in MLX's in-flight cap (at most 10 command buffers;
+    /// the proposal is ~30) until most of the drafter has run, so emitting
+    /// after it held every round's tokens behind the next drafter forward,
+    /// the free run's last round included, whose next block no window reads.
+    /// The same tokens, rounds and graphs; only the emit moves earlier.
+    /// `MLXFAST_MTP_EMIT_FIRST=0` restores emitting after the early block.
+    static let emitsRoundBeforeEarlyBlock: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_MTP_EMIT_FIRST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// `BONSAI_EARLY_REPLAY=0` leaves the committed recurrent state lazy.
+    static let submitsCommittedRecurrentStateEarly: Bool =
+        ProcessInfo.processInfo.environment["BONSAI_EARLY_REPLAY"] != "0"
+
+    /// Drafter layers the early block proposal submits while it is built,
+    /// ahead of the committed recurrent state; the rest of the proposal is
+    /// submitted right after that state. Three layers (with the context
+    /// projection they read) are ~11 of the proposal's ~32 command buffers
+    /// on an M4 Max: as many as MLX keeps in flight without holding the host,
+    /// and enough GPU time to cover the committed state's host build.
+    /// `DARKBLOOM_BONSAI_DRAFT_LEAD_LAYERS=0` restores one submission of the
+    /// whole proposal before the committed state; a positive count overrides.
+    static let earlyDraftLeadingLayers: Int = {
+        guard
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DRAFT_LEAD_LAYERS"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            !raw.isEmpty
+        else { return 3 }
+        if ["0", "off", "false", "no"].contains(raw) { return 0 }
+        return max(0, Int(raw) ?? 3)
+    }()
+
+    /// Start the committed recurrent state on the GPU now (ercumentyildirim,
+    /// `080cb21`). A partially accepted verify commits each recurrent layer by
+    /// replaying the accepted prefix from the pre-verify state; built lazily,
+    /// that replay would run inside the next verify, on the critical path.
+    /// Submitting it here lets the GPU run it behind the early block proposal
+    /// while the host finishes finalize. The arrays and their values are
+    /// exactly the ones the next verify reads. A layer whose commit is still a
+    /// deferred replay (`CBv2DeferredRecurrentReplay`) submits nothing: the
+    /// next verify's scan computes that state, and any other reader builds
+    /// the replay when it reads it.
+    func submitCommittedRecurrentState(for id: CBv2RequestID) {
+        guard Self.submitsCommittedRecurrentStateEarly,
+            let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
+        else { return }
+        let arrays = snapshot.keys.sorted().flatMap { index -> [MLXArray] in
+            let layer = snapshot[index]!
+            if layer.deferredReplay?.isPending == true { return [] }
+            return [layer.conv, layer.ssm].compactMap { $0 }
+        }
+        if !arrays.isEmpty { asyncEval(arrays) }
+    }
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -58,8 +117,44 @@ extension EngineLoopV2 {
             }
         }
 
+        // A prompt row that just sampled its first token carries into a round
+        // directly (block drafter): the token is the next block's anchor and
+        // the prompt's tapped rows are its context. The carry fingerprints the
+        // row exactly as a seed step's would (`tokens.count`, `numComputed`).
+        for carry in round.prefillCarries {
+            guard !step.discard.contains(carry.id),
+                let rec = scheduler.record(for: carry.id),
+                rec.pendingSamples == 0,
+                rec.tokens.count > rec.request.promptTokens.count,
+                let token = rec.tokens.last
+            else { continue }
+            mtp.storeCarry(
+                id: carry.id, token: token, hidden: carry.hidden,
+                tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+        }
+
         guard let verify = round.verify else { return }
         let k = verify.k
+        // The next round's block before the readback, from device values
+        // (`CBv2MTPBlockSpeculation`), so the GPU goes from the verify straight
+        // into the drafter; adopted below, or dropped. The budget guard keeps
+        // clipping out of every round that can adopt it.
+        var speculation: (id: CBv2RequestID, block: any CBv2MTPSpeculativeBlock,
+            drafter: any CBv2MTPBlockSpeculation)?
+        if CBv2MTPDraftBeforeReadback.enabled, verify.rows.count == 1,
+            let context = verify.blockContext,
+            let speculative = mtp.blockDrafter as? any CBv2MTPBlockSpeculation,
+            mtp.config.fixedDraftTokens == k, let metadata = verify.rows.first,
+            let state = metadata.assistantState, !step.discard.contains(metadata.id),
+            let rec = scheduler.record(for: metadata.id),
+            rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1,
+            let block = speculative.speculateBlock(
+                acceptancePacket: verify.acceptancePacket, depth: k, verifyContext: context,
+                requestState: state,
+                leadingLayersBeforeReadback: CBv2MTPDraftBeforeReadback.leadingLayers)
+        {
+            speculation = (metadata.id, block, speculative)
+        }
         // Host readbacks of the MTP round, each counted: an MTP-round
         // finalize adds up to three syncs to the step's one (seed policy
         // margin above, acceptance packet, verify policy margin). Serial
@@ -115,6 +210,10 @@ extension EngineLoopV2 {
 
             var accepted = 0
             while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            if CBv2MTPDraftBeforeReadback.dumpsDrafts {
+                FileHandle.standardError.write(
+                    Data("dflash2 round drafts=\(drafts) targets=\(targets)\n".utf8))
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
@@ -199,49 +298,34 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
-            if let evaluations = verify.recurrentEvaluations[id] {
-                if evaluations.count == 1, evaluations[0].isCaptured {
-                    // Capture-verify: one transaction spans the window. The
-                    // accepted prefix commits by device-side selection of the
-                    // captured state at position `confirmed`; zero confirmed
-                    // tokens restore the pre-verify snapshot by rollback.
-                    do {
-                        if confirmed > 0 {
-                            try evaluations[0].commit(keepPositions: confirmed)
-                        } else {
-                            try evaluations[0].rollback()
-                        }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 captured MTP finalization failed for \(id): \(error)")
-                    }
-                } else {
-                    precondition(
-                        evaluations.count == 1 + k,
-                        "CBv2 recurrent MTP verification generation count mismatch")
-                    do {
-                        for evaluation in evaluations.suffix(rejected).reversed() {
-                            try evaluation.rollback()
-                        }
-                        for evaluation in evaluations.prefix(confirmed) {
-                            try evaluation.commit()
-                        }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP finalization failed for \(id): \(error)")
-                    }
-                }
-            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            // The early block path below, with the columns the speculative
+            // block assumed: adopt it in place of `finalizeRound` + `proposeBlock`.
+            var adoptedProposal: MLXArray?
+            if let speculation, speculation.id == id, finishReason == nil,
+                confirmed == accepted + 1, mtp.config.fixedDraftTokens == k,
+                rec.request.maxTokens - rec.generatedTokenCount > k,
                 let state = metadata.assistantState
             {
-                // Target KV/recurrent truth is committed first. The assistant
+                adoptedProposal = speculation.drafter.adoptSpeculativeBlock(
+                    speculation.block, confirmed: confirmed, requestState: state)
+                if CBv2MTPDraftBeforeReadback.dumpsDrafts {
+                    FileHandle.standardError.write(
+                        Data("dflash2 p1 adopted=\(adoptedProposal != nil)\n".utf8))
+                }
+            }
+            if adoptedProposal == nil,
+                let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                // Target KV truth is committed first (the recurrent commit
+                // follows the early block proposal below; the drafter never
+                // reads target recurrent state). The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
                 //
@@ -276,6 +360,185 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            let observedAccepted = min(accepted, confirmed)
+            // Acceptance/rollback audit record (observability): every value is
+            // already on the host at this boundary. The scheduler fields are
+            // read AFTER recordSampled/rollbackComputed above, so the record
+            // states the row's post-round accounting — the boundary invariant
+            // a consumer checks is
+            // `numComputedAfter == tokensCountAfter - 1`. Nothing between here
+            // and the end of this row's finalize changes those fields.
+            func appendAuditRecord() {
+                mtp.recordRound(
+                    drafted: k, accepted: observedAccepted, emitted: confirmed,
+                    audit: CBv2MTPRoundAuditRecord(
+                        requestID: id.raw,
+                        k: k,
+                        draftTokens: Array(
+                            host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                        targetTokens: outcome.targets,
+                        accepted: accepted,
+                        confirmed: confirmed,
+                        rejected: rejected,
+                        tokensCountAfter: rec.tokens.count,
+                        numComputedAfter: rec.numComputedTokens,
+                        generatedAfter: rec.generatedTokenCount,
+                        finishReason: finishReason.map { String(describing: $0) }))
+            }
+            func emitTokens() {
+                if hasStopStrings {
+                    stream(for: id)?.emit(
+                        .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
+                } else {
+                    let stream = stream(for: id)
+                    stream?.reserveEmission()
+                    let endsWithStopToken = finishReason == .stop
+                    let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
+                    let allTokens = kept
+                    detokQueue.async {
+                        let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
+                        stream?.emit(
+                            .delta(text: text, tokens: allTokens, logprobs: nil),
+                            consumingReservation: true)
+                    }
+                }
+            }
+            // The record first, so a consumer that holds the tokens also holds
+            // the round (`emitsRoundBeforeEarlyBlock`).
+            if Self.emitsRoundBeforeEarlyBlock {
+                appendAuditRecord()
+                emitTokens()
+            }
+            // EARLY BLOCK PROPOSAL. Everything the next round's block drafter
+            // reads is final here: the anchor is the carry token stored below
+            // (`kept[confirmed - 1]`), the committed context was just queued
+            // by `finalizeRound`, and the drafter cache sits at this row's
+            // new committed length (`rec.numComputedTokens`, after the
+            // rollback above). Proposing NOW, before the recurrent commit
+            // below, the rest of finalize and the next step's planning, puts
+            // the drafter forward on the GPU while the host does that work
+            // instead of after it. The proposal is the same call on the same
+            // inputs the next verify build makes (`mtpBuildVerifyGraph`), so
+            // it is the same graph and the same draft; the target still
+            // decides every token. Only a fixed-depth block leg with a full
+            // next round ahead takes this path, so the next round's depth is
+            // the depth proposed here.
+            //
+            // SPLIT SUBMISSION (`earlyDraftLeadingLayers`). One `asyncEval` of
+            // the whole proposal holds this thread in MLX's in-flight cap (at
+            // most 10 command buffers; the proposal is ~30) until the drafter
+            // is nearly done, and only then does the host build and encode
+            // the committed recurrent state below, eating the drafter tail
+            // the next verify build needs to hide under. So the drafter hands
+            // the GPU only its leading layers while it builds, the committed
+            // state is built and submitted while they run, and the rest of
+            // the proposal is submitted after it, still inside this finalize.
+            var earlyBlock: CBv2MTPEarlyBlockProposal?
+            var deferredDraftTargets: [MLXArray] = []
+            if finishReason == nil, confirmed > 0, let block = mtp.blockDrafter,
+                let state = metadata.assistantState,
+                let fixedDepth = mtp.config.fixedDraftTokens, fixedDepth == k,
+                rec.request.maxTokens - rec.generatedTokenCount > k
+            {
+                let anchor = kept[confirmed - 1]
+                let kvOffset = rec.numComputedTokens
+                let leading =
+                    Self.earlyDraftLeadingLayers > 0
+                    ? block as? any CBv2MTPBlockLeadingSubmission : nil
+                let history = rec.tokens
+                let promptLength = rec.request.promptTokens.count
+                let hit = CBv2PromptLookupDraft.continuation(
+                    history: history, promptLength: promptLength, depth: k)
+                let absorbing = block as? any CBv2PromptLookupAbsorbing
+                let proposal: MLXArray?
+                let keepDrafterGraph: Bool
+                if let adoptedProposal {
+                    proposal = adoptedProposal
+                    keepDrafterGraph = true
+                } else if let hit, let absorbing, absorbing.lookupSkipReady,
+                    let absorbed = absorbing.absorbCommittedContext(requestState: state)
+                {
+                    // Prompt copy. The block forward is not built; the absorb
+                    // writes the committed rows it would have written.
+                    proposal = MLXArray(hit.ids, [1, k])
+                    keepDrafterGraph = false
+                    block.trimBlockState(state, toCommittedLength: kvOffset)
+                    asyncEval(
+                        [proposal!] + absorbed + block.evaluationTargets(for: state))
+                    FileHandle.standardError.write(
+                        Data("dflash2 lookup skip: match=\(hit.match) depth=\(k)\n".utf8))
+                } else if let leading {
+                    proposal = try? leading.proposeBlock(
+                        anchor: anchor, depth: k, requestState: state,
+                        submittingLeadingLayers: Self.earlyDraftLeadingLayers)
+                    keepDrafterGraph = true
+                } else {
+                    proposal = try? block.proposeBlock(
+                        anchor: anchor, depth: k, requestState: state)
+                    keepDrafterGraph = true
+                }
+                if let drafted = proposal {
+                    let tokens: MLXArray
+                    if keepDrafterGraph {
+                        // Same object when no unique prompt span matches. The
+                        // drafter graph stays in `drafted` either way.
+                        tokens = CBv2PromptLookupDraft.override(
+                            drafted, history: history,
+                            promptLength: promptLength, depth: k)
+                        block.trimBlockState(state, toCommittedLength: kvOffset)
+                        let targets = [tokens, drafted] + block.evaluationTargets(for: state)
+                        if leading != nil {
+                            deferredDraftTargets = targets
+                        } else {
+                            asyncEval(targets)
+                        }
+                    } else {
+                        tokens = drafted
+                    }
+                    absorbing?.noteLookupProposal(hit != nil, requestState: state)
+                    earlyBlock = CBv2MTPEarlyBlockProposal(
+                        tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
+                }
+            }
+            if let evaluations = verify.recurrentEvaluations[id] {
+                if evaluations.count == 1, evaluations[0].isCaptured {
+                    // Capture-verify: one transaction spans the window. The
+                    // accepted prefix commits by device-side selection of the
+                    // captured state at position `confirmed`; zero confirmed
+                    // tokens restore the pre-verify snapshot by rollback.
+                    do {
+                        if confirmed > 0 {
+                            try evaluations[0].commit(keepPositions: confirmed)
+                        } else {
+                            try evaluations[0].rollback()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 captured MTP finalization failed for \(id): \(error)")
+                    }
+                    submitCommittedRecurrentState(for: id)
+                } else {
+                    precondition(
+                        evaluations.count == 1 + k,
+                        "CBv2 recurrent MTP verification generation count mismatch")
+                    do {
+                        for evaluation in evaluations.suffix(rejected).reversed() {
+                            try evaluation.rollback()
+                        }
+                        for evaluation in evaluations.prefix(confirmed) {
+                            try evaluation.commit()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 recurrent MTP finalization failed for \(id): \(error)")
+                    }
+                }
+            }
+            // The rest of the early proposal, right behind the committed
+            // recurrent state (at once when this row has none).
+            if !deferredDraftTargets.isEmpty {
+                asyncEval(deferredDraftTargets)
+            }
             // The speculative suffix is now reconciled in BOTH the page tables
             // and scheduler record. Publish only the accepted frontier; doing
             // this before rollback would make a rejected block cache-visible.
@@ -284,24 +547,10 @@ extension EngineLoopV2 {
                 requestID: id,
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
-            if hasStopStrings {
-                stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
-            } else {
-                let stream = stream(for: id)
-                stream?.reserveEmission()
-                let endsWithStopToken = finishReason == .stop
-                let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
-                let allTokens = kept
-                detokQueue.async {
-                    let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: allTokens, logprobs: nil),
-                        consumingReservation: true)
-                }
+            if !Self.emitsRoundBeforeEarlyBlock {
+                emitTokens()
             }
 
-            let observedAccepted = min(accepted, confirmed)
             // Per-request timing: this verify row confirmed at the step's
             // readback-done instant (already read by `finalize`).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
@@ -310,27 +559,9 @@ extension EngineLoopV2 {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
-            // Acceptance/rollback audit record (observability): every value is
-            // already on the host at this boundary. The scheduler fields are
-            // read AFTER recordSampled/rollbackComputed above, so the record
-            // states the row's post-round accounting — the boundary invariant
-            // a consumer checks is
-            // `numComputedAfter == tokensCountAfter - 1`.
-            mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
-                audit: CBv2MTPRoundAuditRecord(
-                    requestID: id.raw,
-                    k: k,
-                    draftTokens: Array(
-                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
-                    targetTokens: outcome.targets,
-                    accepted: accepted,
-                    confirmed: confirmed,
-                    rejected: rejected,
-                    tokensCountAfter: rec.tokens.count,
-                    numComputedAfter: rec.numComputedTokens,
-                    generatedAfter: rec.generatedTokenCount,
-                    finishReason: finishReason.map { String(describing: $0) }))
+            if !Self.emitsRoundBeforeEarlyBlock {
+                appendAuditRecord()
+            }
             let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
@@ -385,7 +616,8 @@ extension EngineLoopV2 {
                     previousTopTwoMargin: previousTopTwoMargin,
                     needsHistoryTransition: mtp.carryNeedsHistoryTransition,
                     tokensCount: rec.tokens.count,
-                    kvOffset: rec.numComputedTokens)
+                    kvOffset: rec.numComputedTokens,
+                    earlyBlock: earlyBlock)
             }
         }
 
