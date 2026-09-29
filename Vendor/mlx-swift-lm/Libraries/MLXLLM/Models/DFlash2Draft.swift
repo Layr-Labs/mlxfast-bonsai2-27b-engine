@@ -1714,6 +1714,212 @@ enum DFlash2TensorMatmul {
     /// `prepareSwapped` when every weight's output matched bit for bit.
     nonisolated(unsafe) static var swappedActive = false
 
+    // MARK: Swapped forms (K slabs across threadgroups)
+
+    /// `sourceSwapped` / `sourceSwapped32` with each K slab in its own
+    /// simdgroup of SPT (1 or 2) per threadgroup and SPLITS / SPT
+    /// threadgroups per 32-column block (grid.y): an N = 5120 shape runs 640
+    /// (SPT 1) or 320 threadgroups instead of 160. The text is the swapped
+    /// kernel's own with two edits: the slab index takes grid.y, and the
+    /// reduction becomes a store of the slab's FP32 accumulator(s) (the valid
+    /// elements, at the swapped store's coordinates) to its plane of `part`
+    /// `[SPLITS, ROWS, N]`. So every slab runs the same KT steps in the same K
+    /// order into the same accumulator as simdgroup `slab` of the swapped
+    /// kernel, and `sourceSwappedFold` adds the planes 0 + 1 (+ 2 + 3), the
+    /// order of the swapped kernel's `red[]` sum, and stores `OutT` of it as
+    /// that kernel does: bitwise (`prepareSwapForms` compares every weight at
+    /// load). Nil when an anchor moved (no form is offered then).
+    private static func slabSource(_ text: String, rows32: Bool) -> String? {
+        let from = "const int k0 = int(sg) * kq;"
+        let cut = "threadgroup float red["
+        guard text.components(separatedBy: from).count == 2,
+            text.components(separatedBy: cut).count == 2, let r = text.range(of: cut)
+        else { return nil }
+        let c = rows32 ? "cT0" : "cT"
+        let hi = rows32 ? "\n  p[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = cT1[i];" : ""
+        return String(text[..<r.lowerBound]).replacingOccurrences(
+            of: from, with: "const int k0 = (int(threadgroup_position_in_grid.y) * SPT + int(sg)) * kq;")
+            + """
+            device float* p = part + (size_t)(k0 / kq) * \(rows32 ? 32 : 16) * N;
+            for (uint16_t i = 0; i < cap; i++) {
+              if (!\(c).is_valid_element(i)) continue;
+              auto idx = \(c).get_multidimensional_index(i);
+              p[(size_t)idx[0] * N + n0 + idx[1]] = \(c)[i];\(hi)
+            }
+
+            """
+    }
+
+    /// The planes of `part` added in plane order, `OutT` of each sum stored;
+    /// four consecutive outputs a thread. grid (ROWS * N / 4), (256).
+    private static let sourceSwappedFold = """
+        const size_t plane = (size_t)ROWS * ksz[2];
+        const size_t e = (size_t)thread_position_in_grid.x * 4;
+        if (e >= plane) { return; }
+        float4 v = *(const device float4*)(part + e);
+        #pragma clang loop unroll(full)
+        for (int s = 1; s < SPLITS; s++) { v += *(const device float4*)(part + s * plane + e); }
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; j++) { out[e + j] = OutT(v[j]); }
+        """
+
+    /// The 16-row and the 32-row slab kernels.
+    private static let kernelSlabs: [MLXFast.MLXFastKernel?] = [false, true].map { rows32 in
+        slabSource(rows32 ? sourceSwapped32 : sourceSwapped, rows32: rows32).map {
+            MLXFast.metalKernel(
+                name: rows32 ? "dflash2_bf16_matmul_m32s_slab" : "dflash2_bf16_matmul_m16s_slab",
+                inputNames: ["x", "w", "ksz"], outputNames: ["part"], source: $0, header: header,
+                ensureRowContiguous: true)
+        }
+    }
+
+    private static let kernelFold = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_swapped_fold", inputNames: ["part", "ksz"], outputNames: ["out"],
+        source: sourceSwappedFold, ensureRowContiguous: true)
+
+    /// The low-N shapes the forms serve: fc, q|k|v, o_proj, down_proj (the
+    /// wide gate|up and the 1280-wide convolution projections keep the
+    /// swapped kernel).
+    static func formClass(n: Int) -> Bool { n >= 4096 && n < 16384 }
+
+    /// A form of the swapped kernel over `rows` (16 or 32) rows of `a`: its
+    /// slab kernel with `spt` slabs a threadgroup, then the fold. Nil when the
+    /// slab text was not derived.
+    private static func launchSlabs(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, rows: Int, spt: Int, outputDType: DType
+    ) -> MLXArray? {
+        guard let body = kernelSlabs[rows == 32 ? 1 : 0] else { return nil }
+        let splits = Kernel.stockSplits(n: n)
+        let dims = dimsArray(k: k, n: n)
+        let part = body(
+            [a, w, dims], template: [("SPLITS", splits), ("KT", swappedKT), ("SPT", spt)],
+            grid: (n / 32 * 32 * spt, splits / spt, 1), threadGroup: (32 * spt, 1, 1),
+            outputShapes: [[splits, rows, n]], outputDTypes: [.float32])[0]
+        return kernelFold(
+            [part, dims], template: [("OutT", outputDType), ("SPLITS", splits), ("ROWS", rows)],
+            grid: (rows * n / 4, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `current`'s form for a swapped launch of `rows` rows; nil where the
+    /// swapped kernel runs (form 0, or N outside `formClass`).
+    private static func formProduct(_ a: MLXArray, _ w: MLXArray, k: Int, n: Int, rows: Int) -> MLXArray? {
+        let spt = rows == 32 ? current.slabs32 : current.slabs16
+        guard spt > 0, formClass(n: n) else { return nil }
+        return launchSlabs(a, w, k: k, n: n, rows: rows, spt: spt, outputDType: .bfloat16)
+    }
+
+    private static func flag(_ name: String) -> String? {
+        ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    /// `MLXFAST_DRAFT_SWAP_FORMS=0`: the swapped kernel alone (no form, no trial).
+    static let swapFormsEnabled = !["0", "false", "no", "off"].contains(flag("MLXFAST_DRAFT_SWAP_FORMS") ?? "")
+
+    /// `MLXFAST_DRAFT_SWAP_FORMS_FORCE=n<a>m<b>` (`Kernel.swapForm`; `swapped`
+    /// is n0m0): that form without a trial, once it passed its self-test (the
+    /// swapped kernel otherwise). Diagnostics.
+    static let swapFormForced: Kernel? = flag("MLXFAST_DRAFT_SWAP_FORMS_FORCE").flatMap { Kernel.swapForm($0) }
+
+    /// `MLXFAST_DRAFT_SWAP_FORMS_EVIDENCE=1` (diagnostics only, for a GPU on
+    /// which the swapped kernel fails its self-test against the stock one,
+    /// e.g. an M4): that failure counts as passed, so the forms' self-test,
+    /// forcing, trial and launch paths run; the forms still need the swapped
+    /// kernel's bits. The drafter's values are then not the stock kernel's.
+    static let swapFormsEvidence = ["1", "true", "yes", "on"].contains(flag("MLXFAST_DRAFT_SWAP_FORMS_EVIDENCE") ?? "")
+
+    /// The forms (slabs a threadgroup) that passed, 16-row and 32-row; the
+    /// trial's form candidates.
+    nonisolated(unsafe) static var passedSlabs: [Set<Int>] = [[], []]
+    nonisolated(unsafe) static var passedSwapForms: [Kernel] = []
+
+    /// With the swapped kernel on: each form (1 and 2 slabs a threadgroup)
+    /// against `sourceSwapped` on every one of `weights` in `formClass`
+    /// (16 rows) and against `sourceSwapped32` on every one of `weights32`
+    /// (32 rows), random BF16 inputs, FP32 and BF16 outputs compared as
+    /// integers; each form and row class in its own error scope, so a
+    /// mismatch or an MLX error drops that form only. Then the forced form
+    /// is installed, or the passed ones are offered to the in-situ trial
+    /// (true when it is to run). One stderr line.
+    static func prepareSwapForms(_ weights: [MLXArray], rows32 weights32: [MLXArray]) -> Bool {
+        passedSlabs = [[], []]
+        passedSwapForms = []
+        guard swappedActive, swapFormsEnabled else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let sets = [weights, swapped32Active ? weights32 : []].map { set in
+            set.filter {
+                $0.dtype == .bfloat16 && $0.ndim == 2 && $0.dim(1) % 1024 == 0 && formClass(n: $0.dim(0))
+            }
+        }
+        var report: [String] = []
+        for (c, rows) in [16, 32].enumerated() where !sets[c].isEmpty {
+            for spt in [1, 2] {
+                var values = 0
+                let mismatches = try? withError { scoped -> Int in
+                    var differing: [MLXArray] = []
+                    for (index, w) in sets[c].enumerated() {
+                        let (k, n) = (w.dim(1), w.dim(0))
+                        let a = MLXRandom.normal(
+                            [rows, k], key: MLXRandom.key(UInt64(9603 + 97 * c + index))
+                        ).asType(.bfloat16)
+                        for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                            let reference = rows == 32
+                                ? launch32(a, w, k: k, n: n, swapped: true, outputDType: outputDType)
+                                : launchSwapped(
+                                    a, w, k: k, n: n, splits: Kernel.stockSplits(n: n), outputDType: outputDType)
+                            guard let y = launchSlabs(
+                                a, w, k: k, n: n, rows: rows, spt: spt, outputDType: outputDType)
+                            else { return -1 }
+                            differing.append(
+                                (reference.view(dtype: bits) .!= y.view(dtype: bits)).asType(.int32).sum())
+                            values += rows * n
+                        }
+                        if differing.count >= 16 {
+                            let partial = stacked(differing).sum()
+                            eval(partial)
+                            differing = [partial]
+                        }
+                    }
+                    let total = stacked(differing).sum()
+                    eval(total)
+                    try scoped.check()
+                    return total.item(Int.self)
+                }
+                if mismatches == 0 { passedSlabs[c].insert(spt) }
+                report.append(
+                    "\(rows)-row x\(spt) \(sets[c].count) weights \(values) values "
+                        + (mismatches == 0
+                            ? "passed" : mismatches.map { $0 < 0 ? "not built" : "\($0) mismatches" } ?? "MLX error"))
+            }
+        }
+        // Both classes one slab a threadgroup, both two, and the 32-row one
+        // alone (the form drops its 12 KB `red[]` threadgroup array).
+        for (s16, s32) in [(1, 1), (2, 2), (0, 1)] {
+            var k = Kernel.stock
+            k.slabs16 = passedSlabs[0].contains(s16) ? s16 : 0
+            k.slabs32 = passedSlabs[1].contains(s32) ? s32 : 0
+            if k != .stock, !passedSwapForms.contains(k) { passedSwapForms.append(k) }
+        }
+        var verdict = passedSwapForms.isEmpty ? "swapped kernel kept" : "the in-situ trial decides"
+        if let forced = swapFormForced {
+            let ok = (forced.slabs16 == 0 || passedSlabs[0].contains(forced.slabs16))
+                && (forced.slabs32 == 0 || passedSlabs[1].contains(forced.slabs32))
+            current = ok ? forced : .stock
+            verdict = "\(forced.name) forced by MLXFAST_DRAFT_SWAP_FORMS_FORCE"
+                + (ok ? "" : ", NOT passed: swapped kept")
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 swapped forms (slabs across threadgroups): self-test against the swapped kernel, "
+                    + "FP32 and BF16 bitwise [\(report.joined(separator: ", "))]; forms "
+                    + "[\(passedSwapForms.map(\.name).joined(separator: " "))]; \(verdict)"
+                    + (swapFormsEvidence ? "; EVIDENCE MODE (diagnostics)" : "")
+                    + String(format: "; %.0f ms\n", elapsed)).utf8))
+        return swapFormForced == nil && !passedSwapForms.isEmpty
+    }
+
     // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
     // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
     // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
@@ -1858,7 +2064,8 @@ enum DFlash2TensorMatmul {
                 a = concatenated(
                     [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
             }
-            let y = launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
+            let y = (swapped32Active ? formProduct(a, weight, k: k, n: n, rows: 32) : nil)
+                ?? launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
             let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
             return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
         }
@@ -1869,8 +2076,9 @@ enum DFlash2TensorMatmul {
         let chosen = current
         let y: MLXArray
         if swappedActive {
-            // The swapped kernel reads the stored weight (no copy exists while it is on).
-            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+            // The swapped kernel (or its form) reads the stored weight (no copy exists while it is on).
+            y = formProduct(a, weight, k: k, n: n, rows: 16)
+                ?? launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
         } else if chosen.tiled, let tiled = tiledCopy(weight) {
             y = chosen.variant(n: n)
                 ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
@@ -1997,7 +2205,7 @@ enum DFlash2TensorMatmul {
             }
         }
         let mismatches = stacked(differing).sum().item(Int.self)
-        swappedActive = mismatches == 0
+        swappedActive = mismatches == 0 || swapFormsEvidence
         // The 32-row form, only while the 16-row one is on.
         var mismatches32 = 0
         var values32 = 0
@@ -2021,16 +2229,19 @@ enum DFlash2TensorMatmul {
                 }
             }
             mismatches32 = stacked(differing32).sum().item(Int.self)
-            swapped32Active = mismatches32 == 0
+            swapped32Active = mismatches32 == 0 || swapFormsEvidence
         }
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
         FileHandle.standardError.write(
             Data(
-                ("dflash2 swapped m16 kernel: self-test \(swappedActive ? "passed" : "FAILED") "
+                ("dflash2 swapped m16 kernel: self-test \(mismatches == 0 ? "passed" : "FAILED") "
                     + "(\(eligible.count) weights, \(values) values bitwise, \(mismatches) mismatches); "
                     + (swappedActive ? "on, K step \(swappedKT)" : "stock kept")
                     + "; 32-row form \(eligible32.count) weights, \(values32) values, "
                     + "\(mismatches32) mismatches, " + (swapped32Active ? "on" : "off")
+                    + (swapFormsEvidence && mismatches + mismatches32 > 0
+                        ? "; EVIDENCE MODE (diagnostics): the failed self-test counted as passed, "
+                            + "the drafter's values are not the stock kernel's here" : "")
                     + String(format: "; %.0f ms\n", elapsed)).utf8))
         return swappedActive
     }
@@ -2063,9 +2274,25 @@ enum DFlash2TensorMatmul {
     struct Kernel: Equatable {
         var tiled: Bool
         var wideSplits = 2, wideTN = 32, narrowSplits = 4, narrowTN = 32, prefetch = 0
+        /// With the swapped kernel on (stored layout): its form per class,
+        /// the 16-row low-N launches and the 32-row ones (`formClass`); 0 the
+        /// swapped kernel itself, else `launchSlabs` with that many slabs a
+        /// threadgroup.
+        var slabs16 = 0, slabs32 = 0
 
         static let stock = Kernel(tiled: false)
         static let tiledStock = Kernel(tiled: true)
+
+        /// `swapped` or `n<a>m<b>` (a, b: 0, 1, 2) as a swapped form.
+        static func swapForm(_ name: String) -> Kernel? {
+            if name == "swapped" { return .stock }
+            let v = name.split(whereSeparator: { "nm".contains($0) }).compactMap { Int($0) }
+            guard v.count == 2, v.allSatisfy({ (0 ... 2).contains($0) }), name == "n\(v[0])m\(v[1])"
+            else { return nil }
+            var k = Kernel.stock
+            (k.slabs16, k.slabs32) = (v[0], v[1])
+            return k
+        }
 
         /// The record's K split (`launch`).
         static func stockSplits(n: Int) -> Int { n >= 16384 ? 2 : 4 }
@@ -2087,7 +2314,8 @@ enum DFlash2TensorMatmul {
 
         var name: String {
             !tiled
-                ? "stock"
+                ? self == .stock
+                    ? DFlash2TensorMatmul.swappedActive ? "swapped" : "stock" : "n\(slabs16)m\(slabs32)"
                 : self == .tiledStock
                     ? "tiled" : "w\(wideSplits)x\(wideTN)n\(narrowSplits)x\(narrowTN)p\(prefetch)"
         }
@@ -2135,8 +2363,9 @@ enum DFlash2TensorMatmul {
         return kernel
     }()
 
-    /// The in-situ trial chooses (nothing forces a kernel).
-    static var trialWanted: Bool { tiledSetting == nil && forcedKernel == nil }
+    /// The in-situ trial chooses (nothing forces a kernel; with the swapped
+    /// kernel on, `prepareSwapForms` said so).
+    static var trialWanted: Bool { swappedActive || (tiledSetting == nil && forcedKernel == nil) }
 
     /// The bit-for-bit variants the trial's first request times beside
     /// `stock` and `tiled`: 64 columns on the wide class, the prefetch, both.
@@ -2430,6 +2659,13 @@ enum DFlash2KernelTrial {
     }
 
     static let adoptMargin = 0.005
+    /// With the swapped kernel on (`forms`), stage 1 is it (`stock`) against
+    /// its forms that passed their self-test, and stage 2 the fastest form's
+    /// confirmation request against it; a form is adopted only when it beats
+    /// the swapped kernel by more than this in both, every round's ids the
+    /// tape's. The forms are bitwise, so the trial risks time only.
+    static let formMargin = 0.01
+    nonisolated(unsafe) private static var forms = false
     static let outlierFactor = 1.5
     /// Timed rounds per candidate: stage 1 with variants (12 for the two-way
     /// trial), stage 2.
@@ -2487,8 +2723,11 @@ enum DFlash2KernelTrial {
 
     /// Stage 1's candidates, and the budget both requests use.
     static func beginFirstStage() {
-        candidates = [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
-        perCandidate = candidates.count > 2 ? roundsPerVariant : 12
+        forms = DFlash2TensorMatmul.swappedActive
+        candidates = forms
+            ? [.stock] + DFlash2TensorMatmul.passedSwapForms
+            : [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
+        perCandidate = candidates.count > 2 || forms ? roundsPerVariant : 12
         stage = 1
         pick = .stock
         tape = [:]
@@ -2496,7 +2735,8 @@ enum DFlash2KernelTrial {
         proposalCount = 0
         marks = [DispatchTime.now().uptimeNanoseconds]
         requestRounds = max(
-            roundsNeeded, DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
+            roundsNeeded,
+            forms ? 2 + 2 * roundsPerVariant : DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
     }
 
     static func begin(onEnough: @escaping () -> Void) {
@@ -2544,7 +2784,7 @@ enum DFlash2KernelTrial {
         for c in 1 ..< t.count where eligible[c] {
             if let m = t[c].median, m < (t[best].median ?? .infinity) { best = c }
         }
-        return best > 0 && t[best].median! < reference * (1 - adoptMargin) ? best : 0
+        return best > 0 && t[best].median! < reference * (1 - (forms ? formMargin : adoptMargin)) ? best : 0
     }
 
     private static func describe(_ t: [Timing], _ note: (Int) -> String = { _ in "" }) -> String {
@@ -2568,7 +2808,7 @@ enum DFlash2KernelTrial {
         pick = candidates[best]
         log = describe(t) + " -> \(pick.name)\(change(t, best))"
         proposalCount += roundIndex
-        if DFlash2TensorMatmul.variantsEnabled {
+        if DFlash2TensorMatmul.variantsEnabled || forms {
             for (index, p) in proposals {
                 tape[index] = (p.position, p.tokens.asType(.int32).asArray(Int32.self))
             }
@@ -2585,6 +2825,14 @@ enum DFlash2KernelTrial {
         guard armed, stage == 1 else { return false }
         marks.append(DispatchTime.now().uptimeNanoseconds)
         concludeFirstStage()
+        if forms {
+            guard pick != .stock, !tape.isEmpty else { return false }
+            marks.append(DispatchTime.now().uptimeNanoseconds)
+            candidates = [.stock, pick]
+            perCandidate = roundsPerVariant
+            stage = 2
+            return true
+        }
         guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty else { return false }
         var passed: [Kernel] = []
         var tested: [String] = []
@@ -2648,6 +2896,7 @@ enum DFlash2KernelTrial {
                 + " -> \(adopted.name)\(change(t, best))"
         }
         DFlash2TensorMatmul.current = adopted
+        let kind = !forms ? "stored layout" : adopted == .stock ? "swapped kernel" : "swapped form, bitwise"
         if adopted.tiled {
             DFlash2TensorMatmul.dropTestOperands()
         } else {
@@ -2658,7 +2907,7 @@ enum DFlash2KernelTrial {
         FileHandle.standardError.write(
             Data(
                 ("dflash2 kernel trial: \(log); adopted \(adopted.name) "
-                    + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : "stored layout")); "
+                    + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : kind)); "
                     + "\(proposalCount) proposals; "
                     + String(format: "%.0f ms", Double(elapsedNanoseconds) / 1e6)
                     + " (\(phases.joined(separator: " + ")))\n").utf8))
@@ -4128,10 +4377,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
         let layerWeights = layers.flatMap { $0.tensorWeights() }
-        _ = DFlash2TensorMatmul.prepareSwapped(
-            layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : []),
-            rows32: layers.compactMap { $0.selfAttn.stackedQKVWeight() })
+        let rows16 = layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : [])
+        let rows32 = layers.compactMap { $0.selfAttn.stackedQKVWeight() }
+        _ = DFlash2TensorMatmul.prepareSwapped(rows16, rows32: rows32)
+        // With the swapped kernel on (no copy): its forms' self-test, then their trial.
         return DFlash2TensorMatmul.prepareTiled(layerWeights)
+            || DFlash2TensorMatmul.prepareSwapForms(rows16 + rows32, rows32: rows32)
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
