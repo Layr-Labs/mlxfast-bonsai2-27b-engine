@@ -3311,7 +3311,7 @@ enum DFlash2GreedyWalk {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// `MLXFAST_DFLASH_EDGE_WEIGHT` (default 0.75): the walk scores
+    /// `MLXFAST_DFLASH_EDGE_WEIGHT` (default 0.6; the record used 0.75): the walk scores
     /// `unary + w * edge`. The drafter's edge overweights the predecessor
     /// against its own unary logits; 0.75 ranks the target's continuation
     /// first more often (offline over the chain runs' candidate dumps). The
@@ -3322,7 +3322,7 @@ enum DFlash2GreedyWalk {
     static let edgeWeight: Float = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_EDGE_WEIGHT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let w = raw.flatMap(Float.init), w.isFinite, w >= 0 else { return 0.75 }
+        guard let w = raw.flatMap(Float.init), w.isFinite, w >= 0 else { return 0.6 }
         return w
     }()
     private static let weightSuffix =
