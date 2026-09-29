@@ -317,9 +317,11 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 /// both). `MLXFAST_KV_FIRST_APPEND=0` keeps the zero-filled allocation.
 enum CBv2KVFirstAppend {
     static let enabled: Bool = {
+        // Default off (opt in with 1): its prompt-side value is ~0.2 ms and the
+        // box read the prompt forward slower with it and the supertile order on.
         let value = ProcessInfo.processInfo.environment["MLXFAST_KV_FIRST_APPEND"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(

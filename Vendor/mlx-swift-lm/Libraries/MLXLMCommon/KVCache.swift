@@ -826,7 +826,7 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
     static let firstAppend: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_KV_FIRST_APPEND"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")  // default off, as MLXFAST_KV_FIRST_APPEND
     }()
 
     /// Context rows held in the buffer (`offset` is absolute and may start
