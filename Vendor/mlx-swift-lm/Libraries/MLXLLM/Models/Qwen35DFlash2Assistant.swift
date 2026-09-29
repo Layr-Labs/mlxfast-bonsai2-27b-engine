@@ -628,6 +628,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             // drafter's weights GPU-resident again (`DFlash2ResidencyPrefetch`),
             // and the target's arrays only the window reads.
             DFlash2ResidencyPrefetch.arm(drafter, window: self.target.dFlash2WindowResidencyArrays())
+            // And the seed's first prompt layer, now (`Qwen35SeedResidencyTouch`).
+            Qwen35SeedResidencyTouch.submit(self.target.seedFirstLayerResidencyArrays())
         } else {
             target.dFlash2TapLayerIds = nil
         }

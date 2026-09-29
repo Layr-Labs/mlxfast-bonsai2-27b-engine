@@ -9868,6 +9868,28 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 }
 
+extension Qwen35TextModel {
+    /// The arrays the seed's first prompt layer binds, for
+    /// `Qwen35SeedResidencyTouch`: layer 0's parameters, except that a packed
+    /// projection is read through its prompt-route operands where the prompt
+    /// tensor route is on (it never binds the stored words and constants).
+    func seedFirstLayerResidencyArrays() -> [MLXArray] {
+        guard let layer = model.layers.first else { return [] }
+        let tensorRoute = HadamardQuantizedLinear.tensorRouteTakesPromptRows(512)
+        var arrays: [MLXArray] = []
+        var replaced = Set<ObjectIdentifier>()
+        for (_, module) in layer.namedModules() {
+            guard tensorRoute, let projection = module as? HadamardQuantizedLinear else { continue }
+            arrays += Qwen35TensorPackedMatmul.promptResidencyArrays(projection)
+            for stored in [projection.weight, projection.scales] + (projection.biases.map { [$0] } ?? []) {
+                replaced.insert(ObjectIdentifier(stored))
+            }
+        }
+        return arrays
+            + layer.parameters().flattened().map(\.1).filter { !replaced.contains(ObjectIdentifier($0)) }
+    }
+}
+
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(
         _ logits: MLXArray
