@@ -1316,7 +1316,7 @@ extension Qwen35GDNPrework {
 
     private static let freshStridedRowsKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided_rows",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: freshStridedRowsSource,
         ensureRowContiguous: false)
@@ -1435,25 +1435,25 @@ extension Qwen35GDNPrework {
 
     private static let fusedPrepKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_rows_qk_prep",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "g", "beta", "tail", "tp", "pm", "gf"],
         source: fusedPrepSource, ensureRowContiguous: false)
 
     private static let narrowRowsKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided_rows_n",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: narrowRowsSource, ensureRowContiguous: false)
 
     private static let splitQKKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_rows_qk",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "g", "beta", "tail"],
         source: splitQKSource, ensureRowContiguous: false)
 
     private static let splitValueKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_rows_v",
-        inputNames: ["qkv", "w", "S"], outputNames: ["v"],
+        inputNames: ["qkv", "w"], outputNames: ["v"],
         source: splitValueSource, ensureRowContiguous: false)
 
     /// Every element offset below 2^31 with each input row at most 4 * CD
@@ -1497,8 +1497,7 @@ extension Qwen35GDNPrework {
             let fused = form >= 3 && S % C == 0 && (valueHeads / keyHeads) * C <= headKDim
             let qkRows = fused ? C : rows
             let qk = (fused ? fusedPrepKernel : splitQKKernel)(
-                [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
-                 MLXArray(Int32(S))],
+                [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k],
                 template: [
                     ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                     ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", qkRows),
@@ -1512,7 +1511,7 @@ extension Qwen35GDNPrework {
                        [B, valueHeads, S / C, 2, C]] : []),
                 outputDTypes: [DType](repeating: .float32, count: fused ? 8 : 5))
             let v = splitValueKernel(
-                [qkv, convWeight, MLXArray(Int32(S))],
+                [qkv, convWeight],
                 template: [
                     ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                     ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
@@ -1524,8 +1523,7 @@ extension Qwen35GDNPrework {
                 prepared: fused ? Array(qk[5 ..< 8]) : nil)
         }
         let outputs = (form == 1 ? narrowRowsKernel : freshStridedRowsKernel)(
-            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+            [qkv, convWeight, a, b, decay, dtb, normScales.q, normScales.k],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
@@ -1706,7 +1704,7 @@ extension Qwen35GDNPrework {
         const uint h = threadgroup_position_in_grid.x;
         const uint t = threadgroup_position_in_grid.y;
         const uint bb = threadgroup_position_in_grid.z;
-        const int Sn = S;
+        const int Sn = qkv_shape[1];
         const int64_t qb = int64_t(bb) * qkv_strides[0];
         const int64_t qs1 = qkv_strides[1];
         const int64_t qs2 = qkv_strides[2];
@@ -1819,7 +1817,7 @@ extension Qwen35GDNPrework {
 
     private static let verifyLoadsFirstKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_verify_lf",
-        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
         source: verifyLoadsFirstSource,
         ensureRowContiguous: false)
@@ -1864,8 +1862,7 @@ extension Qwen35GDNPrework {
             return nil
         }
         let outputs = verifyLoadsFirstKernel(
-            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
@@ -1961,7 +1958,7 @@ extension Qwen35GDNPrework {
                     else { throw SelfTestFailure.message("no stock launch") }
                     let lf = verifyLoadsFirstKernel(
                         [qkv, convState, convWeight, a, b, aDecay, dtBias, normScales.q,
-                         normScales.k, MLXArray(Int32(T))],
+                         normScales.k],
                         template: [
                             ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv),
                             ("CD", cd), ("KS", ks),
@@ -2356,7 +2353,7 @@ enum Qwen35PreworkSplit {
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = threadgroup_position_in_grid.y;
         const uint bb = threadgroup_position_in_grid.z;
-        const int Sn = S;
+        const int Sn = qkv_shape[1];
         const int64_t qb = int64_t(bb) * qkv_strides[0];
         const int64_t qs1 = qkv_strides[1];
         const int64_t qs2 = qkv_strides[2];
@@ -2540,7 +2537,7 @@ enum Qwen35PreworkSplit {
 
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_verify_lf_bafold_vsplit",
-        inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "ci", "ao", "bo"],
         source: source,
         ensureRowContiguous: false)

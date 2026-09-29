@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import Metal
 
 /// Exact top-2 token ids and logit values for every row of `[1, rows, vocab]`.
 ///
@@ -27,6 +28,10 @@ public func qwen35MTPTopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: M
 /// `DARKBLOOM_BONSAI_TENSOR_ROUTE=0` keeps the dequantizing kernels.
 enum Qwen35TensorPackedMatmul {
     private static let enabled: Bool = {
+        // These kernels address the native tensor fragment layout.
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
+            MTLCreateSystemDefaultDevice()?.supportsFamily(.apple10) == true
+        else { return false }
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")

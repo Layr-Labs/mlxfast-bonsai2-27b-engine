@@ -685,7 +685,7 @@ enum Qwen35WideNMatmul {
     // sg: rows m0 = 64 * tg.y + 32 * (sg >> 1) .. + 31, columns
     // n0 = 32 * tg.x + 16 * (sg & 1) .. + 15.
     private static let partialSource = """
-        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int K = x_shape[1]; const int M = x_shape[0]; const int N = w_shape[0];
         const int kc = int(threadgroup_position_in_grid.z);
         const uint sg = simdgroup_index_in_threadgroup;
         const int m0 = int(threadgroup_position_in_grid.y) * 64 + 32 * int(sg >> 1);
@@ -719,7 +719,7 @@ enum Qwen35WideNMatmul {
         """
 
     private static let reduceSource = """
-        const int KS = dims[0] / KC; const int M = dims[1]; const int N = dims[2];
+        const int KS = part_shape[0]; const int M = part_shape[1]; const int N = part_shape[2];
         const uint i = thread_position_in_grid.x;
         if (i >= uint(M * N)) { return; }
         float v = 0.0f;
@@ -728,10 +728,10 @@ enum Qwen35WideNMatmul {
         """
 
     private static let partialKernel = MLXFast.metalKernel(
-        name: "qwen35_widen_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
+        name: "qwen35_widen_partial", inputNames: ["x", "w"], outputNames: ["part"],
         source: partialSource, ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
-        name: "qwen35_widen_reduce", inputNames: ["part", "dims"], outputNames: ["out"],
+        name: "qwen35_widen_reduce", inputNames: ["part"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: true)
 
     nonisolated(unsafe) private static var announced = false
@@ -743,13 +743,12 @@ enum Qwen35WideNMatmul {
             FileHandle.standardError.write(
                 Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
         }
-        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
-            [x.reshaped(rows, k), w, dims], template: [("KC", chunk)],
+            [x.reshaped(rows, k), w], template: [("KC", chunk)],
             grid: (n / 32 * 128, rows / 64, k / chunk), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         let y = reduceKernel(
-            [part, dims], template: [("KC", chunk)],
+            [part],
             grid: ((rows * n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
         return y.reshaped(Array(x.shape.dropLast()) + [n])

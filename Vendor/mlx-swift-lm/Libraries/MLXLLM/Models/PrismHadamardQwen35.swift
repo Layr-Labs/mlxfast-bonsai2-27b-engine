@@ -66,7 +66,7 @@ enum Qwen35SmallNMatmul {
     // independent float4 weight loads), and the four sub-range sums of each
     // (row, column) are added in sub-range order.
     private static let partialSource = """
-        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int K = x_shape[1]; const int M = x_shape[0]; const int N = w_shape[0];
         const int nb = int(threadgroup_position_in_grid.x) * 32;
         const int kc = int(threadgroup_position_in_grid.y);
         const int k0 = kc * 128;
@@ -109,7 +109,7 @@ enum Qwen35SmallNMatmul {
     // One thread per output: the KS chunk partials loaded together (unrolled),
     // then added in chunk order.
     private static let reduceSource = """
-        const int M = dims[1]; const int N = dims[2];
+        const int M = part_shape[1]; const int N = part_shape[2];
         const uint i = thread_position_in_grid.x;
         if (i >= uint(M * N)) { return; }
         float v[KS];
@@ -122,10 +122,10 @@ enum Qwen35SmallNMatmul {
         """
 
     private static let partialKernel = MLXFast.metalKernel(
-        name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
+        name: "qwen35_splitk_partial", inputNames: ["x", "w"], outputNames: ["part"],
         source: partialSource, ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
-        name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
+        name: "qwen35_splitk_reduce", inputNames: ["part", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
 
     static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
@@ -150,7 +150,6 @@ enum Qwen35SmallNMatmul {
         let n: Int
         let chunks: Int
         let leading: [Int]
-        let dims: MLXArray
     }
 
     static func partials(_ x: MLXArray, _ w: MLXArray) -> Partials? {
@@ -159,14 +158,13 @@ enum Qwen35SmallNMatmul {
         let n = w.dim(0)
         let rows = x.size / k
         guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
-        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
         let part = partialKernel(
-            [x.reshaped(rows, k), w, dims],
+            [x.reshaped(rows, k), w],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         return Partials(
             part: part, rows: rows, n: n, chunks: k / chunk,
-            leading: Array(x.shape.dropLast()), dims: dims)
+            leading: Array(x.shape.dropLast()))
     }
 
     /// The reduce launch: the chunk partials added in chunk order from 0.0f.
@@ -174,7 +172,8 @@ enum Qwen35SmallNMatmul {
     /// encoded after the qkv|z product, so the partial runs beside it.
     static func reduce(_ p: Partials, after: MLXArray? = nil) -> MLXArray {
         let y = reduceKernel(
-            [p.part, p.dims, (overlap ? after : nil) ?? p.dims], template: [("KS", p.chunks)],
+            [p.part, (overlap ? after : nil) ?? p.part],
+            template: [("KS", p.chunks)],
             grid: ((p.rows * p.n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[p.rows, p.n]], outputDTypes: [.float32])[0]
         return y.reshaped(p.leading + [p.n])
@@ -416,7 +415,7 @@ enum Qwen35SplitKFold {
             && convInputSource(foldedSource) != nil && convInputSource(foldedStridedSource) != nil
     }
 
-    private static let inputNames = ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"]
+    private static let inputNames = ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk"]
 
     private static let plainKernel: MLXFast.MLXFastKernel? = foldedSource.map {
         MLXFast.metalKernel(
@@ -744,7 +743,6 @@ extension Qwen35GDNPrework {
         else { return nil }
         let inputs = [
             qkv, convState, convWeight, abPartials, aDecay, dtb, normScales.q, normScales.k,
-            MLXArray(Int32(S)),
         ]
         let template: [(String, any KernelTemplateArg)] = [
             ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),

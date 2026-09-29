@@ -5702,7 +5702,7 @@ enum Qwen35GDNPrework {
         const uint h = threadgroup_position_in_grid.x;
         const uint t = threadgroup_position_in_grid.y;
         const uint bb = threadgroup_position_in_grid.z;
-        const int Sn = S;
+        const int Sn = qkv_shape[1];
         const size_t rowbase = (size_t(bb) * size_t(Sn)) * size_t(CD);
         const size_t csbase = size_t(bb) * size_t(NK) * size_t(CD);
         threadgroup float red[8];
@@ -5797,7 +5797,7 @@ enum Qwen35GDNPrework {
 
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework",
-        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: source,
         ensureRowContiguous: true)
@@ -5855,7 +5855,7 @@ enum Qwen35GDNPrework {
     /// `kernel` plus the seventh output `ci` (`convInputBlock`).
     private static let convInputKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_ci",
-        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
         source: withConvInput(source),
         ensureRowContiguous: true)
@@ -5912,14 +5912,14 @@ enum Qwen35GDNPrework {
 
     private static let stridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_strided",
-        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: stridedSource,
         ensureRowContiguous: false)
 
     private static let stridedConvInputKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_ci_strided",
-        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
         source: withConvInput(stridedSource),
         ensureRowContiguous: false)
@@ -5981,8 +5981,7 @@ enum Qwen35GDNPrework {
             ? (writeConvInput ? stridedConvInputKernel : stridedKernel)
             : (writeConvInput ? convInputKernel : kernel)
         let outputs = launch(
-            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
@@ -6023,7 +6022,7 @@ enum Qwen35GDNPrework {
 
     private static let freshKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: freshSource,
         ensureRowContiguous: true)
@@ -6064,7 +6063,7 @@ enum Qwen35GDNPrework {
 
     private static let freshStridedKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided",
-        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
+        inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
         source: freshStridedSource,
         ensureRowContiguous: false)
@@ -6114,8 +6113,7 @@ enum Qwen35GDNPrework {
                 headKDim: headKDim, headVDim: headVDim, rows: rowTile)
         }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
-            [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
-             MLXArray(Int32(S))],
+            [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k],
             template: [
                 ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
                 ("DV", headVDim), ("CD", CD), ("KS", KS),
