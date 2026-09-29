@@ -7948,6 +7948,10 @@ extension Qwen35FusedHadamard {
 /// Both arms compute the same values, so the rounds and tokens are the same.
 /// `BONSAI_NARROW_PRODUCER_TRIAL=0` skips it (the producer stays off);
 /// `BONSAI_NARROW_PRODUCER=1` / `=0` force the choice without a trial.
+/// By default a third arm fuses only SwiGLU and the attention sigmoid gate,
+/// leaving the GDN output producer composed. It must beat the inherited
+/// off/on winner by the same margin. All arms use the bitwise-checked kernels;
+/// the extra arm is disabled with `BONSAI_VERIFY_ELEMENTWISE_FUSION=0`.
 enum Qwen35NarrowProducerTrial {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_NARROW_PRODUCER_TRIAL"]?
@@ -7955,15 +7959,31 @@ enum Qwen35NarrowProducerTrial {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    static let elementwiseEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_ELEMENTWISE_FUSION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    static var armNames: [String] { elementwiseEnabled ? ["off", "on", "elementwise"] : ["off", "on"] }
+    static var armCount: Int { elementwiseEnabled ? 3 : 2 }
+
     nonisolated(unsafe) static var active = false
-    nonisolated(unsafe) static var roundTimes: [[UInt64]] = [[], []]
+    nonisolated(unsafe) static var roundTimes: [[UInt64]] = Array(repeating: [], count: armCount)
     nonisolated(unsafe) static var roundIndex = 0
     nonisolated(unsafe) static var lastBoundary: UInt64 = 0
     nonisolated(unsafe) static var onEnough: (() -> Void)?
 
     static let roundsPerArm = 8
     static let adoptMargin = 0.005
-    static var roundsNeeded: Int { 2 + 2 * roundsPerArm }
+    // Preserve the inherited schedule with the kill switch. With three arms,
+    // discard one full cycle, then collect eight complete intervals per arm.
+    static var discardedRounds: Int { elementwiseEnabled ? armCount : 1 }
+    static var roundsNeeded: Int { 1 + discardedRounds + armCount * roundsPerArm }
+
+    private static func select(_ arm: Int) {
+        HadamardQuantizedLinear.narrowProducerActive = arm == 1
+        HadamardQuantizedLinear.narrowElementwiseProducerActive = arm == 2
+    }
 
     /// Whether the trial should run: on, not forced, and the 16-row self-test
     /// passed (it runs here, outside any timed round).
@@ -7979,9 +7999,11 @@ enum Qwen35NarrowProducerTrial {
 
     private static func boundary() {
         let now = DispatchTime.now().uptimeNanoseconds
-        if roundIndex >= 2 { roundTimes[(roundIndex - 1) & 1].append(now - lastBoundary) }
+        if roundIndex > discardedRounds {
+            roundTimes[(roundIndex - 1) % armCount].append(now - lastBoundary)
+        }
         lastBoundary = now
-        HadamardQuantizedLinear.narrowProducerActive = roundIndex & 1 == 1
+        select(roundIndex % armCount)
         roundIndex += 1
         if roundIndex >= roundsNeeded {
             active = false
@@ -7992,7 +8014,7 @@ enum Qwen35NarrowProducerTrial {
     }
 
     static func begin(onEnough: @escaping () -> Void) {
-        roundTimes = [[], []]
+        roundTimes = Array(repeating: [], count: armCount)
         roundIndex = 0
         lastBoundary = 0
         self.onEnough = onEnough
@@ -8016,18 +8038,27 @@ enum Qwen35NarrowProducerTrial {
             let kept = times.filter { Double($0) <= 1.5 * first }
             return (median(kept), kept.count)
         }
-        var adopt = false
+        var adopted = 0
         if let off = arms[0].0, let on = arms[1].0, arms[0].1 >= 4, arms[1].1 >= 4 {
-            adopt = on < off * (1 - adoptMargin)
+            if on < off * (1 - adoptMargin) { adopted = 1 }
         }
-        HadamardQuantizedLinear.narrowProducerActive = adopt
+        if elementwiseEnabled, arms[0].1 >= 4, arms[1].1 >= 4, arms[2].1 >= 4,
+            let best = arms[adopted].0, let elementwise = arms[2].0,
+            elementwise < best * (1 - adoptMargin)
+        {
+            adopted = 2
+        }
+        select(adopted)
         func ms(_ value: Double?) -> String { value.map { String(format: "%.2f", $0 / 1e6) } ?? "-" }
-        let log = "bonsai verify producer trial: off \(ms(arms[0].0)) ms, on \(ms(arms[1].0)) ms, adopted "
-            + (adopt ? "on" : "off")
-            + " (kept \(arms[0].1)/\(roundTimes[0].count) off, \(arms[1].1)/\(roundTimes[1].count) on; "
+        let timings = arms.indices.map { "\(armNames[$0]) \(ms(arms[$0].0)) ms" }.joined(separator: ", ")
+        let kept = arms.indices.map {
+            "\(arms[$0].1)/\(roundTimes[$0].count) \(armNames[$0])"
+        }.joined(separator: ", ")
+        let log = "bonsai verify producer trial: \(timings), adopted \(armNames[adopted])"
+            + " (kept \(kept); "
             + String(format: "%.0f ms)\n", Double(elapsedNanoseconds) / 1e6)
         FileHandle.standardError.write(log.data(using: .utf8)!)
-        roundTimes = [[], []]
+        roundTimes = Array(repeating: [], count: armCount)
     }
 }
 

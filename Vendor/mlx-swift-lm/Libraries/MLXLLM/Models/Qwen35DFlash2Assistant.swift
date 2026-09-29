@@ -200,9 +200,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// stderr line. `MLXFAST_HEAD_TOP2=1` / `=0` force the choice (no trial;
     /// `=0` no self-test either). Nothing runs where the head is not on the
     /// int8 verify route or its fused form fails the self-test.
-    /// The verify-width producer's off/on trial (`Qwen35NarrowProducerTrial`),
+    /// The verify-width producer's off/on/elementwise trial (`Qwen35NarrowProducerTrial`),
     /// after the verify kernels' trial, the same way: one engine request,
-    /// cancelled once both arms have their rounds, the choice, one stderr
+    /// cancelled once all enabled arms have their rounds, the choice, one stderr
     /// line, the buffer cache drained.
     private func runNarrowProducerTrial(serving: any LanguageModel) {
         typealias Trial = Qwen35NarrowProducerTrial

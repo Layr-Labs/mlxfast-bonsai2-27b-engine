@@ -1172,6 +1172,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// its rounds are faster).
     nonisolated(unsafe) public static var narrowProducerActive: Bool = narrowProducerForced ?? false
 
+    /// The load-time trial may keep only the elementwise producers (SwiGLU
+    /// and the attention sigmoid gate). Their benefit need not match the
+    /// GDN norm/gate producer. Never enables a route without its existing
+    /// bitwise rotation check; explicit BONSAI_NARROW_PRODUCER still wins.
+    nonisolated(unsafe) public static var narrowElementwiseProducerActive = false
+
+    private static func narrowProducerTakes(_ producer: SignedBlockHadamard.Int8Producer) -> Bool {
+        if let forced = narrowProducerForced { return forced }
+        if narrowProducerActive { return true }
+        guard narrowElementwiseProducerActive else { return false }
+        switch producer {
+        case .swiglu, .sigmoidGate: return true
+        default: return false
+        }
+    }
+
     /// `BONSAI_NARROW_PRODUCER` when set explicitly (on or off); nil lets the
     /// model decide (its load-time trial, else off).
     public static let narrowProducerForced: Bool? = {
@@ -1193,7 +1209,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     fileprivate func tensorRouteNarrowForwardProducer(
         _ producer: SignedBlockHadamard.Int8Producer, widenOutput: Bool
     ) -> MLXArray? {
-        guard Self.narrowProducerActive, Self.tensorRouteEnabled,
+        guard Self.narrowProducerTakes(producer), Self.tensorRouteEnabled,
             let matmul = Self.tensorPackedMatmulNarrowInt8,
             let applies = Self.tensorPackedMatmulNarrowApplies
         else { return nil }
