@@ -614,6 +614,26 @@ public func sharedHadamardSiblings(_ projections: [Linear]) -> [HadamardQuantize
     return packed
 }
 
+/// `sharedHadamardProjections` for an activation that already carries the
+/// shared transform's signs (see `SignedBlockHadamard.applyPreSigned`): the
+/// rotation skips its sign multiply, and every sibling reads the rotated
+/// array `sharedHadamardProjections` would have formed from the unsigned
+/// activation. Nil when the siblings do not share one ungrouped transform.
+public func sharedHadamardProjectionsPreSigned(
+    _ signed: MLXArray, _ siblings: [HadamardQuantizedLinear], widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return nil }
+    let rotated = first.transform.applyPreSigned(signed)
+    if let fused = first.fusedSiblingsForward(
+        rotated, siblings: siblings, widenOutput: widenOutput)
+    {
+        return fused
+    }
+    return siblings.map { $0.applyRotated(rotated) }
+}
+
 /// Packed folded embeddings with an inverse transform after lookup.
 ///
 /// `asLinear` applies the forward transform, allowing the same packed weights

@@ -563,16 +563,31 @@ extension EngineLoopV2 {
                     preconditionFailure(
                         "CBv2 block MTP assistant state missing for \(row.rec.id)")
                 }
-                let proposal = try block.proposeBlock(
-                    anchor: row.carry!.token, depth: k, requestState: requestState)
+                let carry = row.carry!
+                let proposal: MLXArray
+                if let early = carry.earlyBlock {
+                    // Proposed and submitted at the previous round's finalize
+                    // with this carry's anchor and offset (`storeCarry`
+                    // checks both), and the drafter cache already trimmed.
+                    // A fixed-depth leg plans that same depth; a smaller
+                    // plan (never taken while the early gate holds) reads a
+                    // prefix of the block, which is still only a proposal.
+                    precondition(
+                        k <= early.depth,
+                        "CBv2 block MTP: round depth \(k) exceeds early proposal \(early.depth)")
+                    proposal = k == early.depth ? early.tokens : early.tokens[0..., ..<k]
+                } else {
+                    proposal = try block.proposeBlock(
+                        anchor: carry.token, depth: k, requestState: requestState)
+                    // Align the drafter's context cache with the TARGET's
+                    // committed length, exactly where the reference does it:
+                    // after the proposal absorbed this round's context rows.
+                    // `kvOffset` IS that length (the row's `numComputedTokens`
+                    // when the carry was captured).
+                    block.trimBlockState(
+                        requestState, toCommittedLength: carry.kvOffset)
+                }
                 proposals.append(proposal)
-                // Align the drafter's context cache with the TARGET's
-                // committed length, exactly where the reference does it:
-                // after the proposal absorbed this round's context rows.
-                // `kvOffset` IS that length (the row's `numComputedTokens`
-                // when the carry was captured).
-                block.trimBlockState(
-                    requestState, toCommittedLength: row.carry!.kvOffset)
                 assistantEvalTargets.append(proposal)
                 assistantEvalTargets.append(
                     contentsOf: block.evaluationTargets(for: requestState))
