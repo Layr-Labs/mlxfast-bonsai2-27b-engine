@@ -5,6 +5,17 @@
 import Foundation
 import MLX
 
+/// On unless explicitly disabled: a round whose driver does not use the
+/// marginal depth policy drops the dead verify top-two readback.
+/// `DARKBLOOM_MTP_SKIP_DEAD_MARGIN=0` keeps the readback.
+enum CBv2MTPDeadMarginSkip {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MTP_SKIP_DEAD_MARGIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
     let start: Int
@@ -722,7 +733,11 @@ extension EngineLoopV2 {
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
-            policyTopTwoValues: target.policyTopTwo?.values,
+            // The verify top-two values feed only the marginal depth policy
+            // (`previousTopTwoMargin`); with a fixed draft depth nothing
+            // reads them, so the round neither retains nor reads them back.
+            policyTopTwoValues: (mtp.usesMarginalPolicy || !CBv2MTPDeadMarginSkip.enabled)
+                ? target.policyTopTwo?.values : nil,
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
