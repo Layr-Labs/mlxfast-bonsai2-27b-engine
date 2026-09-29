@@ -15,7 +15,7 @@ enum CBv2VerifyTokenStack {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_TOKEN_STACK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let verified: Bool = {
@@ -68,7 +68,8 @@ extension EngineLoopV2 {
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        stackedTokens: MLXArray? = nil
+        stackedTokens: MLXArray? = nil,
+        prebuild: CBv2MTPVerifyPrebuild? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -205,6 +206,12 @@ extension EngineLoopV2 {
             }
         }
         mtp.recordVerificationStrategy(rectangular: useRectangular)
+        // A verify prefix was built for the captured rectangular window only
+        // (`mtpPrebuildVerify` mirrors the choice above); its rows already
+        // hold that window's first columns, so no other path may run here.
+        precondition(
+            prebuild == nil || useRectangular,
+            "CBv2 MTP: a verify prefix cannot be finished on the serial path")
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
@@ -280,7 +287,7 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularAttention = false
                 }
             }
-            let tokens = stackedTokens ?? concatenated(columns, axis: 1)
+            let tokens = prebuild?.tokens ?? stackedTokens ?? concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
@@ -288,23 +295,41 @@ extension EngineLoopV2 {
                 // recurrent layer. Finalize commits the accepted position
                 // (device-side slice) or rolls the transaction back — no
                 // repair forward on either path.
-                let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
-                    guard let state = recurrentStates[row.rec.id] else {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP state missing for \(row.rec.id)")
+                let evaluations: [CBv2RecurrentStateEvaluation]
+                let positionIds: MLXArray?
+                if let prebuild {
+                    // The window's first layers were built ahead of the round
+                    // (`CBv2MTPVerifyPrebuild`) over a binding of their own
+                    // and the offsets of that time; the rest resumes them.
+                    evaluations = [prebuild.evaluation]
+                    positionIds = prebuild.positionIds
+                } else {
+                    evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
+                        guard let state = recurrentStates[row.rec.id] else {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP state missing for \(row.rec.id)")
+                        }
+                        do { return try state.bind() } catch {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
+                        }
                     }
-                    do { return try state.bind() } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
-                    }
+                    positionIds = CBv2PositionState.decodePositionIds(
+                        states: rows.map(\.rec.request.positionState),
+                        cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
+                        length: tokens.dim(1))
                 }
-                let positionIds = CBv2PositionState.decodePositionIds(
-                    states: rows.map(\.rec.request.positionState),
-                    cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
-                    length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                output = try checkedModelForward(phase: .mtpVerification) {
+                    if let prebuild {
+                        return recurrentModel.forwardVerifyResume(
+                            prebuild.cursor, tokens: tokens, caches: caches,
+                            recurrentState: evaluations, positionIds: positionIds)
+                    }
+                    return recurrentModel.forwardWithHiddenCaptured(
+                        tokens: tokens, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds)
+                }
+                prebuild?.adopt()
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,

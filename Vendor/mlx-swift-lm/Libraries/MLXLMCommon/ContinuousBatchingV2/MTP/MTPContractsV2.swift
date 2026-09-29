@@ -113,6 +113,36 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
+/// A capture-verify window built in two parts: the first `layers` trunk
+/// layers ahead of the round (`CBv2MTPVerifyPrebuild`), the rest when the
+/// round launches. The two calls together are `cbv2ForwardWithHiddenCaptured`
+/// on the same inputs, op for op; the prefix records its early submissions
+/// instead of issuing them. The cursor is the model's own.
+public struct CBv2VerifyPrefix {
+    public let cursor: AnyObject
+    /// The prefix's boundary submissions, in plan order, to issue (one
+    /// `asyncEval` each) when the window is taken.
+    public let deferredSubmissions: [[MLXArray]]
+
+    public init(cursor: AnyObject, deferredSubmissions: [[MLXArray]]) {
+        self.cursor = cursor
+        self.deferredSubmissions = deferredSubmissions
+    }
+}
+
+public protocol CBv2VerifyPrefixForwardable: AnyObject {
+    func cbv2VerifyPrefix(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix?
+
+    func cbv2VerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
@@ -174,6 +204,16 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// `forwardWithHiddenCaptured` in two parts (`CBv2VerifyPrefixForwardable`).
+    func forwardVerifyPrefix(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix?
+    func forwardVerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
 extension CBv2RecurrentMTPSteppableModel {
@@ -196,6 +236,21 @@ extension CBv2RecurrentMTPSteppableModel {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         preconditionFailure(
             "CBv2 capture-verify forward called on a model without captured-window support")
+    }
+
+    /// The split capture-verify window (`CBv2VerifyPrefixForwardable`): nil
+    /// when the model does not split one.
+    public func forwardVerifyPrefix(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        layers: Int
+    ) -> CBv2VerifyPrefix? { nil }
+
+    public func forwardVerifyResume(
+        _ cursor: AnyObject, tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        preconditionFailure("CBv2 verify resume called on a model without a split window")
     }
 }
 

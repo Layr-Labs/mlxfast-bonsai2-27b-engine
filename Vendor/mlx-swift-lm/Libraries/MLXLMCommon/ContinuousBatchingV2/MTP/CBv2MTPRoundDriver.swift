@@ -56,6 +56,10 @@ struct CBv2MTPCarry {
     /// finalize so the GPU is not idle while the host finishes the round.
     /// nil: the next verify build proposes as before.
     var earlyBlock: CBv2MTPEarlyBlockProposal? = nil
+    /// The verify prefix built ahead of the round this carry seeds, over the
+    /// early block above (`CBv2MTPVerifyPrebuild`); nil: the round builds
+    /// its verify whole.
+    var verifyPrebuild: CBv2MTPVerifyPrebuild? = nil
 }
 
 /// A block proposal issued at finalize for the NEXT round. `depth` is the
@@ -566,12 +570,21 @@ final class CBv2MTPRoundDriver {
         carries.removeValue(forKey: id)
     }
 
+    /// Drop a verify prefix the row's carry holds (the row's next step is not
+    /// the round it was built for). The carry itself stays.
+    func discardVerifyPrebuild(for id: CBv2RequestID) {
+        guard let prebuild = carries[id]?.verifyPrebuild else { return }
+        prebuild.discard()
+        carries[id]?.verifyPrebuild = nil
+    }
+
     func storeCarry(
         id: CBv2RequestID, token: Int, hidden: MLXArray,
         shortlist: MLXArray? = nil, previousTopTwoMargin: Double? = nil,
         needsHistoryTransition: Bool = false,
         tokensCount: Int, kvOffset: Int,
-        earlyBlock: CBv2MTPEarlyBlockProposal? = nil
+        earlyBlock: CBv2MTPEarlyBlockProposal? = nil,
+        verifyPrebuild: CBv2MTPVerifyPrebuild? = nil
     ) {
         if tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter,
@@ -584,12 +597,18 @@ final class CBv2MTPRoundDriver {
                 earlyBlock.anchor == token && earlyBlock.kvOffset == kvOffset,
                 "CBv2 block MTP: early proposal does not match the carry it rides")
         }
+        if let verifyPrebuild {
+            precondition(
+                earlyBlock != nil && verifyPrebuild.anchorOffset == kvOffset
+                    && verifyPrebuild.confirmedIfHit.last == token,
+                "CBv2 block MTP: verify prefix does not match the carry it rides")
+        }
         carries[id] = CBv2MTPCarry(
             token: token, hidden: hidden, shortlist: shortlist,
             previousTopTwoMargin: previousTopTwoMargin,
             needsHistoryTransition: needsHistoryTransition,
             tokensCount: tokensCount, kvOffset: kvOffset,
-            earlyBlock: earlyBlock)
+            earlyBlock: earlyBlock, verifyPrebuild: verifyPrebuild)
     }
 
     var tracksPersistentHistory: Bool {
