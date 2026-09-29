@@ -425,6 +425,41 @@ public enum DFlash2SlidingMask {
     }
 }
 
+/// The sliding mask of ONE block forward, built once and handed to every layer
+/// that asks for the same geometry.
+///
+/// Every layer of a forward sees the same context rows and the same block, so
+/// its mask inputs are equal and the mask is the same array. Building it per
+/// layer re-ran the same comparison graph once per layer. The memo is keyed on
+/// every input of ``DFlash2SlidingMask/make(contextLength:blockLength:slidingWindow:isCausal:)``,
+/// so a layer whose inputs differ still gets its own mask. It lives for one
+/// forward only and is a plain class, off the module tree (see
+/// ``DFlash2TapSlot``).
+final class DFlash2SlidingMaskMemo {
+    private var key: [Int]?
+    private var cached: MLXArray?
+
+    func mask(
+        contextLength: Int,
+        blockLength: Int,
+        slidingWindow: Int,
+        isCausal: Bool
+    ) -> MLXArray {
+        let requested = [contextLength, blockLength, slidingWindow, isCausal ? 1 : 0]
+        if let cached, key == requested {
+            return cached
+        }
+        let made = DFlash2SlidingMask.make(
+            contextLength: contextLength,
+            blockLength: blockLength,
+            slidingWindow: slidingWindow,
+            isCausal: isCausal)
+        key = requested
+        cached = made
+        return made
+    }
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -467,7 +502,8 @@ private final class DFlash2Attention: Module {
     ///   - x: the block, `[B, blockLength, hidden]`.
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -489,25 +525,40 @@ private final class DFlash2Attention: Module {
         }
 
         var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
-
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
-        contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        blockKeys = kNorm(blockKeys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-        blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         queries = rope(queries, offset: blockOffset)
-        contextKeys = rope(contextKeys, offset: cache.offset)
-        blockKeys = rope(blockKeys, offset: blockOffset)
+
+        var contextKeys: MLXArray
+        var contextValues: MLXArray
+        var blockKeys: MLXArray
+        var blockValues: MLXArray
+        if dflash2KVConcatEnabled {
+            // One K and one V projection over [context; block]. The block's
+            // positions continue the context's, so one rope at the context's
+            // offset rotates every row where the two separate ropes did.
+            let rows = concatenated([context, x], axis: 1)
+            let n = contextLength + L
+            let keys = rope(
+                kNorm(kProj(rows).reshaped(B, n, kvHeads, -1)).transposed(0, 2, 1, 3),
+                offset: cache.offset)
+            let values = vProj(rows).reshaped(B, n, kvHeads, -1).transposed(0, 2, 1, 3)
+            contextKeys = keys[0..., 0..., ..<contextLength, 0...]
+            contextValues = values[0..., 0..., ..<contextLength, 0...]
+            blockKeys = keys[0..., 0..., contextLength..., 0...]
+            blockValues = values[0..., 0..., contextLength..., 0...]
+        } else {
+            contextKeys = kNorm(kProj(context).reshaped(B, contextLength, kvHeads, -1))
+                .transposed(0, 2, 1, 3)
+            contextValues = vProj(context).reshaped(B, contextLength, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            blockKeys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            blockValues = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+            contextKeys = rope(contextKeys, offset: cache.offset)
+            blockKeys = rope(blockKeys, offset: blockOffset)
+        }
 
         // Only the CONTEXT keys and values enter the cache. The block's own keys
         // and values are concatenated for this forward and then dropped.
@@ -518,11 +569,17 @@ private final class DFlash2Attention: Module {
 
         var mask: MLXArray?
         if let slidingWindow {
-            mask = DFlash2SlidingMask.make(
-                contextLength: cachedLength,
-                blockLength: L,
-                slidingWindow: slidingWindow,
-                isCausal: isCausal)
+            // Every query sits at cachedLength + i (i < L), so the context
+            // term `query - key < window` holds for every context key once
+            // cachedLength + L <= window, and a non-causal block term is all
+            // true: the mask would allow everything.
+            if !(dflash2NoMaskEnabled && !isCausal && cachedLength + L <= slidingWindow) {
+                mask = masks.mask(
+                    contextLength: cachedLength,
+                    blockLength: L,
+                    slidingWindow: slidingWindow,
+                    isCausal: isCausal)
+            }
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
@@ -532,6 +589,20 @@ private final class DFlash2Attention: Module {
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
+
+/// Kill switch for the one-projection context+block K/V (default on).
+private let dflash2KVConcatEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_KV_CONCAT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Kill switch for dropping a sliding mask that allows everything (default on).
+private let dflash2NoMaskEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_NOMASK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 // MARK: - The grouped dynamic causal convolution
 
@@ -594,10 +665,58 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         return output.reshaped(hidden.shape)
     }
 
-    /// The first tap. Returns the convolved input and the dynamic taps the
-    /// matching ``finish(_:dynamic:)`` needs.
+    /// ``convolve(hidden:dynamic:base:groupSize:)`` for tap `tap` as ONE
+    /// kernel (`dflash2GroupedConvKernel`), plus `residual` when given, or
+    /// nil when the inputs do not qualify (the caller keeps the op chain).
+    ///
+    /// The op chain issues ten element-wise launches per call (four products
+    /// and sums per offset, and a two-input concatenate for the shifted
+    /// block); the kernel computes the same element in one. Each element
+    /// takes the chain's operations in the chain's order on the same
+    /// `T`-typed values — `out = 0 + k*v`, `+ d*v`, then offset 1 — with
+    /// every product and sum rounded to `T` as the separate launches round
+    /// it, and contraction off. The residual sum is the layer's own
+    /// `x + conv`. Bit-identical to the chain it replaces.
+    private func fusedConvolve(
+        _ hidden: MLXArray, projection: MLXArray, tap: Int, residual: MLXArray?
+    ) -> MLXArray? {
+        guard dflash2FusedConvEnabled, hidden.ndim == 3 else { return nil }
+        let batch = hidden.dim(0)
+        let length = hidden.dim(1)
+        let hiddenSize = hidden.dim(2)
+        let dtype = hidden.dtype
+        guard [DType.bfloat16, .float16, .float32].contains(dtype),
+            batch > 0, length > 0, hiddenSize == groups * groupSize,
+            hiddenSize % 256 == 0,
+            projection.shape == [batch, length, 2 * kernelSize * groups],
+            projection.dtype == dtype,
+            baseKernel.shape == [2, kernelSize, hiddenSize], baseKernel.dtype == dtype,
+            residual.map({ $0.shape == hidden.shape && $0.dtype == dtype }) ?? true
+        else { return nil }
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("KS", kernelSize), ("GS", groupSize), ("TAP", tap),
+        ]
+        let grid = (hiddenSize, length, batch)
+        if let residual {
+            return dflash2GroupedConvResidualKernel(
+                [hidden, projection, baseKernel, residual],
+                template: template, grid: grid, threadGroup: (256, 1, 1),
+                outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
+        }
+        return dflash2GroupedConvKernel(
+            [hidden, projection, baseKernel],
+            template: template, grid: grid, threadGroup: (256, 1, 1),
+            outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
+    }
+
+    /// The first tap. Returns the convolved input and the dynamic-tap
+    /// projection the matching ``finish(_:projection:residual:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let dynamic = kernelProjection(hidden)
+        let projection = kernelProjection(hidden)
+        if let fused = fusedConvolve(hidden, projection: projection, tap: 0, residual: nil) {
+            return (fused, projection)
+        }
+        let dynamic = projection
             .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
         return (
             Self.convolve(
@@ -605,23 +724,146 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                 dynamic: dynamic[0..., 0..., 0, 0..., 0...],
                 base: baseKernel[0],
                 groupSize: groupSize),
-            dynamic[0..., 0..., 1, 0..., 0...]
+            projection
         )
     }
 
-    /// The second tap, over the sub-layer's output.
-    func finish(_ hidden: MLXArray, dynamic: MLXArray) -> MLXArray {
-        Self.convolve(
-            hidden: hidden, dynamic: dynamic, base: baseKernel[1], groupSize: groupSize)
+    /// The second tap, over the sub-layer's output, added to the layer's
+    /// residual stream: `residual + conv(hidden)`.
+    func finish(_ hidden: MLXArray, projection: MLXArray, residual: MLXArray) -> MLXArray {
+        if let fused = fusedConvolve(
+            hidden, projection: projection, tap: 1, residual: residual)
+        {
+            return fused
+        }
+        let dynamic = projection
+            .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
+        return residual
+            + Self.convolve(
+                hidden: hidden, dynamic: dynamic[0..., 0..., 1, 0..., 0...],
+                base: baseKernel[1], groupSize: groupSize)
     }
 }
 
+/// Kill switch for the one-launch grouped convolution (default on).
+private let dflash2FusedConvEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_FUSED_CONV"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One element of `DFlash2GroupedDynamicCausalConv.convolve` for tap `TAP`.
+///
+/// `h` is the block `[B, L, H]`, `dyn` the kernel projection `[B, L, 2*KS*G]`
+/// (viewed `[B, L, 2, KS, G]`), `base` the base kernel `[2, KS, H]`. The
+/// operations and their order are the op chain's: `out` starts at zero; for
+/// each offset `o` the shifted value `v` (zero before the block start) is
+/// multiplied by the base tap and added, then multiplied by the dynamic tap
+/// and added. Every intermediate is a `T`, as each separate launch stores it.
+private let dflash2GroupedConvHeader = """
+    template <typename T, int KS, int GS, int TAP>
+    inline T dflash2_grouped_conv(
+        const device T* h, const device T* dyn, const device T* base,
+        uint b, uint l, uint c, uint L, uint H) {
+    #pragma clang fp contract(off)
+      const uint G = H / GS;
+      const uint g = c / GS;
+      const size_t row = size_t(b) * L + l;
+      T out = static_cast<T>(0.0f);
+      for (int o = 0; o < KS; ++o) {
+        const T v = (l >= uint(o)) ? h[(row - o) * H + c] : static_cast<T>(0.0f);
+        const T kb = base[(size_t(TAP) * KS + o) * H + c];
+        const T kv = kb * v;
+        out = out + kv;
+        const T d = dyn[row * (2 * KS * G) + (size_t(TAP) * KS + o) * G + g];
+        const T dv = d * v;
+        out = out + dv;
+      }
+      return out;
+    }
+    """
+
+private let dflash2GroupedConvSource = """
+    const uint c = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint H = threads_per_grid.x;
+    const uint L = threads_per_grid.y;
+    out[(size_t(b) * L + l) * H + c] =
+        dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    """
+
+private let dflash2GroupedConvResidualSource = """
+    #pragma clang fp contract(off)
+    const uint c = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint H = threads_per_grid.x;
+    const uint L = threads_per_grid.y;
+    const size_t i = (size_t(b) * L + l) * H + c;
+    const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    out[i] = res[i] + conv;
+    """
+
+private let dflash2GroupedConvKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_conv",
+    inputNames: ["h", "dyn", "base"],
+    outputNames: ["out"],
+    source: dflash2GroupedConvSource,
+    header: dflash2GroupedConvHeader,
+    ensureRowContiguous: true)
+
+private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
+    name: "dflash2_grouped_conv_residual",
+    inputNames: ["h", "dyn", "base", "res"],
+    outputNames: ["out"],
+    source: dflash2GroupedConvResidualSource,
+    header: dflash2GroupedConvHeader,
+    ensureRowContiguous: true)
+
 // MARK: - The decoder layer
+
+/// The gate and up projections' weights stacked along the output axis: the
+/// same BF16 bytes as the two loaded weights, concatenated once on first use
+/// and held in a plain class (never a stored `MLXArray` on the module, so
+/// reflection cannot add it to the parameter tree). One matmul over the
+/// stack replaces two over the same input, and the block's 16 rows fill one
+/// wider tensor tile instead of two. `DARKBLOOM_DFLASH2_STACK_GATEUP=0` keeps
+/// the two matmuls.
+private final class DFlash2GateUpStack {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_STACK_GATEUP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private var weight: MLXArray?
+    private var boundary = 0
+
+    func clear() {
+        weight = nil
+        boundary = 0
+    }
+
+    /// `(gate(x), up(x))` from one matmul, or nil when the stack does not apply.
+    func apply(_ x: MLXArray, gate: Linear, up: Linear) -> (MLXArray, MLXArray)? {
+        guard Self.enabled, gate.bias == nil, up.bias == nil,
+            gate.weight.dtype == up.weight.dtype, gate.weight.dim(1) == up.weight.dim(1),
+            gate.weight.ndim == 2, up.weight.ndim == 2
+        else { return nil }
+        if weight == nil {
+            weight = concatenated([gate.weight, up.weight], axis: 0)
+            boundary = gate.weight.dim(0)
+        }
+        let y = matmul(x, weight!.T)
+        return (y[.ellipsis, ..<boundary], y[.ellipsis, boundary...])
+    }
+}
 
 private final class DFlash2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
+    private let gateUp = DFlash2GateUpStack()
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -630,8 +872,20 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        gateUp.clear()
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        if let (g, u) = gateUp.apply(x, gate: gate, up: up) {
+            return down(silu(g) * u)
+        }
+        return down(silu(gate(x)) * up(x))
     }
 }
 
@@ -663,15 +917,17 @@ private final class DFlash2DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        let attended = x
-            + attentionConv.finish(
-                selfAttn(attentionInput, context: context, rope: rope, cache: cache),
-                dynamic: attentionTaps)
+        let attended = attentionConv.finish(
+            selfAttn(
+                attentionInput, context: context, rope: rope, cache: cache,
+                masks: masks),
+            projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+        return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
     }
 }
 
@@ -711,10 +967,23 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
-        let unary = takeAlong(logits, candidates, axis: -1)
+        let candidates: MLXArray
+        let unary: MLXArray
+        if let top = DFlash2TopK.select(logits, k: topK) {
+            (candidates, unary) = top
+        } else {
+            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+            unary = takeAlong(logits, candidates, axis: -1)
+        }
         let projected = hiddenProjection(hidden)
+
+        if let path = DFlash2GreedyWalk.select(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        {
+            return path
+        }
 
         var predecessor = anchor
         var path = [MLXArray]()
@@ -736,6 +1005,238 @@ final class DFlash2CandidateSelector: Module {
         // Draft tokens are token ids, and the engine reads them as Int32.
         return stacked(path, axis: 1).asType(.int32)
     }
+}
+
+/// The top-`k` logits of each row, as `argPartition` + `takeAlong` return them.
+///
+/// `argPartition` runs MLX's stable ascending merge sort, so its last `k`
+/// slots hold the `k` largest values in ascending order, equal values in
+/// index order (the higher index ranks higher), NaN above everything. Two
+/// launches reproduce that exactly: each threadgroup reduces one chunk of a
+/// row to its top `k` by (value, index), then one simdgroup per row merges
+/// the chunk lists and writes them in the sort's slot order, gathering the
+/// values from the logits. Candidates and unary scores are therefore the
+/// same arrays, element for element.
+enum DFlash2TopK {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_TOPK_KERNEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let chunks = 8
+    private static let threads = 128
+
+    static func select(_ logits: MLXArray, k: Int) -> (MLXArray, MLXArray)? {
+        guard enabled, logits.ndim == 3, logits.dim(0) == 1, logits.dtype == .float32
+        else { return nil }
+        let rows = logits.dim(1)
+        let vocabularySize = logits.dim(2)
+        guard rows >= 1, k >= 1, k <= 32, vocabularySize >= k,
+            vocabularySize < Int(Int32.max)
+        else { return nil }
+        let flat = logits.reshaped([rows, vocabularySize])
+        let template: [(String, any KernelTemplateArg)] = [
+            ("NV", vocabularySize), ("S", chunks), ("TPG", threads), ("KTOP", k),
+        ]
+        let parts = chunkKernel(
+            [flat], template: template,
+            grid: (threads * chunks, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rows, chunks, k], [rows, chunks, k]],
+            outputDTypes: [.uint32, .uint32])
+        let merged = mergeKernel(
+            [flat, parts[0], parts[1]], template: template,
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, k], [rows, k]],
+            outputDTypes: [.uint32, .float32])
+        return (merged[0].reshaped([1, rows, k]), merged[1].reshaped([1, rows, k]))
+    }
+
+    private static let header = """
+            // Order-preserving key: larger float -> larger key; every NaN -> 0xffffffff
+            // (the sort's LessThan puts NaN above +inf); -0 and +0 share a key (they
+            // compare equal). Key 0 is never produced by data and marks an empty slot.
+            inline uint mlxfast_topk_key(float x) {
+                if (isnan(x)) return 0xffffffffu;
+                uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
+                return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+            }
+            // Entries rank by (key, idx): the stable ascending sort keeps equal values in
+            // index order, so among ties the higher index ranks higher.
+            // KK rounds of simdgroup max over per-lane descending lists; each winner pops
+            // its head. Lane r receives the r-th ranked entry (r < KK).
+            template <int KK>
+            inline void mlxfast_topk_simd_merge(thread uint (&k)[KK], thread uint (&id)[KK],
+                                                uint lane, thread uint& outk, thread uint& outi) {
+                for (int r = 0; r < KK; r++) {
+                    uint km = simd_max(k[0]);
+                    uint im = simd_max(k[0] == km ? id[0] : 0u);
+                    if (lane == uint(r)) { outk = km; outi = im; }
+                    if (k[0] == km && id[0] == im) {
+                        for (int j = 0; j < KK - 1; j++) { k[j] = k[j + 1]; id[j] = id[j + 1]; }
+                        k[KK - 1] = 0u; id[KK - 1] = 0u;
+                    }
+                }
+            }
+            """
+
+    private static let chunkKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_topk_chunk",
+        inputNames: ["logits"],
+        outputNames: ["part_key", "part_idx"],
+        source: """
+            // grid (TPG * S, rows): threadgroup (chunk, row) reduces one chunk of a row to its top-KK
+            constexpr int KK = KTOP;
+            static_assert(TPG % 32 == 0 && TPG / 32 <= 32 && KK <= 32, "one merge simdgroup");
+            const uint t = thread_position_in_threadgroup.x;
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr uint CH = (NV + S - 1) / S;
+            const uint lo = chunk * CH;
+            const uint hi = min(lo + CH, uint(NV));
+            const device float* x = logits + size_t(row) * NV;
+            uint k[KK], id[KK];
+            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+            for (uint v = lo + t; v < hi; v += TPG) {
+                uint kx = mlxfast_topk_key(x[v]);
+                if (kx >= k[KK - 1]) {   // this thread visits indices in increasing order
+                    uint ix = v;
+                    for (int j = 0; j < KK; j++) {
+                        bool sw = kx >= k[j];
+                        uint tk = k[j], ti = id[j];
+                        k[j] = sw ? kx : tk; id[j] = sw ? ix : ti;
+                        kx = sw ? tk : kx; ix = sw ? ti : ix;
+                    }
+                }
+            }
+            uint ok = 0u, oi = 0u;
+            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+            constexpr uint NSG = TPG / 32;
+            threadgroup uint sk[NSG * KK], si[NSG * KK];
+            if (lane < uint(KK)) { sk[sg * KK + lane] = ok; si[sg * KK + lane] = oi; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+                if (lane < NSG) {
+                    for (int j = 0; j < KK; j++) { k[j] = sk[lane * KK + j]; id[j] = si[lane * KK + j]; }
+                }
+                mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+                if (lane < uint(KK)) {
+                    size_t o = (size_t(row) * S + chunk) * KK + lane;
+                    part_key[o] = ok; part_idx[o] = oi;
+                }
+            }
+            """,
+        header: header)
+
+    private static let mergeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_topk_merge",
+        inputNames: ["logits", "part_key", "part_idx"],
+        outputNames: ["cand", "val"],
+        source: """
+            // one simdgroup per row merges the S chunk lists (S <= 32), then writes the
+            // top-KK in the sort's ascending order, with the values gathered from logits.
+            constexpr int KK = KTOP;
+            static_assert(S <= 32 && KK <= 32, "one merge simdgroup");
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            uint k[KK], id[KK];
+            for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
+            if (lane < uint(S)) {
+                for (int j = 0; j < KK; j++) {
+                    size_t o = (size_t(row) * S + lane) * KK + j;
+                    k[j] = part_key[o]; id[j] = part_idx[o];
+                }
+            }
+            uint ok = 0u, oi = 0u;
+            mlxfast_topk_simd_merge<KK>(k, id, lane, ok, oi);
+            if (lane < uint(KK)) {
+                uint slot = KK - 1 - lane;
+                uint ii = min(oi, uint(NV - 1));
+                cand[row * KK + slot] = ii;
+                val[row * KK + slot] = logits[size_t(row) * NV + ii];
+            }
+            """,
+        header: header)
+}
+
+/// The greedy candidate walk with every edge score computed up front.
+///
+/// Position 0 scores its candidates against the anchor; every later position
+/// scores its candidates against each candidate of the position before it, as
+/// one `[L-1, K, K]` table built from the same element-wise products and the
+/// same final-axis sum as the per-position loop. One small kernel then walks
+/// the table in order, so the selected path is the loop's path.
+enum DFlash2GreedyWalk {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_FUSED_WALK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func select(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray? {
+        guard enabled, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
+            unary.dtype == .float32
+        else { return nil }
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(-1)
+        guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        let c = candidates[0]
+        // Gather only the codebook rows the candidate lists can visit. The
+        // fused kernel scores each edge and advances the greedy walk in one
+        // pass, instead of materializing an [L-1, K, K, rank] broadcast.
+        let anchorPredecessor = take(predecessorCodebook, anchor, axis: 0)
+            .asType(.float32).reshaped([-1])
+        let previous = take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+            .asType(.float32).reshaped([-1])
+        let next = take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1])
+        let projectedRows = projected[0].asType(.float32).reshaped([-1])
+        let scores = unary[0].asType(.float32).reshaped([-1])
+        let candidateIds = c.asType(.uint32).reshaped([-1])
+        let path = kernel(
+            [anchorPredecessor, previous, next, projectedRows, scores, candidateIds],
+            template: [("L", length), ("K", k), ("R", rank)],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+        return path.reshaped([1, length])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_fused_greedy_walk",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
+        outputNames: ["path"],
+        source: """
+            uint c = thread_index_in_simdgroup;
+            uint previous_slot = 0;
+            for (uint i = 0; i < L; i++) {
+                float score = -INFINITY;
+                if (c < K) {
+                    const uint pred_base = i == 0 ? 0 : ((i - 1) * K + previous_slot) * R;
+                    const uint succ_base = (i * K + c) * R;
+                    float edge = 0.0f;
+                    for (uint d = 0; d < R; d++) {
+                        const float predecessor = i == 0
+                            ? anchor_predecessor[d] : previous[pred_base + d];
+                        edge += (predecessor * projected[i * R + d]) * next[succ_base + d];
+                    }
+                    score = unary[i * K + c] + edge;
+                }
+                float m = simd_max(score);
+                uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                previous_slot = sel;
+                if (c == 0) path[i] = int(cand[i * K + sel]);
+            }
+            """)
 }
 
 // MARK: - The drafter
@@ -867,8 +1368,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
 
+        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
-            h = layer(h, context: context, rope: rope, cache: cache[index])
+            h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
