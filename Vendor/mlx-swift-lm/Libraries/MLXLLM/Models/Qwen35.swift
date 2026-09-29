@@ -240,10 +240,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   first 8 layers (a LEADING verify submission, the verify's first ~5
 ///   command buffers) and a second after 24: the GPU gets the front of the
 ///   verify as soon as it is built, runs layers 8..23 while the host builds
-///   the other 40, and never waits on the host's ~0.1 ms per layer. Two
-///   boundaries rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   the other 40. This experiment adds a third boundary after layer 40 to
+///   overlap more of the remaining host build. It can lose: every extra
+///   command buffer at verify width has a cost (slices every 2 layers had
+///   lengthened the ranked window). `MLXFAST_VERIFY_SLICE_LAYERS`
 ///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
 ///   again. Both trunk paths honour it: the plain per-layer loop and the
@@ -307,12 +307,14 @@ enum Qwen35TrunkSubmission {
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
-        // 24..63 while the GPU runs 8..23. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
-        // keeps the single boundary; `MLXFAST_VERIFY_SLICE_LAYERS` sets
-        // another plan, `0` turns it off.
+        // 24..63 while the GPU runs 8..23. A third boundary after layer 40
+        // tests whether submitting the tail sooner hides more host work; it
+        // also adds a command-buffer handoff that can cost more than it saves.
+        // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -328,7 +330,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
@@ -5164,6 +5166,78 @@ final class Qwen35DecoderLayer: Module {
 
 // MARK: - Prompt embedding rows gathered on the host
 
+/// Keeps the loaded model GPU-resident across the benchmark's idle gates.
+///
+/// MLX puts an allocation into a Metal residency set only while the process's
+/// wired limit covers it, and that limit starts at zero: nothing the engine
+/// allocates is ever in a set, so the OS unmaps the buffers while the box sits
+/// behind the cool-down and quiescence gates, and every timed phase binds them
+/// again as its command buffers commit, about 0.1 ms per 10 MB (the drafter's
+/// residency prefetch and the seed's host embedding gather exist to hide that
+/// cost behind queued work; the first command buffer of every prompt forward
+/// and the timed prefill's embedding gather still pay it). Raising the limit
+/// to cover the loaded model adds every tracked allocation to a set at once
+/// (`ResidencySets::resize`), and later allocations join as they are made
+/// while the budget holds. The sets are attached to the command queue with a
+/// standing residency request, so the buffers stay mapped through the gates.
+/// No value changes anywhere.
+///
+/// The budget is the active memory at arm time plus 2 %, and never more than
+/// 70 % of the device's recommended working set, which the allocator refuses
+/// to exceed. It is kept that tight on purpose: every allocation that joins a
+/// set commits it under the allocator's lock (`ResidencySets::insert`), so a
+/// loose budget would make the fresh intermediates of the first timed forward
+/// after `warmSpeculativeShapes` drains the cache pay one commit each. With
+/// the model filling the budget, a later allocation is tracked but left out
+/// (no commit), and each re-arm (after the deferred trials adopt their
+/// copies, after the drain) raises it over what is active then. `MLXFAST_WIRED_RESIDENCY=0` leaves the limit
+/// alone; a number sets the budget in GiB. The limit is only ever raised.
+enum Qwen35WiredResidency {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var applied = 0
+    nonisolated(unsafe) private static var announced = false
+
+    private static let setting: String =
+        ProcessInfo.processInfo.environment["MLXFAST_WIRED_RESIDENCY"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+
+    /// `arm`, unless a budget is already in place: the prompt forward's call,
+    /// so a worker that never builds the assistant (the prefill phase's)
+    /// wires its model at its untimed warm-up prompt.
+    static func armOnce() {
+        lock.lock()
+        let armed = applied > 0
+        lock.unlock()
+        if !armed { arm() }
+    }
+
+    static func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        let raw = setting
+        if ["0", "false", "no", "off"].contains(raw) { return }
+        guard let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0 else { return }
+        let ceiling = recommended / 10 * 7
+        let active = Memory.activeMemory
+        var budget = active + active / 50
+        if let gib = Double(raw), gib > 0, gib < 4096 {
+            budget = Int(gib * Double(1 << 30))
+        }
+        let limit = min(budget, ceiling)
+        guard limit > applied else { return }
+        var previous: size_t = 0
+        guard mlx_set_wired_limit(&previous, size_t(limit)) == 0 else { return }
+        applied = limit
+        if !announced {
+            announced = true
+            FileHandle.standardError.write(
+                ("mlxfast-worker: wired residency: limit \(limit >> 20) MB "
+                    + "(active \(active >> 20) MB, recommended working set \(recommended >> 20) MB)\n")
+                    .data(using: .utf8)!)
+        }
+    }
+}
+
 /// A prompt-width embedding lookup reads its packed rows on the host.
 ///
 /// WHY. A decode request's prompt forward (the seed) is the first GPU work
@@ -5227,6 +5301,7 @@ enum Qwen35PromptEmbeddingHostGather {
             inputs.dtype == .int32, inputs.size >= BonsaiPromptWidth.minimumRows,
             passesSelfTest(table)
         else { return nil }
+        Qwen35WiredResidency.armOnce()
         if let early = Qwen35PromptEmbeddingEarly.take(inputs) { return early }
         Qwen35PromptEmbeddingEarly.makeHostAvailable(inputs)
         return embed(table, inputs)
