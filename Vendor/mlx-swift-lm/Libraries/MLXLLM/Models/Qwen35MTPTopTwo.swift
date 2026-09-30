@@ -770,30 +770,13 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          // Same fold as the scalar loop; store four consecutive columns as
-          // float4/half4. Layout: i groups of 4 share mh,nq with c=0..3.
-          // Alignment: fn in {0,4,8,12}, n0 multiple of TN, N multiple of 32.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i += 4) {
-            const int mh = (i >> 2) & 1;
-            const int nq = i >> 3;
-            float v0 = acc[i];
-            float v1 = acc[i + 1];
-            float v2 = acc[i + 2];
-            float v3 = acc[i + 3];
+          for (int i = 0; i < CAP; i++) {
+            float v = acc[i];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) {
-              v0 += red[q][i * 32 + lane];
-              v1 += red[q][(i + 1) * 32 + lane];
-              v2 += red[q][(i + 2) * 32 + lane];
-              v3 += red[q][(i + 3) * 32 + lane];
-            }
-            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
-            if constexpr (sizeof(OutT) == sizeof(float)) {
-              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-            } else {
-              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-            }
+            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
           }
         }
         """
@@ -3291,13 +3274,15 @@ enum Qwen35TensorPackedMatmul {
         // shape but the head).
         case rb = 70
         case k32pd2i32 = 73
+        /// k32pd1 on the narrow-offset text (`kernelNarrowInt8Zoo32`), as k32pd2i32 is k32pd2.
+        case k32pd1i32 = 74
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
                 .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
-                .i4p4k32pd1, .rb:
+                .i4p4k32pd1, .rb, .k32pd1i32:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
@@ -3318,7 +3303,7 @@ enum Qwen35TensorPackedMatmul {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1, .k32pd2i32:
+                .csk32pd2, .i4p4k32pd1, .k32pd2i32, .k32pd1i32:
                 return 32
             case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
@@ -3327,7 +3312,7 @@ enum Qwen35TensorPackedMatmul {
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32, .k32pd1i32: return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
@@ -4358,7 +4343,7 @@ enum Qwen35TensorPackedMatmul {
             }
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
-            let zooKernel = v == .k32pd2i32 && narrowZoo32Fits(k: k, n: n, m: m)
+            let zooKernel = (v == .k32pd2i32 || v == .k32pd1i32) && narrowZoo32Fits(k: k, n: n, m: m)
                 ? kernelNarrowInt8Zoo32 ?? kernelNarrowInt8Zoo
                 : v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
             return zooKernel(
@@ -4475,10 +4460,10 @@ enum Qwen35TensorPackedMatmul {
     /// Zoo bodies in self-test order (the deadline cuts the last): the zoo's
     /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
-        .k32pd2, .k32pd2i32, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
+        .k32pd2, .k32pd2i32, .k32pd1i32, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
         .aw64pd1, .k32pd1, .pk32pd1,
         .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
-    ].filter { $0 != .k32pd2i32 || kernelNarrowInt8Zoo32 != nil }
+    ].filter { ($0 != .k32pd2i32 && $0 != .k32pd1i32) || kernelNarrowInt8Zoo32 != nil }
 
     /// Zoo 3a's bodies (`NarrowVariant.xtg`), self-tested after the zoo's
     /// with a budget of their own, and also on every production shape but the
@@ -4777,9 +4762,10 @@ enum Qwen35TensorPackedMatmul {
                 }
 
                 // A per-shape BASE over the record's pick (`..._TZOO_BASE`, the
-                // per-shape force map's syntax; default k32pd1 on the five tower
-                // shapes, the head, and `dhead`, the head rows the drafter reads
-                // on the int8 route): a same-box reading of sarthakagrawal927's
+                // per-shape force map's syntax; default k32pd1i32 on the five
+                // tower shapes, the head, and `dhead`, the head rows the drafter
+                // reads on the int8 route; k32pd1 where the narrow-offset text
+                // did not build): a same-box reading of sarthakagrawal927's
                 // b497a150, which forced k32pd2 on the five tower shapes, put its
                 // window 1.85% under the trial's own picks with identical
                 // acceptance. k32pd1 is the same body with a one-group word
@@ -4793,12 +4779,16 @@ enum Qwen35TensorPackedMatmul {
                 // left to the record's pick, which that trial makes among the
                 // record's bodies (v0, pd1, their FP32-scale forms): v0 runs the
                 // 16 x 248320 head in 761 us, k32pd1 in 621 (the words' plain
-                // read takes 568). Unlike the force map the trial still runs,
-                // over this base; each body passes FP16, and FP32 on a wide
-                // shape, or the record's pick is kept. `..._TZOO_BASE=0` keeps
-                // the record's pick.
+                // read takes 568). GordoAR's narrow offsets (`k32pd2i32`,
+                // a2891a6a) carried over to k32pd1: bitwise the same body, 32-bit
+                // element offsets, the wide text where a shape does not fit
+                // (`narrowZoo32Fits`), k32pd1 if either output check fails.
+                // Unlike the force map the trial still runs, over this base; each
+                // body passes FP16, and FP32 on a wide shape, or the record's pick
+                // is kept. `..._TZOO_BASE=0` keeps the record's pick.
+                let baseBody = kernelNarrowInt8Zoo32 == nil ? "k32pd1" : "k32pd1i32"
                 let baseValue = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_BASE")
-                    ?? "attn=k32pd1,qkvz=k32pd1,gateup=k32pd1,o=k32pd1,down=k32pd1,head=k32pd1,dhead=k32pd1"
+                    ?? "attn=\(baseBody),qkvz=\(baseBody),gateup=\(baseBody),o=\(baseBody),down=\(baseBody),head=\(baseBody),dhead=\(baseBody)"
                 if narrowZoo, baseValue.contains("=") {
                     let names = NarrowInSituTrial.perShapeNames.map { $0.replacingOccurrences(of: "|", with: "") } + ["head", "dhead"]
                     let keys = NarrowInSituTrial.perShapeKeys + [NarrowInSituTrial.headKey, NarrowInSituTrial.draftHeadKey]
@@ -4812,12 +4802,12 @@ enum Qwen35TensorPackedMatmul {
                             variant.derived == nil || narrowDerivedVariants.contains(variant)
                         else { ok = false; break }
                         var kernel = NarrowKernel(variant: variant, form: zooForm)
-                        if variant == .k32pd2i32, !exact16.contains(kernel) {
+                        if variant == .k32pd2i32 || variant == .k32pd1i32, !exact16.contains(kernel) {
                             if zooExact(kernel, .float16), zooExact(kernel, .float32) {
                                 exact16.insert(kernel)
                                 exact32.insert(kernel)
                             } else {
-                                kernel = NarrowKernel(variant: .k32pd2, form: zooForm)
+                                kernel = NarrowKernel(variant: variant == .k32pd1i32 ? .k32pd1 : .k32pd2, form: zooForm)
                             }
                         }
                         if !exact16.contains(kernel) {
