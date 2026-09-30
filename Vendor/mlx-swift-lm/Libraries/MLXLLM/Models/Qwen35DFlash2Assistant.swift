@@ -991,7 +991,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
-                submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
+                submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed,
+                acceptancePacket: packet)
         else { return nil }
         return Speculation(state: state, block: block, kernelTag: kernelTag)
     }
@@ -1039,9 +1040,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         // The front's one-launch forms passed their own self-tests; should the
         // whole block still differ, the composed front is proven instead of
         // losing the block before the readback.
-        var frontNote = DFlash2SpeculativeFront.active ? "; one-launch front" : ""
-        if failure != nil, DFlash2SpeculativeFront.active {
+        var frontNote = DFlash2SpeculativeFront.active || DFlash2PacketFront.active ? "; one-launch front" : ""
+        if failure != nil, DFlash2SpeculativeFront.active || DFlash2PacketFront.active {
             DFlash2SpeculativeFront.deactivate()
+            DFlash2PacketFront.deactivate()
             frontNote = "; one-launch front FAILED (\(failure!)), composed front kept"
             speculationPlan = SpeculationPlan(classes: classes, maskUnconfirmed: masked)
             (failure, compared) = speculationCheck(block: block)
