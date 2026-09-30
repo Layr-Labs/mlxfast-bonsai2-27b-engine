@@ -165,10 +165,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Qwen35TensorPackedMatmul.PlaneFormTrial.run()
                 Stream().synchronize()
                 Memory.clearCache()
-                // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
-                DFlash2TensorMatmul.SwapTrial.run()
-                Stream().synchronize()
-                Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
