@@ -333,23 +333,31 @@ enum Qwen35TrunkSubmission {
         return plan.isOff ? verify : plan
     }()
 
+    /// The plain prompt plan: a boundary every 4 layers, shifted so the
+    /// FIRST falls after layer 1 — the GPU starts on the forward while the
+    /// host builds layers 2..4, the denser-front trade the fused prompt plan
+    /// was promoted for (`promptFused`). One extra handoff vs the aligned
+    /// stride (16 boundaries instead of 15). `MLXFAST_PREFILL_PIPELINE` sets
+    /// another plan (same syntax); `0`/`off` submits it as one graph.
     static let prompt: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE"],
-        default: Plan(stride: 4, offset: 0, explicit: nil))
+        default: Plan(stride: 4, offset: 1, explicit: nil))
 
     /// The prompt plan of a forward on the pending-residual path (the tensor
     /// route's fused layer boundaries, see `Qwen35FusedBoundaryQ8`), which
     /// builds each layer through `cbv2ForwardPending` and so never reaches
     /// the plain loop's submissions. Newjordan's `9024f66b` pending path
     /// commits after layers 4, 16, 32 and 48; here the front is denser, after
-    /// layers 1, 2, 4, 8, 16, 32 and 48 (ercumentyildirim's promoted
-    /// `6e19fe12`), so the GPU starts on the first layer instead of waiting for
-    /// the host to build four. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan
-    /// (same syntax, `4,16,32,48` restores the previous one); `0` submits the
-    /// forward as one graph.
+    /// layers 1, 2, 4, 8, 16, 32, 48 and 56 (ercumentyildirim's promoted
+    /// `6e19fe12`, plus one tail boundary at 56 on this crown), so the GPU
+    /// starts on the first layer instead of waiting for the host to build
+    /// four, and the last 8 layers submit as soon as they are built rather
+    /// than as one 16-layer block. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the
+    /// plan (same syntax, `4,16,32,48` restores the previous one); `0`
+    /// submits the forward as one graph.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48]))
+        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48, 56]))
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
