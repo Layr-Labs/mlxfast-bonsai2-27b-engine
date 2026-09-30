@@ -1105,19 +1105,32 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         ]
         if let context {
             let rows = context.dim(1) + length
-            return dflash2GroupedConvJoinKernel(
+            let narrow = dflash2ConvIndex32(
+                h: hidden.size, dyn: projection.size, base: baseKernel.size,
+                context: context.size, residual: 0, batch: batch, width: hiddenSize, rows: rows)
+            let kernel = narrow ? dflash2GroupedConvJoinKernel32 ?? dflash2GroupedConvJoinKernel
+                : dflash2GroupedConvJoinKernel
+            return kernel(
                 [hidden, projection, baseKernel, context],
                 template: template, grid: (dflash2ConvColumns(hiddenSize, dtype, groupSize), rows, batch), threadGroup: (256, 1, 1),
                 outputShapes: [[batch, rows, hiddenSize]], outputDTypes: [dtype])[0]
         }
         let grid = (dflash2ConvColumns(hiddenSize, dtype, groupSize), length, batch)
+        let narrow = dflash2ConvIndex32(
+            h: hidden.size, dyn: projection.size, base: baseKernel.size,
+            context: 0, residual: residual?.size ?? 0,
+            batch: batch, width: hiddenSize, rows: length)
         if let residual {
-            return dflash2GroupedConvResidualKernel(
+            let kernel = narrow ? dflash2GroupedConvResidualKernel32 ?? dflash2GroupedConvResidualKernel
+                : dflash2GroupedConvResidualKernel
+            return kernel(
                 [hidden, projection, baseKernel, residual],
                 template: template, grid: grid, threadGroup: (256, 1, 1),
                 outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
         }
-        return dflash2GroupedConvKernel(
+        let kernel = narrow ? dflash2GroupedConvKernel32 ?? dflash2GroupedConvKernel
+            : dflash2GroupedConvKernel
+        return kernel(
             [hidden, projection, baseKernel],
             template: template, grid: grid, threadGroup: (256, 1, 1),
             outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
@@ -1215,7 +1228,12 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                         let template: [(String, any KernelTemplateArg)] = [
                             ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(dtype, gs)),
                         ]
-                        let fused = dflash2GroupedConvJoinKernel(
+                        let narrow = dflash2ConvIndex32(
+                            h: h.size, dyn: dyn.size, base: base.size,
+                            context: context.size, residual: 0, batch: 1, width: hs, rows: c + l)
+                        let kernel = narrow ? dflash2GroupedConvJoinKernel32 ?? dflash2GroupedConvJoinKernel
+                            : dflash2GroupedConvJoinKernel
+                        let fused = kernel(
                             [h, dyn, base, context], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), c + l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [[1, c + l, hs]],
                             outputDTypes: [dtype])[0]
@@ -1223,6 +1241,21 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                             [h, dyn, base], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [h.shape],
                             outputDTypes: [dtype])[0]
+                        if narrow, let plain = dflash2GroupedConvKernel32,
+                            let residual = dflash2GroupedConvResidualKernel32
+                        {
+                            let result = plain(
+                                [h, dyn, base], template: template,
+                                grid: (dflash2ConvColumns(hs, dtype, gs), l, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [h.shape], outputDTypes: [dtype])[0]
+                            let sum = residual(
+                                [h, dyn, base, h], template: template,
+                                grid: (dflash2ConvColumns(hs, dtype, gs), l, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [h.shape], outputDTypes: [dtype])[0]
+                            same = same && all(result.view(dtype: .uint16) .== conv.view(dtype: .uint16)).item(Bool.self)
+                                && all(sum.view(dtype: .uint16) .== (h + conv).view(dtype: .uint16)).item(Bool.self)
+                            compared += 2 * conv.size
+                        }
                         let reference = DFlash2Concat.concatenate([context, conv], axis: 1)
                         same = same && fused.shape == reference.shape
                             && all(fused.view(dtype: .uint16) .== reference.view(dtype: .uint16))
@@ -1290,6 +1323,30 @@ private func dflash2ConvQuad(_ dtype: DType, _ groupSize: Int) -> Bool {
 }
 private func dflash2ConvColumns(_ width: Int, _ dtype: DType, _ groupSize: Int) -> Int {
     dflash2ConvQuad(dtype, groupSize) ? width / 4 : width
+}
+
+/// Complete contiguous buffer extents, including the joined output.
+private func dflash2ConvIndex32(
+    h: Int, dyn: Int, base: Int, context: Int, residual: Int,
+    batch: Int, width: Int, rows: Int
+) -> Bool {
+    let limit = Int(Int32.max)
+    return h > 0 && h <= limit && dyn > 0 && dyn <= limit && base > 0 && base <= limit
+        && context >= 0 && context <= limit && residual >= 0 && residual <= limit
+        && batch > 0 && width > 0 && rows > 0 && rows <= limit / batch / width
+}
+
+private func dflash2ConvNarrowKernel(
+    _ name: String, inputs: [String], source: String, count: Int
+) -> MLXFast.MLXFastKernel? {
+    guard dflash2GroupedConvHeader.components(separatedBy: "size_t").count == 9,
+        source.components(separatedBy: "size_t").count == count + 1
+    else { return nil }
+    return MLXFast.metalKernel(
+        name: name, inputNames: inputs, outputNames: ["out"],
+        source: source.replacingOccurrences(of: "size_t", with: "uint"),
+        header: dflash2GroupedConvHeader.replacingOccurrences(of: "size_t", with: "uint"),
+        ensureRowContiguous: true)
 }
 
 private let dflash2GroupedConvHeader = """
@@ -1430,6 +1487,16 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     source: dflash2GroupedConvResidualSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
+
+private let dflash2GroupedConvKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_io32", inputs: ["h", "dyn", "base"],
+    source: dflash2GroupedConvSource, count: 2)
+private let dflash2GroupedConvResidualKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_residual_io32", inputs: ["h", "dyn", "base", "res"],
+    source: dflash2GroupedConvResidualSource, count: 2)
+private let dflash2GroupedConvJoinKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_join_io32", inputs: ["h", "dyn", "base", "ctx"],
+    source: dflash2GroupedConvJoinSource, count: 4)
 
 // MARK: - The decoder layer
 
@@ -6389,11 +6456,7 @@ enum DFlash2SpeculativeFront {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    private static let joinKernel = MLXFast.metalKernel(
-        name: "dflash2_grouped_conv_join_at",
-        inputNames: ["h", "dyn", "base", "ctx", "cdev"],
-        outputNames: ["out"],
-        source: """
+    private static let joinSource = """
             const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
             const uint r = thread_position_in_grid.y;
             const uint b = thread_position_in_grid.z;
@@ -6419,9 +6482,19 @@ enum DFlash2SpeculativeFront {
               } else { v = static_cast<T>(0.0f); }
               out[(size_t(b) * R + r) * H + c] = v;
             }
-            """,
+            """
+
+    private static let joinKernel = MLXFast.metalKernel(
+        name: "dflash2_grouped_conv_join_at",
+        inputNames: ["h", "dyn", "base", "ctx", "cdev"],
+        outputNames: ["out"],
+        source: joinSource,
         header: dflash2GroupedConvHeader,
         ensureRowContiguous: true)
+
+    private static let joinKernel32 = dflash2ConvNarrowKernel(
+        "dflash2_grouped_conv_join_at_io32", inputs: ["h", "dyn", "base", "ctx", "cdev"],
+        source: joinSource, count: 4)
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its
     /// text no longer has the lines the variant rewrites.
@@ -6469,7 +6542,11 @@ enum DFlash2SpeculativeFront {
         rows: Int, ks: Int, gs: Int
     ) -> MLXArray {
         let (b, hs) = (h.dim(0), h.dim(2))
-        return joinKernel(
+        let narrow = dflash2ConvIndex32(
+            h: h.size, dyn: dyn.size, base: base.size, context: ctx.size, residual: 0,
+            batch: b, width: hs, rows: rows)
+        let kernel = narrow ? joinKernel32 ?? joinKernel : joinKernel
+        return kernel(
             [h, dyn, base, ctx, c.reshaped([1])],
             template: [("T", h.dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(h.dtype, gs))],
             grid: (dflash2ConvColumns(hs, h.dtype, gs), rows, b), threadGroup: (256, 1, 1),
