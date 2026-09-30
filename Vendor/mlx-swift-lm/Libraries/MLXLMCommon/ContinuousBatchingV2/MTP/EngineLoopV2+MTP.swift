@@ -9,6 +9,16 @@ import MLX
 
 extension EngineLoopV2 {
 
+    /// `MLXFAST_DEFER_ROUND_RELEASE=0` releases the finished round's arrays
+    /// in place at replacement (the crown's behavior). Independent of the
+    /// block-release switch so each is revertible alone.
+    static let deferRoundRelease: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DEFER_ROUND_RELEASE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+
     /// Execute a plan containing MTP work. Graph construction includes seed
     /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
     /// decode neighbors, and per-request prefill chunks.
@@ -93,6 +103,18 @@ extension EngineLoopV2 {
         if graph.verify != nil || !graph.seedRows.isEmpty
             || !graph.committedObservationRows.isEmpty || !graph.prefillCarries.isEmpty
         {
+            // The round this replaces carries the finished verify's arrays
+            // (last hidden, packet, draft ids, the captured evaluations);
+            // releasing them HERE would spend host cycles on the path the
+            // next round's build and submission occupy while the GPU runs
+            // the early block. The crown's `CBv2MTPDeferredRelease` pattern
+            // (promoted for the unadopted drafter block) applies: hold the
+            // finished round and let it release at the step's end, behind
+            // the next submission. `MLXFAST_DEFER_ROUND_RELEASE=0` restores
+            // the in-place release.
+            if Self.deferRoundRelease, let previous = step.mtpRound {
+                CBv2MTPDeferredRelease.hold(previous)
+            }
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
