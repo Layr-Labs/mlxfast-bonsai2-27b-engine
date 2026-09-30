@@ -123,7 +123,8 @@ enum Qwen35SmallNMatmul {
 
     private static let partialKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
-        source: partialSource, ensureRowContiguous: true)
+        source: Qwen35IO32.narrow(partialSource, count: 3, "qwen35_splitk_partial"),
+        ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
