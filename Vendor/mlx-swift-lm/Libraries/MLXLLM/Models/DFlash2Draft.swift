@@ -3970,22 +3970,56 @@ enum DFlash2TopK {
             for (uint j = 0; j < NSG; j++) T = min(T, sthr[j]);
             uint k[KK], id[KK];
             for (int j = 0; j < KK; j++) { k[j] = 0u; id[j] = 0u; }
-            for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
-                uint k0, k1, k2, k3;
-                if (HALF) {
-                    const half4 q = *(const device half4*)(x + v);
-                    k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
-                    k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
-                } else {
-                    const float4 q = *(const device float4*)(x + v);
-                    k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
-                    k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+            threadgroup uint owners[NSG * 32];
+            const uint live = uint(mx >= T);
+            const uint rank = simd_prefix_exclusive_sum(live);
+            const uint count = simd_sum(live);
+            if (count <= 16u) {
+                if (live) owners[sg * 32u + rank] = t;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                uint slots = 1u;
+                while (slots < count) slots <<= 1u;
+                const uint slot = lane & (slots - 1u);
+                const uint offset = lane / slots;
+                const uint factor = 32u / slots;
+                uint begin = hi;
+                if (slot < count) begin = lo + 4u * owners[sg * 32u + slot] + offset * TPG * 4u;
+                for (uint v = begin; v + 3u < hi; v += factor * TPG * 4u) {
+                    uint k0, k1, k2, k3;
+                    if (HALF) {
+                        const half4 q = *(const device half4*)(x + v);
+                        k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                        k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                    } else {
+                        const float4 q = *(const device float4*)(x + v);
+                        k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                        k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                    }
+                    if (max(max(k0, k1), max(k2, k3)) >= T) {
+                        if (k0 >= T) mlxfast_topk_consider<KK>(k, id, k0, v);
+                        if (k1 >= T) mlxfast_topk_consider<KK>(k, id, k1, v + 1u);
+                        if (k2 >= T) mlxfast_topk_consider<KK>(k, id, k2, v + 2u);
+                        if (k3 >= T) mlxfast_topk_consider<KK>(k, id, k3, v + 3u);
+                    }
                 }
-                if (max(max(k0, k1), max(k2, k3)) >= T) {
-                    if (k0 >= T) mlxfast_topk_consider<KK>(k, id, k0, v);
-                    if (k1 >= T) mlxfast_topk_consider<KK>(k, id, k1, v + 1u);
-                    if (k2 >= T) mlxfast_topk_consider<KK>(k, id, k2, v + 2u);
-                    if (k3 >= T) mlxfast_topk_consider<KK>(k, id, k3, v + 3u);
+            } else {
+                for (uint v = lo + t * 4u; v + 3u < hi; v += TPG * 4u) {
+                    uint k0, k1, k2, k3;
+                    if (HALF) {
+                        const half4 q = *(const device half4*)(x + v);
+                        k0 = mlxfast_topk_key(float(q[0])); k1 = mlxfast_topk_key(float(q[1]));
+                        k2 = mlxfast_topk_key(float(q[2])); k3 = mlxfast_topk_key(float(q[3]));
+                    } else {
+                        const float4 q = *(const device float4*)(x + v);
+                        k0 = mlxfast_topk_key(q[0]); k1 = mlxfast_topk_key(q[1]);
+                        k2 = mlxfast_topk_key(q[2]); k3 = mlxfast_topk_key(q[3]);
+                    }
+                    if (max(max(k0, k1), max(k2, k3)) >= T) {
+                        if (k0 >= T) mlxfast_topk_consider<KK>(k, id, k0, v);
+                        if (k1 >= T) mlxfast_topk_consider<KK>(k, id, k1, v + 1u);
+                        if (k2 >= T) mlxfast_topk_consider<KK>(k, id, k2, v + 2u);
+                        if (k3 >= T) mlxfast_topk_consider<KK>(k, id, k3, v + 3u);
+                    }
                 }
             }
             uint ok = 0u, oi = 0u;
