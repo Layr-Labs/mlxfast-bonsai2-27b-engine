@@ -206,7 +206,7 @@ enum CBv2PromptLookupDraft {
     static let spliceMinimum: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_MIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return max(6, raw.flatMap(Int.init) ?? 8)
+        return max(6, raw.flatMap(Int.init) ?? 7)
     }()
 
     /// `DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN` sets the evidence an ANCHORED

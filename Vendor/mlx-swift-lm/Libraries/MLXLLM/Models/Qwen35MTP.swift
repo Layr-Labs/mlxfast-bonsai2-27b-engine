@@ -1312,12 +1312,57 @@ enum Qwen35AttentionPreworkKV {
         ensureRowContiguous: false,
         mutableInputs: ["kc", "vc"])
 
+    /// `BONSAI_ATTN_PREWORK_IO32=0` keeps the 64-bit text.
+    static let io32Enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_ATTN_PREWORK_IO32"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    // `source` with its 22 int64_t, 4 size_t and 15 stride reads as uint; nil
+    // if a count moved. It runs where each stride (unsigned) is under a cap
+    // that keeps every offset below 2^31 for L <= 16 and rows below 2^17 (the
+    // launch checks), else `source` runs (lazy views: strides known at eval).
+    private static let fastSource: String? = {
+        guard let reads = try? NSRegularExpression(pattern: #"(\w+_strides\[\d\])"#) else { return nil }
+        let all = NSRange(source.startIndex..., in: source)
+        guard source.components(separatedBy: "int64_t").count == 23,
+            source.components(separatedBy: "size_t").count == 5,
+            reads.numberOfMatches(in: source, range: all) == 15
+        else { return nil }
+        let narrow = reads.stringByReplacingMatches(
+            in: source, range: all, withTemplate: "uint($1)"
+        ).replacingOccurrences(of: "int64_t", with: "uint").replacingOccurrences(of: "size_t", with: "uint")
+        let caps = [
+            ("q", "1ul << 26", "(1ul << 29) / HQ"), ("k", "1ul << 26", "(1ul << 29) / HK"),
+            ("v", "1ul << 26", "(1ul << 29) / HK"), ("kc", "(1ul << 29) / HK", "1ul << 13"),
+            ("vc", "(1ul << 29) / HK", "1ul << 13"),
+        ].map {
+            "(ulong(\($0)_strides[1]) <= (\($1))) & (ulong(\($0)_strides[2]) <= (\($2)))"
+                + " & (ulong(\($0)_strides[3]) <= (1ul << 29) / D)"
+        }
+        return "if (\(caps.joined(separator: " & "))) {\n\(narrow)\n} else {\n\(source)\n}\n"
+    }()
+
+    private static let fastKernel: MLXFast.MLXFastKernel? = fastSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_attn_prework_kv32",
+            inputNames: [
+                "q", "k", "v", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale", "wr",
+                "prev", "kc", "vc",
+            ],
+            outputNames: ["qo", "fence"], source: $0, ensureRowContiguous: false,
+            mutableInputs: ["kc", "vc"])
+    }
+
     private struct Geometry: Hashable {
         let hq: Int, hk: Int, d: Int, rd: Int, dtype: String, vdtype: String
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+    /// The FP32 geometry (HQ, HK, D, RD) whose twin passed its self-test.
+    nonisolated(unsafe) private static var fastPassed: (Int, Int, Int, Int)?
 
     /// The attention output `[1, HQ, L, D]` of `cache.updateAndAttend` over
     /// the prework's queries and keys and `v` transposed, with the append
@@ -1366,17 +1411,86 @@ enum Qwen35AttentionPreworkKV {
             destination.keys.dim(3) == D, destination.values.dim(3) == D
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
-        let outputs = kernel(
+        // No strings here: the in-place trial times this host path too.
+        let fast =
+            L <= 16 && destination.row >= 0 && destination.row <= (1 << 17) - L && HQ * D <= 1 << 26
+            && q.dtype == .float32 && v.dtype == .float32
+            && lock.withLock({ fastPassed.map { $0 == (HQ, HK, D, ropeDims) } ?? false })
+        let outputs = encode(
+            (fast ? fastKernel : nil) ?? kernel, q: q, k: k, v: v, wq: wq, wk: wk, offs: offs,
+            epsQ: epsQ, epsK: epsK, ropeDims: ropeDims, ropeBase: ropeBase, row: destination.row,
+            prev: destination.previous ?? MLXArray([Int32(0)]), kc: destination.keys,
+            vc: destination.values)
+        return layer.attendAfterInPlaceAppend(queries: outputs[0], fence: outputs[1], scale: scale)
+    }
+
+    private static func encode(
+        _ kern: MLXFast.MLXFastKernel, q: MLXArray, k: MLXArray, v: MLXArray, wq: MLXArray,
+        wk: MLXArray, offs: MLXArray, epsQ: Float, epsK: Float, ropeDims: Int, ropeBase: Float,
+        row: Int, prev: MLXArray, kc: MLXArray, vc: MLXArray
+    ) -> [MLXArray] {
+        let (L, HQ, HK, D) = (q.dim(1), q.dim(2), k.dim(2), q.dim(3))
+        return kern(
             [
                 q, k, v, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-                MLXArray(log2(ropeBase)), MLXArray(Float(1)), MLXArray(Int32(destination.row)),
-                destination.previous ?? MLXArray([Int32(0)]), destination.keys, destination.values,
+                MLXArray(log2(ropeBase)), MLXArray(Float(1)), MLXArray(Int32(row)), prev, kc, vc,
             ],
             template: [("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK)],
             grid: ((D / 4) * (HQ + 2 * HK), L, 1), threadGroup: (D / 4, 1, 1),
             outputShapes: [[1, HQ, L, D], [1]],
             outputDTypes: [.float32, .int32])
-        return layer.attendAfterInPlaceAppend(queries: outputs[0], fence: outputs[1], scale: scale)
+    }
+
+    /// The twin against the 64-bit text at 16, 9, 3 and 1 rows, every bit of
+    /// qo and both caches: column views of one stack (row 1500), with edge
+    /// values (the last rows), reversed (the 64-bit branch). A mismatch or an
+    /// MLX error keeps the 64-bit text.
+    private static func fastSelfTest(_ geo: Geometry, ropeBase: Float, epsQ: Float, epsK: Float) {
+        guard io32Enabled, let fastKernel else { return }
+        var (values, bad, detail) = (0, 0, "")
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6b76_3332), into: 5)
+        let w = keys[..<2].map { 1 + 0.25 * MLXRandom.normal([geo.d], key: $0) }
+        do {
+            try withError { error in
+                for rows in [16, 9, 3, 1] {
+                    for form in 0 ..< 3 {
+                        var o = operands(geo, rows: rows, key: keys[2 + form], edge: form == 1)
+                        if form == 2 {
+                            o = (o.q[.ellipsis, .stride(by: -1)], o.k[.ellipsis, .stride(by: -1)],
+                                o.v[.ellipsis, .stride(by: -1)])
+                        }
+                        let row = form == 1 ? 2048 - rows : 1500
+                        let outs = [kernel, fastKernel].map { kern -> [MLXArray] in
+                            let kv = (0 ..< 2).map { _ in MLXArray.zeros([1, geo.hk, 2048, geo.d]) }
+                            eval(kv)
+                            let r = encode(
+                                kern, q: o.q, k: o.k, v: o.v, wq: w[0], wk: w[1], offs: MLXArray([Int32(row)]),
+                                epsQ: epsQ, epsK: epsK, ropeDims: geo.rd, ropeBase: ropeBase, row: row,
+                                prev: MLXArray([Int32(0)]), kc: kv[0], vc: kv[1])
+                            eval(r)
+                            return [r[0]] + kv
+                        }
+                        let c = stacked(
+                            zip(outs[0], outs[1]).map {
+                                ($0.view(dtype: .uint32) .!= $1.view(dtype: .uint32)).asType(.int32).sum()
+                            }
+                        ).sum()
+                        eval(c)
+                        try error.check()
+                        values += outs[0].reduce(0) { $0 + $1.size }
+                        bad += Int(c.item(Int32.self))
+                    }
+                }
+            }
+        } catch {
+            (bad, detail) = (max(bad, 1), " (\(error))")
+        }
+        lock.withLock { fastPassed = bad == 0 ? (geo.hq, geo.hk, geo.d, geo.rd) : nil }
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            Data(
+                ("qwen35 in-place KV append, 32-bit offsets: self-test \(bad == 0 ? "passed" : "FAILED") "
+                    + "(12 cases, \(values) values, \(bad) mismatches\(detail))\n").utf8))
     }
 
     /// Compile, self-test and time the in-place form for one attention
@@ -1394,6 +1508,7 @@ enum Qwen35AttentionPreworkKV {
         // The reference is the prework itself; where it is not used, neither is this.
         guard Qwen35AttentionPrework.verified(hq: hq, hk: hk, d: d, rd: rd, dtype: .float32)
         else { return }
+        fastSelfTest(geometry, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
         let checked = selfTest(geometry, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
         var use = checked.passed
         var timing = ""
@@ -1416,13 +1531,21 @@ enum Qwen35AttentionPreworkKV {
 
     /// One attention layer's operands as the verify produces them: q, k and v
     /// column views of one stacked projection, wide magnitude spread.
-    private static func operands(_ geo: Geometry, rows: Int, key: MLXArray)
+    /// `edge`: zero, 1e30, +-inf and -0.0 blocks in every 4 D columns.
+    private static func operands(_ geo: Geometry, rows: Int, key: MLXArray, edge: Bool = false)
         -> (q: MLXArray, k: MLXArray, v: MLXArray)
     {
-        let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+        let (width, d) = (geo.hq * 2 * geo.d + 2 * geo.hk * geo.d, geo.d)
         let pair = MLXRandom.split(key: key)
-        let wide = MLXRandom.normal([1, rows, width], key: pair.0)
+        var wide = MLXRandom.normal([1, rows, width], key: pair.0)
             * exp(MLXRandom.normal([1, rows, width], key: pair.1))
+        let i = MLXArray(0 ..< width) % (4 * d)
+        for (lo, hi, v) in [
+            (0, d, Float(0)), (d, d + 64, Float(1e30)), (2 * d + 5, 2 * d + 6, Float.infinity),
+            (3 * d + 9, 3 * d + 10, -Float.infinity), (3 * d + 128, 4 * d, Float(-0.0)),
+        ] where edge {
+            wide = which((i .>= lo) .&& (i .< hi), MLXArray(v), wide)
+        }
         let parts = MLX.split(
             wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d], axis: -1)
         return (
