@@ -73,15 +73,60 @@ enum CBv2PromptLookupDraft {
     /// ids read from the prompt on the host, not a device-side splice).
     nonisolated(unsafe) private static var hostLookup: Set<CBv2RequestID> = []
 
+    /// Requests whose newest proposal went through the splice, with the
+    /// splice's device flag: whether it found a prompt span to continue.
+    nonisolated(unsafe) private static var spliceSpan: [CBv2RequestID: MLXArray] = [:]
+
     /// Records where `id`'s newest proposal came from; `host` when it is a host
-    /// lookup's continuation (`lookup`, or `override`'s own match).
-    static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool, host: Bool = false) {
+    /// lookup's continuation (`lookup`, or `override`'s own match); `span` the
+    /// splice's flag when the splice ran (`lastSpliceFound`).
+    static func noteProposal(
+        _ id: CBv2RequestID, fromPrompt prompt: Bool, host: Bool = false, span: MLXArray? = nil
+    ) {
         guard enabled else { return }
         lock.withLock {
             if host { hostLookup.insert(id) } else { hostLookup.remove(id) }
+            spliceSpan[id] = host ? nil : span
             guard skipEnabled else { return }
             if prompt { fromPrompt.insert(id) } else { fromPrompt.remove(id) }
         }
+    }
+
+    /// `MLXFAST_DFLASH_SPLICE_SPAN_HOLD=0` builds the next block before the
+    /// readback after every splice, as `spliceSpeculationEnabled` alone does.
+    ///
+    /// A splice that found a prompt span means the output has started
+    /// quoting the prompt, so the next round's host lookup is likely to hit.
+    /// A block built before the readback is then dropped unadopted, but its
+    /// leading layers were already submitted and run on the GPU ahead of
+    /// that round's verify. With this on, a splice that found a span holds
+    /// the next block back like a host lookup does (the lookup runs first,
+    /// the drafter only on a miss); a splice that found nothing lets it be
+    /// built before the readback. The flag is evaluated with the proposal,
+    /// ahead of the verify that reads the proposal, so reading it waits for
+    /// the drafter's tail at most, never for the verify.
+    static let spliceSpanHoldEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_SPAN_HOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The last `override`'s splice flag (a boolean scalar, to evaluate with
+    /// the proposal), or nil when the splice did not run. Read by the engine
+    /// thread right after the call that set it.
+    nonisolated(unsafe) static var lastSpliceFound: MLXArray?
+
+    /// True when `id`'s newest proposal went through a splice that found a
+    /// prompt span (the flag is read once, then kept as a host value).
+    private static func spliceFoundSpan(_ id: CBv2RequestID) -> Bool {
+        guard spliceSpanHoldEnabled,
+            let flag = lock.withLock({ spliceSpan[id] })
+        else { return false }
+        let found = flag.item(Bool.self)
+        lock.withLock {
+            if spliceSpan[id] === flag { spliceSpan[id] = found ? flag : nil }
+        }
+        return found
     }
 
     /// True when `id`'s newest proposal is a host lookup's continuation.
@@ -137,7 +182,7 @@ enum CBv2PromptLookupDraft {
     /// True when `id`'s next block may not be built before the readback.
     static func holdsSpeculation(_ id: CBv2RequestID) -> Bool {
         guard expectsPromptProposal(id) else { return false }
-        return !spliceSpeculationEnabled || proposalIsHostLookup(id)
+        return !spliceSpeculationEnabled || proposalIsHostLookup(id) || spliceFoundSpan(id)
     }
 
     /// True when a block built before the readback must be dropped because
@@ -247,6 +292,7 @@ enum CBv2PromptLookupDraft {
         _ proposal: MLXArray, history: [Int], promptLength: Int, depth: Int
     ) -> MLXArray {
         lastOverrideWasHostLookup = false
+        lastSpliceFound = nil
         guard enabled, depth > 0, proposal.ndim == 2, proposal.dim(0) == 1,
             proposal.dim(1) == depth
         else { return proposal }
@@ -374,6 +420,9 @@ enum CBv2PromptLookupDraft {
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
+            // `splicePick` fires on the best score; a score is 0 or at least
+            // `minimum`.
+            lastSpliceFound = ranked.max() .>= MLXArray(Int32(minimum))
             return splicePick(
                 [ranked, block, promptIDs, dims],
                 grid: (256, 1, 1), threadGroup: (256, 1, 1),
@@ -453,6 +502,7 @@ enum CBv2PromptLookupDraft {
             line += " run=\(anyRun) committed=\(count - prompt) depth=\(depth)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
+        lastSpliceFound = fire
         return proposal
     }
 
@@ -466,59 +516,40 @@ enum CBv2PromptLookupDraft {
     /// The continuation has to lie entirely inside the prompt. Two prompt
     /// spans of the same length with different continuations are ambiguous,
     /// and this length is skipped rather than guessed.
+    // Each continuation endpoint contributes its longest matching suffix.
+    // Shorter suffixes add endpoints but cannot remove existing ambiguity:
+    // if two maximal matches have different continuations, every shorter
+    // length retains both. Thus only the global longest match needs selection.
     static func continuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
-        let minimum = minimumMatch
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
-        guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
+        guard depth >= 1, prompt >= minimumMatch + depth, count >= minimumMatch else { return nil }
         let longest = min(64, count - depth, prompt - depth)
-        guard longest >= minimum else { return nil }
-        // Every longer eligible match contains this suffix and leaves the
-        // same continuation inside the prompt. Prove a miss in one scan
-        // before scanning all longer lengths; ambiguous hits still use the
-        // original longest-match selection below.
-        let minimumSuffix = history[(count - minimum) ..< count]
-        let lastMinimumStart = prompt - minimum - depth
-        guard (0 ... lastMinimumStart).contains(where: { start in
-            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
-        }) else { return nil }
-        for length in stride(from: longest, through: minimum, by: -1) {
-            let suffix = count - length
-            let lastStart = prompt - length - depth
-            if lastStart < 0 { continue }
-            var chosen: [Int]?
-            var ambiguous = false
-            var start = lastStart
-            while start >= 0 {
-                if history[start] == history[suffix],
-                    history[start + length - 1] == history[count - 1]
-                {
-                    var same = true
-                    var offset = 1
-                    while offset < length - 1 {
-                        if history[start + offset] != history[suffix + offset] {
-                            same = false
-                            break
-                        }
-                        offset += 1
-                    }
-                    if same {
-                        let from = start + length
-                        let ids = Array(history[from ..< (from + depth)])
-                        if let chosen, chosen != ids {
-                            ambiguous = true
-                            break
-                        }
-                        chosen = ids
-                    }
-                }
-                start -= 1
+        guard longest >= minimumMatch else { return nil }
+        var best = minimumMatch - 1
+        var chosenEnd: Int? = nil
+        var ambiguous = false
+        for end in minimumMatch ... (prompt - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
             }
-            if let chosen, !ambiguous {
-                return Hit(match: length, ids: chosen)
+            guard length >= minimumMatch, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
             }
         }
-        return nil
+        guard let chosenEnd, !ambiguous else { return nil }
+        return Hit(match: best, ids: Array(history[chosenEnd ..< chosenEnd + depth]))
     }
 }
 
