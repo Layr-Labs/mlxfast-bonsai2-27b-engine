@@ -5273,6 +5273,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps,
             hidden: config.hiddenSize, kernelSize: config.dflash.convKernelSize,
             groupSize: config.dflash.convGroupSize, blockSize: blockSize)
+        DFlash2PacketFront.prepare(depth: blockSize - 1, width: config.targetHiddenSize, dtype: dtype)
     }
 
     /// Builds and self-tests the tiled copies of the weights the block
@@ -5596,10 +5597,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// with `submitLead` the leading layers' writes are installed (donating
     /// their buffers) and those layers submitted; otherwise the whole block is
     /// submitted with the round's other drafter work after adoption.
+    ///
+    /// `acceptancePacket` (the verify's `[drafts | targets]` that `anchor`
+    /// and `confirmed` were read from, depth `blockSize - 1`) lets the block's
+    /// device inputs take one launch (`DFlash2PacketFront`); `anchor` and
+    /// `confirmed` are then not read.
     public func proposeSpeculative(
         anchor: MLXArray, confirmed: MLXArray, verifyContext: MLXArray, contextRows: Int,
         cache: [KVCache], blockSize: Int, leadingLayers: Int, submitLead: Bool,
-        maskUnconfirmed: Bool = false
+        maskUnconfirmed: Bool = false, acceptancePacket: MLXArray? = nil
     ) throws -> DFlash2SpeculativeBlock? {
         guard let geometry = speculativeGeometry(cache: cache, blockSize: blockSize),
             anchor.size == 1, confirmed.size == 1,
@@ -5608,27 +5614,36 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let caches = cache.map { $0 as! DFlash2BlockKVCache }
         let n = 2 * blockSize
+        let keys = geometry.rows + n
+        let packetFront = acceptancePacket.flatMap {
+            DFlash2PacketFront.apply(
+                $0, depth: blockSize - 1, context: verifyContext, rows: contextRows, dtype: dtype,
+                masked: maskUnconfirmed, keys: keys, keyBound: geometry.rows + blockSize,
+                offset: geometry.offset)
+        }
+        let anchor = packetFront?.anchor ?? anchor
         var h = try blockEmbedding(anchorIDs: anchor.reshaped([1, 1]), maskColumns: blockSize - 1)
             .asType(dtype)
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let c = confirmed.reshaped([]).asType(.int32)
+        let c = (packetFront?.confirmed ?? confirmed).reshaped([]).asType(.int32)
         let verifyRows = verifyContext[0..., ..<contextRows, 0...]
         // `DFlash2ExactRowClasses`: the rows at and past the confirmed count
         // become the zero rows today's padded projection reads.
         let context = contextProjection(
-            maskUnconfirmed
-                ? which(
-                    (MLXArray(Int32(0) ..< Int32(contextRows)) .< c).reshaped([1, contextRows, 1]),
-                    verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
-                : verifyRows)
+            packetFront?.rows
+                ?? (maskUnconfirmed
+                    ? which(
+                        (MLXArray(Int32(0) ..< Int32(contextRows)) .< c).reshaped([1, contextRows, 1]),
+                        verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
+                    : verifyRows))
         let base = concatenated(
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
-        let queryOffset = MLXArray(Int32(geometry.offset)) + c
-        let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        let queryOffset = packetFront?.queryOffset.reshaped([]) ?? (MLXArray(Int32(geometry.offset)) + c)
+        let keyMask = packetFront?.keyMask
+            ?? (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         // The front's one-launch forms read `context` and `c` themselves;
@@ -7092,6 +7107,258 @@ enum DFlash2SpeculativeFront {
                     + " (\(compared) values compared bitwise)\(note); rows "
                     + (rowsWins ? "one launch" : "composed") + ", heads "
                     + (headsWins ? "one launch" : "composed") + "; \(ms) ms\n").data(using: .utf8)!)
+        }
+    }
+}
+
+/// The next block's device inputs from the verify's acceptance packet, in ONE
+/// launch (`DFlash2DraftModel.proposeSpeculative`).
+///
+/// A block built before the readback reads the round's outcome on the
+/// device: `accepted` (the cumulative product of `drafts == targets`,
+/// summed), the anchor (the target at `accepted`), the confirmed count
+/// `c = accepted + 1`, the verify context's rows in the drafter's dtype with
+/// the rows at and past `c` zeroed (`DFlash2ExactRowClasses`), the block
+/// attention's key mask (`key < held + L + c`) and the queries' rope offset
+/// (`offset + c`). Composed, that is a dependent chain of small launches
+/// (compare, widen, scan, sum, take, add, compare, the select and its zero
+/// fill, cast, add, add, compare) in front of the block's first projection,
+/// all on the GPU's path from the verify's end to the drafter, each waiting
+/// for the one before it: a fixed few microseconds a launch whatever the
+/// device's bandwidth. Here every thread counts the leading matches itself
+/// (at most `k` integer compares of the packet), and one launch writes every
+/// output.
+///
+/// EXACT: the same integers, the same select and the same cast (a
+/// `static_cast` of the context element to the drafter's dtype, as the
+/// composed `asType`). `prepare` runs it against the composed ops at load,
+/// for every accept count 0...k, the context dtypes the block meets, masked
+/// and unmasked, on rows carrying NaN, infinities, signed zeros and
+/// subnormals, every output compared bit for bit; the speculation self-test
+/// then proves whole blocks through it. A mismatch or an MLX error keeps the
+/// composed ops. `MLXFAST_DFLASH_PACKET_FRONT=0` keeps them.
+enum DFlash2PacketFront {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PACKET_FRONT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    /// Set once at bind by `prepare`: the self-test passed and the trial kept it.
+    nonisolated(unsafe) private(set) static var active = false
+    nonisolated(unsafe) private static var prepared = false
+
+    /// Back to the composed ops (the speculation self-test failed with it).
+    static func deactivate() {
+        lock.withLock { active = false }
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_packet_front",
+        inputNames: ["packet", "ctx", "dims"],
+        outputNames: ["rows", "anchor", "conf", "keymask", "qoff"],
+        source: """
+            // dims: [k, context rows, width, keys, key bound at c = 0, rope offset at c = 0]
+            const uint gid = thread_position_in_grid.x;
+            const int k = dims[0];
+            int a = 0;
+            while (a < k && packet[a] == packet[k + a]) {
+              a++;
+            }
+            const int c = a + 1;
+            if (gid == 0) {
+              anchor[0] = packet[k + a];
+              conf[0] = c;
+              qoff[0] = dims[5] + c;
+            }
+            if (gid < uint(dims[3])) {
+              keymask[gid] = int(gid) < dims[4] + c;
+            }
+            const uint w = uint(dims[2]);
+            const uint e = gid * 4;
+            if (e < uint(dims[1]) * w) {
+              // `w % 4 == 0`: the four elements share a row.
+              const bool kept = !MASK || int(e / w) < c;
+              for (uint i = 0; i < 4; i++) {
+                rows[e + i] = kept ? static_cast<O>(ctx[e + i]) : static_cast<O>(static_cast<T>(0));
+              }
+            }
+            """,
+        ensureRowContiguous: true)
+
+    typealias Inputs = (
+        anchor: MLXArray, confirmed: MLXArray, rows: MLXArray, keyMask: MLXArray,
+        queryOffset: MLXArray
+    )
+
+    private static func launch(
+        _ packet: MLXArray, depth k: Int, context: MLXArray, rows: Int, dtype: DType,
+        masked: Bool, keys: Int, keyBound: Int, offset: Int
+    ) -> Inputs {
+        let width = context.dim(2)
+        let dims = MLXArray(
+            [Int32(k), Int32(rows), Int32(width), Int32(keys), Int32(keyBound), Int32(offset)])
+        let out = kernel(
+            [packet, context[0..., ..<rows, 0...], dims],
+            template: [("T", context.dtype), ("O", dtype), ("MASK", masked)],
+            grid: (max(rows * width / 4, keys), 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, rows, width], [1, 1], [1], [1, keys], [1]],
+            outputDTypes: [dtype, .int32, .int32, .bool, .int32])
+        return (out[1], out[2], out[0], out[3], out[4])
+    }
+
+    /// The composed ops the launch stands in for, as `speculateBlock` and
+    /// `proposeSpeculative` build them.
+    static func composed(
+        _ packet: MLXArray, depth k: Int, context: MLXArray, rows: Int, dtype: DType,
+        masked: Bool, keys: Int, keyBound: Int, offset: Int
+    ) -> Inputs {
+        let targets = packet[k ..< (2 * k + 1)]
+        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+            .sum().asType(.int32)
+        let anchor = targets.take(accepted.reshaped([1]), axis: 0)
+        let c = (accepted + MLXArray(Int32(1))).reshaped([]).asType(.int32)
+        let verifyRows = context[0..., ..<rows, 0...]
+        let projected =
+            masked
+            ? which(
+                (MLXArray(Int32(0) ..< Int32(rows)) .< c).reshaped([1, rows, 1]),
+                verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
+            : verifyRows
+        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(keyBound)) + c))
+            .reshaped([1, keys])
+        return (
+            anchor.reshaped([1, 1]), c.reshaped([1]), projected.asType(dtype), keyMask,
+            (MLXArray(Int32(offset)) + c).reshaped([1])
+        )
+    }
+
+    /// The launch's outputs for `packet` (`[drafts | targets]`, int32, depth
+    /// `k`) and the verify `context` (its leading `rows` rows), or nil when it
+    /// does not apply (the caller keeps the composed ops).
+    static func apply(
+        _ packet: MLXArray, depth k: Int, context: MLXArray, rows: Int, dtype: DType,
+        masked: Bool, keys: Int, keyBound: Int, offset: Int
+    ) -> Inputs? {
+        guard active, packet.ndim == 1, packet.dtype == .int32, k >= 1,
+            packet.dim(0) >= 2 * k + 1, context.ndim == 3, context.dim(0) == 1,
+            (1 ... context.dim(1)).contains(rows), context.dim(2) % 4 == 0,
+            [DType.float16, .bfloat16, .float32].contains(context.dtype),
+            [DType.float16, .bfloat16].contains(dtype), keys >= 1
+        else { return nil }
+        return launch(
+            packet, depth: k, context: context, rows: rows, dtype: dtype, masked: masked,
+            keys: keys, keyBound: keyBound, offset: offset)
+    }
+
+    /// The self-test and the trial, once, at bind (the drafter's block of
+    /// `k + 1` rows over `width`-wide verify rows, in `dtype`).
+    static func prepare(depth k: Int, width: Int, dtype: DType) {
+        guard enabled, k >= 1, width % 4 == 0, [DType.float16, .bfloat16].contains(dtype) else {
+            return
+        }
+        lock.withLock {
+            guard !prepared else { return }
+            prepared = true
+            let start = DispatchTime.now().uptimeNanoseconds
+            var same = true
+            var compared = 0
+            var trialInputs: (MLXArray, MLXArray)?
+            do {
+                try withError { error in
+                    let rows = k + 1
+                    for (seed, (contextType, masked)) in [
+                        (DType.float16, true), (.float32, true), (.bfloat16, true), (.float16, false),
+                    ].enumerated() {
+                        // Rows from 1e-8 to 1e8, then NaN, infinities, signed
+                        // zeros and values below the narrow types' normals.
+                        var values = MLXRandom.normal(
+                            [1, rows, width], key: MLXRandom.key(UInt64(0x7a3 + seed)))
+                            * exp(MLXRandom.uniform(
+                                Float(-18) ..< Float(18), [1, rows, 1],
+                                key: MLXRandom.key(UInt64(0x7b3 + seed))))
+                        let column = MLXArray(Int32(0) ..< Int32(width)).reshaped([1, 1, width])
+                        for (index, special) in [
+                            Float.nan, .infinity, -.infinity, -0.0, 1e-7, -3e-39, 70000,
+                        ].enumerated() {
+                            values = which(column .== Int32(97 * index + 5), MLXArray(special), values)
+                        }
+                        let context = values.asType(contextType)
+                        eval(context)
+                        for a in 0 ... k {
+                            // Drafts match the targets on their first `a`.
+                            let targets = (0 ... k).map { Int32(1000 + ($0 &* 7919 &+ a &* 104_729 &+ seed) % 90_000) }
+                            var drafts = Array(targets[..<k])
+                            if a < k { drafts[a] &+= 1 + Int32(seed) }
+                            for i in stride(from: a + 1, to: k, by: 2) { drafts[i] = targets[i] }
+                            let packet = MLXArray(drafts + targets + [Int32(-5)])
+                            let keys = 37 + 91 * a + seed
+                            let keyBound = keys - 2 * rows + rows
+                            let offset = 4077 * a + seed
+                            let fused = launch(
+                                packet, depth: k, context: context, rows: rows, dtype: dtype,
+                                masked: masked, keys: keys, keyBound: keyBound, offset: offset)
+                            let reference = composed(
+                                packet, depth: k, context: context, rows: rows, dtype: dtype,
+                                masked: masked, keys: keys, keyBound: keyBound, offset: offset)
+                            let pairs = [
+                                (fused.anchor, reference.anchor), (fused.confirmed, reference.confirmed),
+                                (fused.queryOffset, reference.queryOffset),
+                                (fused.keyMask.asType(.int32), reference.keyMask.asType(.int32)),
+                                (fused.rows.view(dtype: .uint16).asType(.int32),
+                                    reference.rows.view(dtype: .uint16).asType(.int32)),
+                            ]
+                            for (f, r) in pairs {
+                                same = same && f.shape == r.shape && all(f .== r).item(Bool.self)
+                                compared += r.size
+                            }
+                            trialInputs = (packet, context)
+                        }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            // The trial: the composed chain against the launch, at the
+            // drafter's shapes, followed by one reader of every output.
+            var note = ""
+            var wins = same
+            if same, let (packet, context) = trialInputs {
+                let rows = k + 1
+                let keys = 600
+                func read(_ x: Inputs) -> [MLXArray] {
+                    [x.rows[0..., 0 ..< 1, 0 ..< 8].asType(.float32).sum()
+                        + x.anchor.asType(.float32).sum() + x.confirmed.asType(.float32).sum()
+                        + x.keyMask.asType(.float32).sum() + x.queryOffset.asType(.float32).sum()]
+                }
+                let t = DFlash2LaunchTrial.race([
+                    {
+                        read(composed(
+                            packet, depth: k, context: context, rows: rows, dtype: dtype,
+                            masked: true, keys: keys, keyBound: keys - rows, offset: 512))
+                    },
+                    {
+                        read(launch(
+                            packet, depth: k, context: context, rows: rows, dtype: dtype,
+                            masked: true, keys: keys, keyBound: keys - rows, offset: 512))
+                    },
+                ])
+                if t.count == 2 {
+                    wins = t[1] <= t[0] * DFlash2LaunchTrial.tolerance
+                    note = String(format: "; trial per 5 fronts: composed %.1f us, one launch %.1f us", t[0], t[1])
+                } else {
+                    wins = false
+                    note = "; trial failed"
+                }
+            }
+            active = wins
+            let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            FileHandle.standardError.write(
+                ("dflash2 packet front: self-test " + (same ? "passed" : "FAILED")
+                    + " (accept counts 0-\(k), \(compared) values compared bitwise)\(note); "
+                    + (wins ? "one launch" : "composed") + "; \(ms) ms\n").data(using: .utf8)!)
         }
     }
 }
