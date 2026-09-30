@@ -2077,6 +2077,37 @@ enum Qwen35TensorPackedMatmul {
         return k <= limit / 16 && n <= limit / 16 && n <= limit / (k / 16)
     }
 
+    // One constants group for PD1; the original body remains the reference.
+    private static let sourceNarrowInt8ZooC1: String? = {
+        let old = "constexpr int CD = PD < 2 ? 2 : PD;"
+        guard sourceNarrowInt8Zoo.components(separatedBy: old).count == 2 else { return nil }
+        return sourceNarrowInt8Zoo.replacingOccurrences(of: old, with: "constexpr int CD = 1;")
+    }()
+
+    private static let kernelNarrowInt8ZooC1: MLXFast.MLXFastKernel? = sourceNarrowInt8ZooC1.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    // Keep the original two-group loop with a single constants slot.
+    private static let sourceNarrowInt8ZooC1U2: String? = {
+        guard var source = sourceNarrowInt8ZooC1 else { return nil }
+        for (old, new) in [("g += CD", "g += 2"), ("j < CD", "j < 2")] {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return source
+    }()
+
+    private static let kernelNarrowInt8ZooC1U2: MLXFast.MLXFastKernel? = sourceNarrowInt8ZooC1U2.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1u2",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
     private static let kernelNarrowInt8Zoo = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8z",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -3256,13 +3287,15 @@ enum Qwen35TensorPackedMatmul {
         // shape but the head).
         case rb = 70
         case k32pd2i32 = 73
+        case k32pd1c1 = 74
+        case k32pd1c1u2 = 75
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
                 .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
-                .i4p4k32pd1, .rb:
+                .i4p4k32pd1, .rb, .k32pd1c1, .k32pd1c1u2:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
@@ -3283,7 +3316,7 @@ enum Qwen35TensorPackedMatmul {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1, .k32pd2i32:
+                .csk32pd2, .i4p4k32pd1, .k32pd2i32, .k32pd1c1, .k32pd1c1u2:
                 return 32
             case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
@@ -3292,7 +3325,7 @@ enum Qwen35TensorPackedMatmul {
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32, .k32pd1c1, .k32pd1c1u2: return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
@@ -4320,9 +4353,15 @@ enum Qwen35TensorPackedMatmul {
             }
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
-            let zooKernel = v == .k32pd2i32 && narrowZoo32Fits(k: k, n: n, m: m)
-                ? kernelNarrowInt8Zoo32 ?? kernelNarrowInt8Zoo
-                : v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            let zooKernel: MLXFast.MLXFastKernel
+            switch v {
+            case .k32pd2i32:
+                zooKernel = narrowZoo32Fits(k: k, n: n, m: m)
+                    ? kernelNarrowInt8Zoo32 ?? kernelNarrowInt8Zoo : kernelNarrowInt8Zoo
+            case .k32pd1c1: zooKernel = kernelNarrowInt8ZooC1 ?? kernelNarrowInt8Zoo
+            case .k32pd1c1u2: zooKernel = kernelNarrowInt8ZooC1U2 ?? kernelNarrowInt8Zoo
+            default: zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            }
             return zooKernel(
                 inputs, template: zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)],
                 grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4438,9 +4477,16 @@ enum Qwen35TensorPackedMatmul {
     /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
         .k32pd2, .k32pd2i32, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
-        .aw64pd1, .k32pd1, .pk32pd1,
+        .aw64pd1, .k32pd1, .k32pd1c1, .k32pd1c1u2, .pk32pd1,
         .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
-    ].filter { $0 != .k32pd2i32 || kernelNarrowInt8Zoo32 != nil }
+    ].filter {
+        switch $0 {
+        case .k32pd2i32: return kernelNarrowInt8Zoo32 != nil
+        case .k32pd1c1: return kernelNarrowInt8ZooC1 != nil
+        case .k32pd1c1u2: return kernelNarrowInt8ZooC1U2 != nil
+        default: return true
+        }
+    }
 
     /// Zoo 3a's bodies (`NarrowVariant.xtg`), self-tested after the zoo's
     /// with a budget of their own, and also on every production shape but the
@@ -6107,7 +6153,15 @@ extension Qwen35TensorPackedMatmul {
         t.replaceSubrange(swiftRange, with: headTop2Insert)
         t += headTop2Tail.replacingOccurrences(of: "HT2COLS", with: columns)
         guard !t.contains("out + base"), !t.contains("out["), !t.contains("OutT(") else { return nil }
-        return t
+        // Only element offsets narrow. The device pointers keep their width.
+        return "typedef metal::conditional<IO32 != 0, uint, size_t>::type IndexT;\n"
+            + t.replacingOccurrences(of: "size_t", with: "IndexT")
+    }
+
+    static func headTop2IO32Fits(k: Int, n: Int) -> Bool {
+        guard k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
+        let limit = Int(Int32.max)
+        return k <= limit / 16 && n <= limit / 16 && n <= limit / (k / 16)
     }
 
     private static func headTop2Kernel(
@@ -6130,6 +6184,12 @@ extension Qwen35TensorPackedMatmul {
     // The zoo bodies' fused forms (the head on a zoo body, zoo 2).
     private static let kernelNarrowInt8ZooTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8z_top2", sourceNarrowInt8Zoo, columns: "TN")
+    private static let kernelNarrowInt8ZooC1Top2 = sourceNarrowInt8ZooC1.flatMap {
+        headTop2Kernel("bonsai_tensor_packed_matmul_m16_i8zc1_top2", $0, columns: "TN")
+    }
+    private static let kernelNarrowInt8ZooC1U2Top2 = sourceNarrowInt8ZooC1U2.flatMap {
+        headTop2Kernel("bonsai_tensor_packed_matmul_m16_i8zc1u2_top2", $0, columns: "TN")
+    }
     private static let kernelNarrowInt8PairTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8x_top2", sourceNarrowInt8Pair, columns: "32")
     private static let kernelNarrowInt8Zoo2Top2 = headTop2Kernel(
@@ -6137,9 +6197,8 @@ extension Qwen35TensorPackedMatmul {
     private static let kernelNarrowInt8PairRTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8r_top2", sourceNarrowInt8PairR, columns: "32")
 
-    /// One simdgroup per row merges the blocks' pairs (`DFlash2TopK`'s merge
-    /// pattern): each lane takes every 32nd block, then five butterfly steps.
-    /// grid (32, rows, 1), threadgroup (32, 1, 1).
+    /// SIMD groups partition each row's blocks, then merge their top pairs.
+    /// The startup trial selects the group count for this head shape.
     private static let headTop2MergeKernel = MLXFast.metalKernel(
         name: "bonsai_head_top2_merge",
         inputNames: ["pid", "pval"],
@@ -6148,16 +6207,30 @@ extension Qwen35TensorPackedMatmul {
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
+            const uint sg = simdgroup_index_in_threadgroup;
+            threadgroup bonsai_head_top2 states[SGS];
             bonsai_head_top2 st = bonsai_head_top2_empty();
-            for (uint b = lane; b < blocks; b += 32) {
+            for (uint b = sg * 32 + lane; b < blocks; b += 32 * SGS) {
               const size_t o = (size_t(row) * size_t(blocks) + size_t(b)) * 2;
-              bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
-              bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+              const int2 ids = *(const device int2*)(pid + o);
+              const float2 values = *(const device float2*)(pval + o);
+              bonsai_head_top2_insert(st, values.x, uint(ids.x));
+              bonsai_head_top2_insert(st, values.y, uint(ids.y));
             }
             for (ushort m = 16; m > 0; m >>= 1) {
               bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
             }
-            if (lane == 0) {
+            if constexpr (SGS > 1) {
+              if (lane == 0) { states[sg] = st; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (sg == 0) {
+                st = lane < SGS ? states[lane] : bonsai_head_top2_empty();
+                for (ushort m = SGS / 2; m > 0; m >>= 1) {
+                  bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
+                }
+              }
+            }
+            if (sg == 0 && lane == 0) {
               top_ids[row * 2] = int(st.first_id);
               top_ids[row * 2 + 1] = int(st.second_id);
               top_values[row * 2] = st.first_value;
@@ -6166,6 +6239,83 @@ extension Qwen35TensorPackedMatmul {
             """,
         header: headTop2Header,
         ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static var headTop2MergeGroups = 1
+
+    private static func headTop2Merge(_ inputs: [MLXArray], groups: Int) -> [MLXArray] {
+        let rows = inputs[0].dim(0)
+        return headTop2MergeKernel(
+            inputs, template: [("SGS", groups)],
+            grid: (32 * groups, rows, 1), threadGroup: (32 * groups, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2]], outputDTypes: [.int32, .float32])
+    }
+
+    /// Choose on this device and head shape; the original group count stays
+    /// unless bit checks and a separate timing confirmation pass.
+    private static func chooseHeadTop2Merge(blocks: Int) {
+        headTop2MergeGroups = 1
+        let ids = MLXArray((0 ..< 16 * blocks * 2).map { Int32($0 % (blocks * 2)) })
+            .reshaped(16, blocks, 2)
+        let values = MLXRandom.normal([16, blocks, 2], key: MLXRandom.key(0x6d65_7267))
+        let inputs = [ids, values]
+        do {
+            try withError { error in
+                eval(inputs)
+                let reference = headTop2Merge(inputs, groups: 1)
+                eval(reference)
+                var passing = [1]
+                for groups in [2, 4, 8] {
+                    let pair = headTop2Merge(inputs, groups: groups)
+                    let bad = (pair[0].view(dtype: .uint32) .!= reference[0].view(dtype: .uint32))
+                        .asType(.int32).sum()
+                        + (pair[1].view(dtype: .uint32) .!= reference[1].view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(bad)
+                    try error.check()
+                    if bad.item(Int.self) == 0 { passing.append(groups) }
+                }
+                guard passing.count > 1 else { return }
+                func sample(_ groups: Int) -> Double {
+                    let pair = headTop2Merge(inputs, groups: groups)
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    eval(pair)
+                    return Double(DispatchTime.now().uptimeNanoseconds - begin)
+                }
+                func median(_ samples: [Double]) -> Double {
+                    let sorted = samples.sorted(), mid = sorted.count / 2
+                    return (sorted[(sorted.count - 1) / 2] + sorted[mid]) / 2
+                }
+                var times = [Int: [Double]]()
+                for round in 0 ..< 7 {
+                    for j in passing.indices {
+                        let groups = passing[(j + round) % passing.count]
+                        let time = sample(groups)
+                        if round > 0 { times[groups, default: []].append(time) }
+                    }
+                }
+                let best = passing.dropFirst().min { median(times[$0]!) < median(times[$1]!) }!
+                if median(times[best]!) < median(times[1]!) * 0.995 {
+                    var old = [Double](), new = [Double]()
+                    for round in 0 ..< 6 {
+                        if round % 2 == 0 {
+                            old.append(sample(1)); new.append(sample(best))
+                        } else {
+                            new.append(sample(best)); old.append(sample(1))
+                        }
+                    }
+                    if median(new) < median(old) * 0.995 { headTop2MergeGroups = best }
+                }
+                try error.check()
+                FileHandle.standardError.write(Data(("bonsai head top-2 merge: exact groups "
+                    + passing.map(String.init).joined(separator: ",")
+                    + "; installed \(headTop2MergeGroups), blocks \(blocks)\n").utf8))
+            }
+        } catch {
+            headTop2MergeGroups = 1
+            FileHandle.standardError.write(
+                Data("bonsai head top-2 merge: check error (\(error)); one group kept\n".utf8))
+        }
+    }
 
     /// The fused form of `launchNarrowInt8` with FP32 output: the same
     /// kernel body, template and grid, returning each of the 16 rows' top
@@ -6183,6 +6333,7 @@ extension Qwen35TensorPackedMatmul {
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", DType.float32), ("NEG", kernel.form == .base ? 0 : 1),
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
+            ("IO32", headTop2IO32Fits(k: k, n: n) ? 1 : 0),
         ]
         let v = kernel.variant
         let columns = v == .v0 ? 32 : v.tn
@@ -6195,7 +6346,7 @@ extension Qwen35TensorPackedMatmul {
             // A zoo body's fused form: the same body text, template and grid
             // as its stock launch (`launchNarrowInt8`), on the tiled copy only.
             guard tiled else { return nil }
-            let zooTemplate = Array(template.prefix(3))
+            let zooTemplate = Array(template.prefix(3)) + [template[4]]
             let launch: MLXFast.MLXFastKernel?
             let t: [(String, any KernelTemplateArg)]
             var grid = (n / v.tn * 128, 1, 1)
@@ -6209,7 +6360,11 @@ extension Qwen35TensorPackedMatmul {
                 t = zooTemplate + [("PD", v.pd), ("KH", v.kh)]
                 (grid, threads) = ((n / 32 * 256, 1, 1), 256)
             } else {
-                launch = kernelNarrowInt8ZooTop2
+                switch v {
+                case .k32pd1c1: launch = kernelNarrowInt8ZooC1Top2
+                case .k32pd1c1u2: launch = kernelNarrowInt8ZooC1U2Top2
+                default: launch = kernelNarrowInt8ZooTop2
+                }
                 t = zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)]
             }
             guard let launch else { return nil }
@@ -6232,9 +6387,7 @@ extension Qwen35TensorPackedMatmul {
                     outputShapes: shapes, outputDTypes: dtypes)
             }
         }
-        let merged = headTop2MergeKernel(
-            partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
+        let merged = headTop2Merge(partial, groups: headTop2MergeGroups)
         return (merged[0], merged[1])
     }
 
@@ -6271,6 +6424,8 @@ extension Qwen35TensorPackedMatmul {
         let (k, n) = (site.k, site.n)
         let start = DispatchTime.now().uptimeNanoseconds
         let kernels = [site.kernel()]
+        let columns = kernels[0].variant == .v0 ? 32 : kernels[0].variant.tn
+        if n % columns == 0 { chooseHeadTop2Merge(blocks: n / columns) }
         var log = "bonsai head top-2: "
         let base = NarrowOperands(k: k, n: n, seed: 0x7432_6865)
         func repeated(_ period: Int, specials: Bool) -> NarrowOperands {

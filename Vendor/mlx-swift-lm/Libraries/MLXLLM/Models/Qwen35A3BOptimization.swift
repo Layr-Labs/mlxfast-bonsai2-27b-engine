@@ -848,6 +848,7 @@ enum Qwen35WideNMatmul {
     private static let stagedLock = NSLock()
     nonisolated(unsafe) private static var stagedVerdict: Bool?
     nonisolated(unsafe) private static var stagedFailed = false
+    nonisolated(unsafe) private static var staging = (kb: 16, pad: 4)
 
     /// Whether `apply` takes the staged pair: decided once, at the first
     /// prompt-width call (the load-time warm), by `stagedSelfTest`.
@@ -857,6 +858,7 @@ enum Qwen35WideNMatmul {
             if let stagedVerdict { return stagedVerdict }
             let (passed, summary) = stagedSelfTest()
             stagedVerdict = passed
+            if passed { chooseStaging() }
             FileHandle.standardError.write(
                 Data(("qwen35 prompt split-K b|a staged: " + summary
                     + (passed ? "; staged partial and four-wide reduce\n" : "; stock kernels kept\n")).utf8))
@@ -898,15 +900,102 @@ enum Qwen35WideNMatmul {
         return (passed, summary)
     }
 
+    /// Select the stage on this device, after bitwise checks against the
+    /// installed pair. Dependent partials measure latency, not throughput.
+    private static func chooseStaging() {
+        let forms = [(kb: 16, pad: 4), (kb: 8, pad: 4), (kb: 32, pad: 4), (kb: 32, pad: 8)]
+        var passing = [0]
+        var inputs: [MLXArray] = []
+        do {
+            try withError { error in
+                for (rows, k, n) in [(64, 1024, 64), (512, 5120, 96)] {
+                    let x = MLXRandom.normal([rows, k], key: MLXRandom.key(0x7374_6167))
+                        * Float(1 / sqrt(512.0))
+                    let w = MLXRandom.normal([n, k], key: MLXRandom.key(0x7374_6168)) * Float(0.02)
+                    let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+                    let (ref, reduced) = launch(x, w, dims, rows: rows, k: k, n: n, staged: true)
+                    eval(ref, reduced)
+                    for f in forms.indices.dropFirst() where rows == 64 || passing.contains(f) {
+                        let (part, y) = launch(
+                            x, w, dims, rows: rows, k: k, n: n, staged: true, stage: forms[f])
+                        let bad = (ref.view(dtype: .uint32) .!= part.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                            + (reduced.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                        eval(bad)
+                        try error.check()
+                        if rows == 64, bad.item(Int.self) == 0 { passing.append(f) }
+                        if rows == 512, bad.item(Int.self) != 0 { passing.removeAll { $0 == f } }
+                    }
+                    if rows == 512 { inputs = [x, w, dims] }
+                }
+                try error.check()
+            }
+        } catch {
+            FileHandle.standardError.write(
+                Data("qwen35 prompt split-K staging: check error (\(error)); 16/4 kept\n".utf8))
+            return
+        }
+        guard passing.count > 1 else { return }
+        func sample(_ f: Int) -> Double {
+            var weight = inputs[1]
+            var part = weight
+            // At 512 rows the partial has N*K elements, so the next launch
+            // can read it as its weight without a copy or an extra kernel.
+            for _ in 0 ..< 16 {
+                part = stagedPartialKernel(
+                    [inputs[0], weight, inputs[2]],
+                    template: [("KC", chunk), ("KB", forms[f].kb), ("PAD", forms[f].pad)],
+                    grid: (96 / 32 * 64, 512 / 32, 5120 / chunk), threadGroup: (64, 1, 1),
+                    outputShapes: [[5120 / chunk, 512, 96]], outputDTypes: [.float32])[0]
+                weight = part.reshaped(96, 5120)
+            }
+            let begin = DispatchTime.now().uptimeNanoseconds
+            eval(part)
+            return Double(DispatchTime.now().uptimeNanoseconds - begin) / 16
+        }
+        var times = [[Double]](repeating: [], count: forms.count)
+        for round in 0 ..< 7 {
+            for j in passing.indices {
+                let f = passing[(j + round) % passing.count]
+                let t = sample(f)
+                if round > 0 { times[f].append(t) }
+            }
+        }
+        func gain(_ f: Int) -> Double {
+            let ratios = zip(times[f], times[0]).map { $0 / $1 }.sorted()
+            return (ratios[(ratios.count - 1) / 2] + ratios[ratios.count / 2]) / 2 - 1
+        }
+        let best = passing.dropFirst().min { gain($0) < gain($1) }!
+        var line = "qwen35 prompt split-K staging: exact ["
+            + passing.map { "\(forms[$0].kb)/\(forms[$0].pad)" }.joined(separator: " ") + "]"
+        for f in passing.dropFirst() {
+            line += String(format: " | %d/%d %+.1f%%", forms[f].kb, forms[f].pad, gain(f) * 100)
+        }
+        if gain(best) < -0.02 {
+            for round in 0 ..< 6 {
+                let first = round % 2 == 0 ? 0 : best
+                let second = first == 0 ? best : 0
+                times[first].append(sample(first))
+                times[second].append(sample(second))
+            }
+            if gain(best) < -0.02 { staging = forms[best] }
+            line += String(format: "; confirmation %+.1f%%", gain(best) * 100)
+        }
+        line += "; installed \(staging.kb)/\(staging.pad)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
     /// One product as partials and reduce, by either pair.
     private static func launch(
-        _ x: MLXArray, _ w: MLXArray, _ dims: MLXArray, rows: Int, k: Int, n: Int, staged: Bool
+        _ x: MLXArray, _ w: MLXArray, _ dims: MLXArray, rows: Int, k: Int, n: Int, staged: Bool,
+        stage: (kb: Int, pad: Int) = (16, 4)
     ) -> (MLXArray, MLXArray) {
         let part: MLXArray
         let y: MLXArray
         if staged {
             part = stagedPartialKernel(
-                [x, w, dims], template: [("KC", chunk), ("KB", 16), ("PAD", 4)],
+                [x, w, dims], template: [("KC", chunk), ("KB", stage.kb), ("PAD", stage.pad)],
                 grid: (n / 32 * 64, rows / 32, k / chunk), threadGroup: (64, 1, 1),
                 outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
             y = stagedReduceKernel(
@@ -936,7 +1025,10 @@ enum Qwen35WideNMatmul {
                 Data("qwen35 prompt split-K b|a: in use (rows \(rows), k \(k), n \(n))\n".utf8))
         }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
-        let (_, y) = launch(x.reshaped(rows, k), w, dims, rows: rows, k: k, n: n, staged: staged)
+        let useStaged = staged
+        let (_, y) = launch(
+            x.reshaped(rows, k), w, dims, rows: rows, k: k, n: n,
+            staged: useStaged, stage: staging)
         return y.reshaped(Array(x.shape.dropLast()) + [n])
     }
 }

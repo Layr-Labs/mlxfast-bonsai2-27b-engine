@@ -2430,13 +2430,21 @@ enum Qwen35RotationQ8Blocks {
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = uint(index + r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
@@ -3167,12 +3175,20 @@ enum Qwen35BoundaryBlocks {
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = lane * 4 + uint(r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { codes[base + size_t(g) * 128 + kp] = int8_t(q); } else { codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { codes[base + size_t(g) * 128 + kp] = int8_t(q); } else { codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(codes + base + size_t(g) * 128 + lane * 4) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
@@ -3494,13 +3510,21 @@ extension Qwen35RotationQ8Blocks {
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = uint(index + r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
@@ -3713,7 +3737,7 @@ extension Qwen35GatedDeltaChunked {
     /// `text` with K also staged transposed and 32-bit offsets (`kt`), by
     /// checked replacements on the record's fresh scan text, prefetch staging
     /// (`prefetch`) or stock; nil when a target moved.
-    private static func ktSource(_ text: String, prefetch: Bool) -> String? {
+    private static func ktSource(_ text: String, prefetch: Bool, singleK: Bool = false) -> String? {
         var text = text
         let kStore = prefetch
             ? "*(threadgroup float4*)(Ksh + row * LK + c4) = pk_[i];"
@@ -3752,6 +3776,19 @@ extension Qwen35GatedDeltaChunked {
             guard text.components(separatedBy: target).count == 2 else { return nil }
             text = text.replacingOccurrences(of: target, with: replacement)
         }
+        if singleK {
+            // Both matrix operands read the transposed K tile. Keep the same
+            // MMA order while removing the second shared copy of K.
+            for (target, replacement) in [
+                ("threadgroup float Ksh[C * LK];", ""),
+                ("*(threadgroup float4*)(Ksh + row * LK + c4) = \(kValue);", ""),
+                ("simdgroup_load(ka, Ksh + (ti * 8) * LK + d * 8, LK);",
+                 "simdgroup_load(ka, KTsh + (d * 8) * LT + ti * 8, LT, ulong2(0, 0), true);"),
+            ] {
+                guard text.components(separatedBy: target).count == 2 else { return nil }
+                text = text.replacingOccurrences(of: target, with: replacement)
+            }
+        }
         return text
     }
 
@@ -3771,6 +3808,19 @@ extension Qwen35GatedDeltaChunked {
             inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
             outputNames: ["y", "state_out"],
             source: text)
+    }()
+
+    private static let singleKKernel: MLXFast.MLXFastKernel? = {
+        let prefetch = scanPrefetchActive && scanFreshPrefetchSource != nil
+        guard let text = ktSource(
+            prefetch ? scanFreshPrefetchSource! : scanFreshSource,
+            prefetch: prefetch, singleK: true)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: prefetch ? "bonsai_gated_delta_chunk_scan_fresh_pf_kt1"
+                : "bonsai_gated_delta_chunk_scan_fresh_kt1",
+            inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
+            outputNames: ["y", "state_out"], source: text)
     }()
 
     private struct ScanForm {
@@ -3811,6 +3861,12 @@ extension Qwen35GatedDeltaChunked {
                 ScanForm(name: "kt/8", kernel: ktKernel, simdgroups: 8),
             ]
         }
+        if let singleKKernel {
+            forms += [
+                ScanForm(name: "kt1/4", kernel: singleKKernel, simdgroups: 4),
+                ScanForm(name: "kt1/8", kernel: singleKKernel, simdgroups: 8),
+            ]
+        }
         forms = forms.filter { (dv / 8) % $0.simdgroups == 0 }
         guard forms.count > 1, forms[0].simdgroups == 4 else { return }
         let start = DispatchTime.now().uptimeNanoseconds
@@ -3846,15 +3902,23 @@ extension Qwen35GatedDeltaChunked {
                     eval([yRef, sRef] + p)
                     try error.check()
                     for f in 1 ..< forms.count where verdict[f] {
-                        let (y, s) = scanFormLaunch(
-                            forms[f], q: q, k: k, v: v, prepared: p, stateShape: stateShape)
-                        let differ = (yRef.view(dtype: .uint32) .!= y.view(dtype: .uint32))
-                            .asType(.int32).sum()
-                            + (sRef.view(dtype: .uint32) .!= s.view(dtype: .uint32))
-                            .asType(.int32).sum()
-                        eval(differ)
-                        try error.check()
-                        if differ.item(Int32.self) != 0 { verdict[f] = false }
+                        do {
+                            try withError { formError in
+                                let (y, s) = scanFormLaunch(
+                                    forms[f], q: q, k: k, v: v, prepared: p, stateShape: stateShape)
+                                let differ = (yRef.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                                    .asType(.int32).sum()
+                                    + (sRef.view(dtype: .uint32) .!= s.view(dtype: .uint32))
+                                    .asType(.int32).sum()
+                                eval(differ)
+                                try formError.check()
+                                if differ.item(Int32.self) != 0 { verdict[f] = false }
+                            }
+                        } catch {
+                            // A new form's compile error must not discard a
+                            // passing form from the promoted source.
+                            verdict[f] = false
+                        }
                     }
                     if T == 512 { timingSet = (q, k, v, p, stateShape) }
                 }
