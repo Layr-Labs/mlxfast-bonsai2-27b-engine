@@ -1105,19 +1105,32 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         ]
         if let context {
             let rows = context.dim(1) + length
-            return dflash2GroupedConvJoinKernel(
+            let narrow = dflash2ConvIndex32(
+                h: hidden.size, dyn: projection.size, base: baseKernel.size,
+                context: context.size, residual: 0, batch: batch, width: hiddenSize, rows: rows)
+            let kernel = narrow ? dflash2GroupedConvJoinKernel32 ?? dflash2GroupedConvJoinKernel
+                : dflash2GroupedConvJoinKernel
+            return kernel(
                 [hidden, projection, baseKernel, context],
                 template: template, grid: (dflash2ConvColumns(hiddenSize, dtype, groupSize), rows, batch), threadGroup: (256, 1, 1),
                 outputShapes: [[batch, rows, hiddenSize]], outputDTypes: [dtype])[0]
         }
         let grid = (dflash2ConvColumns(hiddenSize, dtype, groupSize), length, batch)
+        let narrow = dflash2ConvIndex32(
+            h: hidden.size, dyn: projection.size, base: baseKernel.size,
+            context: 0, residual: residual?.size ?? 0,
+            batch: batch, width: hiddenSize, rows: length)
         if let residual {
-            return dflash2GroupedConvResidualKernel(
+            let kernel = narrow ? dflash2GroupedConvResidualKernel32 ?? dflash2GroupedConvResidualKernel
+                : dflash2GroupedConvResidualKernel
+            return kernel(
                 [hidden, projection, baseKernel, residual],
                 template: template, grid: grid, threadGroup: (256, 1, 1),
                 outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
         }
-        return dflash2GroupedConvKernel(
+        let kernel = narrow ? dflash2GroupedConvKernel32 ?? dflash2GroupedConvKernel
+            : dflash2GroupedConvKernel
+        return kernel(
             [hidden, projection, baseKernel],
             template: template, grid: grid, threadGroup: (256, 1, 1),
             outputShapes: [hidden.shape], outputDTypes: [dtype])[0]
@@ -1215,7 +1228,12 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                         let template: [(String, any KernelTemplateArg)] = [
                             ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(dtype, gs)),
                         ]
-                        let fused = dflash2GroupedConvJoinKernel(
+                        let narrow = dflash2ConvIndex32(
+                            h: h.size, dyn: dyn.size, base: base.size,
+                            context: context.size, residual: 0, batch: 1, width: hs, rows: c + l)
+                        let kernel = narrow ? dflash2GroupedConvJoinKernel32 ?? dflash2GroupedConvJoinKernel
+                            : dflash2GroupedConvJoinKernel
+                        let fused = kernel(
                             [h, dyn, base, context], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), c + l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [[1, c + l, hs]],
                             outputDTypes: [dtype])[0]
@@ -1223,6 +1241,21 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                             [h, dyn, base], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [h.shape],
                             outputDTypes: [dtype])[0]
+                        if narrow, let plain = dflash2GroupedConvKernel32,
+                            let residual = dflash2GroupedConvResidualKernel32
+                        {
+                            let result = plain(
+                                [h, dyn, base], template: template,
+                                grid: (dflash2ConvColumns(hs, dtype, gs), l, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [h.shape], outputDTypes: [dtype])[0]
+                            let sum = residual(
+                                [h, dyn, base, h], template: template,
+                                grid: (dflash2ConvColumns(hs, dtype, gs), l, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [h.shape], outputDTypes: [dtype])[0]
+                            same = same && all(result.view(dtype: .uint16) .== conv.view(dtype: .uint16)).item(Bool.self)
+                                && all(sum.view(dtype: .uint16) .== (h + conv).view(dtype: .uint16)).item(Bool.self)
+                            compared += 2 * conv.size
+                        }
                         let reference = DFlash2Concat.concatenate([context, conv], axis: 1)
                         same = same && fused.shape == reference.shape
                             && all(fused.view(dtype: .uint16) .== reference.view(dtype: .uint16))
@@ -1290,6 +1323,30 @@ private func dflash2ConvQuad(_ dtype: DType, _ groupSize: Int) -> Bool {
 }
 private func dflash2ConvColumns(_ width: Int, _ dtype: DType, _ groupSize: Int) -> Int {
     dflash2ConvQuad(dtype, groupSize) ? width / 4 : width
+}
+
+/// Complete contiguous buffer extents, including the joined output.
+private func dflash2ConvIndex32(
+    h: Int, dyn: Int, base: Int, context: Int, residual: Int,
+    batch: Int, width: Int, rows: Int
+) -> Bool {
+    let limit = Int(Int32.max)
+    return h > 0 && h <= limit && dyn > 0 && dyn <= limit && base > 0 && base <= limit
+        && context >= 0 && context <= limit && residual >= 0 && residual <= limit
+        && batch > 0 && width > 0 && rows > 0 && rows <= limit / batch / width
+}
+
+private func dflash2ConvNarrowKernel(
+    _ name: String, inputs: [String], source: String, count: Int
+) -> MLXFast.MLXFastKernel? {
+    guard dflash2GroupedConvHeader.components(separatedBy: "size_t").count == 9,
+        source.components(separatedBy: "size_t").count == count + 1
+    else { return nil }
+    return MLXFast.metalKernel(
+        name: name, inputNames: inputs, outputNames: ["out"],
+        source: source.replacingOccurrences(of: "size_t", with: "uint"),
+        header: dflash2GroupedConvHeader.replacingOccurrences(of: "size_t", with: "uint"),
+        ensureRowContiguous: true)
 }
 
 private let dflash2GroupedConvHeader = """
@@ -1430,6 +1487,16 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     source: dflash2GroupedConvResidualSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
+
+private let dflash2GroupedConvKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_io32", inputs: ["h", "dyn", "base"],
+    source: dflash2GroupedConvSource, count: 2)
+private let dflash2GroupedConvResidualKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_residual_io32", inputs: ["h", "dyn", "base", "res"],
+    source: dflash2GroupedConvResidualSource, count: 2)
+private let dflash2GroupedConvJoinKernel32 = dflash2ConvNarrowKernel(
+    "dflash2_grouped_conv_join_io32", inputs: ["h", "dyn", "base", "ctx"],
+    source: dflash2GroupedConvJoinSource, count: 4)
 
 // MARK: - The decoder layer
 
@@ -2544,6 +2611,10 @@ enum DFlash2PackedWeights {
         let offsets: MLXArray
         let escapes: MLXArray
         let escapeCount: Int
+        var columns16 = 32
+        var columns32 = 32
+        var ahead16 = 1
+        var ahead32 = 1
         var arrays: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
     }
 
@@ -2564,23 +2635,25 @@ enum DFlash2PackedWeights {
         #include <metal_tensor>
         #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
-        // One lane's share of a packed tile, as read: its KT / 16 byte words
+        // TN=16 reads one half of the original TN=32 lane share.
+        // prepareTiles checks this mapping on every selected weight.
+        // One lane's share of a packed tile, as read: its KT * TN / 512 byte words
         // and code words, and the tile's first four escape words.
-        template <int KT>
+        template <int KT, int TN = 32>
         struct dflash2_pack12_share {
-          uint4 m[KT / 16];
-          uint2 e[KT / 16];
+          uint4 m[KT * TN / 512];
+          uint2 e[KT * TN / 512];
           uint4 first;
           uint base;
         };
 
-        template <int KT>
+        template <int KT, int TN = 32>
         inline void dflash2_pack12_read(
-            thread dflash2_pack12_share<KT>& t, const device uint4* mant, const device uint2* code,
-            const device uint4* first4, const device uint* bases, int tile, uint lane) {
-          constexpr int WORDS = KT / 16;
-          const device uint4* mp = mant + (size_t)tile * WORDS * 32 + lane;
-          const device uint2* cp = code + (size_t)tile * WORDS * 32 + lane;
+            thread dflash2_pack12_share<KT, TN>& t, const device uint4* mant, const device uint2* code,
+            const device uint4* first4, const device uint* bases, int tile, uint lane, uint side = 0) {
+          constexpr int WORDS = KT * TN / 512;
+          const device uint4* mp = mant + (size_t)tile * (KT / 16) * 32 + side * WORDS * 32 + lane;
+          const device uint2* cp = code + (size_t)tile * (KT / 16) * 32 + side * WORDS * 32 + lane;
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
             t.m[j] = mp[j * 32];
@@ -2598,11 +2671,11 @@ enum DFlash2PackedWeights {
         // position lane * KT + i: one of the tile's first four (read with the
         // share, so the common escape waits on no further read), else one
         // past them.
-        template <int KT, typename LW>
+        template <int KT, int TN = 32, typename LW>
         inline void dflash2_pack12_decode(
-            thread LW& lw, thread const dflash2_pack12_share<KT>& t,
-            const device uint* offsets, const device uint* escapes, int tile, uint lane) {
-          constexpr int WORDS = KT / 16;
+            thread LW& lw, thread const dflash2_pack12_share<KT, TN>& t,
+            const device uint* offsets, const device uint* escapes, int tile, uint lane, uint side = 0) {
+          constexpr int WORDS = KT * TN / 512;
           const uint E2 = t.base | (t.base << 16);
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
@@ -2624,7 +2697,7 @@ enum DFlash2PackedWeights {
               #pragma clang loop unroll(full)
               for (int b = 0; b < 16; b++) {
                 if (((e[b >> 3] >> (4 * (b & 7))) & 0xfu) == 0u) {
-                  const uint pos = lane * uint(KT) + uint(j * 16 + b);
+                  const uint pos = lane * uint(KT) + side * uint(KT / 2) + uint(j * 16 + b);
                   uint bits = 0u;
                   if ((t.first.x >> 16) == pos) {
                     bits = t.first.x & 0xffffu;
@@ -2784,21 +2857,23 @@ enum DFlash2PackedWeights {
         const int K = ksz[0]; const int N = ksz[2];
         const uint lane = thread_index_in_simdgroup;
         const int steps = K / KT;
-        const int tile = int(threadgroup_position_in_grid.x);
-        const int n0 = (tile / steps) * 32;
+        const int nb = int(threadgroup_position_in_grid.x);
+        const int tile = nb / (32 / TN);
+        const uint side = uint(nb % (32 / TN));
+        const int n0 = (tile / steps) * 32 + int(side) * TN;
         const int k = (tile % steps) * KT;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            TN, 16, KT, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> O((device bfloat*)out, dextents<int, 2>(K, N));
         auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
-        dflash2_pack12_share<KT> t;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_share<KT, TN> t;
+        dflash2_pack12_read<KT, TN>(
             t, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            tile, lane);
-        dflash2_pack12_decode<KT>(lw, t, offsets, escapes, tile, lane);
-        lw.store(O.template slice<KT, 32>(k, n0));
+            tile, lane, side);
+        dflash2_pack12_decode<KT, TN>(lw, t, offsets, escapes, tile, lane, side);
+        lw.store(O.template slice<KT, TN>(k, n0));
         """
 
     // `sourceSwapped` with the operand rebuilt from the packed tile instead
@@ -2807,20 +2882,21 @@ enum DFlash2PackedWeights {
     private static let source = """
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
-        const int n0 = nb * 32;
+        const int n0 = nb * TN;
+        const uint side = uint(nb % (32 / TN));
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const int kq = K / SPLITS;
         const int k0 = int(sg) * kq;
         const int steps = K / KT;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            TN, 16, KT, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         // `Wt` only names the operand type the destination is built for.
         tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
         tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16));
-        auto tW0 = Wt.template slice<KT, 32>(0, n0);
+        auto tW0 = Wt.template slice<KT, TN>(0, n0);
         auto tX0 = X.template slice<KT, 16>(0, 0);
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
@@ -2829,23 +2905,45 @@ enum DFlash2PackedWeights {
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
         // The next tile's share is read before this one's op (one tile ahead).
-        dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_share<KT, TN> cur, nxt, nxt2;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT, TN>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KT, lane);
-        for (int k = k0; k < k0 + kq; k += KT) {
-          const int tile = nb * steps + k / KT;
-          if (k + KT < k0 + kq) {
-            dflash2_pack12_read<KT>(
-                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
-                bases, tile + 1, lane);
+            (nb / (32 / TN)) * steps + k0 / KT, lane, side);
+        }
+        if constexpr (AHEAD == 2) {
+          if (KT < kq) {
+            dflash2_pack12_read<KT, TN>(
+            nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
+            (nb / (32 / TN)) * steps + k0 / KT + 1, lane, side);
           }
-          dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
+        }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          const int tile = (nb / (32 / TN)) * steps + k / KT;
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT, TN>(
+                cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile, lane, side);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KT < k0 + kq) {
+            dflash2_pack12_read<KT, TN>(
+                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile + 1, lane, side);
+          }
+          } else {
+            if (k + 2 * KT < k0 + kq) {
+              dflash2_pack12_read<KT, TN>(
+                nxt2, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile + 2, lane, side);
+            }
+          }
+          dflash2_pack12_decode<KT, TN>(lw, cur, offsets, escapes, tile, lane, side);
           auto tX = X.template slice<KT, 16>(k, 0);
           op.run(lw, tX, cT);
-          cur = nxt;
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD == 2) { nxt = nxt2; }
         }
-        threadgroup float red[SPLITS - 1][16 * 32];
+        threadgroup float red[SPLITS - 1][16 * TN];
         if (sg > 0) {
           for (uint16_t i = 0; i < cap; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
         }
@@ -2870,19 +2968,20 @@ enum DFlash2PackedWeights {
     private static let source32 = """
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
-        const int n0 = nb * 32;
+        const int n0 = nb * TN;
+        const uint side = uint(nb % (32 / TN));
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const int kq = K / SPLITS;
         const int k0 = int(sg) * kq;
         const int steps = K / KT;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            TN, 16, KT, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
         tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
-        auto tW0 = Wt.template slice<KT, 32>(0, n0);
+        auto tW0 = Wt.template slice<KT, TN>(0, n0);
         auto tX0 = X.template slice<KT, 16>(0, 0);
         auto cT0 = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
@@ -2892,29 +2991,51 @@ enum DFlash2PackedWeights {
         const uint16_t cap = cT0.get_capacity();
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
-        dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_share<KT, TN> cur, nxt, nxt2;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT, TN>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KT, lane);
-        for (int k = k0; k < k0 + kq; k += KT) {
-          const int tile = nb * steps + k / KT;
-          if (k + KT < k0 + kq) {
-            dflash2_pack12_read<KT>(
-                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
-                bases, tile + 1, lane);
+            (nb / (32 / TN)) * steps + k0 / KT, lane, side);
+        }
+        if constexpr (AHEAD == 2) {
+          if (KT < kq) {
+            dflash2_pack12_read<KT, TN>(
+            nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
+            (nb / (32 / TN)) * steps + k0 / KT + 1, lane, side);
           }
-          dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
-          cur = nxt;
+        }
+        for (int k = k0; k < k0 + kq; k += KT) {
+          const int tile = (nb / (32 / TN)) * steps + k / KT;
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT, TN>(
+                cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile, lane, side);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KT < k0 + kq) {
+            dflash2_pack12_read<KT, TN>(
+                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile + 1, lane, side);
+          }
+          } else {
+            if (k + 2 * KT < k0 + kq) {
+              dflash2_pack12_read<KT, TN>(
+                nxt2, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
+                bases, tile + 2, lane, side);
+            }
+          }
+          dflash2_pack12_decode<KT, TN>(lw, cur, offsets, escapes, tile, lane, side);
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD == 2) { nxt = nxt2; }
           auto tXlo = X.template slice<KT, 16>(k, 0);
           op.run(lw, tXlo, cT0);
           auto tXhi = X.template slice<KT, 16>(k, 16);
           op.run(lw, tXhi, cT1);
         }
-        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        threadgroup float red[SPLITS - 1][2 * 16 * TN];
         if (sg > 0) {
           for (uint16_t i = 0; i < cap; i++) {
             red[sg - 1][i * 32 + lane] = cT0[i];
-            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+            red[sg - 1][(cap + i) * 32 + lane] = cT1[i];
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2924,11 +3045,11 @@ enum DFlash2PackedWeights {
             float v0, v1;
             if constexpr (SPLITS == 2) {
               v0 = cT0[i] + red[0][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+              v1 = cT1[i] + red[0][(cap + i) * 32 + lane];
             } else {
               v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
-                  + red[2][(16 + i) * 32 + lane];
+              v1 = cT1[i] + red[0][(cap + i) * 32 + lane] + red[1][(cap + i) * 32 + lane]
+                  + red[2][(cap + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
             out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
@@ -2962,6 +3083,30 @@ enum DFlash2PackedWeights {
         inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz"],
         outputNames: ["out"], source: source32, header: header, ensureRowContiguous: true)
 
+    // Binding the prior result makes MLX insert its Metal buffer barrier.
+    // `depends` alone aliases x and does not register that result as a read.
+    // These kernels run only in the loader's trial, never in inference.
+    private static let trialKernel = MLXFast.metalKernel(
+        name: "dflash2_pack12_trial_m16",
+        inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "dependency"],
+        outputNames: ["out"], source: source, header: header, ensureRowContiguous: true)
+    private static let trialKernel32 = MLXFast.metalKernel(
+        name: "dflash2_pack12_trial_m32",
+        inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "dependency"],
+        outputNames: ["out"], source: source32, header: header, ensureRowContiguous: true)
+
+    private static func trial(
+        _ a: MLXArray, _ c: Copy, rows: Int, columns: Int, ahead: Int, dependency: MLXArray
+    ) -> MLXArray {
+        let n = c.source.dim(0)
+        let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
+        return (rows == 16 ? trialKernel : trialKernel32)(
+            [a] + c.arrays + [dims(c.source), dependency],
+            template: [("OutT", DType.bfloat16), ("SPLITS", splits), ("KT", kt), ("TN", columns), ("AHEAD", ahead)],
+            grid: (n / columns * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.bfloat16])[0]
+    }
+
     private static func dims(_ w: MLXArray) -> MLXArray {
         DFlash2TensorMatmul.dimsArray(k: w.dim(1), n: w.dim(0))
     }
@@ -2980,13 +3125,17 @@ enum DFlash2PackedWeights {
     }
 
     /// The swapped kernel's split and grid (`launch`, `launch32`) over the copy.
-    private static func launch(_ a: MLXArray, _ c: Copy, rows: Int, outputDType: DType) -> MLXArray {
+    private static func launch(
+        _ a: MLXArray, _ c: Copy, rows: Int, outputDType: DType, columns: Int? = nil, ahead: Int? = nil
+    ) -> MLXArray {
         let n = c.source.dim(0)
+        let tn = columns ?? (rows == 16 ? c.columns16 : c.columns32)
+        let readAhead = ahead ?? (rows == 16 ? c.ahead16 : c.ahead32)
         let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", kt)],
-            grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", kt), ("TN", tn), ("AHEAD", readAhead)],
+            grid: (n / tn * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
 
@@ -3058,7 +3207,7 @@ enum DFlash2PackedWeights {
                     // Every weight rebuilt, against its stored bits.
                     let tiles = n / 32 * (k / kt)
                     let unpacked = unpackKernel(
-                        c.arrays + [dims(w)], template: [("KT", kt)],
+                        c.arrays + [dims(w)], template: [("KT", kt), ("TN", 32)],
                         grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
                         outputShapes: [[n, k]], outputDTypes: [.bfloat16])[0]
                     var differing = [
@@ -3094,6 +3243,8 @@ enum DFlash2PackedWeights {
             passed = false
         }
         if passed {
+            Memory.cacheLimit = cacheLimit
+            prepareTiles(&packed, rows32: rows32)
             lock.withLock {
                 for c in packed { copies[ObjectIdentifier(c.source)] = c }
             }
@@ -3113,7 +3264,140 @@ enum DFlash2PackedWeights {
                         : "stored layout kept")
                     + String(format: "; %.0f ms\n", elapsed)).utf8))
     }
+
+    /// TN16 changes the implementation-defined operand layout; rebuild every
+    /// narrow weight before it is offered. Read-ahead changes only read timing.
+    /// Check every product at both output dtypes, then stream the shape's real
+    /// weights through a dependent chain. The final full-weight chain must also
+    /// beat the original plan, otherwise every original width/read-ahead stays.
+    private static func prepareTiles(_ packed: inout [Copy], rows32: Set<ObjectIdentifier>) {
+        typealias Form = (columns: Int, ahead: Int)
+        var groups: [[Int]: [Int]] = [:]
+        for (index, c) in packed.enumerated() {
+            for m in rows32.contains(ObjectIdentifier(c.source)) ? [16, 32] : [16] {
+                groups[[m, c.source.dim(0), c.source.dim(1)], default: []].append(index)
+            }
+        }
+        let original = packed
+        var selected = packed
+        var narrowWeights = Set<[Int]>()
+        var inputs: [[Int]: MLXArray] = [:]
+        let shapes = groups.keys.sorted { $0.lexicographicallyPrecedes($1) }
+        for (shapeIndex, shape) in shapes.enumerated() {
+            let (m, n, k) = (shape[0], shape[1], shape[2])
+            let indices = groups[shape]!
+            let a = MLXRandom.normal(
+                [m, k], key: MLXRandom.key(UInt64(8901 + shapeIndex))
+            ).asType(.bfloat16)
+            eval(a)
+            inputs[shape] = a
+            var narrow = n <= 6144 && k <= 6144
+            // One exact matrix rebuild per weight; shared between row counts.
+            if narrow, m == 16 {
+                do {
+                    try withError { error in
+                        for index in indices {
+                            let c = packed[index]
+                            let rebuilt = unpackKernel(
+                                c.arrays + [dims(c.source)], template: [("KT", kt), ("TN", 16)],
+                                grid: (n / 32 * (k / kt) * 2 * 32, 1, 1), threadGroup: (32, 1, 1),
+                                outputShapes: [[n, k]], outputDTypes: [.bfloat16])[0]
+                            if !all(rebuilt.view(dtype: .uint16) .== c.source.view(dtype: .uint16))
+                                .item(Bool.self) { narrow = false; break }
+                        }
+                        try error.check()
+                    }
+                } catch { narrow = false }
+            } else if narrow {
+                // The M16 group precedes M32 and proves the same lane mapping.
+                narrow = groups[[16, n, k]] != nil && narrowWeights.contains([n, k])
+            }
+            if m == 16, narrow { narrowWeights.insert([n, k]) }
+            var forms: [Form] = [(32, 1), (32, 0), (32, 2)]
+            if narrow { forms += [(16, 1), (16, 0), (16, 2)] }
+            var passed: [Form] = [forms[0]]
+            var compared = 0
+            for form in forms.dropFirst() {
+                var same = false
+                do {
+                    try withError { error in
+                        var differing: [MLXArray] = []
+                        for index in indices {
+                            let c = packed[index]
+                            for (dtype, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                                let reference = launch(a, c, rows: m, outputDType: dtype, columns: 32, ahead: 1)
+                                let mine = launch(a, c, rows: m, outputDType: dtype,
+                                    columns: form.columns, ahead: form.ahead)
+                                differing.append(
+                                    (reference.view(dtype: bits) .!= mine.view(dtype: bits)).asType(.int32).sum())
+                                compared += m * n
+                            }
+                        }
+                        same = stacked(differing).sum().item(Int.self) == 0
+                        try error.check()
+                    }
+                } catch { same = false }
+                if same { passed.append(form) }
+            }
+            let builders: [() -> [MLXArray]] = passed.map { form in
+                {
+                    var result: MLXArray?
+                    for j in 0 ..< max(10, indices.count) {
+                        result = trial(a, original[indices[j % indices.count]], rows: m,
+                            columns: form.columns, ahead: form.ahead, dependency: result ?? a)
+                    }
+                    return [result!]
+                }
+            }
+            let times = DFlash2LaunchTrial.race(builders, copies: 1, samples: 9)
+            var pick = 0
+            if times.count == passed.count {
+                for i in times.indices where times[i] < times[pick] { pick = i }
+            }
+            for index in indices {
+                if m == 16 {
+                    selected[index].columns16 = passed[pick].columns
+                    selected[index].ahead16 = passed[pick].ahead
+                } else {
+                    selected[index].columns32 = passed[pick].columns
+                    selected[index].ahead32 = passed[pick].ahead
+                }
+            }
+            let choices = passed.enumerated().map { i, form in
+                "TN\(form.columns)/a\(form.ahead) "
+                    + (times.count == passed.count ? String(format: "%.1f us", times[i] / 5) : "trial failed")
+            }.joined(separator: ", ")
+            FileHandle.standardError.write(Data(
+                ("dflash2 packed tiles M\(m) K\(k) N\(n): \(passed.count)/\(forms.count) forms exact "
+                    + "(\(compared) product values); " + choices
+                    + "; pick TN\(passed[pick].columns)/a\(passed[pick].ahead)\n").utf8))
+        }
+        // Recheck the selected mix with all distinct projection weights, not
+        // with one warm weight repeated. Each prior output is bound as a read.
+        let plans = [packed, selected]
+        let builders: [() -> [MLXArray]] = plans.map { plan in
+            {
+                var result: MLXArray?
+                for c in plan {
+                    let m = rows32.contains(ObjectIdentifier(c.source)) ? 32 : 16
+                    let a = inputs[[m, c.source.dim(0), c.source.dim(1)]]!
+                    result = trial(a, c, rows: m,
+                        columns: m == 16 ? c.columns16 : c.columns32,
+                        ahead: m == 16 ? c.ahead16 : c.ahead32, dependency: result ?? a)
+                }
+                return [result!]
+            }
+        }
+        let times = DFlash2LaunchTrial.race(builders, copies: 1, samples: 9)
+        let adopted = times.count == 2 && times[1] < times[0]
+        if adopted { packed = selected }
+        FileHandle.standardError.write(Data(
+            ("dflash2 packed tile mix: "
+                + (times.count == 2 ? String(format: "%.1f/%.1f us original/selected; ", times[0] / 5, times[1] / 5) : "trial failed; ")
+                + (adopted ? "selected mix" : "original TN32/a1 kept") + "\n").utf8))
+    }
 }
+
 /// The drafter kernel's in-situ trial, in the load-time warm
 /// (`Qwen35DFlash2Assistant.runKernelTrial`), modelled on the verify int8
 /// kernels' `NarrowInSituTrial`: engine requests whose rounds rotate through
@@ -6389,11 +6673,7 @@ enum DFlash2SpeculativeFront {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    private static let joinKernel = MLXFast.metalKernel(
-        name: "dflash2_grouped_conv_join_at",
-        inputNames: ["h", "dyn", "base", "ctx", "cdev"],
-        outputNames: ["out"],
-        source: """
+    private static let joinSource = """
             const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
             const uint r = thread_position_in_grid.y;
             const uint b = thread_position_in_grid.z;
@@ -6419,9 +6699,19 @@ enum DFlash2SpeculativeFront {
               } else { v = static_cast<T>(0.0f); }
               out[(size_t(b) * R + r) * H + c] = v;
             }
-            """,
+            """
+
+    private static let joinKernel = MLXFast.metalKernel(
+        name: "dflash2_grouped_conv_join_at",
+        inputNames: ["h", "dyn", "base", "ctx", "cdev"],
+        outputNames: ["out"],
+        source: joinSource,
         header: dflash2GroupedConvHeader,
         ensureRowContiguous: true)
+
+    private static let joinKernel32 = dflash2ConvNarrowKernel(
+        "dflash2_grouped_conv_join_at_io32", inputs: ["h", "dyn", "base", "ctx", "cdev"],
+        source: joinSource, count: 4)
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its
     /// text no longer has the lines the variant rewrites.
@@ -6469,7 +6759,11 @@ enum DFlash2SpeculativeFront {
         rows: Int, ks: Int, gs: Int
     ) -> MLXArray {
         let (b, hs) = (h.dim(0), h.dim(2))
-        return joinKernel(
+        let narrow = dflash2ConvIndex32(
+            h: h.size, dyn: dyn.size, base: base.size, context: ctx.size, residual: 0,
+            batch: b, width: hs, rows: rows)
+        let kernel = narrow ? joinKernel32 ?? joinKernel : joinKernel
+        return kernel(
             [h, dyn, base, ctx, c.reshaped([1])],
             template: [("T", h.dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(h.dtype, gs))],
             grid: (dflash2ConvColumns(hs, h.dtype, gs), rows, b), threadGroup: (256, 1, 1),
