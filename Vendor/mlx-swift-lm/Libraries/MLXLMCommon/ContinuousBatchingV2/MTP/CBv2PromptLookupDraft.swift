@@ -276,7 +276,10 @@ enum CBv2PromptLookupDraft {
 
         uint x = thread_position_in_grid.x;
         int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
-        if (x >= n*d) return;
+        // Only j = 0 can use the committed-run bonus. Later rows need
+        // d-j >= minimum even to have a possible eligible alignment.
+        int scoreRows = metal::max(1, d - minimum + 1);
+        if (x >= n*scoreRows) return;
         int j = int(x)/n, c = int(x)%n;
         int a = 0;
         while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
@@ -295,7 +298,8 @@ enum CBv2PromptLookupDraft {
         int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
         int floor_ = anchored > 0 && anchored < minimum ? anchored : minimum;
         int bs = 0, bi = 0;
-        for (int i = int(tid); i < n*d; i += 256) {
+        int scoreRows = metal::max(1, d - minimum + 1);
+        for (int i = int(tid); i < n*scoreRows; i += 256) {
          int s = ranked[i];
          if (s > bs || (s == bs && i < bi)) { bs=s; bi=i; }
         }
@@ -370,10 +374,13 @@ enum CBv2PromptLookupDraft {
             let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
             let anchored = spliceAnchorMinimum > 0 && spliceAnchorMinimum < minimum ? spliceAnchorMinimum : 0
             let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum), Int32(anchored)])
+            // For j > 0 the score is at most depth-j; skipped trailing
+            // rows are all zero and cannot change the pick's (0, 0) tie.
+            let scoreRows = max(1, depth - minimum + 1)
             let ranked = spliceScore(
                 [block, promptIDs, MLXArray(runs), dims],
-                grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
+                grid: (candidates * scoreRows, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[candidates * scoreRows]], outputDTypes: [.int32])[0]
             return splicePick(
                 [ranked, block, promptIDs, dims],
                 grid: (256, 1, 1), threadGroup: (256, 1, 1),

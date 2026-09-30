@@ -382,20 +382,18 @@ enum Qwen35TrunkSubmission {
 
 // MARK: - GatedDeltaNet
 
-/// 32-bit element offsets for this file's custom kernels, the verify
-/// window's GDN prework, attention KV prework and b|a split-K partial, and
-/// the prompt window's fused chunk prep, K^T scan forms and staged b|a
-/// split-K (Apple GPUs emulate 64-bit integer arithmetic). A kernel launches
-/// its text with every `size_t` index / offset as `uint`: the same elements
-/// are read and written, and no arithmetic on values, accumulation order,
-/// thread mapping or buffer layout changes. At this model's shapes every
-/// such offset is far below 2^31 (rows times widths of 5120 / 6144 / 17408,
-/// the GDN conv's 10240 channels, 16 x 128 keys, 48 x 128 values, 24 x 256
-/// queries, prompt and verify rows) and none is negative. The stored texts
-/// stay as they are (other kernels are derived from them by anchored
-/// replacements); only the text handed to `metalKernel` changes, and only
-/// when it holds the expected number of `size_t` (otherwise the stock text,
-/// noted on stderr).
+/// 32-bit element offsets for this file's custom kernels and the verify
+/// window's GDN prework and attention KV prework (Apple GPUs emulate 64-bit
+/// integer arithmetic). A kernel launches its text with every `size_t`
+/// index / offset as `uint`: the same elements are read and written, and no
+/// arithmetic on values, accumulation order, thread mapping or buffer layout
+/// changes. At this model's shapes every such offset is far below 2^31 (rows
+/// times widths of 5120 / 6144 / 17408, the GDN conv's 10240 channels, 16 x
+/// 128 keys, 48 x 128 values, 24 x 256 queries, prompt and verify rows) and
+/// none is negative. The stored texts stay as they are (other kernels are
+/// derived from them by anchored replacements); only the text handed to
+/// `metalKernel` changes, and only when it holds the expected number of
+/// `size_t` (otherwise the stock text, noted on stderr).
 /// `MLXFAST_IO32_GDN=0` launches the stock texts.
 enum Qwen35IO32 {
     static let enabled: Bool = {
@@ -635,15 +633,11 @@ enum Qwen35GatedDeltaV3 {
     /// selects the four-row layout (samfenwick `41a687f6`, carried in
     /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
     /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
-    /// `BONSAI_GDN_V3_DVPL=4` / `=2` forces the layout (no trial). Otherwise 2
-    /// until the load-time trial (`Qwen35ExactFormTrial`) picks one; the
-    /// kernels below read it once per launch.
-    static let rowsPerLaneForced: Int? = {
+    static let rowsPerLane: Int = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "4" ? 4 : value == "2" ? 2 : nil
+        return value == "4" ? 4 : 2
     }()
-    nonisolated(unsafe) static var rowsPerLane: Int = rowsPerLaneForced ?? 2
 
     fileprivate static let source = """
         constexpr int R = 16;
@@ -788,8 +782,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -800,9 +793,9 @@ enum Qwen35GatedDeltaV3 {
             [outputNeeded ? q : g, k, v, g, beta, state, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
-                ("OUTPUT_NEEDED", outputNeeded), ("DVPL", dvpl),
+                ("OUTPUT_NEEDED", outputNeeded), ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [outputNeeded ? [B, T, Hv, Dv] : [1], state.shape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
@@ -878,8 +871,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -887,9 +879,9 @@ enum Qwen35GatedDeltaV3 {
             [q, k, v, g, beta, state, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", dvpl),
+                ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv]],
             outputDTypes: [.float32])[0]
     }
@@ -931,8 +923,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, stateShape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -940,9 +931,9 @@ enum Qwen35GatedDeltaV3 {
             [q, k, v, g, beta, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", dvpl),
+                ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], stateShape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
@@ -2421,6 +2412,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),
@@ -6390,15 +6382,15 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
-        if strided, B == 1,
-            let tile = rowTileVerified(
+        if strided, B == 1, S % rowTile == 0,
+            rowTileVerified(
                 keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
-                dtype: qkv.dtype, rows: S)
+                dtype: qkv.dtype)
         {
             return freshStridedRows(
                 qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
                 normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
-                headKDim: headKDim, headVDim: headVDim, rows: tile)
+                headKDim: headKDim, headVDim: headVDim, rows: rowTile)
         }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
             [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
@@ -8783,14 +8775,6 @@ enum Qwen35FusedBoundaryQ8 {
             report = selfTest(
                 unsignedGain: unsignedGain, eps: eps, transform: transform,
                 cases: [(16, 43), (16, 44)])
-        }
-        if report.passed, Qwen35BoundaryBlocks.active, Qwen35ExactFormTrial.boundaryOffered {
-            // The per-row kernel as the load-time trial's alternative: the same test.
-            Qwen35BoundaryBlocks.stock = true
-            Qwen35BoundaryBlocks.stockVerified = selfTest(
-                unsignedGain: unsignedGain, eps: eps, transform: transform,
-                cases: [(16, 43), (16, 44)]).passed
-            Qwen35BoundaryBlocks.stock = false
         }
         narrowVerdict = report.passed
         FileHandle.standardError.write(

@@ -171,7 +171,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
-                self.runExactFormTrials(serving: serving)
             }
         }
         Stream().synchronize()
@@ -257,26 +256,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         Memory.clearCache()
     }
 
-    /// The exact kernel forms' trials (`Qwen35ExactFormTrial`), after the
-    /// record's own: the verify rounds' (one engine request, cancelled once
-    /// every arm has its rounds) and the prompt prework tiles' (a real-shape
-    /// launch race); each logs one stderr line, and the buffer cache is
-    /// drained after each. `BONSAI_EXACT_TRIALS=0` skips both.
-    private func runExactFormTrials(serving: any LanguageModel) {
-        typealias Trial = Qwen35ExactFormTrial
-        guard Trial.enabled else { return }
-        if Self.engineRoundWarmEnabled, Trial.prepareVerify() {
-            let start = DispatchTime.now().uptimeNanoseconds
-            warmEngineRound(serving: serving, trialRounds: Trial.roundsNeeded, exactTrial: true)
-            Stream().synchronize()
-            Trial.finishVerify(elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - start)
-            Memory.clearCache()
-        }
-        Trial.runPromptRows()
-        Stream().synchronize()
-        Memory.clearCache()
-    }
-
     /// `MLXFAST_ENGINE_ROUND_WARM=0` skips `warmEngineRound`.
     static let engineRoundWarmEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_ENGINE_ROUND_WARM"]?
@@ -315,7 +294,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// hook instead of the kernel trial's; `kernelTrial`: `DFlash2KernelTrial`'s).
     private func warmEngineRound(
         serving: any LanguageModel, trialRounds: Int = 0, headTrial: Bool = false,
-        kernelTrial: Bool = false, producerTrial: Bool = false, exactTrial: Bool = false
+        kernelTrial: Bool = false, producerTrial: Bool = false
     ) {
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
@@ -384,9 +363,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     guard let engine else { return }
                     DispatchQueue.global(qos: .userInitiated).async { engine.cancel(requestID) }
                 }
-                if exactTrial {
-                    Qwen35ExactFormTrial.begin(onEnough: cancel)
-                } else if producerTrial {
+                if producerTrial {
                     Qwen35NarrowProducerTrial.begin(onEnough: cancel)
                 } else if headTrial {
                     Qwen35HeadTopTwo.Trial.begin(onEnough: cancel)
@@ -410,7 +387,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Qwen35NarrowProducerTrial.active = false
                 Qwen35HeadTopTwo.Trial.active = false
                 DFlash2KernelTrial.active = false
-                Qwen35ExactFormTrial.active = false
             }
         }
         // The engine is out of scope here; its last references go as the
@@ -800,7 +776,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
-        Qwen35ExactFormTrial.roundBoundary()
         let state = self.state(requestState)
         // A state whose committed rows were all absorbed ahead of this round
         // (`prefetchCommittedContext`) proposes over its cache alone.
@@ -1005,7 +980,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         Qwen35NarrowProducerTrial.roundBoundary()
         Qwen35HeadTopTwo.Trial.roundBoundary()
         DFlash2KernelTrial.roundBoundary()
-        Qwen35ExactFormTrial.roundBoundary()
         drafter.adoptSpeculative(s.block, confirmed: confirmed, cache: state.caches)
         if let stage = s.block.stage { asyncEval([stage]) }
         // As `finalizeRound` of the confirmed rows, then `proposeBlock`.
