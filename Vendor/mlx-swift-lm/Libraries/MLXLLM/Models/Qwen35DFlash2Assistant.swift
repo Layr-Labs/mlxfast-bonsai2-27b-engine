@@ -111,6 +111,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 target: text.configuration.hiddenLayers)
         }
         try drafter.bind(target: text)
+        text.model.dFlash2PromptTapBF16 =
+            drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
@@ -935,6 +937,32 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         }
     }
 
+    /// `MLXFAST_DFLASH_ACCEPT_WALK_ONE=0` keeps the accept walk as its
+    /// separate ops (compare, cast, cumulative product, sum, cast, take, add).
+    /// On (default), one single-thread launch computes the same integers:
+    /// the cumulative product of 0/1 equalities summed is the length of the
+    /// leading run of equal ids, so the loop that stops at the first
+    /// difference yields the same count; the anchor is `packet[k + count]`
+    /// and the confirmed count `count + 1`, as the take and the add give.
+    /// `establishSpeculation`'s load-time proof runs through this path.
+    static let acceptWalkFused: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ACCEPT_WALK_ONE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let acceptWalkKernel = MLXFast.metalKernel(
+        name: "dflash2_accept_walk",
+        inputNames: ["packet"],
+        outputNames: ["anchor", "confirmed"],
+        source: """
+            int count = 0;
+            while (count < K && packet[count] == packet[K + count]) { count += 1; }
+            anchor[0] = packet[K + count];
+            confirmed[0] = count + 1;
+            """,
+        ensureRowContiguous: true)
+
     /// On the device: `accepted` = the accept walk (cumulative product of
     /// draft == target), `accepted + 1` columns confirmed, anchor = target id
     /// at `accepted`. Nothing may be pending: the confirmed columns are then
@@ -949,15 +977,28 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
+        let anchor: MLXArray
+        let confirmed: MLXArray
+        if Self.acceptWalkFused {
+            // One launch: the leading run of draft == target, the target id
+            // at that run's end, and the run plus one.
+            let walk = Self.acceptWalkKernel(
+                [packet], template: [("K", k)], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                outputShapes: [[1], [1]], outputDTypes: [.int32, .int32])
+            (anchor, confirmed) = (walk[0], walk[1])
+        } else {
+            let targets = packet[k ..< (2 * k + 1)]
+            let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+                .sum().asType(.int32)
+            anchor = targets.take(accepted.reshaped([1]), axis: 0)
+            confirmed = accepted + MLXArray(Int32(1))
+        }
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                anchor: anchor,
+                confirmed: confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
