@@ -2907,6 +2907,51 @@ enum Qwen35TensorPackedMatmul {
             ensureRowContiguous: true)
     }
 
+    /// On unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_PREFETCH=0`: the plane
+    /// body issues the next group's word pair before extracting this group's
+    /// operand and running its op, so the load's latency overlaps the op and
+    /// the epilogue (the same hoist `sourceNarrowInt8RBPrefetched` brings to
+    /// the RB body and measured +1 % there). The same loads, values and
+    /// arithmetic in the same order: the body stays bitwise the plane
+    /// kernel's and is checked against `sourceStaged8Reg` at load by the same
+    /// `promptPlaneSelfTest`.
+    static let planePrefetch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `sourceStaged8RegPlane` with its plane loads one group ahead: the
+    /// extract takes the loaded pair, and the loop loads group g + 1's pair
+    /// before extracting group g's operand. Nil if an anchor is missing (the
+    /// plane kernel is kept).
+    private static let sourceStaged8RegPlanePrefetched: String? = {
+        guard let base = sourceStaged8RegPlane else { return nil }
+        var text = base
+        let edits: [(String, String)] = [
+            ("auto load = [&](int g) {\n          const device uint4* src = wcol + (size_t)g * 64;\n          #pragma clang loop unroll(full)\n          for (int c = 0; c < 2; c++) { wv[c] = src[c]; }\n        };",
+             "auto load = [&](const uint4 nl, const uint4 nh) {\n          wv[0] = nl; wv[1] = nh;\n        };"),
+            ("for (int g = 0; g < Kg; g++) {\n          load(g); extract();",
+             "uint4 nw0 = wcol[0]; uint4 nw1 = wcol[1];\n        for (int g = 0; g < Kg; g++) {\n          const uint4 cw0 = nw0; const uint4 cw1 = nw1;\n          if (g + 1 < Kg) { nw0 = wcol[(size_t)(g + 1) * 64]; nw1 = wcol[(size_t)(g + 1) * 64 + 1]; }\n          load(cw0, cw1); extract();"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    private static let kernelStaged8RegPlanePrefetched: MLXFast.MLXFastKernel? =
+        sourceStaged8RegPlanePrefetched.map {
+            MLXFast.metalKernel(
+                name: "bonsai_tensor_packed_matmul_q8_rpf2",
+                inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+                outputNames: ["out"],
+                source: $0,
+                header: header,
+                ensureRowContiguous: true)
+        }
+
     // The plane kernel's forms for the load-time per-shape trial
     // (`PlaneFormTrial`): each simdgroup still runs the plane kernel's
     // 32 x 32 x 128 op over its 32 rows and one 32-column tile, the right
@@ -3038,6 +3083,36 @@ enum Qwen35TensorPackedMatmul {
         source: sourcePlaneForms,
         header: header,
         ensureRowContiguous: true)
+
+    // `sourcePlaneForms` with its plane loads one tile ahead, tile-major
+    // (`planePrefetch`): every form carries the hoist, so an adopted form is
+    // bitwise the plane kernel's by the same argument as the plane body's.
+    // Nil if an anchor is missing (the unprefetched forms kernel is kept).
+    private static let sourcePlaneFormsPrefetched: String? = {
+        var text = sourcePlaneForms
+        let edits: [(String, String)] = [
+            ("auto load = [&](int t, int g) {\n          const device uint4* wcol = (const device uint4*)(w + (IndexT)((ns0 + 32 * t) >> 5) * (IndexT)Kg * 256) + lane * 2;\n          const device uint4* src = wcol + (IndexT)g * 64;\n          #pragma clang loop unroll(full)\n          for (int c = 0; c < 2; c++) { wv[c] = src[c]; }\n        };",
+             "auto load = [&](const uint4 nl, const uint4 nh) {\n          wv[0] = nl; wv[1] = nh;\n        };\n        uint4 fw0, fw1;\n        auto fetch = [&](int t, int g) {\n          const device uint4* wcol = (const device uint4*)(w + (IndexT)((ns0 + 32 * t) >> 5) * (IndexT)Kg * 256) + lane * 2;\n          const device uint4* src = wcol + (IndexT)g * 64;\n          fw0 = src[0]; fw1 = src[1];\n        };"),
+            ("#pragma clang loop unroll(full)\n          for (int t = 0; t < CT; t++) {\n            load(t, g); extract();",
+             "if (g == 0) { fetch(0, 0); }\n          #pragma clang loop unroll(full)\n          for (int t = 0; t < CT; t++) {\n            const uint4 cw0 = fw0; const uint4 cw1 = fw1;\n            if (t + 1 == CT) { if (g + 1 < Kg) { fetch(0, g + 1); } } else { fetch(t + 1, g); }\n            load(cw0, cw1); extract();"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    private static let kernelPlaneFormsPrefetched: MLXFast.MLXFastKernel? =
+        sourcePlaneFormsPrefetched.map {
+            MLXFast.metalKernel(
+                name: "bonsai_tensor_packed_matmul_q8_rpfp",
+                inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+                outputNames: ["out"],
+                source: $0,
+                header: header,
+                ensureRowContiguous: true)
+        }
 
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
@@ -4177,7 +4252,8 @@ enum Qwen35TensorPackedMatmul {
                         [codes, tiled] + rest, template: [("OutT", outputDType)],
                         grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
                         outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
-                    let planar = planeKernel(
+                    let planar = (planePrefetch
+                        ? kernelStaged8RegPlanePrefetched ?? planeKernel : planeKernel)(
                         [codes, plane] + rest, template: [("OutT", outputDType)],
                         grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
                         outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
@@ -5227,17 +5303,22 @@ enum Qwen35TensorPackedMatmul {
                             PlaneFormTrial.note(
                                 key, .init(plane: plane, tiled: words, scalesT: scalesT, biasesT: biasesT,
                                            folded: foldedSums))
-                        } else if let form = PlaneFormTrial.form(key, m: m) {
-                            return launchPlaneForm(
-                                form, codes, plane, scalesT, biasesT, foldedSums, activation.scales,
-                                activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType)
+                        } else {
+                            if let form = PlaneFormTrial.form(key, m: m) {
+                                return launchPlaneForm(
+                                    form, codes, plane, scalesT, biasesT, foldedSums, activation.scales,
+                                    activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType)
+                            }
+                            // The prefetched plane body ships when it built and
+                            // the switch is on (bitwise, `promptPlaneSelfTest`).
+                            return (planePrefetch
+                                    ? kernelStaged8RegPlanePrefetched ?? planeKernel : planeKernel)(
+                                [codes, plane, scalesT, biasesT, foldedSums,
+                                 activation.scales, activation.scaledSums, dimsArray(k: k, m: m, n: n)],
+                                template: [("OutT", outputDType)],
+                                grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
                         }
-                        return planeKernel(
-                            [codes, plane, scalesT, biasesT, foldedSums,
-                             activation.scales, activation.scaledSums, dimsArray(k: k, m: m, n: n)],
-                            template: [("OutT", outputDType)],
-                            grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
-                            outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
                     }
                     return kernelStaged8Reg(
                         [codes, words, scalesT, biasesT, foldedSums, activation.scales,
@@ -5398,7 +5479,8 @@ extension Qwen35TensorPackedMatmul {
         _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
         k: Int, m: Int, n: Int, outputDType: DType
     ) -> MLXArray {
-        kernelPlaneForms(
+        (planePrefetch
+            ? kernelPlaneFormsPrefetched ?? kernelPlaneForms : kernelPlaneForms)(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at)],
             grid: (n / form.columns * 32 * form.sgn, m / 32, 1), threadGroup: (32 * form.sgn, 1, 1),
@@ -5412,7 +5494,8 @@ extension Qwen35TensorPackedMatmul {
         k: Int, m: Int, n: Int, outputDType: DType
     ) -> MLXArray? {
         guard let planeKernel = kernelStaged8RegPlane else { return nil }
-        return planeKernel(
+        return (planePrefetch
+            ? kernelStaged8RegPlanePrefetched ?? planeKernel : planeKernel)(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [("OutT", outputDType)],
             grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
