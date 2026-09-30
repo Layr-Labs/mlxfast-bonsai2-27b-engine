@@ -493,6 +493,14 @@ enum DFlash2AttentionPipeline {
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXArray?
     ) -> MLXArray {
+        if let split = DFlash2SplitAttention.attend(queries, keys, values, scale: scale, mask: mask) { return split }
+        return stock(queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+    }
+
+    /// MLX's attention, the block's path without `DFlash2SplitAttention`.
+    static func stock(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, mask: MLXArray?
+    ) -> MLXArray {
         let rows = queries.dim(2)
         if padQueries, rows <= 16, queries.ndim == 4 {
             let padded = concatenated(
@@ -539,6 +547,359 @@ enum DFlash2AttentionPipeline {
             ("dflash2 block attention key pipeline: "
                 + (same ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; pipelined\n"
                     : "self-test failed; queries padded to 17 rows (untouched path)\n")).data(using: .utf8)!)
+    }
+}
+
+/// The drafter block's attention split over the context (flash decoding),
+/// in both block forwards (`DFlash2AttentionPipeline.attend`, and the
+/// unmasked `callAsFunction`, which the block before the readback must match
+/// bit for bit): 16 queries, head dim 128, BF16, a bool key mask or none.
+/// MLX runs a threadgroup per head (32), each over every key. Here a
+/// threadgroup per head and 8-query half runs `SG` simdgroups, simdgroup s
+/// over the 16-key blocks s, s + SG, ... with the steel kernel's block loop
+/// (FP32 Q.K^T on 8x8 fragments in its order, masked and tail keys at
+/// -FLT_MAX, running max, exp2, sum, FP32 P.V; blocks past the last allowed
+/// key add exact zeros, so masked trailing keys change no bit, as in MLX);
+/// the slices merge in FP32 in threadgroup memory (scaled by exp2 of their
+/// max less the rows' max, added pairwise, divided once). One slice is the
+/// steel kernel's arithmetic; eight reorder the sums, so it serves only the
+/// drafter, whose proposals the target's verification decides. `verify`
+/// (bind) fails closed; `trial` (deferred load warm) adopts it only where
+/// faster (an M5 runs MLX's NAX kernel). `MLXFAST_DRAFT_ATTN_SPLIT=0` keeps
+/// MLX's attention; `=1` adopts it after the self-test, without the trial.
+enum DFlash2SplitAttention {
+    static let setting: Bool? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_ATTN_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
+        else { return nil }
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+    nonisolated(unsafe) static var adopted = false
+    nonisolated(unsafe) private static var verified = false
+    nonisolated(unsafe) private static var tested = false
+    nonisolated(unsafe) private static var heads = (q: 0, kv: 0)
+
+    private static let source = """
+        const int lane = int(thread_index_in_simdgroup);
+        const int slice = int(simdgroup_index_in_threadgroup);
+        const int hh = int(threadgroup_position_in_grid.y);
+        const int h = hh >> 1;
+        const int N = meta[0]; const int H = meta[2];
+        const float sc = as_type<float>(meta[3]) * M_LOG2E_F;
+        const int qid = lane >> 2;
+        const int fm = (qid & 4) + ((lane >> 1) & 3);
+        const int fn = ((qid & 2) << 1) + ((lane & 1) << 1);
+        const int row = (hh & 1) * 8 + fm;
+        const int qs3 = int(q_strides[3]); const int ks2 = int(k_strides[2]); const int ks3 = int(k_strides[3]);
+        const int vs2 = int(v_strides[2]); const int vs3 = int(v_strides[3]); const int ms1 = int(mask_strides[1]);
+        const device bool* mp = mask + row * (mask_shape[0] == 1 ? 0 : int(mask_strides[0]));
+        const device bfloat16_t* qp = q + h * int(q_strides[1]) + row * int(q_strides[2]);
+        const device bfloat16_t* kp = k + (h / meta[1]) * int(k_strides[1]);
+        const device bfloat16_t* vp = v + (h / meta[1]) * int(v_strides[1]);
+        simdgroup_float8x8 qf[16];
+        simdgroup_float8x8 of[16];
+        float mx = -FLT_MAX;
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < 16; d++) {
+          const device bfloat16_t* qr = qp + (8 * d + fn) * qs3;
+          DA_E(qf[d]) = float2(float(qr[0]), float(qr[qs3]));
+          of[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (int kb = 16 * slice; kb < N; kb += 16 * SG) {
+          const int c0 = kb + fn;
+          const device bfloat16_t* k0 = kp + min(c0, N - 1) * ks2;
+          const device bfloat16_t* k1 = kp + min(c0 + 1, N - 1) * ks2;
+          const device bfloat16_t* k2 = kp + min(c0 + 8, N - 1) * ks2;
+          const device bfloat16_t* k3 = kp + min(c0 + 9, N - 1) * ks2;
+          simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+          simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < 16; d++) {
+            const int o = (8 * d + fm) * ks3;
+            simdgroup_float8x8 t0;
+            simdgroup_float8x8 t1;
+            DA_E(t0) = float2(float(k0[o]), float(k1[o]));
+            DA_E(t1) = float2(float(k2[o]), float(k3[o]));
+            simdgroup_multiply_accumulate(s0, qf[d], t0, s0);
+            simdgroup_multiply_accumulate(s1, qf[d], t1, s1);
+          }
+          const int r0 = kb + fm;
+          const bool ok0 = r0 < N;
+          const bool ok1 = r0 + 8 < N;
+          const device bfloat16_t* v0 = vp + min(r0, N - 1) * vs2;
+          const device bfloat16_t* v1 = vp + min(r0 + 8, N - 1) * vs2;
+          float2 p0 = DA_E(s0) * sc;
+          float2 p1 = DA_E(s1) * sc;
+          p0.x = (c0 < N && mp[c0 * ms1]) ? p0.x : -FLT_MAX;
+          p0.y = (c0 + 1 < N && mp[(c0 + 1) * ms1]) ? p0.y : -FLT_MAX;
+          p1.x = (c0 + 8 < N && mp[(c0 + 8) * ms1]) ? p1.x : -FLT_MAX;
+          p1.y = (c0 + 9 < N && mp[(c0 + 9) * ms1]) ? p1.y : -FLT_MAX;
+          float nm = mx;
+          { float t = max(p0.x, p0.y); float u = max(t, simd_shuffle_xor(t, ushort(1)));
+            nm = max(nm, max(u, simd_shuffle_xor(u, ushort(8)))); }
+          { float t = max(p1.x, p1.y); float u = max(t, simd_shuffle_xor(t, ushort(1)));
+            nm = max(nm, max(u, simd_shuffle_xor(u, ushort(8)))); }
+          p0 = fast::exp2(p0 - nm);
+          p1 = fast::exp2(p1 - nm);
+          const float factor = fast::exp2(mx - nm);
+          mx = nm;
+          float st = 0.0f;
+          { float t = p0.x + p0.y; float u = t + simd_shuffle_xor(t, ushort(1));
+            st = st + (u + simd_shuffle_xor(u, ushort(8))); }
+          { float t = p1.x + p1.y; float u = t + simd_shuffle_xor(t, ushort(1));
+            st = st + (u + simd_shuffle_xor(u, ushort(8))); }
+          sum = sum * factor + st;
+          DA_E(s0) = p0;
+          DA_E(s1) = p1;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < 16; d++) {
+            const int o0 = (8 * d + fn) * vs3;
+            simdgroup_float8x8 w0;
+            simdgroup_float8x8 w1;
+            DA_E(w0) = ok0 ? float2(float(v0[o0]), float(v0[o0 + vs3])) : float2(0.0f);
+            DA_E(w1) = ok1 ? float2(float(v1[o0]), float(v1[o0 + vs3])) : float2(0.0f);
+            DA_E(of[d]) *= factor;
+            simdgroup_multiply_accumulate(of[d], s0, w0, of[d]);
+            simdgroup_multiply_accumulate(of[d], s1, w1, of[d]);
+          }
+        }
+        threadgroup float tm[SG][8];
+        threadgroup float tl[4][8];
+        threadgroup float to[4][16][64];
+        if (SG > 1) {
+          if (fn == 0) { tm[slice][fm] = mx; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float m = tm[0][fm];
+          for (int s = 1; s < SG; s++) { m = max(m, tm[s][fm]); }
+          const float w = fast::exp2(mx - m);
+          sum = sum * w;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < 16; d++) { DA_E(of[d]) *= w; }
+          for (int hs = SG / 2; hs >= 1; hs /= 2) {
+            for (int base = 0; base < hs; base += 4) {
+              const int lim = min(base + 4, hs);
+              if (slice >= hs + base && slice < hs + lim) {
+                const int j = slice - hs - base;
+                if (fn == 0) { tl[j][fm] = sum; }
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < 16; d++) { *((threadgroup float2*)(&to[j][d][2 * lane])) = DA_E(of[d]); }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (slice >= base && slice < lim) {
+                const int j = slice - base;
+                sum = sum + tl[j][fm];
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < 16; d++) {
+                  DA_E(of[d]) = DA_E(of[d]) + *((threadgroup float2*)(&to[j][d][2 * lane]));
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        }
+        if (slice == 0) {
+          device bfloat16_t* dst = out + (row * H + h) * 128 + fn;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < 16; d++) {
+            const float2 e = DA_E(of[d]) / sum;
+            dst[8 * d] = bfloat16_t(e.x);
+            dst[8 * d + 1] = bfloat16_t(e.y);
+          }
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_split_attention", inputNames: ["q", "k", "v", "mask", "meta"], outputNames: ["out"],
+        source: source, header: "#define DA_E(m) (reinterpret_cast<thread float2&>((m).thread_elements()))\n",
+        ensureRowContiguous: false)
+
+    /// Every key allowed (the unmasked forward), sliced to the keys.
+    nonisolated(unsafe) private static let allowAll: MLXArray = {
+        let mask = MLXArray.ones([1, 8192], dtype: .bool)
+        eval(mask)
+        return mask
+    }()
+
+    /// The split form where adopted and it fits (`mask` nil: every key), else nil.
+    static func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float, mask: MLXArray?) -> MLXArray? {
+        guard adopted, k.ndim == 4 else { return nil }
+        let m = mask ?? allowAll[0..., ..<min(k.dim(2), 8192)]
+        return fits(q, k, v, m) ? launch(q, k, v, scale: scale, mask: m) : nil
+    }
+
+    /// 16 queries, head dim 128, BF16, a `[1 or 16, keys]` bool mask, grouped
+    /// heads, at most 8,192 keys (block cache views: 32-bit offsets).
+    static func fits(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ mask: MLXArray) -> Bool {
+        q.ndim == 4 && k.ndim == 4 && mask.ndim == 2 && mask.dtype == .bool
+            && q.dtype == .bfloat16 && k.dtype == .bfloat16 && v.dtype == .bfloat16 && k.shape == v.shape
+            && q.dim(0) == 1 && q.dim(2) == 16 && q.dim(3) == 128 && k.dim(0) == 1 && k.dim(3) == 128
+            && k.dim(1) > 0 && q.dim(1) % k.dim(1) == 0 && (1 ... 8192).contains(k.dim(2))
+            && mask.dim(1) == k.dim(2) && (mask.dim(0) == 1 || mask.dim(0) == 16)
+    }
+
+    /// `[1, H, 16, 128]` over `[1, 16, H, 128]` storage.
+    static func launch(
+        _ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float, mask: MLXArray, slices: Int = 8
+    ) -> MLXArray {
+        let (h, l, d) = (q.dim(1), q.dim(2), q.dim(3))
+        let meta = MLXArray([Int32(k.dim(2)), Int32(h / k.dim(1)), Int32(h), Int32(bitPattern: scale.bitPattern)])
+        return kernel(
+            [q, k, v, mask, meta], template: [("SG", slices)], grid: (32 * slices, 2 * h, 1),
+            threadGroup: (32 * slices, 1, 1), outputShapes: [[1, l, h, d]], outputDTypes: [q.dtype])[0]
+            .transposed(0, 2, 1, 3)
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data(("dflash2 split block attention" + line + "\n").utf8))
+    }
+
+    /// The largest `|a - b|` over one BF16 ulp of its row's largest `|b|`
+    /// (NaN if not finite), and the count of differing values.
+    private static func distance(_ a: MLXArray, _ b: MLXArray) -> (worst: Float, differ: Int) {
+        let y = b.asType(.float32)
+        let ulp = MLX.pow(MLXArray(Float(2)), MLX.floor(MLX.log2(MLX.abs(y).max(axis: -1, keepDims: true))) - 7)
+        let ratio = MLX.abs(a.asType(.float32) - y) / ulp
+        let bad = (MLX.isNaN(ratio) .|| MLX.isInf(ratio)).any()
+        let worst = ratio.max()
+        let differ = (a.view(dtype: .uint16) .!= b.view(dtype: .uint16)).asType(.int32).sum()
+        eval(worst, bad, differ)
+        return (bad.item(Bool.self) ? .nan : worst.item(Float.self), differ.item(Int.self))
+    }
+
+    /// Queries (and a strided view); K and V as long as the in-place block
+    /// cache (window 2048 + 32 block rows), sliced to the keys as live.
+    private static func operands(salt: UInt64) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        func key(_ i: UInt64) -> MLXArray { MLXRandom.key(salt + i) }
+        let q = (MLXRandom.normal([1, heads.q, 16, 128], key: key(0)) * 2).asType(.bfloat16)
+        let qT = (MLXRandom.normal([1, 16, heads.q, 128], key: key(1)) * 2).asType(.bfloat16)
+        let k = (MLXRandom.normal([1, heads.kv, 2080, 128], key: key(2)) * 2).asType(.bfloat16)
+        let v = MLXRandom.normal([1, heads.kv, 2080, 128], key: key(3)).asType(.bfloat16)
+        eval(q, qT, k, v)
+        return (q, qT.transposed(0, 2, 1, 3), k, v)
+    }
+
+    private static func keyMask(_ keys: Int, _ allowed: Int) -> MLXArray {
+        (MLXArray(Int32(0) ..< Int32(keys)) .< MLXArray(Int32(allowed))).reshaped([1, keys])
+    }
+
+    /// The self-test, once, at bind: at 8 slices against `stock` (the live
+    /// mask at held 480/576/672 with 0, 8, 16 confirmed rows and at held 1
+    /// and 1000; per-row masks with a single-key row at 545 and 707 keys;
+    /// strided queries at 640) and the unmasked form against MLX's unmasked
+    /// attention (600 keys), every value within one BF16 ulp of its row's
+    /// magnitude; that form bit for bit the masked one at 624 keys; one slice
+    /// (608 and 545 keys) bit for bit where MLX runs the steel kernel, within
+    /// the bound where it runs NAX (other blocks and MMA units).
+    static func verify(heads: Int, kvHeads: Int, headDim: Int) {
+        guard !tested else { return }
+        tested = true
+        guard setting != false else { return log(": off (MLXFAST_DRAFT_ATTN_SPLIT=0); MLX's attention kept") }
+        guard headDim == 128, kvHeads > 0, heads % kvHeads == 0 else { return }
+        self.heads = (heads, kvHeads)
+        let nax = GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+        var (worst, differ, cases, oneWorst, oneDiffer, trailing) = (Float(0), 0, 0, Float(0), 0, -1)
+        do {
+            try withError { error in
+                let (q, qT, kb, vb) = operands(salt: 0xda20)
+                let scale = 1 / Float(128).squareRoot()
+                var list: [(MLXArray, Int, MLXArray, Int)] = []
+                for held in [480, 576, 672] {
+                    for c in [0, 8, 16] { list.append((q, held + 32, keyMask(held + 32, held + 16 + c), 8)) }
+                }
+                list += [(q, 33, keyMask(33, 33), 8), (q, 1032, keyMask(1032, 1016), 8)]
+                var perRow: [MLXArray] = []
+                for n in [545, 707] {
+                    let col = MLXArray(Int32(0) ..< Int32(n)).reshaped([1, n])
+                    let prefix = col .<= (MLXArray(Int32(0) ..< Int32(16)) * MLXArray(Int32(n / 17))).reshaped([16, 1])
+                    let r = MLXRandom.uniform(Float(0) ..< Float(1), [16, n], key: MLXRandom.key(UInt64(n)))
+                    perRow.append(((r .> MLXArray(Float(0.4))) .&& prefix) .|| (col .== MLXArray(Int32(0))))
+                    list.append((q, n, perRow.last!, 8))
+                }
+                list += [(qT, 640, keyMask(640, 631), 8), (q, 608, keyMask(608, 600), 1), (q, 545, perRow[0], 1)]
+                let (k6, v6) = (kb[0..., 0..., ..<600, 0...], vb[0..., 0..., ..<600, 0...])
+                let open = launch(q, k6, v6, scale: scale, mask: allowAll[0..., ..<600])
+                trailing = distance(launch(
+                    q, kb[0..., 0..., ..<624, 0...], vb[0..., 0..., ..<624, 0...], scale: scale, mask: keyMask(624, 600)),
+                    open).differ
+                let d = distance(open, MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k6, values: v6, scale: scale, mask: nil))
+                (worst, differ, cases) = (d.worst <= 1 ? d.worst : .infinity, d.differ, 1)
+                for (queries, n, mask, sg) in list {
+                    let (k, v) = (kb[0..., 0..., ..<n, 0...], vb[0..., 0..., ..<n, 0...])
+                    let d = distance(
+                        launch(queries, k, v, scale: scale, mask: mask, slices: sg),
+                        DFlash2AttentionPipeline.stock(queries: queries, keys: k, values: v, scale: scale, mask: mask))
+                    let w: Float = d.worst <= 1 ? d.worst : .infinity
+                    if sg == 1 {
+                        (oneWorst, oneDiffer) = (max(oneWorst, w), oneDiffer + d.differ)
+                    } else {
+                        (worst, differ, cases) = (max(worst, w), differ + d.differ, cases + 1)
+                    }
+                }
+                try error.check()
+            }
+        } catch {
+            return log(": self-test failed (an MLX error); MLX's attention kept")
+        }
+        verified = worst <= 1 && oneWorst <= 1 && (nax || oneDiffer == 0) && trailing == 0
+        adopted = verified && setting == true
+        let size = 16 * heads * 128
+        log(String(
+            format: ": self-test %@: 8 slices, %ld cases (keys 33-1032; live, no, per-row masks; strided queries): "
+                + "%ld of %ld values differ from MLX's attention, worst %.3f row-magnitude BF16 ulp; one slice: "
+                + "%ld of %ld differ, worst %.3f (%@); unmasked vs 24 masked trailing keys: %ld of %ld differ; %@",
+            verified ? "passed" : "FAILED", cases, differ, cases * size, worst, oneDiffer, 2 * size, oneWorst,
+            nax ? "MLX's NAX kernel here: the ulp bound" : "MLX's steel kernel here: bit for bit",
+            trailing, size, !verified ? "MLX's attention kept" : adopted ? "adopted (MLXFAST_DRAFT_ATTN_SPLIT=1, no trial)"
+                : "the load-time trial decides"))
+    }
+
+    /// The trial (deferred load warm, before the in-situ trials): at 512, 608
+    /// and 704 keys, `stock` and the split form in turn, each a serialized
+    /// chain of 20 launches (queries = the previous output), order alternating,
+    /// 2 discarded + 10 rounds; adopted only if its median is at most 0.95 of
+    /// `stock`'s at every length. An MLX error keeps `stock`.
+    static func trial() {
+        guard verified, setting == nil, !adopted else { return }
+        let lengths = [512, 608, 704]
+        var times = [[Double]](repeating: [], count: 6)
+        do {
+            try withError { error in
+                let (q, _, kb, vb) = operands(salt: 0xda40)
+                let scale = 1 / Float(128).squareRoot()
+                func sample(_ n: Int, _ split: Bool) -> Double {
+                    let (k, v, m) = (kb[0..., 0..., ..<n, 0...], vb[0..., 0..., ..<n, 0...], keyMask(n, n - 8))
+                    var (x, outs) = (q, [MLXArray]())
+                    for _ in 0 ..< 20 {
+                        let o = split ? launch(x, k, v, scale: scale, mask: m)
+                            : DFlash2AttentionPipeline.stock(queries: x, keys: k, values: v, scale: scale, mask: m)
+                        outs.append(o)
+                        x = o.transposed(0, 2, 1, 3).reshaped(1, heads.q, 16, 128)
+                    }
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    eval(outs)
+                    return Double(DispatchTime.now().uptimeNanoseconds - t0) / 20_000
+                }
+                for round in 0 ..< 12 {
+                    for (i, n) in lengths.enumerated() {
+                        let first = (round + i) % 2 == 1
+                        let a = sample(n, first)
+                        let b = sample(n, !first)
+                        if round >= 2 { times[2 * i] += [first ? b : a]; times[2 * i + 1] += [first ? a : b] }
+                    }
+                }
+                try error.check()
+            }
+        } catch {
+            return log(" trial failed (an MLX error); MLX's attention kept")
+        }
+        let med = times.map { t in t.sorted()[4] / 2 + t.sorted()[5] / 2 }
+        adopted = (0 ..< 3).allSatisfy { med[2 * $0 + 1] <= 0.95 * med[2 * $0] }
+        func row(_ j: Int) -> String { (0 ..< 3).map { String(format: "%.1f", med[2 * $0 + j]) }.joined(separator: "/") }
+        log(" trial (keys 512/608/704, serialized chains of 20 launches, 10 rounds): MLX's attention " + row(0)
+            + " us, split " + row(1) + " us per launch (medians); "
+            + (adopted ? "split adopted" : "MLX's attention kept (split must be at most 0.95 of it at every length)"))
     }
 }
 
@@ -740,8 +1101,8 @@ private final class DFlash2Attention: Module {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
 
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        let output = DFlash2SplitAttention.attend(queries, keys, values, scale: scale, mask: mask)
+            ?? MLXFast.scaledDotProductAttention(queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DFlash2TensorMatmul.linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
@@ -4098,6 +4459,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
         DFlash2AttentionPipeline.verify(
             dtype: dtype, heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
+        DFlash2SplitAttention.verify(heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
         DFlash2TopK.prepareThreshold(vocabularySize: Qwen35TextModel.drafterVocabularyRows > 0
             ? min(Qwen35TextModel.drafterVocabularyRows, config.vocabularySize) : config.vocabularySize,
             k: candidateSelector.topK)
