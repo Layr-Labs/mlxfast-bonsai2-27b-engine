@@ -1660,6 +1660,7 @@ enum DFlash2TensorMatmul {
         }
         threadgroup float red[SPLITS - 1][2 * 16 * 32];
         if (sg > 0) {
+          #pragma clang loop unroll(full)
           for (uint16_t i = 0; i < cap; i++) {
             red[sg - 1][i * 32 + lane] = cT0[i];
             red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
@@ -1667,6 +1668,7 @@ enum DFlash2TensorMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          #pragma clang loop unroll(full)
           for (uint16_t i = 0; i < cap; i++) {
             if (!cT0.is_valid_element(i)) continue;
             float v0, v1;
