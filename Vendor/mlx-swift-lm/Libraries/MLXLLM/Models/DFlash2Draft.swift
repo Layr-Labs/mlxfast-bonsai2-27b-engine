@@ -2,7 +2,8 @@
 
 // DFlash 2 block drafter.
 // The wide FP32 selector reuses singleton-batch views from the narrow path;
-// selector arithmetic, output ids, and the pinned parameter format are unchanged.
+// selector arithmetic remains available as the default path; the optional
+// expected-prefix policy changes draft ids while target verification is unchanged.
 //
 // This is a port of the reference MLX Python implementation, `dflash/model_mlx.py`
 // of `z-lab/dflash` at `07ebd93`: `DFlashAttention`, `GroupedDynamicCausalConv`,
@@ -3411,6 +3412,11 @@ enum DFlash2GreedyWalk {
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
         guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        if expectedPrefixSetting, length <= 16 {
+            return selectExpectedPrefixWide(
+                candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+                predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        }
         if narrowOperands, unary.ndim == 3, unary.dim(0) == 1, projected.ndim == 3,
             projected.dim(0) == 1, predecessorCodebook.dtype == successorCodebook.dtype,
             [DType.bfloat16, .float16, .float32].contains(predecessorCodebook.dtype),
@@ -3507,8 +3513,79 @@ enum DFlash2GreedyWalk {
             outputDTypes: [.int32])[0]
     }
 
+    /// The expected-prefix walk over the same FP32 edge table as `walkParallel`.
+    private static func selectExpectedPrefixWide(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray? {
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(-1)
+        let c = candidates.dim(0) == 1 ? candidates.squeezed(axis: 0) : candidates[0]
+        let operands = [
+            take(predecessorCodebook, anchor, axis: 0).asType(.float32).reshaped([-1]),
+            take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0)
+                .asType(.float32).reshaped([-1]),
+            take(successorCodebook, c, axis: 0).asType(.float32).reshaped([-1]),
+            (projected.dim(0) == 1 ? projected.squeezed(axis: 0) : projected[0])
+                .asType(.float32).reshaped([-1]),
+            (unary.dim(0) == 1 ? unary.squeezed(axis: 0) : unary[0])
+                .asType(.float32).reshaped([-1]),
+            c.asType(.uint32).reshaped([-1]),
+        ]
+        let edgeCount = k + (length - 1) * k * k
+        let edges = edgeKernel(
+            operands,
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
+            grid: (edgeCount, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[edgeCount]], outputDTypes: [.float32])[0]
+        return selectExpectedPrefix(
+            edgeTable: edges, unary: operands[4].reshaped([length, k]),
+            candidates: operands[5].reshaped([length, k]), length: length, k: k)
+    }
+
+    /// Internal table-only entry point for CPU/GPU selector checks.
+    static func selectExpectedPrefix(
+        edgeTable: MLXArray, unary: MLXArray, candidates: MLXArray, length: Int? = nil,
+        k: Int? = nil
+    ) -> MLXArray? {
+        guard edgeTable.ndim == 1,
+            (unary.ndim == 2 || (unary.ndim == 3 && unary.dim(0) == 1)),
+            (candidates.ndim == 2 || (candidates.ndim == 3 && candidates.dim(0) == 1))
+        else { return nil }
+        let rows = unary.ndim == 3 && unary.dim(0) == 1 ? unary.squeezed(axis: 0) : unary
+        let ids = candidates.ndim == 3 && candidates.dim(0) == 1 ? candidates.squeezed(axis: 0) : candidates
+        let l = length ?? rows.dim(0)
+        let kk = k ?? rows.dim(1)
+        guard l >= 2, l <= 16, kk >= 1, kk <= 32,
+            edgeTable.dtype == .float32, rows.dtype == .float32, ids.dtype == .uint32,
+            rows.ndim == 2, ids.ndim == 2,
+            rows.dim(0) == l, rows.dim(1) == kk,
+            ids.dim(0) == l, ids.dim(1) == kk,
+            edgeTable.dim(0) == kk + (l - 1) * kk * kk
+        else { return nil }
+        return expectedPrefixKernel(
+            [edgeTable, rows.reshaped([-1]), ids.reshaped([-1])],
+            template: [("L", l), ("K", kk)],
+            grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[l]], outputDTypes: [.int32])[0].reshaped([1, l])
+    }
+
     static let parallelSetting: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_PARALLEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Expected accepted-prefix selection; `MLXFAST_DFLASH_EXPECTED_PREFIX=0`
+    /// restores the per-position greedy walk. Probabilities normalize only
+    /// the existing candidate set and are a proposal heuristic, not a target
+    /// acceptance guarantee. The target still verifies every proposed token.
+    static let expectedPrefixSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_EXPECTED_PREFIX"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -3634,6 +3711,95 @@ enum DFlash2GreedyWalk {
                 if (c == 0) path[i] = int(cand[i * K + sel]);
             }
             """))
+
+    private static let expectedPrefixKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_expected_prefix" + weightSuffix,
+        inputNames: ["edges", "unary", "cand"], outputNames: ["path"],
+        source: """
+            static_assert(L >= 2 && L <= 16 && K >= 1 && K <= 32, "shape");
+            const uint a = thread_position_in_threadgroup.x;
+            threadgroup float values[2][32];
+            threadgroup uchar policy[16][32];
+            values[0][a] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int next = 0;
+            for (int i = L - 1; i >= 1; i--) {
+                if (a < uint(K)) {
+                    const uint edgeBase = K + uint(i - 1) * K * K + a * K;
+                    float maximum = -INFINITY;
+                    uint greedy = 0u;
+                    bool invalid = false;
+                    for (uint c = 0; c < uint(K); c++) {
+                        const float score = unary[uint(i) * K + c]
+                            + as_type<float>(\(edgeWeight.bitPattern)u) * edges[edgeBase + c];
+                        invalid = invalid || !isfinite(score);
+                        if (score > maximum) { maximum = score; greedy = c; }
+                    }
+                    float total = 0.0f;
+                    if (!invalid && isfinite(maximum)) {
+                        for (uint c = 0; c < uint(K); c++) {
+                            const float score = unary[uint(i) * K + c]
+                                + as_type<float>(\(edgeWeight.bitPattern)u) * edges[edgeBase + c];
+                            total += exp(score - maximum);
+                        }
+                    }
+                    uint selected = greedy;
+                    float best = -INFINITY;
+                    if (!invalid && isfinite(total) && total > 0.0f) {
+                        for (uint c = 0; c < uint(K); c++) {
+                            const float score = unary[uint(i) * K + c]
+                                + as_type<float>(\(edgeWeight.bitPattern)u) * edges[edgeBase + c];
+                            const float probability = exp(score - maximum) / total;
+                            const float value = probability * (1.0f + values[next][c]);
+                            if (value > best) { best = value; selected = c; }
+                        }
+                        values[1 - next][a] = best;
+                    } else {
+                        values[1 - next][a] = 1.0f + values[next][greedy];
+                    }
+                    policy[i][a] = uchar(selected);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                next = 1 - next;
+            }
+            if (a == 0u) {
+                float maximum = -INFINITY;
+                uint greedy = 0u;
+                bool invalid = false;
+                for (uint c = 0; c < uint(K); c++) {
+                    const float score = unary[c]
+                        + as_type<float>(\(edgeWeight.bitPattern)u) * edges[c];
+                    invalid = invalid || !isfinite(score);
+                    if (score > maximum) { maximum = score; greedy = c; }
+                }
+                float total = 0.0f;
+                if (!invalid && isfinite(maximum)) {
+                    for (uint c = 0; c < uint(K); c++) {
+                        const float score = unary[c]
+                            + as_type<float>(\(edgeWeight.bitPattern)u) * edges[c];
+                        total += exp(score - maximum);
+                    }
+                }
+                uint selected = greedy;
+                float best = -INFINITY;
+                if (!invalid && isfinite(total) && total > 0.0f) {
+                    for (uint c = 0; c < uint(K); c++) {
+                        const float score = unary[c]
+                            + as_type<float>(\(edgeWeight.bitPattern)u) * edges[c];
+                        const float probability = exp(score - maximum) / total;
+                        const float value = probability * (1.0f + values[next][c]);
+                        if (value > best) { best = value; selected = c; }
+                    }
+                }
+                policy[0][0] = uchar(selected);
+                uint predecessor = 0u;
+                for (uint i = 0; i < uint(L); i++) {
+                    const uint slot = uint(policy[i][predecessor]);
+                    path[i] = int(cand[i * K + slot]);
+                    predecessor = slot;
+                }
+            }
+            """)
 
     /// The walk reading its operands as they are: the batch axis squeezed
     /// (a view) where `[0]` gathered a copy of candidates, scores and
