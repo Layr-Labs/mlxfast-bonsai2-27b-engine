@@ -5812,6 +5812,15 @@ extension Qwen35TensorPackedMatmul {
         }()
         static let forced: PlaneForm? = forcedName.flatMap { PlaneForm(name: $0) }
 
+        /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_EXTENDED=0` offers only
+        /// the record's candidates (the default list without the forms the
+        /// grammar admits but the record never timed).
+        static let extendedForms: Bool = {
+            let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_EXTENDED"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }()
+
         /// `..._PLANE_FORMS_LIST` selects candidates; the default covers the
         /// form grammar's grid: SGN 2/4/8, the two-column-tile forms `c2`
         /// (each simdgroup runs two 32-column tiles against the same
@@ -5820,10 +5829,17 @@ extension Qwen35TensorPackedMatmul {
         /// row-tile forms (`r2`, `r4`: each weight tile loaded and extracted
         /// once per 64 or 128 rows) and six with the plane loads one tile
         /// ahead (`f`; `p2f` is the prefetched plane kernel's tiling) and six
-        /// with the column-major traversal (`y`).
+        /// with the column-major traversal (`y`), plus the grammar's
+        /// remaining combinations of those axes at 32-bit-free offsets: row
+        /// tiles at SGN 1/4/8/16 and with two column tiles, staged row tiles,
+        /// and row, column and staging tiles with the one-ahead loads and the
+        /// column-major walk (every one checked bitwise and timed like the rest).
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
                 ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32,p1t,p1c2,p1c2t,p2t,p2c2t,p4t,p4c2t,p8c2,p8c2t,p16,p16t,p1r2,p2r2,p4r2,p8r2,p2c2r2,p1r4,p2r4,p2r2t,p4r2t,p2f,p4f,p8f,p2tf,p2r2f,p4r2f,p2y,p4y,p8y,p2ty,p2r2y,p2fy"
+                    + (extendedForms
+                        ? ",p4r4,p8r4,p16r2,p1c2r2,p4c2r2,p1r2t,p8r2t,p2c2r2t,p2r4f,p8r2f,p4tf,p4r2y,p2r4y,p2c2y,p4fy,p8fy,p4r2fy"
+                        : "")
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
