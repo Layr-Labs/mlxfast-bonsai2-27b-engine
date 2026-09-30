@@ -645,8 +645,20 @@ enum Qwen35GDNReplayFused {
         let useStaged =
             (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
             && P <= stagedRows
-        let inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
+        var inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
             + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
+        // Reuse this tape's verify gates when their layout fits the staged read.
+        var storedGates = false
+        if useStaged, let pg = tape.g, let pb = tape.beta,
+            pg.dtype == .float32, pb.dtype == .float32,
+            pg.shape == [1, P, Hv], pb.shape == [1, P, Hv],
+            pg.strides == [P * Hv, Hv, 1], pb.strides == [P * Hv, Hv, 1]
+        {
+            inputs[9] = pg
+            inputs[10] = pb
+            inputs[13] = MLXArray([Int32(Hv), Int32(Hv)])
+            storedGates = true
+        }
         let template: [(String, any KernelTemplateArg)] = [
             ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
             ("DVPL", dvpl),
@@ -654,7 +666,10 @@ enum Qwen35GDNReplayFused {
         if useStaged {
             // The committed state, and (`storeFinal`) the window's final state.
             let out = stagedKernel(
-                inputs, template: template + [("SC", true), ("SF", storeFinal)],
+                inputs, template: template + [
+                    ("SC", true), ("SF", storeFinal), ("GATES_STORED", storedGates),
+                    ("REPLAY_NEEDED", keep > 0),
+                ],
                 grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
                 outputShapes: [[1, T, Hv, Dv], ps.shape, storeFinal ? ps.shape : [1]],
                 outputDTypes: [.float32, .float32, .float32])
@@ -712,6 +727,7 @@ enum Qwen35GDNReplayFused {
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
+                ("GATES_STORED", false), ("REPLAY_NEEDED", false),
             ],
             grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1, T, Hv, Dv], [1], storeFinal ? state.shape : [1]],
@@ -848,11 +864,15 @@ enum Qwen35GDNReplayFused {
                     let window = [
                         rows(11, Hk, Dk, 0.09), rows(12, Hk, Dk, 0.09), nextV, gates[0], gates[1],
                     ]
+                    let previousGates = Qwen35FusedElementwise.gatedDeltaGates(
+                        [pair[0..., 0..., Hv...], pair[0..., 0..., ..<Hv], aLog, dtBias])
                     let tape = ArraysCache.PrefixReplayTape(
                         convInput: convInput, q: rows(13, Hk, Dk, 0.09), k: rows(14, Hk, Dk, 0.09),
                         v: v, a: pair[0..., 0..., Hv...], b: pair[0..., 0..., ..<Hv],
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
-                    eval(window + [ssmPre, convInput, tape.q, tape.k, v, tape.a, tape.b, aLog, dtBias])
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK,
+                        g: previousGates[0], beta: previousGates[1])
+                    eval(window + previousGates
+                        + [ssmPre, convInput, tape.q, tape.k, v, tape.a, tape.b, aLog, dtBias])
                     operands.append(
                         Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
                     windows.append(window)
@@ -1004,7 +1024,8 @@ extension Qwen35GDNReplayFused {
         }
 
         // Phase 1: the previous tape's KP rows, the batched replay's step.
-        {
+        // A zero-row replay has no previous staging or recurrence.
+        if (REPLAY_NEEDED) {
           const int a_rs = ab_rows[0];
           const int b_rs = ab_rows[1];
           const float g_nexp = -metal::precise::exp(alog[hv_idx]);
@@ -1019,9 +1040,14 @@ extension Qwen35GDNReplayFused {
             tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
           }
           if (tid < uint(KP)) {
-            const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
-            tgate[tid] = metal::precise::exp(g_nexp * g_sp);
-            tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
+            if (GATES_STORED) {
+              tgate[tid] = pa[hv_idx + tid * a_rs];
+              tgate[16 + tid] = pb[hv_idx + tid * b_rs];
+            } else {
+              const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
+              tgate[tid] = metal::precise::exp(g_nexp * g_sp);
+              tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
+            }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           for (int t = 0; t < KP; ++t) {
@@ -1080,7 +1106,7 @@ extension Qwen35GDNReplayFused {
 
         // Phase 2: this verify's T rows, the output-only scan's step.
         {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (REPLAY_NEEDED) threadgroup_barrier(mem_flags::mem_threadgroup);
           const device float4* k4src = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
           const device float4* q4src = (const device float4*)(q + (b_idx * T * Hk + hk_idx) * Dk);
           for (uint e = tid; e < uint(T) * 32u; e += NT) {
@@ -1373,7 +1399,8 @@ enum Qwen35GDNFullAcceptStore {
                     else { throw SelfTestFailure.message("no plain scan") }
                     let tape = ArraysCache.PrefixReplayTape(
                         convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK,
+                        g: pre.g, beta: pre.beta)
                     guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
                     else { throw SelfTestFailure.message("tape rejected") }
                     let replayed = layer.replayedPrefixState(
