@@ -1,4 +1,3 @@
-import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -581,25 +580,6 @@ enum Qwen35GDNReplayFused {
             ensureRowContiguous: false)
     }
 
-    /// `BONSAI_REPLAY_EVAL_SKIP=0` keeps the replays' stride waits on
-    /// inputs that are already available.
-    static let evalSkipEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_REPLAY_EVAL_SKIP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `eval(arrays)` unless every array is already available (evaluated,
-    /// its event signaled): that eval would wait on nothing and change no
-    /// value or stride. Any other array is evaluated and waited for.
-    static func evalUnlessAvailable(_ arrays: [MLXArray]) {
-        if evalSkipEnabled, arrays.allSatisfy({
-            var available = false
-            return _mlx_array_is_available(&available, $0.ctx) == 0 && available
-        }) { return }
-        eval(arrays)
-    }
-
     /// One row's `(y, committed state)`: `keep` rows of the previous `tape`
     /// from its pre-verify state, then this verify's rows (`q` ... `beta`,
     /// the prework's row-contiguous FP32 outputs). Nil when it does not fit.
@@ -632,7 +612,7 @@ enum Qwen35GDNReplayFused {
         else { return nil }
         // Read in place, as the batched replay reads them: evaluated with
         // their verify, so this wait is a no-op.
-        evalUnlessAvailable(previous)
+        eval(previous)
         guard Qwen35GDNReplayBatch.rowContiguousAfterLeading(ps),
             Qwen35GDNReplayBatch.rowContiguousAfterLeading(tape.k),
             Qwen35GDNReplayBatch.rowContiguousAfterLeading(tape.v),

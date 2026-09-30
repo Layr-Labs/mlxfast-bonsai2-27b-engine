@@ -2166,10 +2166,9 @@ enum DFlash2TensorMatmul {
     /// A block-width launch's tiling. The swapped BF16 kernel (`sourceSwapped`,
     /// `sourceSwapped32`; `ahead` nil): the K step `KT` and the K split `SPLITS`
     /// (simdgroups per 32-column threadgroup, each over one contiguous
-    /// `K / SPLITS` slab). The packed 12-bit kernel (`DFlash2PackedWeights`,
-    /// `[cols, 64]` tiles, 16 columns per threadgroup by default): its K step
-    /// is the copy's tile (`DFlash2PackedWeights.ks`: another K step or tile
-    /// width would need another copy, so neither is a knob), so its knobs are the
+    /// `K / SPLITS` slab). The packed 12-bit kernel (`DFlash2PackedWeights`):
+    /// its K step is the copy's tile (`DFlash2PackedWeights.kt`: another K step
+    /// would need another copy, so it is not a knob), so its knobs are the
     /// split and `ahead`, how many tiles before its op a simdgroup reads a
     /// tile's share (the record: one). A K step keeps each slab's products in
     /// K order and a look-ahead moves only the reads (bit for bit where the op
@@ -2188,7 +2187,7 @@ enum DFlash2TensorMatmul {
             let v = name.split(whereSeparator: { "tsa".contains($0) }).compactMap { Int($0) }
             let packed = standard.ahead != nil
             guard v.count == (packed ? 3 : 2), name == "t\(v[0])s\(v[1])" + (packed ? "a\(v[2])" : ""),
-                (packed ? [DFlash2PackedWeights.ks] : [64, 128, 256]).contains(v[0]),
+                (packed ? [DFlash2PackedWeights.kt] : [64, 128, 256]).contains(v[0]),
                 [0, 2, 4, 8].contains(v[1]), !packed || (0 ... 2).contains(v[2])
             else { return nil }
             self.init(kt: v[0], splits: v[1] == 0 ? standard.splits : v[1], ahead: packed ? v[2] : nil)
@@ -2205,7 +2204,7 @@ enum DFlash2TensorMatmul {
         func standard(packed: Bool) -> SwapTiling {
             let splits = Kernel.stockSplits(n: n)
             return packed
-                ? SwapTiling(kt: DFlash2PackedWeights.ks, splits: splits, ahead: 1)
+                ? SwapTiling(kt: DFlash2PackedWeights.kt, splits: splits, ahead: 1)
                 : SwapTiling(kt: swappedKT, splits: splits)
         }
     }
@@ -2270,7 +2269,7 @@ enum DFlash2TensorMatmul {
         private static var list: [String] {
             listed ?? [2, 4, 8].flatMap { s in
                 packed
-                    ? (0 ... 2).map { "t\(DFlash2PackedWeights.ks)s\(s)a\($0)" } : [64, 128, 256].map { "t\($0)s\(s)" }
+                    ? (0 ... 2).map { "t\(DFlash2PackedWeights.kt)s\(s)a\($0)" } : [64, 128, 256].map { "t\($0)s\(s)" }
             }
         }
 
@@ -2844,8 +2843,8 @@ enum DFlash2TensorMatmul {
 /// weight keeps the stored layout. `MLXFAST_DRAFT_PACK12=0` keeps the stored
 /// layout everywhere.
 ///
-/// Tiling (`DFlash2TensorMatmul.SwapTrial`): the K step and the columns are
-/// the tile's, fixed by the copy; the split and `AHEAD` (how many tiles ahead of its op a
+/// Tiling (`DFlash2TensorMatmul.SwapTrial`): the K step is the tile's, fixed
+/// by the copy; the split and `AHEAD` (how many tiles ahead of its op a
 /// simdgroup reads a tile's share; the record reads one) are template values.
 /// A look-ahead moves only the reads, a split reorders the FP32 sum; a shape
 /// takes another tiling only if the load-time trial checked and adopted it.
@@ -3388,7 +3387,7 @@ enum DFlash2PackedWeights {
         let t = tiling ?? DFlash2TensorMatmul.swapTiling(k: c.source.dim(1), n: n, rows32: rows > 16, packed: true)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", t.splits)] + geometry + [("AHEAD", t.ahead ?? 1)],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("AHEAD", t.ahead ?? 1)] + geometry,
             grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
