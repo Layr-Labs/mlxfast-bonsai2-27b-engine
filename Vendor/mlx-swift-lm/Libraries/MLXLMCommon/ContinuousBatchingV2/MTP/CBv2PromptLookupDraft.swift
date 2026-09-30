@@ -473,52 +473,40 @@ enum CBv2PromptLookupDraft {
         guard depth >= 1, prompt >= minimum + depth, count >= minimum else { return nil }
         let longest = min(64, count - depth, prompt - depth)
         guard longest >= minimum else { return nil }
-        // Every longer eligible match contains this suffix and leaves the
-        // same continuation inside the prompt. Prove a miss in one scan
-        // before scanning all longer lengths; ambiguous hits still use the
-        // original longest-match selection below.
-        let minimumSuffix = history[(count - minimum) ..< count]
-        let lastMinimumStart = prompt - minimum - depth
-        guard (0 ... lastMinimumStart).contains(where: { start in
-            history[start ..< (start + minimum)].elementsEqual(minimumSuffix)
-        }) else { return nil }
-        for length in stride(from: longest, through: minimum, by: -1) {
-            let suffix = count - length
-            let lastStart = prompt - length - depth
-            if lastStart < 0 { continue }
-            var chosen: [Int]?
-            var ambiguous = false
-            var start = lastStart
-            while start >= 0 {
-                if history[start] == history[suffix],
-                    history[start + length - 1] == history[count - 1]
-                {
-                    var same = true
-                    var offset = 1
-                    while offset < length - 1 {
-                        if history[start + offset] != history[suffix + offset] {
-                            same = false
-                            break
-                        }
-                        offset += 1
-                    }
-                    if same {
-                        let from = start + length
-                        let ids = Array(history[from ..< (from + depth)])
-                        if let chosen, chosen != ids {
-                            ambiguous = true
-                            break
-                        }
-                        chosen = ids
-                    }
-                }
-                start -= 1
+        // Scan prompt endpoints once. A match ending at `end` supplies the
+        // same continuation at every eligible suffix length up to its run.
+        // Thus the first nonempty incumbent length is the maximum run; if
+        // continuations disagree there, they still disagree at every shorter
+        // length. Preserve that exact longest/ambiguity rule without rescans.
+        let anchor = history[count - 1]
+        var bestLength = minimum - 1
+        var chosenFrom = -1
+        var ambiguous = false
+        for end in stride(from: prompt - depth - 1, through: minimum - 1, by: -1) {
+            // All remaining endpoints have an even smaller possible run.
+            if end + 1 < bestLength { break }
+            guard history[end] == anchor else { continue }
+            var run = 1
+            while run < longest, run <= end,
+                history[end - run] == history[count - 1 - run]
+            {
+                run += 1
             }
-            if let chosen, !ambiguous {
-                return Hit(match: length, ids: chosen)
+            guard run >= minimum else { continue }
+            let from = end + 1
+            if run > bestLength {
+                bestLength = run
+                chosenFrom = from
+                ambiguous = false
+            } else if run == bestLength,
+                !history[from ..< (from + depth)].elementsEqual(
+                    history[chosenFrom ..< (chosenFrom + depth)])
+            {
+                ambiguous = true
             }
         }
-        return nil
+        guard chosenFrom >= 0, !ambiguous else { return nil }
+        return Hit(match: bestLength, ids: Array(history[chosenFrom ..< (chosenFrom + depth)]))
     }
 }
 
