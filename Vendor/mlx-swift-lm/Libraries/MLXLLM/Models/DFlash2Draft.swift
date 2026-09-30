@@ -12,7 +12,10 @@
 // consumes a block of `depth + 1` input tokens — the last committed token
 // followed by `depth` mask tokens — and returns `depth` draft tokens. The block
 // attends to itself without a causal mask and to a rotating window of context
-// keys and values projected from the target's own hidden states.
+// keys and values projected from the target's own hidden states. Deeper blocks
+// preserve the config's trained prefix and make extension rows causal;
+// DARKBLOOM_DFLASH_TRAINED_BLOCK_MASK=0 restores full block attention.
+// Target verification still decides every emitted token.
 //
 // The drafter owns NO embedding table and NO output projection. It binds the
 // target's. On this track both are packed Hadamard modules, so this file calls
@@ -440,6 +443,23 @@ public enum DFlash2SlidingMask {
 final class DFlash2SlidingMaskMemo {
     private var key: [Int]?
     private var cached: MLXArray?
+    private var keptKey: [Int]?
+    private var kept: MLXArray?
+
+    /// ``DFlash2TrainedBlockMask`` for one plain block forward's geometry,
+    /// shared by its layers. Left lazy: the context length moves every round,
+    /// so evaluating it here would add a wait per round.
+    func trainedBlockMask(contextLength: Int, blockLength: Int, trained: Int) -> MLXArray {
+        let requested = [contextLength, blockLength, trained]
+        if let kept, keptKey == requested { return kept }
+        let made = DFlash2TrainedBlockMask.make(
+            keyCount: contextLength + blockLength, blockStart: MLXArray(Int32(contextLength)),
+            blockLength: blockLength, trained: trained)
+        keptKey = requested
+        kept = made
+        return made
+    }
+
 
     func mask(
         contextLength: Int,
@@ -463,6 +483,43 @@ final class DFlash2SlidingMaskMemo {
         key = requested
         cached = made
         return made
+    }
+}
+
+// MARK: - The trained block, kept inside a deeper block
+
+/// Preserve the configured training span inside a deeper draft block.
+/// Rows i<T see context and j<T; extension rows i>=T see context and j<=i.
+/// Boundaries come from dflash_config.block_size, never prompt content.
+/// This causal rule was restored from promoted 57002db. The caller still
+/// applies its context window and speculative padding mask; the unchanged
+/// target verifier decides every emitted token.
+/// DARKBLOOM_DFLASH_TRAINED_BLOCK_MASK=0 disables this default-on rule.
+enum DFlash2TrainedBlockMask {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_TRAINED_BLOCK_MASK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let on = value == nil || ["1", "true", "yes", "on"].contains(value ?? "")
+        if on {
+            FileHandle.standardError.write(Data(
+                "dflash trained-block mask: on; config boundary, causal extension\n".utf8))
+        }
+        return on
+    }()
+
+    static func applies(blockLength: Int, trained: Int) -> Bool {
+        enabled && trained > 0 && blockLength > trained
+    }
+
+    /// `true` where allowed, `[blockLength, keyCount]`: key `k` is block row
+    /// `k - blockStart` (negative for a context key, always allowed here; the
+    /// caller ANDs in its own context and tail terms).
+    static func make(
+        keyCount: Int, blockStart: MLXArray, blockLength: Int, trained: Int
+    ) -> MLXArray {
+        let row = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount) - blockStart
+        let query = MLXArray(Int32(0) ..< Int32(blockLength)).reshaped(blockLength, 1)
+        return (row .< Int32(trained)) .|| ((query .>= Int32(trained)) .&& (row .<= query))
     }
 }
 
@@ -549,6 +606,8 @@ private final class DFlash2Attention: Module {
     let heads: Int
     let kvHeads: Int
     let scale: Float
+    /// The drafter config training block, including the anchor.
+    let trainedBlock: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -578,6 +637,7 @@ private final class DFlash2Attention: Module {
         self.layerType = config.layerTypes[layerIndex]
         self.slidingWindow = layerType == .slidingAttention ? config.slidingWindow : nil
         self.isCausal = config.isCausal
+        self.trainedBlock = config.dflash.blockSize
         self.heads = config.attentionHeads
         self.kvHeads = config.kvHeads
         self.scale = pow(Float(config.headDim), -0.5)
@@ -738,6 +798,11 @@ private final class DFlash2Attention: Module {
             }
         } else if isCausal {
             mask = createCausalMask(n: L, offset: cachedLength)
+        }
+        if DFlash2TrainedBlockMask.applies(blockLength: L, trained: trainedBlock) {
+            let kept = masks.trainedBlockMask(
+                contextLength: cachedLength, blockLength: L, trained: trainedBlock)
+            mask = mask.map { $0 .&& kept } ?? kept
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -4464,8 +4529,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             axis: 1)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        var keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
             .reshaped([1, keys])
+        if DFlash2TrainedBlockMask.applies(blockLength: blockSize, trained: config.dflash.blockSize) {
+            // The block sits at row `held + c` of the keys, as in the plain
+            // path it sits right after the cached context.
+            keyMask = keyMask .&& DFlash2TrainedBlockMask.make(
+                keyCount: keys, blockStart: MLXArray(Int32(geometry.rows)) + c,
+                blockLength: blockSize, trained: config.dflash.blockSize)
+        }
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         // The front's one-launch forms read `context` and `c` themselves;
         // `base` is then never evaluated.
