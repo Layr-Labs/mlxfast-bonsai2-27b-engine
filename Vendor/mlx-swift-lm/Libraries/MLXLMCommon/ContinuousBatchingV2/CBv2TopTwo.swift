@@ -80,6 +80,30 @@ private let cbv2TopTwoHeader = """
     }
 """
 
+/// The tree loop of the branch-free stage one and of stage two with its
+/// barrier taken only between strides (`BONSAI_LAST_BARRIER_SKIP=0` keeps the
+/// stock texts). At stride 1 lane 0 alone writes `scratch[0]`, and after the
+/// loop lane 0 alone reads it: its own store, in program order, so that
+/// barrier orders nothing. Every other barrier, load, store and merge is the
+/// stock text's; a text without exactly one such loop tail is kept as it is.
+/// The stock stage one stays the fast one's bitwise reference.
+private func cbv2TopTwoTreeTail(_ kernel: String, _ text: String) -> String {
+    let value = ProcessInfo.processInfo.environment["BONSAI_LAST_BARRIER_SKIP"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !["0", "false", "no", "off"].contains(value ?? "") else { return text }
+    let tail = "threadgroup_barrier(mem_flags::mem_threadgroup);\n    }\n\n    if (lane == 0) {"
+    guard text.components(separatedBy: tail).count == 2 else {
+        FileHandle.standardError.write(
+            "cbv2 top-2 \(kernel): tree loop tail not found, stock text kept\n".data(using: .utf8)!)
+        return text
+    }
+    FileHandle.standardError.write(
+        "cbv2 top-2 \(kernel): tree loop's last barrier skipped\n".data(using: .utf8)!)
+    return text.replacingOccurrences(
+        of: tail, with: "if (stride > 1u) { threadgroup_barrier(mem_flags::mem_threadgroup); }"
+            + "\n    }\n\n    if (lane == 0) {")
+}
+
 /// Stage one: 32 threadgroups per row reduce disjoint vocabulary stripes.
 private let cbv2TopTwoPartialKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_partial",
@@ -145,7 +169,7 @@ private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_finalize",
     inputNames: ["partial_ids", "partial_values"],
     outputNames: ["top_ids", "top_values"],
-    source: """
+    source: cbv2TopTwoTreeTail("stage two", """
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         uint base = (row * 32 + lane) * 2;
@@ -179,7 +203,7 @@ private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
             top_values[output_base] = scratch[0].first_value;
             top_values[output_base + 1] = scratch[0].second_value;
         }
-    """,
+    """),
     header: cbv2TopTwoHeader,
     ensureRowContiguous: false
 )
@@ -202,7 +226,7 @@ private let cbv2TopTwoPartialFastKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_partial_fast",
     inputNames: ["logits"],
     outputNames: ["partial_ids", "partial_values"],
-    source: """
+    source: cbv2TopTwoTreeTail("branch-free stage one", """
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
         uint row = group_index / 32;
@@ -268,7 +292,7 @@ private let cbv2TopTwoPartialFastKernel = MLXFast.metalKernel(
             partial_values[base + 1] = scratch[0].count > 1
                 ? scratch[0].second_value : sentinel_value;
         }
-    """,
+    """),
     header: cbv2TopTwoHeader,
     ensureRowContiguous: false
 )
