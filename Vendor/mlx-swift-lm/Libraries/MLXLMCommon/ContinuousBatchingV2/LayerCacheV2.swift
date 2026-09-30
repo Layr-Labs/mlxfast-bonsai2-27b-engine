@@ -292,12 +292,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 /// copy is set wherever the array is rebuilt and advanced exactly as the
 /// device chain is, so the values are the chain's, stale or not. Every layer
 /// of a step holds the same values, so they share one array.
-/// `MLXFAST_HOST_POSITION_OFFSETS=0` keeps the on-device add.
+/// On by default; `MLXFAST_HOST_POSITION_OFFSETS=0` keeps the on-device add.
 enum CBv2HostPositionOffsets {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_HOST_POSITION_OFFSETS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let lock = NSLock()

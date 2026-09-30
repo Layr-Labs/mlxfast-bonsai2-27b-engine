@@ -124,6 +124,106 @@ enum Qwen35SmallNMatmul {
     private static let partialKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
         source: partialSource, ensureRowContiguous: true)
+
+    /// `partialSource` with the shared reduction array's row pitch 32 instead
+    /// of 33 (GordoAR's a2891a6a): the declaration and all six index uses
+    /// change together; no operation reads a padding column, so every write
+    /// and read addresses the same (quarter, row, column) value and the
+    /// additions keep their order. 16,384 bytes of threadgroup memory instead
+    /// of 16,640. Derived by checked replacements (nil if the text moved) and
+    /// taken only for a geometry whose load-time check (`preparePitch`) found
+    /// it bit for bit equal to the record's partial kernel.
+    private static let partialPitch32Source: String? = {
+        var text = partialSource
+        for (target, replacement, count) in [
+            ("threadgroup float red[4 * 16 * 33];", "threadgroup float red[4 * 16 * 32];", 1),
+            ("red[(s * 16 + m) * 33 + c] = acc;", "red[(s * 16 + m) * 32 + c] = acc;", 1),
+            ("* 16 + m) * 33 + cc]", "* 16 + m) * 32 + cc]", 4),
+        ] {
+            guard text.components(separatedBy: target).count == count + 1 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        return text
+    }()
+
+    private static let partialPitch32Kernel: MLXFast.MLXFastKernel? = partialPitch32Source.map {
+        MLXFast.metalKernel(
+            name: "qwen35_splitk_partial_p32", inputNames: ["x", "w", "dims"], outputNames: ["part"],
+            source: $0, ensureRowContiguous: true)
+    }
+
+    /// On unless `DARKBLOOM_QWEN35_SPLITK_BA_PITCH32=0` (the record's pitch).
+    static let pitch32Enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_SPLITK_BA_PITCH32"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let pitchLock = NSLock()
+    /// `[k, n]` geometries whose pitch-32 check passed (written only at model
+    /// construction, before any forward).
+    nonisolated(unsafe) private static var pitch32Verified = Set<[Int]>()
+    nonisolated(unsafe) private static var pitchChecked = Set<[Int]>()
+
+    /// The load-time check of the pitch-32 partial on the layer's b|a
+    /// geometry (`k` = hidden, `n` = 2 x value heads): 16-, 3- and 1-row
+    /// windows of random FP32 operands with a wide magnitude spread, zeros
+    /// and signed zeros, every chunk partial compared with the record
+    /// kernel's as unsigned integers. A mismatch, a compile failure or an MLX
+    /// error keeps the record's kernel. One stderr line per geometry.
+    static func preparePitch(k: Int, n: Int) {
+        guard enabled, pitch32Enabled, let pitch32 = partialPitch32Kernel, k > 0, n > 0,
+            n % 32 == 0, k % chunk == 0
+        else { return }
+        let first = pitchLock.withLock { pitchChecked.insert([k, n]).inserted }
+        guard first else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7033_3270), into: 12)
+        var values = 0
+        var mismatches = 0
+        var detail = ""
+        do {
+            try withError { error in
+                let w0 = MLXRandom.normal([n, k], key: keys[0])
+                    * exp(MLXRandom.normal([n, k], key: keys[1]) * 2)
+                let wPick = MLXRandom.randInt(Int32(0) ..< Int32(32), [n, k], key: keys[2])
+                let w = which(wPick .== MLXArray(Int32(0)), MLXArray(Float(-0.0)), w0)
+                for (index, rows) in [16, 3, 1].enumerated() {
+                    let x0 = MLXRandom.normal([rows, k], key: keys[3 + 3 * index])
+                        * exp(MLXRandom.normal([rows, k], key: keys[4 + 3 * index]) * 2)
+                    let xPick = MLXRandom.randInt(Int32(0) ..< Int32(32), [rows, k], key: keys[5 + 3 * index])
+                    let x = which(xPick .== MLXArray(Int32(0)), MLXArray(Float(0)), x0)
+                    let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+                    func run(_ kernel: MLXFast.MLXFastKernel) -> MLXArray {
+                        kernel(
+                            [x, w, dims], grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
+                            outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
+                    }
+                    let reference = run(partialKernel)
+                    let candidate = run(pitch32)
+                    let differ = (reference.view(dtype: .uint32) .!= candidate.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    mismatches += Int(differ.item(Int32.self))
+                    values += reference.size
+                }
+            }
+        } catch {
+            detail = " (\(error))"
+            mismatches = max(mismatches, 1)
+        }
+        let passed = mismatches == 0
+        if passed { pitchLock.withLock { _ = pitch32Verified.insert([k, n]) } }
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 split-K b|a partial, reduction pitch 32 (\(k)x\(n), 16/3/1 rows): self-test "
+                + (passed ? "passed" : "FAILED") + ": \(values) values compared bitwise, "
+                + "\(mismatches) mismatches" + detail
+                + (passed ? "; pitch 32 taken" : "; the record's pitch-33 kernel kept")
+                + String(format: "; %.0f ms\n", Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6))
+                .data(using: .utf8)!)
+    }
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
@@ -160,7 +260,8 @@ enum Qwen35SmallNMatmul {
         let rows = x.size / k
         guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
-        let part = partialKernel(
+        let kernel = pitch32Verified.contains([k, n]) ? partialPitch32Kernel ?? partialKernel : partialKernel
+        let part = kernel(
             [x.reshaped(rows, k), w, dims],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]

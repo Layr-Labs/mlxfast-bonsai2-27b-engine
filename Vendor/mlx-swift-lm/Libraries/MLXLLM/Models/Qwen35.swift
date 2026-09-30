@@ -2924,6 +2924,7 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35PreworkSplit.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
+        Qwen35SmallNMatmul.preparePitch(k: hiddenSize, n: 2 * numVHeads)
         Qwen35SplitKFold.prepare(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
