@@ -111,6 +111,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 target: text.configuration.hiddenLayers)
         }
         try drafter.bind(target: text)
+        text.model.dFlash2PromptTapBF16 =
+            drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
