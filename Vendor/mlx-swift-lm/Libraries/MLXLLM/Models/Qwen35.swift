@@ -10208,11 +10208,11 @@ extension Qwen35TextModel: DFlash2TapTarget {
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
 
-    /// 100,352 = 98 x 1024: the leading rows the drafter scores (see above).
+    /// 94,208 = 92 x 1024: the leading rows the drafter scores (see above).
     static let drafterVocabularyRows: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_VOCAB_ROWS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return max(0, raw.flatMap { Int($0) } ?? 100_352)
+        return max(0, raw.flatMap { Int($0) } ?? 94_208)
     }()
 
     /// The arrays of this target a DFlash 2 decode window reads that its seed
