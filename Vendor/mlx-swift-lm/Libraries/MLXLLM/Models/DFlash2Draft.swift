@@ -2532,8 +2532,39 @@ enum DFlash2PackedWeights {
         return !["0", "false", "no", "off"].contains(raw ?? "")
     }()
 
+    /// Bounded element offsets; zero keeps the original wide arithmetic.
+    private static let narrowIndexSetting: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_PACK12_IO32"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
     /// The K step of a tile.
     static let kt = 64
+
+    /// `DARKBLOOM_DRAFT_PACK12_ALL=1` packs every eligible weight, as the
+    /// packed kernel's first form did.
+    private static let packAll: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DRAFT_PACK12_ALL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(raw ?? "")
+    }()
+
+    /// Whether the packed kernel is the faster read of an `[n, k]` weight.
+    /// It reads a quarter fewer bytes but adds decode work to every tile,
+    /// which only enough tiles in flight hide: a wide weight (many column
+    /// blocks, as the gate|up stack) or a deep one (many K tiles per
+    /// simdgroup, as down_proj and fc). A narrow, shallow weight waits on the
+    /// decode instead. On an M5 Max, chained launches over the real weights
+    /// (each launch a different layer's copy, so every read streams), packed
+    /// against the stored layout: gate|up -20%, down_proj -3%, fc +1%, the
+    /// q|k|v stack +2% (32 rows +1%), o_proj +7% (+8%), and the tap
+    /// projections +63% (+64%). A weight left out keeps the swapped kernel
+    /// over its stored layout, whose products the packed kernel matches bit
+    /// for bit, so no value changes either way.
+    static func worthPacking(n: Int, k: Int) -> Bool {
+        packAll || n >= 16384 || k >= 16384
+    }
 
     struct Copy {
         let source: MLXArray
@@ -2544,6 +2575,7 @@ enum DFlash2PackedWeights {
         let offsets: MLXArray
         let escapes: MLXArray
         let escapeCount: Int
+        let narrowOffsetsFit: Bool
         var arrays: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
     }
 
@@ -2574,13 +2606,14 @@ enum DFlash2PackedWeights {
           uint base;
         };
 
-        template <int KT>
+        template <int KT, int IO32 = 0>
         inline void dflash2_pack12_read(
             thread dflash2_pack12_share<KT>& t, const device uint4* mant, const device uint2* code,
             const device uint4* first4, const device uint* bases, int tile, uint lane) {
           constexpr int WORDS = KT / 16;
-          const device uint4* mp = mant + (size_t)tile * WORDS * 32 + lane;
-          const device uint2* cp = code + (size_t)tile * WORDS * 32 + lane;
+          using ReadIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
+          const device uint4* mp = mant + ReadIndexT(tile) * WORDS * 32 + lane;
+          const device uint2* cp = code + ReadIndexT(tile) * WORDS * 32 + lane;
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
             t.m[j] = mp[j * 32];
@@ -2806,6 +2839,7 @@ enum DFlash2PackedWeights {
     // (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). x bfloat [16, K].
     private static let source = """
         const int K = ksz[0]; const int N = ksz[2];
+        using OutIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * 32;
         const uint lane = thread_index_in_simdgroup;
@@ -2830,13 +2864,13 @@ enum DFlash2PackedWeights {
         for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
         // The next tile's share is read before this one's op (one tile ahead).
         dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_read<KT, IO32>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
             nb * steps + k0 / KT, lane);
         for (int k = k0; k < k0 + kq; k += KT) {
           const int tile = nb * steps + k / KT;
           if (k + KT < k0 + kq) {
-            dflash2_pack12_read<KT>(
+            dflash2_pack12_read<KT, IO32>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
@@ -2860,7 +2894,7 @@ enum DFlash2PackedWeights {
               v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
             }
             auto idx = cT.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+            out[(OutIndexT)idx[0] * N + n0 + idx[1]] = OutT(v);
           }
         }
         """
@@ -2869,6 +2903,7 @@ enum DFlash2PackedWeights {
     // multiplied by rows 0-15 and 16-31. x bfloat [32, K].
     private static let source32 = """
         const int K = ksz[0]; const int N = ksz[2];
+        using OutIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * 32;
         const uint lane = thread_index_in_simdgroup;
@@ -2893,13 +2928,13 @@ enum DFlash2PackedWeights {
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
         dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_read<KT, IO32>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
             nb * steps + k0 / KT, lane);
         for (int k = k0; k < k0 + kq; k += KT) {
           const int tile = nb * steps + k / KT;
           if (k + KT < k0 + kq) {
-            dflash2_pack12_read<KT>(
+            dflash2_pack12_read<KT, IO32>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
@@ -2931,8 +2966,8 @@ enum DFlash2PackedWeights {
                   + red[2][(16 + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
-            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            out[(OutIndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(OutIndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
           }
         }
         """
@@ -2985,7 +3020,10 @@ enum DFlash2PackedWeights {
         let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", kt)],
+            template: [
+                ("OutT", outputDType), ("SPLITS", splits), ("KT", kt),
+                ("IO32", narrowIndexSetting && c.narrowOffsetsFit ? 1 : 0),
+            ],
             grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
@@ -3012,9 +3050,17 @@ enum DFlash2PackedWeights {
             grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[max(escapeCount, 1)], [tiles * 4]], outputDTypes: [.uint32, .uint32])
         eval(written)
+        // Prepared once for this immutable copy. Every source buffer has a
+        // bounded element extent; division bounds the largest 32-row output
+        // before multiplication. The signed tile calculations fit as well.
+        let indexLimit = Int(Int32.max)
+        let narrowOffsetsFit = w.dim(0) > 0 && w.dim(1) > 0
+            && w.dim(0) <= indexLimit / 32
+            && (first + [w, offsets] + written).allSatisfy { $0.size <= indexLimit }
         return Copy(
             source: w, mantissas: first[0], codes: first[1], first: written[1], bases: first[2],
-            offsets: offsets, escapes: written[0], escapeCount: escapeCount)
+            offsets: offsets, escapes: written[0], escapeCount: escapeCount,
+            narrowOffsetsFit: narrowOffsetsFit)
     }
 
     /// Packs every eligible one of `weights` (16-row products) and
@@ -3037,7 +3083,8 @@ enum DFlash2PackedWeights {
         let eligible = (weights + weights32).filter {
             guard $0.dtype == .bfloat16, $0.ndim == 2, $0.dim(0) % 32 == 0 else { return false }
             let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: $0.dim(0))
-            return $0.dim(1) % (splits * kt) == 0 && seen.insert(ObjectIdentifier($0)).inserted
+            return $0.dim(1) % (splits * kt) == 0 && worthPacking(n: $0.dim(0), k: $0.dim(1))
+                && seen.insert(ObjectIdentifier($0)).inserted
         }
         var packed: [Copy] = []
         var escapes = 0
