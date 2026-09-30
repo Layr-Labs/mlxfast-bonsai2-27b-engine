@@ -169,6 +169,19 @@ enum CBv2PromptLookupDraft {
         return max(6, raw.flatMap(Int.init) ?? 8)
     }()
 
+    /// `MLXFAST_DFLASH_SPLICE_FIRST_MIN` sets the shortest alignment at
+    /// position 0 in the first round after the seed, when the committed text
+    /// is the prompt and the seed token alone: the drafter's block from its
+    /// first token plus the seed token running along the same prompt span.
+    /// 6 by default, 3 at the least, never above `spliceMinimum` (which it
+    /// equals, the record's bar, when set to 8); later positions and later
+    /// rounds keep `spliceMinimum`.
+    static let spliceFirstMinimum: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_FIRST_MIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return min(spliceMinimum, max(3, raw.flatMap(Int.init) ?? 6))
+    }()
+
     /// `MLXFAST_DFLASH_SPLICE_TRACE=1` reads the splice's choice back and
     /// prints it. Diagnostic only: the readback waits for the drafter.
     static let spliceTrace: Bool =
@@ -207,9 +220,10 @@ enum CBv2PromptLookupDraft {
         source: """
 
         uint x = thread_position_in_grid.x;
-        int n = dims[0], d = dims[1], minimum = dims[2];
+        int n = dims[0], d = dims[1];
         if (x >= n*d) return;
         int j = int(x)/n, c = int(x)%n;
+        int minimum = j == 0 ? dims[3] : dims[2];
         int a = 0;
         while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
         int s = a + (j == 0 ? runs[c] : 0);
@@ -222,7 +236,7 @@ enum CBv2PromptLookupDraft {
         source: """
 
         uint tid = thread_position_in_threadgroup.x;
-        int n = dims[0], d = dims[1], minimum = dims[2];
+        int n = dims[0], d = dims[1];
         int bs = 0, bi = 0;
         for (int i = int(tid); i < n*d; i += 256) {
          int s = ranked[i];
@@ -243,7 +257,7 @@ enum CBv2PromptLookupDraft {
         }
         if (tid < uint(d)) {
          int j=indices[0]/n, c=indices[0]%n;
-         out[tid] = scores[0] >= minimum && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
+         out[tid] = scores[0] > 0 && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
         """, ensureRowContiguous: true)
 
@@ -274,6 +288,9 @@ enum CBv2PromptLookupDraft {
         let minimum = spliceMinimum
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
+        // The first round after the seed has only the seed token to run
+        // along a span, so its position-0 alignments take a lower bar.
+        let firstMinimum = count == prompt + 1 ? spliceFirstMinimum : minimum
         // Alignment c: the drafter's token at position j + t is compared with
         // prompt token c + 1 + t. Every c keeps its whole continuation inside
         // the prompt (c + depth <= prompt - 1).
@@ -297,7 +314,9 @@ enum CBv2PromptLookupDraft {
         if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
             let block = drafted.reshaped([depth]).asType(.int32)
             let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
-            let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum)])
+            let dims = MLXArray([
+                Int32(candidates), Int32(depth), Int32(minimum), Int32(firstMinimum),
+            ])
             let ranked = spliceScore(
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
@@ -339,10 +358,13 @@ enum CBv2PromptLookupDraft {
         let agree = cumprod((shifted .== continuation).asType(.int32), axis: 2).sum(axis: 2)
         let score =
             agree + MLXArray(firstRow, [depth, 1]) * MLXArray(runs, [1, candidates])
-        let eligible = (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(Int32(minimum)))
+        var minima = [Int32](repeating: Int32(minimum), count: depth)
+        minima[0] = Int32(firstMinimum)
+        let eligible =
+            (agree .>= MLXArray(Int32(1))) .&& (score .>= MLXArray(minima, [depth, 1]))
         let ranked = which(eligible, score, MLXArray(Int32(0))).reshaped([depth * candidates])
         let best = argMax(ranked, axis: 0).asType(.int32)
-        let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(minimum))
+        let fire = take(ranked, best, axis: 0) .> MLXArray(Int32(0))
         let j = floorDivide(best, MLXArray(Int32(candidates)))
         let c = best - j * MLXArray(Int32(candidates))
         let steps = MLXArray((0 ..< depth).map { Int32($0) })
@@ -365,6 +387,97 @@ enum CBv2PromptLookupDraft {
     struct Hit {
         let match: Int
         let ids: [Int]
+    }
+
+    /// `MLXFAST_DFLASH_SEED_LOOKUP=0` keeps the drafter in the first round.
+    ///
+    /// In the first round after the seed the committed text is the prompt
+    /// and the seed token. When the seed token and the committed tokens
+    /// before it run along exactly one prompt position for at least
+    /// `MLXFAST_DFLASH_SEED_LOOKUP_MIN` tokens (2 by default), longer than
+    /// along any other, the first round's ids are that position's prompt
+    /// continuation and the drafter's block is not run (its context rows stay
+    /// pending, as after any lookup round).
+    static let seedLookupEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SEED_LOOKUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static let seedLookupMinimum: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SEED_LOOKUP_MIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return max(2, raw.flatMap(Int.init) ?? 2)
+    }()
+
+    /// The first round's ids from the prompt, or nil (then the drafter runs).
+    static func seedLookup(history: [Int], promptLength: Int, depth: Int) -> MLXArray? {
+        guard enabled, seedLookupEnabled, depth > 0,
+            let hit = seedContinuation(history: history, promptLength: promptLength, depth: depth)
+        else { return nil }
+        FileHandle.standardError.write(
+            Data("dflash2 prompt lookup: seed run=\(hit.match) depth=\(depth), drafter skipped\n".utf8))
+        return MLXArray(hit.ids, [1, depth])
+    }
+
+    /// The prompt continuation after the one position where the seed token
+    /// and the tokens before it run longest, or nil when the history is not
+    /// the prompt plus the seed token, the longest run is shorter than the
+    /// minimum, or two positions tie with different continuations.
+    static func seedContinuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard depth >= 1, count == prompt + 1, prompt > depth else { return nil }
+        let anchor = history[count - 1]
+        var best = 0
+        var chosen: [Int]?
+        var ambiguous = false
+        for c in 0 ..< (prompt - depth) where history[c] == anchor {
+            var run = 1
+            while run < 64, c - run >= 0, history[c - run] == history[count - 1 - run] {
+                run += 1
+            }
+            if run < best { continue }
+            let ids = Array(history[(c + 1) ..< (c + 1 + depth)])
+            if run > best {
+                (best, chosen, ambiguous) = (run, ids, false)
+            } else if chosen != ids {
+                ambiguous = true
+            }
+        }
+        guard best >= seedLookupMinimum, !ambiguous, let chosen else { return nil }
+        return Hit(match: best, ids: chosen)
+    }
+
+    /// `MLXFAST_DFLASH_PREFETCH_ON_MISS=0` absorbs a prompt's drafter context
+    /// behind the prompt forward whatever the first round does.
+    ///
+    /// The prompt row's context absorb (~19 ms of BF16 GEMM on an M4 Max for
+    /// 512 rows) is read only by a drafter block. A prompt row that can hit
+    /// the seed lookup defers it to its finalize, which submits it only on a
+    /// miss; on a hit the rows stay pending for the next block that runs, as
+    /// after any lookup round (the absorbed rows are the same either way).
+    static let prefetchOnMissEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_PREFETCH_ON_MISS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// True when a prompt row's context absorb waits for its seed token: the
+    /// first round has a known depth and could take the seed lookup (whose run
+    /// needs the prompt's last token at an earlier prompt position).
+    static func defersPromptAbsorb(prompt: [Int], depth: Int?) -> Bool {
+        guard prefetchOnMissEnabled, enabled, seedLookupEnabled, let depth, depth > 0,
+            prompt.count > depth + 1, let last = prompt.last
+        else { return false }
+        return prompt[0 ..< (prompt.count - depth - 1)].contains(last)
+    }
+
+    /// True when the first round will take its ids from the prompt (the same
+    /// test `seedLookup` makes), from the prompt and the seed token.
+    static func seedLookupHits(history: [Int], promptLength: Int, depth: Int) -> Bool {
+        guard enabled, seedLookupEnabled, depth > 0 else { return false }
+        return seedContinuation(history: history, promptLength: promptLength, depth: depth) != nil
     }
 
     /// Longest unique prompt continuation of `history`'s suffix, or nil.
