@@ -202,11 +202,11 @@ enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_SPLICE_MIN` sets the shortest alignment the splice
     /// accepts: the drafter's own tokens that equal a prompt span, plus (when
     /// the drafter's block agrees from its first token) the committed suffix
-    /// that already runs along that span. 8 by default, 6 at the least.
+    /// that already runs along that span. 7 by default, 6 at the least.
     static let spliceMinimum: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_MIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return max(6, raw.flatMap(Int.init) ?? 8)
+        return max(6, raw.flatMap(Int.init) ?? 7)
     }()
 
     /// `DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN` sets the evidence an ANCHORED
@@ -232,7 +232,7 @@ enum CBv2PromptLookupDraft {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let raw, ["0", "false", "no", "off"].contains(raw) { return 0 }
-        return max(2, raw.flatMap(Int.init) ?? 5)
+        return max(2, raw.flatMap(Int.init) ?? 6)
     }()
 
     /// `MLXFAST_DFLASH_SPLICE_TRACE=1` (or `DARKBLOOM_DFLASH_SPLICE_TRACE=1`,

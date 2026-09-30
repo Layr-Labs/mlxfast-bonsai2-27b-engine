@@ -3291,13 +3291,38 @@ enum Qwen35TensorPackedMatmul {
         // shape but the head).
         case rb = 70
         case k32pd2i32 = 73
+        // PD1 twins (`narrowZooPD1Variants`): the one-group word ring of every
+        // body offered only at PD 2 (k32pd1 runs ahead of k32pd2 on all five
+        // tower shapes on M5 Max), and the base's PD 1 neighbours: KH 64 / 128
+        // on the zoo text, zoo 2's `c1k32pd1` (CD 1: a group's constants loaded
+        // at its start) and `k16pd1`. The same texts with other templates, so
+        // each keeps the zoo's rule (a)-(c) and its self-test.
+        case z64pd1 = 80
+        case z128pd1 = 81
+        case a128pd1 = 82
+        case a64pd1 = 83
+        case pk64pd1 = 84
+        case c1k32pd1 = 85
+        case k16pd1 = 86
+        case pk16pd1 = 87
+        case x4k32pd1 = 88
+        case x4k128pd1 = 89
+        case x2k32pd1 = 90
+        case x4p2k32pd1 = 91
+        case x2p2k32pd1 = 92
+        case csk32pd1 = 93
+        case csa128pd1 = 94
+        case i4k128pd1 = 95
+        case i4csk128pd1 = 96
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
                 .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
-                .i4p4k32pd1, .rb:
+                .i4p4k32pd1, .rb, .z64pd1, .z128pd1, .a128pd1, .a64pd1, .pk64pd1, .c1k32pd1, .k16pd1,
+                .pk16pd1, .x4k32pd1, .x4k128pd1, .x2k32pd1, .x4p2k32pd1, .x2p2k32pd1, .csk32pd1,
+                .csa128pd1, .i4k128pd1, .i4csk128pd1:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
@@ -3316,26 +3341,31 @@ enum Qwen35TensorPackedMatmul {
         }
         var kh: Int {
             switch self {
-            case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
+            case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2, .z64pd1,
+                .a64pd1, .pk64pd1:
+                return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1, .k32pd2i32:
+                .csk32pd2, .i4p4k32pd1, .k32pd2i32, .c1k32pd1, .csk32pd1:
                 return 32
-            case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
+            case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2, .k16pd1, .pk16pd1:
+                return 16
             default: return 128
             }
         }
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32, .z64pd1, .z128pd1, .c1k32pd1, .k16pd1:
+                return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
-            case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
-            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
+            case .a128pd2, .a64pd2, .aw64pd1, .a128pd1, .a64pd1: return "acoop"
+            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .pk64pd1, .pk16pd1:
+                return "pair"
             case .g2k32pd1: return "dual"
-            case .csk32pd2: return "cs"
-            case .csa128pd2: return "csa"
-            case .i4k128pd2: return "i4"
-            case .i4csk128pd2: return "i4cs"
+            case .csk32pd2, .csk32pd1: return "cs"
+            case .csa128pd2, .csa128pd1: return "csa"
+            case .i4k128pd2, .i4k128pd1: return "i4"
+            case .i4csk128pd2, .i4csk128pd1: return "i4cs"
             case .csp4k16x2: return "csp"
             case .i4p4k32pd1: return "i4p"
             case .rb: return "rb"
@@ -3355,19 +3385,24 @@ enum Qwen35TensorPackedMatmul {
             case .x4p2k32pd2: return (2, 1, 2, pair)
             case .x4p4k16pd1: return (2, 1, 4, [("PD", 1), ("KH", 16), ("R", 4), ("XS", 0), ("CD", 1)])
             case .x2p2k32pd2: return (2, 2, 2, pair)
+            case .x4k32pd1: return (0, 1, 1, [("PD", 1), ("TN", 32), ("KH", 32), ("AM", 0)])
+            case .x4k128pd1: return (0, 1, 1, [("PD", 1), ("TN", 32), ("KH", 128), ("AM", 0)])
+            case .x2k32pd1: return (0, 2, 1, [("PD", 1), ("TN", 32), ("KH", 32), ("AM", 0)])
+            case .x4p2k32pd1: return (2, 1, 2, [("PD", 1), ("KH", 32), ("R", 2), ("XS", 0), ("CD", 0)])
+            case .x2p2k32pd1: return (2, 2, 2, [("PD", 1), ("KH", 32), ("R", 2), ("XS", 0), ("CD", 0)])
             default: return nil
             }
         }
-        var am: Int { [.a128pd2, .a64pd2, .aw64pd1, .csa128pd2].contains(self) ? 2 : 0 }
+        var am: Int { [.a128pd2, .a64pd2, .aw64pd1, .csa128pd2, .a128pd1, .a64pd1, .csa128pd1].contains(self) ? 2 : 0 }
         /// RB: reads the plane copy of the words (`narrowPlaneWeight`).
         var rb: Bool { self == .rb }
         /// Zoo 4: the zoo text's changes (`narrowDerivedSource`) and the body's
         /// kernel (`kernelNarrowDerived`); nil for every other body.
         var derived: (i4: Bool, cs: Bool, index: Int)? {
             switch self {
-            case .csk32pd2, .csa128pd2: return (false, true, 0)
-            case .i4k128pd2: return (true, false, 1)
-            case .i4csk128pd2: return (true, true, 2)
+            case .csk32pd2, .csa128pd2, .csk32pd1, .csa128pd1: return (false, true, 0)
+            case .i4k128pd2, .i4k128pd1: return (true, false, 1)
+            case .i4csk128pd2, .i4csk128pd1: return (true, true, 2)
             case .csp4k16x2: return (false, true, 3)
             case .i4p4k32pd1: return (true, false, 4)
             default: return nil
@@ -3378,8 +3413,8 @@ enum Qwen35TensorPackedMatmul {
         /// (false); nil for every other body.
         var zoo2Pair: Bool? {
             switch self {
-            case .k16pd2, .k16pd4, .w128k32pd1, .g2k32pd1: return false
-            case .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2, .i4p4k32pd1: return true
+            case .k16pd2, .k16pd4, .w128k32pd1, .g2k32pd1, .c1k32pd1, .k16pd1: return false
+            case .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2, .i4p4k32pd1, .pk16pd1: return true
             default: return nil
             }
         }
@@ -3401,6 +3436,9 @@ enum Qwen35TensorPackedMatmul {
             case .i4p4k32pd1: return [("PD", 1), ("KH", 32), ("R", 4), ("XS", 0), ("CD", 1)]
             case .p4k16x1: return [("PD", 1), ("KH", 16), ("R", 4), ("XS", 1), ("CD", 1)]
             case .p5k16pd1: return [("PD", 1), ("KH", 16), ("R", 5), ("XS", 2), ("CD", 1)]
+            case .c1k32pd1: return [("PD", 1), ("TN", 32), ("KH", 32), ("CD", 1), ("GS", 1), ("RC", 0)]
+            case .k16pd1: return [("PD", 1), ("TN", 32), ("KH", 16), ("CD", 0), ("GS", 1), ("RC", 0)]
+            case .pk16pd1: return [("PD", 1), ("KH", 16), ("R", 2), ("XS", 0), ("CD", 0)]
             default: return []
             }
         }
@@ -3408,7 +3446,7 @@ enum Qwen35TensorPackedMatmul {
         /// simdgroups per K quarter (the zoo's pair bodies two).
         var threads: Int {
             switch self {
-            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2: return 256
+            case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .pk64pd1, .pk16pd1: return 256
             case .p4k16pd1, .p4k16x1, .csp4k16x2, .i4p4k32pd1: return 512
             case .p5k16pd1: return 640
             default: return 128
@@ -3419,7 +3457,8 @@ enum Qwen35TensorPackedMatmul {
         var zooClasses: Set<Int> {
             switch self {
             case .k16pd4, .g2k32pd1, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p2k32pd2, .x4p4k16pd1,
-                .x2p2k32pd2, .csk32pd2, .csa128pd2, .i4k128pd2, .i4csk128pd2, .csp4k16x2, .i4p4k32pd1:
+                .x2p2k32pd2, .csk32pd2, .csa128pd2, .i4k128pd2, .i4csk128pd2, .csp4k16x2, .i4p4k32pd1,
+                .pk16pd1, .x4p2k32pd1, .x2p2k32pd1, .csk32pd1, .csa128pd1, .i4k128pd1, .i4csk128pd1:
                 return [1]
             default: return [1, 2]
             }
@@ -4537,6 +4576,45 @@ enum Qwen35TensorPackedMatmul {
         }
     }()
 
+    /// The PD1 twins (`NarrowVariant.z64pd1` .. `.i4csk128pd1`), self-tested
+    /// after RB with `narrowZooPD1Budget` of their own (the earlier groups'
+    /// budgets are unchanged), each in its family (xtg / xtgp / cs / csa / i4 /
+    /// i4cs only where that group's text built and its switch is on). Each
+    /// family's trial sets then come in pairs: its fastest body, and its
+    /// fastest PD 1 body (`.pd1`), since the load-time burst timing that ranks
+    /// a family ranks k32pd2 ahead of k32pd1 on M5 Max while verify rounds run
+    /// k32pd1 faster; and pair bodies get a wide set as well. Equal sets
+    /// collapse, and the in-situ rounds decide as before.
+    /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_PD1=0` drops all of this.
+    static let narrowZooPD1Enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_PD1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    static let narrowZooPD1Budget: Double = 10000
+    static let narrowZooPD1Variants: [NarrowVariant] = {
+        guard narrowZooPD1Enabled else { return [] }
+        func on(_ name: String) -> Bool {
+            let value = ProcessInfo.processInfo.environment[name]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !["0", "false", "no", "off"].contains(value ?? "")
+        }
+        let xtg = on("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_XTG")
+        let cs = on("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_CS")
+        let i4 = on("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_I4")
+        return [
+            NarrowVariant.z64pd1, .z128pd1, .c1k32pd1, .a128pd1, .a64pd1, .x4k32pd1, .x4k128pd1, .x2k32pd1,
+            .pk64pd1, .x4p2k32pd1, .x2p2k32pd1, .csk32pd1, .csa128pd1, .i4k128pd1, .i4csk128pd1, .k16pd1,
+            .pk16pd1,
+        ].filter {
+            if let x = $0.xtg, !xtg || kernelNarrowXTG[x.body] == nil { return false }
+            if let d = $0.derived, kernelNarrowDerived[d.index] == nil || (!cs && d.cs) || (!i4 && d.i4) {
+                return false
+            }
+            return true
+        }
+    }()
+
     /// Chooses the verify int8 kernels once, at load, on the running GPU.
     ///
     /// Self-test: every candidate runs against `original` on synthetic
@@ -4726,8 +4804,8 @@ enum Qwen35TensorPackedMatmul {
                 }
                 if narrowZoo, let name = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE"),
                     let variant = NarrowVariant(name: name), variant.family != nil,
-                    variant.xtg == nil || narrowXTGVariants.contains(variant),
-                    variant.derived == nil || narrowDerivedVariants.contains(variant)
+                    variant.xtg == nil || (narrowXTGVariants + narrowZooPD1Variants).contains(variant),
+                    variant.derived == nil || (narrowDerivedVariants + narrowZooPD1Variants).contains(variant)
                 {
                     let forced = NarrowKernel(variant: variant, form: zooForm)
                     if zooExact(forced, .float16), zooExact(forced, .float32) {
@@ -4752,8 +4830,8 @@ enum Qwen35TensorPackedMatmul {
                         let part = entry.split(separator: "=").map { $0.trimmingCharacters(in: .whitespaces) }
                         guard part.count == 2, let index = names.firstIndex(of: part[0]),
                             let variant = NarrowVariant(name: part[1]), variant.family != nil,
-                            variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5),
-                            variant.derived == nil || narrowDerivedVariants.contains(variant)
+                            variant.xtg == nil || ((narrowXTGVariants + narrowZooPD1Variants).contains(variant) && index < 5),
+                            variant.derived == nil || (narrowDerivedVariants + narrowZooPD1Variants).contains(variant)
                         else { ok = false; break }
                         let kernel = NarrowKernel(variant: variant, form: zooForm)
                         if !exact16.contains(kernel) {
@@ -4808,8 +4886,8 @@ enum Qwen35TensorPackedMatmul {
                         let part = entry.split(separator: "=").map { $0.trimmingCharacters(in: .whitespaces) }
                         guard part.count == 2, let index = names.firstIndex(of: part[0]),
                             let variant = NarrowVariant(name: part[1]), variant.family != nil,
-                            variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5),
-                            variant.derived == nil || narrowDerivedVariants.contains(variant)
+                            variant.xtg == nil || ((narrowXTGVariants + narrowZooPD1Variants).contains(variant) && index < 5),
+                            variant.derived == nil || (narrowDerivedVariants + narrowZooPD1Variants).contains(variant)
                         else { ok = false; break }
                         var kernel = NarrowKernel(variant: variant, form: zooForm)
                         if variant == .k32pd2i32, !exact16.contains(kernel) {
@@ -4933,11 +5011,17 @@ enum Qwen35TensorPackedMatmul {
     ) -> [(NarrowChoice, String, Int)] {
         let start = DispatchTime.now().uptimeNanoseconds
         var passed: [NarrowKernel] = [], failed: [NarrowKernel] = [], skipped: [NarrowKernel] = []
-        for variant in narrowZooVariants + narrowXTGVariants + narrowDerivedVariants + narrowRBVariants {
+        var pd1Start: UInt64?
+        for variant in narrowZooVariants + narrowXTGVariants + narrowDerivedVariants + narrowRBVariants
+            + narrowZooPD1Variants
+        {
             let kernel = NarrowKernel(variant: variant, form: form)
-            let budget: Double = variant.rb ? 21000
+            // the PD1 twins: a budget of their own, from their first self-test
+            let twin = narrowZooPD1Variants.contains(variant)
+            if twin, pd1Start == nil { pd1Start = DispatchTime.now().uptimeNanoseconds }
+            let budget: Double = twin ? narrowZooPD1Budget : variant.rb ? 21000
                 : (variant.derived != nil ? 17000 : (variant.xtg == nil ? 9000 : 13000))
-            if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 > budget {
+            if Double(DispatchTime.now().uptimeNanoseconds - (twin ? pd1Start! : start)) / 1e6 > budget {
                 skipped.append(kernel)
             } else if exact(kernel, .float16) {
                 passed.append(kernel)
@@ -4945,7 +5029,7 @@ enum Qwen35TensorPackedMatmul {
                 failed.append(kernel)
             }
         }
-        zooExact16 = Set(passed)
+        zooExact16.formUnion(passed)
         func names(_ kernels: [NarrowKernel]) -> String { kernels.map { "\($0.variant)" }.joined(separator: " ") }
         log += "; tzoo self-test passed [\(names(passed))]"
         if !failed.isEmpty { log += " failed [\(names(failed))]" }
@@ -5003,29 +5087,37 @@ enum Qwen35TensorPackedMatmul {
         let perRound: [Double] = [48, 64, 64, 16, 64]
         func build(_ usable: [NarrowKernel]) -> [(NarrowChoice, String, Int)] {
             var choices: [(NarrowChoice, String, Int)] = []
+            // each family's fastest body, and (PD1 twins) its fastest PD 1 body
+            let twins: [(String, Bool)] = narrowZooPD1Enabled ? [("", false), (".pd1", true)] : [("", false)]
             for family in ["k32", "wide", "acoop", "pair", "dual", "xtg", "xtgp", "cs", "csa", "i4", "i4cs", "csp", "i4p", "rb"] {
-                let members = usable.filter { $0.variant.family == family }
-                var map = byShape
-                var changed = false
-                for index in shapes.indices where classes[index] == 1 {
-                    let fit = members.filter { t[$0]![index].isFinite }
-                    if let best = fit.min(by: { t[$0]![index] < t[$1]![index] }) {
-                        map[keys[index]] = best
-                        changed = true
+                for (suffix, pd1) in twins {
+                    let members = usable.filter { $0.variant.family == family && (!pd1 || $0.variant.pd == 1) }
+                    var map = byShape
+                    var changed = false
+                    for index in shapes.indices where classes[index] == 1 {
+                        let fit = members.filter { t[$0]![index].isFinite }
+                        if let best = fit.min(by: { t[$0]![index] < t[$1]![index] }) {
+                            map[keys[index]] = best
+                            changed = true
+                        }
                     }
+                    if changed { choices.append(((fallback, map), "\(family)\(suffix)/5120", 1)) }
                 }
-                if changed { choices.append(((fallback, map), "\(family)/5120", 1)) }
             }
-            for family in ["k32", "wide", "acoop", "xtg", "rb"] {
+            for family in ["k32", "wide", "acoop", "xtg", "rb"] + (narrowZooPD1Enabled ? ["pair"] : []) {
                 func cost(_ kernel: NarrowKernel) -> Double {
                     shapes.indices.filter { classes[$0] == 2 }.reduce(0) { $0 + perRound[$1] * t[kernel]![$1] }
                 }
-                let fit = usable.filter { $0.variant.family == family && cost($0).isFinite }
-                guard let best = fit.min(by: { cost($0) < cost($1) }) else { continue }
-                var map = byShape
-                for index in shapes.indices where classes[index] == 2 { map[keys[index]] = best }
-                if best.variant.xtg == nil, !best.variant.rb { map[head] = best }
-                choices.append(((fallback, map), "\(family)/wide", 2))
+                for (suffix, pd1) in twins {
+                    let fit = usable.filter {
+                        $0.variant.family == family && (!pd1 || $0.variant.pd == 1) && cost($0).isFinite
+                    }
+                    guard let best = fit.min(by: { cost($0) < cost($1) }) else { continue }
+                    var map = byShape
+                    for index in shapes.indices where classes[index] == 2 { map[keys[index]] = best }
+                    if best.variant.xtg == nil, !best.variant.rb { map[head] = best }
+                    choices.append(((fallback, map), "\(family)\(suffix)/wide", 2))
+                }
             }
             return choices
         }
