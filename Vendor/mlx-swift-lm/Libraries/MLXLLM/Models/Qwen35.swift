@@ -382,20 +382,18 @@ enum Qwen35TrunkSubmission {
 
 // MARK: - GatedDeltaNet
 
-/// 32-bit element offsets for this file's custom kernels, the verify
-/// window's GDN prework, attention KV prework and b|a split-K partial, and
-/// the prompt window's fused chunk prep, K^T scan forms and staged b|a
-/// split-K (Apple GPUs emulate 64-bit integer arithmetic). A kernel launches
-/// its text with every `size_t` index / offset as `uint`: the same elements
-/// are read and written, and no arithmetic on values, accumulation order,
-/// thread mapping or buffer layout changes. At this model's shapes every
-/// such offset is far below 2^31 (rows times widths of 5120 / 6144 / 17408,
-/// the GDN conv's 10240 channels, 16 x 128 keys, 48 x 128 values, 24 x 256
-/// queries, prompt and verify rows) and none is negative. The stored texts
-/// stay as they are (other kernels are derived from them by anchored
-/// replacements); only the text handed to `metalKernel` changes, and only
-/// when it holds the expected number of `size_t` (otherwise the stock text,
-/// noted on stderr).
+/// 32-bit element offsets for this file's custom kernels and the verify
+/// window's GDN prework and attention KV prework (Apple GPUs emulate 64-bit
+/// integer arithmetic). A kernel launches its text with every `size_t`
+/// index / offset as `uint`: the same elements are read and written, and no
+/// arithmetic on values, accumulation order, thread mapping or buffer layout
+/// changes. At this model's shapes every such offset is far below 2^31 (rows
+/// times widths of 5120 / 6144 / 17408, the GDN conv's 10240 channels, 16 x
+/// 128 keys, 48 x 128 values, 24 x 256 queries, prompt and verify rows) and
+/// none is negative. The stored texts stay as they are (other kernels are
+/// derived from them by anchored replacements); only the text handed to
+/// `metalKernel` changes, and only when it holds the expected number of
+/// `size_t` (otherwise the stock text, noted on stderr).
 /// `MLXFAST_IO32_GDN=0` launches the stock texts.
 enum Qwen35IO32 {
     static let enabled: Bool = {
@@ -635,15 +633,11 @@ enum Qwen35GatedDeltaV3 {
     /// selects the four-row layout (samfenwick `41a687f6`, carried in
     /// terrapinelf `2e0f5f12`). Rows never mix, so the values are the same bit
     /// for bit either way. A threadgroup covers `16 * DVPL` dv rows.
-    /// `BONSAI_GDN_V3_DVPL=4` / `=2` forces the layout (no trial). Otherwise 2
-    /// until the load-time trial (`Qwen35ExactFormTrial`) picks one; the
-    /// kernels below read it once per launch.
-    static let rowsPerLaneForced: Int? = {
+    static let rowsPerLane: Int = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "4" ? 4 : value == "2" ? 2 : nil
+        return value == "4" ? 4 : 2
     }()
-    nonisolated(unsafe) static var rowsPerLane: Int = rowsPerLaneForced ?? 2
 
     fileprivate static let source = """
         constexpr int R = 16;
@@ -788,8 +782,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -800,9 +793,9 @@ enum Qwen35GatedDeltaV3 {
             [outputNeeded ? q : g, k, v, g, beta, state, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
-                ("OUTPUT_NEEDED", outputNeeded), ("DVPL", dvpl),
+                ("OUTPUT_NEEDED", outputNeeded), ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [outputNeeded ? [B, T, Hv, Dv] : [1], state.shape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
@@ -878,8 +871,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, state.shape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -887,9 +879,9 @@ enum Qwen35GatedDeltaV3 {
             [q, k, v, g, beta, state, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", dvpl),
+                ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv]],
             outputDTypes: [.float32])[0]
     }
@@ -931,8 +923,7 @@ enum Qwen35GatedDeltaV3 {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = rowsPerLane
-        guard Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0, T > 0,
+        guard Dk == 128, Dv % (16 * rowsPerLane) == 0, Hv % Hk == 0, T > 0,
             q.shape == k.shape, stateShape == [B, Hv, Dv, Dk],
             g.shape == [B, T, Hv], beta.shape == [B, T, Hv]
         else { return nil }
@@ -940,9 +931,9 @@ enum Qwen35GatedDeltaV3 {
             [q, k, v, g, beta, MLXArray(Int32(T))],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
-                ("DVPL", dvpl),
+                ("DVPL", rowsPerLane),
             ],
-            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / (16 * rowsPerLane), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], stateShape],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
@@ -5603,9 +5594,6 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
-    // Set at drafter load only after the prompt join's bitwise self-test.
-    var dFlash2PromptTapBF16 = false
-
     /// `DARKBLOOM_BONSAI_LAST_ROW_FINAL=0` keeps the final layer full width.
     static let lastRowNarrowingEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LAST_ROW_FINAL"]?
@@ -5809,131 +5797,13 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            let parts = tapped.map { $0! }
-            // Only the prompt observation changes dtype. Target residuals,
-            // verify observations and context submission boundaries stay put.
-            dFlash2Tap.tappedHidden =
-                (dFlash2PromptTapBF16 && promptForward
-                    ? Qwen35PromptTapJoin.join(parts) : nil)
-                ?? DFlash2Concat.concatenate(parts, axis: -1)
+            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
         }
         return hiddenStates
     }
 }
 
 
-
-// MARK: - Prompt observation join
-
-/// Write five prompt taps directly to their BF16 consumer buffer. This removes
-/// the target-dtype concat and its later cast, not any context or target work.
-/// `BONSAI_PROMPT_TAP_BF16=0` restores the original concat/cast path.
-enum Qwen35PromptTapJoin {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_TAP_BF16"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_prompt_tap_bf16",
-        inputNames: ["x0", "x1", "x2", "x3", "x4"],
-        outputNames: ["out"],
-        source: """
-            const uint width = uint(x0_shape[2]);
-            const uint j = thread_position_in_grid.x * 4;
-            const uint row = thread_position_in_grid.y;
-            const uint tap = thread_position_in_grid.z;
-            if (j >= width) return;
-            const uint src = row * width + j;
-            const uint dst = (row * 5 + tap) * width + j;
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 4; ++i) {
-              if (j + i < width) {
-                switch (tap) {
-                  case 0: out[dst + i] = cast_to<bfloat16_t>(x0[src + i]); break;
-                  case 1: out[dst + i] = cast_to<bfloat16_t>(x1[src + i]); break;
-                  case 2: out[dst + i] = cast_to<bfloat16_t>(x2[src + i]); break;
-                  case 3: out[dst + i] = cast_to<bfloat16_t>(x3[src + i]); break;
-                  default: out[dst + i] = cast_to<bfloat16_t>(x4[src + i]); break;
-                }
-              }
-            }
-            """,
-        ensureRowContiguous: true)
-
-    private static func launch(_ parts: [MLXArray]) -> MLXArray {
-        let shape = parts[0].shape
-        let columns = (shape[2] + 3) / 4
-        return kernel(
-            parts, grid: (columns, shape[0] * shape[1], 5),
-            threadGroup: (min(256, columns), 1, 1),
-            outputShapes: [[shape[0], shape[1], 5 * shape[2]]],
-            outputDTypes: [.bfloat16])[0]
-    }
-
-    static func join(_ parts: [MLXArray]) -> MLXArray? {
-        guard enabled, parts.count == 5, let first = parts.first,
-            first.ndim == 3, first.size > 0, first.size < Int(Int32.max) / 5,
-            [DType.float16, .float32].contains(first.dtype),
-            parts.allSatisfy({ $0.shape == first.shape && $0.dtype == first.dtype })
-        else { return nil }
-        return launch(parts)
-    }
-
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdict: Bool?
-
-    /// Called at drafter load, never from a timed forward. Both source dtypes
-    /// must pass; errors and mismatches leave the model's opt-in flag false.
-    static func prepare() -> Bool {
-        guard enabled else { return false }
-        return lock.withLock {
-            if let verdict { return verdict }
-            var same = true
-            var compared = 0
-            do {
-                try withError { error in
-                    for dtype in [DType.float16, .float32] {
-                        for (rows, width) in [(3, 37), (512, 5120)] {
-                            let parts = (0 ..< 5).map { i in
-                                (MLXRandom.normal(
-                                    [1, rows, width], key: MLXRandom.key(UInt64(901 + i)))
-                                    * Float(i + 1) * 17).asType(dtype)
-                            }
-                            let result = launch(parts)
-                            let reference = concatenated(parts, axis: -1).asType(.bfloat16)
-                            same = same && all(
-                                result.view(dtype: .uint16) .== reference.view(dtype: .uint16)
-                            ).item(Bool.self)
-                            compared += reference.size
-                        }
-                    }
-                    // Exhaustive FP16 encodings, including signed zeros,
-                    // subnormals, infinities and NaN payloads.
-                    let half = MLXArray((0 ..< 65536).map { UInt16($0) })
-                        .view(dtype: .float16).reshaped([1, 128, 512])
-                    let parts = Array(repeating: half, count: 5)
-                    let result = launch(parts)
-                    let reference = concatenated(parts, axis: -1).asType(.bfloat16)
-                    same = same && all(
-                        result.view(dtype: .uint16) .== reference.view(dtype: .uint16)
-                    ).item(Bool.self)
-                    compared += reference.size
-                    try error.check()
-                }
-            } catch {
-                same = false
-            }
-            verdict = same
-            FileHandle.standardError.write(
-                ("bonsai prompt BF16 tap join: "
-                    + (same ? "self-test passed, \(compared) values bitwise, 0 mismatches\n"
-                        : "self-test failed; original concat/cast kept\n")).data(using: .utf8)!)
-            return same
-        }
-    }
-}
 
 // MARK: - Fused gated-delta prework
 
@@ -6390,15 +6260,15 @@ enum Qwen35GDNPrework {
         else { return nil }
         let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
         let strided = freshStridedReads && B * S >= BonsaiPromptWidth.minimumRows
-        if strided, B == 1,
-            let tile = rowTileVerified(
+        if strided, B == 1, S % rowTile == 0,
+            rowTileVerified(
                 keyHeads: keyHeads, valueHeads: valueHeads, convDim: CD, taps: KS,
-                dtype: qkv.dtype, rows: S)
+                dtype: qkv.dtype)
         {
             return freshStridedRows(
                 qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtb,
                 normScales: normScales, keyHeads: keyHeads, valueHeads: valueHeads,
-                headKDim: headKDim, headVDim: headVDim, rows: tile)
+                headKDim: headKDim, headVDim: headVDim, rows: rowTile)
         }
         let outputs = (strided ? freshStridedKernel : freshKernel)(
             [qkv, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
@@ -8783,14 +8653,6 @@ enum Qwen35FusedBoundaryQ8 {
             report = selfTest(
                 unsignedGain: unsignedGain, eps: eps, transform: transform,
                 cases: [(16, 43), (16, 44)])
-        }
-        if report.passed, Qwen35BoundaryBlocks.active, Qwen35ExactFormTrial.boundaryOffered {
-            // The per-row kernel as the load-time trial's alternative: the same test.
-            Qwen35BoundaryBlocks.stock = true
-            Qwen35BoundaryBlocks.stockVerified = selfTest(
-                unsignedGain: unsignedGain, eps: eps, transform: transform,
-                cases: [(16, 43), (16, 44)]).passed
-            Qwen35BoundaryBlocks.stock = false
         }
         narrowVerdict = report.passed
         FileHandle.standardError.write(

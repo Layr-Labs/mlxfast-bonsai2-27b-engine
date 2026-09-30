@@ -1407,20 +1407,11 @@ private let dflash2GroupedConvJoinSource = """
     }
     """
 
-/// 32-bit element offsets (`Qwen35IO32`, `MLXFAST_IO32_GDN=0` keeps the stock
-/// texts) for the drafter's per-round kernels: the grouped conv, its residual,
-/// join and `_join_at` forms, the BF16 tensor matmuls (m16, m32, their swapped
-/// forms and the K-split variant), `dflash2_qk_prework_at`, the top-k chunk,
-/// threshold and merge passes, and the four-wide concat. Every narrowed offset
-/// is a non-negative element / word index below 2^31: at most (262144 context
-/// + 64) rows x 6144 columns, 32 rows x the 248320-entry vocabulary, a
-/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The headers keep
-/// their `size_t`.
 private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv_join",
     inputNames: ["h", "dyn", "base", "ctx"],
     outputNames: ["out"],
-    source: Qwen35IO32.narrow(dflash2GroupedConvJoinSource, count: 4, "dflash2_grouped_conv_join"),
+    source: dflash2GroupedConvJoinSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
 
@@ -1428,7 +1419,7 @@ private let dflash2GroupedConvKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv",
     inputNames: ["h", "dyn", "base"],
     outputNames: ["out"],
-    source: Qwen35IO32.narrow(dflash2GroupedConvSource, count: 2, "dflash2_grouped_conv"),
+    source: dflash2GroupedConvSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
 
@@ -1436,7 +1427,7 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv_residual",
     inputNames: ["h", "dyn", "base", "res"],
     outputNames: ["out"],
-    source: Qwen35IO32.narrow(dflash2GroupedConvResidualSource, count: 2, "dflash2_grouped_conv_residual"),
+    source: dflash2GroupedConvResidualSource,
     header: dflash2GroupedConvHeader,
     ensureRowContiguous: true)
 
@@ -1626,7 +1617,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m32",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source32, count: 2, "dflash2_bf16_matmul_m32"),
+        source: source32,
         header: header,
         ensureRowContiguous: true)
 
@@ -1641,7 +1632,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: source,
         header: header,
         ensureRowContiguous: true)
 
@@ -1712,7 +1703,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16s",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(sourceSwapped, count: 1, "dflash2_bf16_matmul_m16s"),
+        source: sourceSwapped,
         header: header,
         ensureRowContiguous: true)
 
@@ -1784,7 +1775,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m32s",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(sourceSwapped32, count: 2, "dflash2_bf16_matmul_m32s"),
+        source: sourceSwapped32,
         header: header,
         ensureRowContiguous: true)
 
@@ -1918,7 +1909,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: variantSource,
         header: header,
         ensureRowContiguous: true)
 
@@ -2636,8 +2627,8 @@ enum DFlash2PackedWeights {
             thread dflash2_pack12_share<KT>& t, const device uint4* mant, const device uint2* code,
             const device uint4* first4, const device uint* bases, int tile, uint lane) {
           constexpr int WORDS = KT / 16;
-          const device uint4* mp = mant + (size_t)tile * WORDS * 32 + lane;
-          const device uint2* cp = code + (size_t)tile * WORDS * 32 + lane;
+          const device uint4* mp = mant + uint(tile) * uint(WORDS * 32) + lane;
+          const device uint2* cp = code + uint(tile) * uint(WORDS * 32) + lane;
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
             t.m[j] = mp[j * 32];
@@ -2825,13 +2816,13 @@ enum DFlash2PackedWeights {
           if (dflash2_pack12_code(bits, base) == 0u) {
             const uint v = ((lane * uint(KT) + uint(i)) << 16) | bits;
             escapes[start + slot] = v;
-            if (slot < 4u) { first4[(size_t)tile * 4 + slot] = v; }
+            if (slot < 4u) { first4[uint(tile) * 4u + slot] = v; }
             slot += 1u;
           }
         }
         // Unused first words: all ones (no position matches).
         if (lane >= offsets[tile + 1] - start && lane < 4u) {
-          first4[(size_t)tile * 4 + lane] = 0xffffffffu;
+          first4[uint(tile) * 4u + lane] = 0xffffffffu;
         }
         """
 
@@ -2917,7 +2908,7 @@ enum DFlash2PackedWeights {
               v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
             }
             auto idx = cT.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+            out[uint(idx[0]) * uint(N) + uint(n0) + uint(idx[1])] = OutT(v);
           }
         }
         """
@@ -2988,8 +2979,8 @@ enum DFlash2PackedWeights {
                   + red[2][(COLS / 2 + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
-            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            out[uint(idx[0]) * uint(N) + uint(n0) + uint(idx[1])] = OutT(v0);
+            out[uint(16 + idx[0]) * uint(N) + uint(n0) + uint(idx[1])] = OutT(v1);
           }
         }
         """
@@ -3853,7 +3844,7 @@ enum DFlash2TopK {
         name: "mlxfast_dflash_topk_chunk",
         inputNames: ["logits"],
         outputNames: ["part_key", "part_idx"],
-        source: Qwen35IO32.narrow("""
+        source: """
             // grid (TPG * S, rows): threadgroup (chunk, row) reduces one chunk of a row to its top-KK
             constexpr int KK = KTOP;
             static_assert(TPG % 32 == 0 && TPG / 32 <= 32 && KK <= 32, "one merge simdgroup");
@@ -3909,7 +3900,7 @@ enum DFlash2TopK {
                     part_key[o] = ok; part_idx[o] = oi;
                 }
             }
-            """, count: 3, "mlxfast_dflash_topk_chunk"),
+            """,
         header: header)
 
     /// `MLXFAST_DFLASH_TOPK_THRESHOLD=0` keeps the one-pass chunk scan.
@@ -3985,7 +3976,7 @@ enum DFlash2TopK {
         name: "mlxfast_dflash_topk_chunk_threshold",
         inputNames: ["logits"],
         outputNames: ["part_key", "part_idx"],
-        source: Qwen35IO32.narrow("""
+        source: """
             constexpr int KK = KTOP;
             constexpr uint NSG = TPG / 32;
             static_assert(TPG % 32 == 0 && NSG <= 32 && KK <= 32 && (KK % NSG) == 0 && VEC, "shape");
@@ -4063,14 +4054,14 @@ enum DFlash2TopK {
                     part_key[o] = ok; part_idx[o] = oi;
                 }
             }
-            """, count: 3, "mlxfast_dflash_topk_chunk_threshold"),
+            """,
         header: header)
 
     private static let mergeKernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_topk_merge",
         inputNames: ["logits", "part_key", "part_idx"],
         outputNames: ["cand", "val"],
-        source: Qwen35IO32.narrow("""
+        source: """
             // one simdgroup per row merges the S chunk lists (S <= 32), then writes the
             // top-KK in the sort's ascending order, with the values gathered from logits.
             constexpr int KK = KTOP;
@@ -4093,7 +4084,7 @@ enum DFlash2TopK {
                 cand[row * KK + slot] = ii;
                 val[row * KK + slot] = logits[size_t(row) * NV + ii];
             }
-            """, count: 3, "mlxfast_dflash_topk_merge"),
+            """,
         header: header)
 }
 
@@ -5596,8 +5587,7 @@ enum DFlash2Concat {
             let kernel = MLXFast.metalKernel(
                 name: "dflash2_concat_quad\(n)",
                 inputNames: (0 ..< n).map { "x\($0)" } + ["dims"],
-                outputNames: ["out"], source: Qwen35IO32.narrow(source, count: n + 1, "dflash2_concat_quad\(n)"),
-                ensureRowContiguous: true)
+                outputNames: ["out"], source: source, ensureRowContiguous: true)
             quadKernels[n] = kernel
             return kernel
         }
@@ -6453,7 +6443,7 @@ enum DFlash2SpeculativeFront {
         name: "dflash2_grouped_conv_join_at",
         inputNames: ["h", "dyn", "base", "ctx", "cdev"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow("""
+        source: """
             const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
             const uint r = thread_position_in_grid.y;
             const uint b = thread_position_in_grid.z;
@@ -6479,7 +6469,7 @@ enum DFlash2SpeculativeFront {
               } else { v = static_cast<T>(0.0f); }
               out[(size_t(b) * R + r) * H + c] = v;
             }
-            """, count: 4, "dflash2_grouped_conv_join_at"),
+            """,
         header: dflash2GroupedConvHeader,
         ensureRowContiguous: true)
 
@@ -6504,8 +6494,7 @@ enum DFlash2SpeculativeFront {
         }
         return MLXFast.metalKernel(
             name: "dflash2_qk_prework_at", inputNames: ["y", "qw", "kw", "p", "pos", "cdev"],
-            outputNames: ["q", "k"], source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework_at"),
-            ensureRowContiguous: true)
+            outputNames: ["q", "k"], source: source, ensureRowContiguous: true)
     }()
 
     private static let lock = NSLock()

@@ -1242,8 +1242,8 @@ enum Qwen35GDNFullAcceptStore {
         guard enabled, CBv2VerifyRoundHint.proposalFromPrompt,
             !Qwen35NarrowProducerTrial.active, !Qwen35TensorPackedMatmul.NarrowInSituTrial.active,
             !Qwen35HeadTopTwo.Trial.active, !DFlash2KernelTrial.active,
-            !Qwen35ExactFormTrial.active, Qwen35GDNReplayFused.stagedActive,
-            Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer)
+            Qwen35GDNReplayFused.stagedActive, Qwen35GDNVerifyStateSkip.applies(to: layer),
+            Qwen35GDNReplayFused.applies(to: layer)
         else { return false }
         let key = geometry(layer)
         return lock.withLock { verdicts[key] ?? false }
@@ -1253,16 +1253,9 @@ enum Qwen35GDNFullAcceptStore {
         case message(String)
     }
 
-    /// The verdict for `layer`'s geometry at the current rows per lane.
-    static func verdict(layer: Qwen35GatedDeltaNet) -> Bool? {
-        let key = geometry(layer)
-        return lock.withLock { verdicts[key] }
-    }
-
     /// Once per geometry at model construction, after the state skip's and
     /// the fused replay's checks.
     static func prepare(layer: Qwen35GatedDeltaNet) {
-        Qwen35ExactFormTrial.gdnLayer = layer
         guard enabled, Qwen35GDNReplayFused.stagedActive,
             Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer)
         else { return }
@@ -1414,22 +1407,6 @@ extension Qwen35GDNPrework {
     /// chosen per chip or at run time. A chunk whose row count it does not
     /// divide takes `freshStridedKernel`.
     static let rowTile = 4
-
-    /// The tile the prompt prework takes when it divides the chunk and passed
-    /// its check (`checkRowTile`); else `rowTile`. Set by the load-time trial
-    /// (`Qwen35ExactFormTrial`) or `BONSAI_GDN_PREWORK_ROW_TILE=<n>`.
-    nonisolated(unsafe) static var rowTileChoice = rowTile
-    static let rowTileForced: Int? = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_ROW_TILE"]
-            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        return value.flatMap { [2, 8, 16].contains($0) ? $0 : nil }
-    }()
-    private struct RowTileAlternative: Hashable {
-        let geometry: RowTileGeometry, rows: Int
-    }
-    nonisolated(unsafe) private static var rowTileAlternatives: [RowTileAlternative: Bool] = [:]
-    nonisolated(unsafe) private static var preparedShape: [Int]?
-    nonisolated(unsafe) private static var rowTileForcedChecked = false
 
     /// `freshStridedSource` with one threadgroup per (key head, `RW`
     /// consecutive rows) instead of per (key head, row). The stock launch reads
@@ -1750,8 +1727,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_fresh_rows_qk_prep",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "g", "beta", "tail", "tp", "pm", "gf"],
-        source: Qwen35IO32.narrow(fusedPrepSource, count: 6, "qwen35_gdn_prework_fresh_rows_qk_prep"),
-        ensureRowContiguous: false)
+        source: fusedPrepSource, ensureRowContiguous: false)
 
     private static let narrowRowsKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_fresh_strided_rows_n",
@@ -1876,92 +1852,12 @@ extension Qwen35GDNPrework {
     /// forward); a geometry or qkv dtype that was not prepared, or failed its
     /// check, keeps the stock kernel.
     static func rowTileVerified(
-        keyHeads: Int, valueHeads: Int, convDim: Int, taps: Int, dtype: DType, rows S: Int
-    ) -> Int? {
-        guard rowTiledEnabled else { return nil }
+        keyHeads: Int, valueHeads: Int, convDim: Int, taps: Int, dtype: DType
+    ) -> Bool {
+        guard rowTiledEnabled else { return false }
         let geometry = RowTileGeometry(
             hk: keyHeads, hv: valueHeads, cd: convDim, ks: taps, dtype: "\(dtype)")
-        lastPromptDType = dtype
-        return rowTileLock.withLock { () -> Int? in
-            guard rowTileVerdicts[geometry] ?? false else { return nil }
-            let choice = rowTileChoice
-            if choice != rowTile, S % choice == 0,
-                rowTileAlternatives[RowTileAlternative(geometry: geometry, rows: choice)] ?? false
-            {
-                return choice
-            }
-            return S % rowTile == 0 ? rowTile : nil
-        }
-    }
-
-    /// Checks `rows` rows per threadgroup bit for bit against the stock launch
-    /// for the prepared geometry and every qkv dtype, through every launch
-    /// form the record's tile passed; true when all match (then `rowTileChoice`
-    /// may name it).
-    static func checkRowTile(_ rows: Int) -> Bool {
-        guard rows != rowTile, let shape = rowTileLock.withLock({ preparedShape }) else {
-            return false
-        }
-        let (hk, dk, hv, dv, ks) = (shape[0], shape[1], shape[2], shape[3], shape[4])
-        guard (hv / hk) * rows <= dk, 512 % rows == 0 else { return false }
-        let cd = 2 * hk * dk + hv * dv
-        var all = true
-        for dtype in [DType.float16, .bfloat16, .float32] {
-            let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
-            let key = RowTileAlternative(geometry: geometry, rows: rows)
-            if let known = rowTileLock.withLock({ rowTileAlternatives[key] }) {
-                all = all && known
-                continue
-            }
-            guard let record = rowTileLock.withLock({ () -> Int? in
-                (rowTileVerdicts[geometry] ?? false) ? (rowFormVerdicts[geometry] ?? 0) : nil
-            }) else { continue }
-            let passed = rowTileSelfCheck(
-                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, dtype: dtype, forms: record + 1,
-                rows: rows)
-            let verdict = passed == record + 1
-            rowTileLock.withLock { rowTileAlternatives[key] = verdict }
-            all = all && verdict
-        }
-        return all
-    }
-
-    /// The prompt qkv dtype last seen by `rowTileVerified`.
-    nonisolated(unsafe) static var lastPromptDType: DType?
-
-    /// Real-shape launch race of `tiles` rows per threadgroup (512 rows, the
-    /// prepared geometry, the prompt qkv dtype, the verified launch form):
-    /// per tile the median wall time of a burst of launches, in us. Empty on
-    /// an MLX error or without a prepared geometry.
-    static func raceRowTiles(_ tiles: [Int]) -> [Double] {
-        guard let shape = rowTileLock.withLock({ preparedShape }) else { return [] }
-        let (hk, dk, hv, dv, ks) = (shape[0], shape[1], shape[2], shape[3], shape[4])
-        let T = 512
-        let dtype = lastPromptDType ?? .float16
-        let cd = 2 * hk * dk + hv * dv
-        let width = cd + hv * dv
-        let keys = MLXRandom.split(key: MLXRandom.key(0x7261_6365), into: 6)
-        let stack = (MLXRandom.normal([1, T, width], key: keys[0])
-            * exp(MLXRandom.normal([1, T, width], key: keys[1]))).asType(dtype)
-        let qkv = stack[.ellipsis, ..<cd]
-        let ba = MLXRandom.normal([1, T, 2 * hv], key: keys[2]) * 2
-        let b = ba[.ellipsis, ..<hv]
-        let a = ba[.ellipsis, hv...]
-        let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[3]) * 0.5
-        let aDecay = Qwen35GDNDerived().decay(MLXRandom.normal([hv], key: keys[4]) * 0.5)
-        let dtBias = MLXRandom.normal([hv], key: keys[5])
-        let normScales = (q: MLXArray.ones([dk]), k: MLXArray.ones([dk]))
-        eval(stack, ba, convWeight, aDecay, dtBias, normScales.q, normScales.k)
-        let builders: [() -> [MLXArray]] = tiles.map { rows in
-            {
-                let o = freshStridedRows(
-                    qkv: qkv, convWeight: convWeight, a: a, b: b, decay: aDecay, dtb: dtBias,
-                    normScales: normScales, keyHeads: hk, valueHeads: hv, headKDim: dk,
-                    headVDim: dv, rows: rows)
-                return [o.q, o.k, o.v, o.g, o.beta, o.tail] + (o.prepared ?? [])
-            }
-        }
-        return DFlash2LaunchTrial.race(builders, copies: 8, samples: 11)
+        return rowTileLock.withLock { rowTileVerdicts[geometry] ?? false }
     }
 
     /// Compile the row-tiled kernel for this geometry and check it bit for bit
@@ -1974,17 +1870,6 @@ extension Qwen35GDNPrework {
             hv % hk == 0, (hv / hk) * rowTile <= dk, ks > 1
         else { return }
         let cd = 2 * hk * dk + hv * dv
-        rowTileLock.withLock { preparedShape = [hk, dk, hv, dv, ks] }
-        defer {
-            if let forced = rowTileForced, rowTileChoice == rowTile, !rowTileForcedChecked {
-                rowTileForcedChecked = true
-                let passed = checkRowTile(forced)
-                if passed { rowTileChoice = forced }
-                FileHandle.standardError.write(
-                    "qwen35 GDN prompt prework: \(forced) rows per threadgroup forced: bitwise check \(passed ? "passed, installed" : "FAILED, \(rowTile) kept")\n"
-                        .data(using: .utf8)!)
-            }
-        }
         for dtype in [DType.float16, .bfloat16, .float32] {
             let geometry = RowTileGeometry(hk: hk, hv: hv, cd: cd, ks: ks, dtype: "\(dtype)")
             if rowTileLock.withLock({ rowTileVerdicts[geometry] != nil }) { continue }
@@ -2014,8 +1899,7 @@ extension Qwen35GDNPrework {
     /// for bit, stopping at the first that does not (0: the row-tiled kernel
     /// does not).
     private static func rowTileSelfCheck(
-        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType, forms: Int,
-        rows rowTile: Int = Qwen35GDNPrework.rowTile
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, dtype: DType, forms: Int
     ) -> Int {
         var passed = forms
         let cd = 2 * hk * dk + hv * dv
@@ -2227,7 +2111,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -2595,17 +2479,7 @@ enum Qwen35RotationQ8Blocks {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return value == "128" ? 128 : 256
     }()
-    /// `BONSAI_ROTATION_Q8_TPB_SMALL=128` takes 128 at most 128 blocks too.
-    static let smallThreadsForced: Int? = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_ROTATION_Q8_TPB_SMALL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "128" ? 128 : nil
-    }()
-    /// The threads per block in use (the load-time trial may change them,
-    /// `Qwen35ExactFormTrial`); every form is self-tested at its first use.
-    nonisolated(unsafe) static var smallThreads = smallThreadsForced ?? 256
-    nonisolated(unsafe) static var wideThreadsInUse = wideThreads
-    static func threads(blocks: Int) -> Int { blocks <= 128 ? smallThreads : wideThreadsInUse }
+    static func threads(blocks: Int) -> Int { blocks <= 128 ? 256 : wideThreads }
 
     private struct Form: Hashable {
         let width: Int, presigned: Bool, gr: Int, gkh: Int, gd: Int
@@ -3323,12 +3197,7 @@ enum Qwen35BoundaryBlocks {
 
     /// Cleared when the 16-row self-test fails through this kernel.
     nonisolated(unsafe) static var live = true
-    /// Set when the per-row kernel is in use (the load-time trial's
-    /// alternative, `Qwen35ExactFormTrial`); `stockVerified` is its own 16-row
-    /// self-test through the same test.
-    nonisolated(unsafe) static var stock = false
-    nonisolated(unsafe) static var stockVerified: Bool?
-    static var active: Bool { enabled && live && !stock }
+    static var active: Bool { enabled && live }
 
     private static let threads = 256
 
@@ -3898,8 +3767,7 @@ extension Qwen35RotationQ8Blocks {
         guard rows < BonsaiPromptWidth.minimumRows || (prod == 3 && producerPromptGatedNorm)
         else { return nil }
         let blocks = rows * (width / 1024)
-        // The gated norm holds one head per simdgroup: always 256 threads.
-        let tpb = prod == 3 ? 256 : threads(blocks: blocks)
+        let tpb = threads(blocks: blocks)
         guard (1 ... 3).contains(prod), gr == 1 || gd % 4 == 0,
             prod != 3 || (gd == 128 && tpb == 256)
         else { return nil }
@@ -4113,7 +3981,7 @@ extension Qwen35GatedDeltaChunked {
                 : "bonsai_gated_delta_chunk_scan_fresh_kt",
             inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
             outputNames: ["y", "state_out"],
-            source: Qwen35IO32.narrow(text, count: 8, "bonsai_gated_delta_chunk_scan_fresh_kt"))
+            source: text)
     }()
 
     private struct ScanForm {
@@ -4383,401 +4251,5 @@ extension Qwen35TextModel: CBv2PromptEmbeddingPrefetching {
 extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
     public func cbv2PrefetchPromptEmbedding(_ tokens: MLXArray) {
         languageModel.cbv2PrefetchPromptEmbedding(tokens)
-    }
-}
-
-// MARK: - Exact kernel forms chosen on the device at load
-
-/// Launch parameters that were fixed from M4 measurements, or never timed on
-/// the ranked device, where a bit-identical alternative exists; after the
-/// load, outside any timed window, this device times them and keeps the
-/// faster. Every alternative computes the same values (checked bit for bit
-/// before it is offered), so tokens, rounds and acceptance never change.
-///
-/// Verify rounds (`runVerify` hooks, in the deferred boot warm after the
-/// record's trials, one engine request as `Qwen35NarrowProducerTrial`):
-/// - `dvpl4`: the GDN recurrence with four dv rows per lane (template `DVPL`,
-///   `Qwen35GatedDeltaV3.rowsPerLane`) instead of two, for the verify scan,
-///   the fused replay and the state stores. Rows never mix; checked here:
-///   `run` / `runOutputOnly` / `runFreshState` at 2 and 4 rows per lane on
-///   the same operands (1, 3 and 16 rows) bit for bit, then the derived
-///   kernels' own self-tests (state skip, fused replay, full-accept store)
-///   at 4 rows per lane, which must reach the verdicts they reached at 2.
-/// - `tpb128`, `wide128`: the per-block quantizing rotations
-///   (`Qwen35RotationQ8Blocks`, plain and SwiGLU / attention-gate producer)
-///   with 128 threads per 1024-block instead of 256, at most 128 blocks
-///   (6144 wide) and above (17408 wide). Each form is compared bit for bit
-///   with the stock kernel before its first use (the arm's first round,
-///   untimed); a failing form keeps the stock kernel, the same values.
-/// - `rowkernel`: the verify boundary on the per-row kernel instead of
-///   `Qwen35BoundaryBlocks` (80 threadgroups of 256); offered only when the
-///   16-row self-test passed through both.
-/// Round 0 and each arm's first round warm up; then the arms rotate for
-/// `roundsPerArm` rounds each, rounds above 1.5x their arm's median dropped,
-/// and an alternative is kept only when its median round beats the record's
-/// by more than `adoptMargin`.
-///
-/// Prompt (`runPromptRows`): the GDN prompt prework with 8 or 2 rows per
-/// threadgroup instead of 4 (`checkRowTile`: every launch form the record's
-/// tile passed, bit for bit against the stock launch, three dtypes), raced
-/// at the real prompt shape. (Whole prompt forwards are too coarse for it:
-/// 2.36 s each on the M4 Max, arms within 0.02 %.)
-///
-/// `BONSAI_EXACT_TRIALS=0` keeps every record form (no trial, no extra
-/// self-test). Per item (default on): `BONSAI_TRIAL_GDN_DVPL`,
-/// `BONSAI_TRIAL_ROTATION_TPB`, `BONSAI_TRIAL_BOUNDARY`,
-/// `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced form skips its item:
-/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
-/// `BONSAI_ROTATION_Q8_TPB_SMALL=128`, `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
-/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
-enum Qwen35ExactFormTrial {
-    private static func on(_ name: String) -> Bool {
-        let value = ProcessInfo.processInfo.environment[name]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }
-
-    static let enabled = on("BONSAI_EXACT_TRIALS")
-    static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
-    static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
-    static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
-    static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
-
-    /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
-    static var boundaryOffered: Bool { boundaryWanted && Qwen35BoundaryBlocks.enabled }
-
-    /// A GDN layer of the model (its geometry and parameters for the checks).
-    nonisolated(unsafe) static weak var gdnLayer: Qwen35GatedDeltaNet?
-
-    /// One alternative: `set(true)` installs it, `set(false)` the record's form.
-    struct Arm {
-        let name: String
-        let knob: String
-        let set: (Bool) -> Void
-    }
-
-    static let roundsPerArm = 8
-    static let adoptMargin = 0.005
-
-    nonisolated(unsafe) static var active = false
-    nonisolated(unsafe) private static var arms: [Arm] = []
-    nonisolated(unsafe) private static var roundTimes: [[UInt64]] = []
-    nonisolated(unsafe) private static var roundIndex = 0
-    nonisolated(unsafe) private static var lastBoundary: UInt64 = 0
-    nonisolated(unsafe) private static var onEnough: (() -> Void)?
-    nonisolated(unsafe) private static var checks: [String] = []
-
-    /// Boundaries the request needs: round 0 and one warm round per arm
-    /// (untimed), `roundsPerArm` timed rounds per arm, and the closing one.
-    static var roundsNeeded: Int { 2 + arms.count * (1 + roundsPerArm) }
-
-    private static func install(_ arms: [Arm], _ chosen: Int?) {
-        for arm in arms.dropFirst() { arm.set(false) }
-        if let chosen, chosen > 0 { arms[chosen].set(true) }
-    }
-
-    // MARK: Verify rounds
-
-    /// Builds the verify arms (running their checks); true when any is offered.
-    static func prepareVerify() -> Bool {
-        arms = []
-        checks = []
-        guard enabled else { return false }
-        var list = [Arm(name: "record", knob: "", set: { _ in })]
-        if dvplWanted, gdnLayer == nil { checks.append("dvpl4 not offered (no GDN layer)") }
-        if dvplWanted, Qwen35GatedDeltaV3.enabled, Qwen35GatedDeltaV3.rowsPerLaneForced == nil,
-            Qwen35GatedDeltaV3.rowsPerLane == 2, !Qwen35GDNReplayBatch.enabled,
-            let layer = gdnLayer
-        {
-            let (passed, detail) = dvplCheck(layer: layer)
-            checks.append("dvpl4 " + (passed ? "passed" : "FAILED") + " (\(detail))")
-            if passed {
-                list.append(Arm(name: "dvpl4", knob: "dvpl") {
-                    Qwen35GatedDeltaV3.rowsPerLane = $0 ? 4 : 2
-                })
-            }
-        }
-        if rotationWanted, Qwen35RotationQ8Blocks.enabled {
-            if Qwen35RotationQ8Blocks.smallThreadsForced == nil {
-                list.append(Arm(name: "tpb128", knob: "small") {
-                    Qwen35RotationQ8Blocks.smallThreads = $0 ? 128 : 256
-                })
-            }
-            if Qwen35RotationQ8Blocks.wideThreads == 256 {
-                list.append(Arm(name: "wide128", knob: "wide") {
-                    Qwen35RotationQ8Blocks.wideThreadsInUse = $0 ? 128 : 256
-                })
-            }
-        }
-        if boundaryWanted, Qwen35BoundaryBlocks.active {
-            let verdict = Qwen35BoundaryBlocks.stockVerified
-            checks.append(
-                "rowkernel " + (verdict == true ? "passed" : verdict == false ? "FAILED" : "untested"))
-            if verdict == true {
-                list.append(Arm(name: "rowkernel", knob: "boundary") {
-                    Qwen35BoundaryBlocks.stock = $0
-                })
-            }
-        }
-        guard list.count > 1 else {
-            if !checks.isEmpty || enabled {
-                FileHandle.standardError.write(
-                    ("bonsai exact forms trial (verify rounds): nothing offered"
-                        + (checks.isEmpty ? "" : "; checks: " + checks.joined(separator: ", "))
-                        + "\n").data(using: .utf8)!)
-            }
-            return false
-        }
-        arms = list
-        return true
-    }
-
-    @inline(__always) static func roundBoundary() {
-        guard active else { return }
-        boundary()
-    }
-
-    private static func arm(round: Int) -> Int { round == 0 ? 0 : (round - 1) % arms.count }
-
-    private static func boundary() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        let ended = roundIndex - 1
-        if ended > arms.count { roundTimes[arm(round: ended)].append(now - lastBoundary) }
-        lastBoundary = now
-        install(arms, arm(round: roundIndex))
-        roundIndex += 1
-        if roundIndex >= roundsNeeded {
-            active = false
-            install(arms, nil)
-            let enough = onEnough
-            onEnough = nil
-            enough?()
-        }
-    }
-
-    static func begin(onEnough: @escaping () -> Void) {
-        roundTimes = [[UInt64]](repeating: [], count: arms.count)
-        roundIndex = 0
-        lastBoundary = 0
-        self.onEnough = onEnough
-        active = true
-    }
-
-    private static func median(_ values: [Double]) -> Double? {
-        guard !values.isEmpty else { return nil }
-        let sorted = values.sorted()
-        let mid = sorted.count / 2
-        return sorted.count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
-    }
-
-    /// Per arm: the median after dropping samples above 1.5x the median, and
-    /// how many were kept.
-    private static func filtered(_ times: [[Double]]) -> [(Double?, Int)] {
-        times.map { t in
-            guard let first = median(t) else { return (nil, 0) }
-            let kept = t.filter { $0 <= 1.5 * first }
-            return (median(kept), kept.count)
-        }
-    }
-
-    /// Per knob, the arm with the lowest median among those beating the
-    /// record's by more than `margin` (with at least `minKept` samples each).
-    private static func choose(
-        _ arms: [Arm], _ stats: [(Double?, Int)], margin: Double, minKept: Int
-    ) -> [Int] {
-        guard let base = stats[0].0, stats[0].1 >= minKept else { return [] }
-        var best: [String: Int] = [:]
-        for i in arms.indices.dropFirst() {
-            guard let t = stats[i].0, stats[i].1 >= minKept, t < base * (1 - margin) else { continue }
-            if let j = best[arms[i].knob], let tj = stats[j].0, tj <= t { continue }
-            best[arms[i].knob] = i
-        }
-        return best.values.sorted()
-    }
-
-    private static func report(
-        _ title: String, _ arms: [Arm], _ stats: [(Double?, Int)], _ adopted: [Int],
-        elapsed: UInt64, unit: Double = 1e6
-    ) {
-        func ms(_ v: Double?) -> String { v.map { String(format: "%.2f", $0 / unit) } ?? "-" }
-        var parts: [String] = []
-        for (i, arm) in arms.enumerated() {
-            var text = "\(arm.name) \(ms(stats[i].0)) ms (\(stats[i].1))"
-            if i > 0, let t = stats[i].0, let b = stats[0].0 {
-                text += String(format: " %+.2f%%", (t / b - 1) * 100)
-            }
-            parts.append(text)
-        }
-        let line = "bonsai exact forms trial (\(title)): " + parts.joined(separator: " | ")
-            + "; adopted " + (adopted.isEmpty ? "none (record)" : adopted.map { arms[$0].name }.joined(separator: ", "))
-            + (checks.isEmpty ? "" : "; checks: " + checks.joined(separator: ", "))
-            + String(format: " (%.0f ms)\n", Double(elapsed) / 1e6)
-        FileHandle.standardError.write(line.data(using: .utf8)!)
-    }
-
-    /// Ends the verify trial: installs the choice, logs one line.
-    static func finishVerify(elapsedNanoseconds: UInt64) {
-        active = false
-        onEnough = nil
-        guard !arms.isEmpty else { return }
-        let stats = filtered(roundTimes.map { $0.map { Double($0) } })
-        let adopted = choose(arms, stats, margin: adoptMargin, minKept: 4)
-        install(arms, nil)
-        for i in adopted { arms[i].set(true) }
-        report("verify rounds", arms, stats, adopted, elapsed: elapsedNanoseconds)
-        roundTimes = []
-        arms = []
-        checks = []
-    }
-
-    /// GDN recurrence at 2 and 4 rows per lane, bit for bit, then the derived
-    /// kernels' self-tests at 4 (restoring 2 whatever happens).
-    private static func dvplCheck(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
-        let hk = layer.numKHeads
-        let dk = layer.headKDim
-        let hv = layer.numVHeads
-        let dv = layer.headVDim
-        guard dk == 128, dv % 64 == 0, hv % hk == 0 else { return (false, "geometry") }
-        defer { Qwen35GatedDeltaV3.rowsPerLane = 2 }
-        let before = (
-            Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer),
-            Qwen35GDNFullAcceptStore.verdict(layer: layer))
-        let stagedBefore = Qwen35GDNReplayFused.stagedLive
-        var values = 0
-        var mismatches = 0
-        do {
-            try withError { error in
-                let keys = MLXRandom.split(key: MLXRandom.key(0x4456_504c), into: 6)
-                for T in [1, 3, 16] {
-                    func spread(_ shape: [Int], _ i: Int) -> MLXArray {
-                        MLXRandom.normal(shape, key: keys[i])
-                            * exp(MLXRandom.normal(shape, key: keys[(i + 3) % 6]))
-                    }
-                    let q = spread([1, T, hk, dk], 0) * 0.1
-                    let k = spread([1, T, hk, dk], 1) * 0.1
-                    let v = spread([1, T, hv, dv], 2)
-                    let g = MLXRandom.uniform(0.5 ..< 1.0, [1, T, hv], key: keys[3])
-                    let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[4])
-                    let state = spread([1, hv, dv, dk], 5)
-                    var outs: [[MLXArray]] = []
-                    for rows in [2, 4] {
-                        Qwen35GatedDeltaV3.rowsPerLane = rows
-                        var o: [MLXArray] = []
-                        if let r = Qwen35GatedDeltaV3.run(
-                            q: q, k: k, v: v, g: g, beta: beta, state: state)
-                        {
-                            o += [r.0, r.1]
-                        }
-                        if let y = Qwen35GatedDeltaV3.runOutputOnly(
-                            q: q, k: k, v: v, g: g, beta: beta, state: state)
-                        {
-                            o.append(y)
-                        }
-                        if let r = Qwen35GatedDeltaV3.runFreshState(
-                            q: q, k: k, v: v, g: g, beta: beta, stateShape: state.shape)
-                        {
-                            o += [r.0, r.1]
-                        }
-                        eval(o)
-                        outs.append(o)
-                    }
-                    Qwen35GatedDeltaV3.rowsPerLane = 2
-                    guard outs[0].count == 5, outs[1].count == 5 else {
-                        throw SelfTestFailure.message("a launch declined")
-                    }
-                    var differ: [MLXArray] = []
-                    for (a, b) in zip(outs[0], outs[1]) {
-                        differ.append(
-                            (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
-                        values += a.size
-                    }
-                    let count = stacked(differ).sum()
-                    eval(count)
-                    try error.check()
-                    mismatches += Int(count.item(Int32.self))
-                }
-            }
-        } catch {
-            Qwen35GatedDeltaV3.rowsPerLane = 2
-            return (false, "\(error)")
-        }
-        guard mismatches == 0 else { return (false, "\(values) values, \(mismatches) mismatches") }
-        // The derived kernels at 4 rows per lane (each against the stock
-        // kernel at 4, now equal to it at 2 bit for bit).
-        Qwen35GatedDeltaV3.rowsPerLane = 4
-        Qwen35GDNVerifyStateSkip.prepare(layer: layer)
-        Qwen35GDNReplayFused.prepare(layer: layer)
-        Qwen35GDNFullAcceptStore.prepare(layer: layer)
-        let after = (
-            Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer),
-            Qwen35GDNFullAcceptStore.verdict(layer: layer))
-        Qwen35GatedDeltaV3.rowsPerLane = 2
-        let stagedSame = Qwen35GDNReplayFused.stagedLive == stagedBefore
-        if !stagedSame { Qwen35GDNReplayFused.stagedLive = stagedBefore }
-        Memory.clearCache()
-        let derivedSame = after.0 == before.0 && after.1 == before.1 && after.2 == before.2
-            && stagedSame
-        return (
-            derivedSame,
-            "\(values) values bitwise, 0 mismatches; derived kernels "
-                + (derivedSame ? "same verdicts" : "DIFFERENT verdicts"))
-    }
-
-    private enum SelfTestFailure: Error {
-        case message(String)
-    }
-
-    // MARK: Prompt prework tiles
-
-    static let rowsMargin = 0.02
-
-    /// The prompt prework's rows per threadgroup: 8 and 2 are checked bit for
-    /// bit (`checkRowTile`), then raced against 4 at the real prompt shape
-    /// (512 rows, the model's geometry and prompt qkv dtype;
-    /// `Qwen35GDNPrework.raceRowTiles`), and the fastest is installed only
-    /// when it beats 4 by more than `rowsMargin` in the race and in a
-    /// confirmation race. One stderr line.
-    static func runPromptRows() {
-        guard promptRowsWanted, Qwen35GDNPrework.rowTiledEnabled,
-            Qwen35GDNPrework.rowTileForced == nil,
-            Qwen35GDNPrework.rowTileChoice == Qwen35GDNPrework.rowTile
-        else { return }
-        let start = DispatchTime.now().uptimeNanoseconds
-        var tiles = [Qwen35GDNPrework.rowTile]
-        var notes: [String] = []
-        for rows in [8, 2] {
-            let passed = Qwen35GDNPrework.checkRowTile(rows)
-            notes.append("\(rows) rows " + (passed ? "passed" : "FAILED"))
-            if passed { tiles.append(rows) }
-        }
-        var line = "bonsai exact forms trial (prompt prework rows): bitwise " + notes.joined(separator: ", ")
-        defer {
-            line += String(format: " (%.0f ms)\n", Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
-            FileHandle.standardError.write(line.data(using: .utf8)!)
-        }
-        guard tiles.count > 1 else {
-            line += "; 4 kept"
-            return
-        }
-        let first = Qwen35GDNPrework.raceRowTiles(tiles)
-        guard first.count == tiles.count else {
-            line += "; race failed, 4 kept"
-            return
-        }
-        line += "; race us:" + zip(tiles, first).map { " \($0) " + String(format: "%.1f", $1) }.joined()
-        var best = 0
-        for i in tiles.indices.dropFirst() where first[i] < first[best] { best = i }
-        guard best > 0, first[best] < first[0] * (1 - rowsMargin) else {
-            line += "; 4 kept"
-            return
-        }
-        let again = Qwen35GDNPrework.raceRowTiles([tiles[0], tiles[best]])
-        guard again.count == 2, again[1] < again[0] * (1 - rowsMargin) else {
-            line += "; \(tiles[best]) not confirmed" + (again.count == 2
-                ? String(format: " (%.1f vs %.1f)", again[1], again[0]) : "") + ", 4 kept"
-            return
-        }
-        Qwen35GDNPrework.rowTileChoice = tiles[best]
-        line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
     }
 }
