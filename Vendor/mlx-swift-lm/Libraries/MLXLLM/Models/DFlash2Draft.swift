@@ -2177,19 +2177,27 @@ enum DFlash2TensorMatmul {
     struct SwapTiling: Hashable, CustomStringConvertible {
         var kt: Int, splits: Int, ahead: Int?
         var description: String { "t\(kt)s\(splits)" + (ahead.map { "a\($0)" } ?? "") }
-        func fits(k: Int) -> Bool { k % splits == 0 && (k / splits) % kt == 0 }
+        /// The split's slabs are whole K steps, and the packed kernel's fold
+        /// buffer (`red`: splits - 1 slabs of 16 x cols floats per 16 rows)
+        /// fits 32 KB of threadgroup memory (split 16: 15 or 30 KB at the
+        /// default 16 columns).
+        func fits(_ shape: SwapShape) -> Bool {
+            shape.k % splits == 0 && (shape.k / splits) % kt == 0
+                && (ahead == nil || (splits - 1) * (shape.rows32 ? 2 : 1) * DFlash2PackedWeights.cols * 64 <= 32768)
+        }
 
         init(kt: Int, splits: Int, ahead: Int? = nil) { (self.kt, self.splits, self.ahead) = (kt, splits, ahead) }
 
         /// `t<KT>s<S>` for the swapped kernel (KT 64, 128 or 256) or
         /// `t<tile>s<S>a<A>` for the packed one (A 0, 1 or 2), `standard`'s
-        /// kernel only; S 2, 4, 8, or 0 for `standard`'s split.
+        /// kernel only; S 2, 4, 8 (the packed kernel also 16), or 0 for
+        /// `standard`'s split.
         init?(name: String, standard: SwapTiling) {
             let v = name.split(whereSeparator: { "tsa".contains($0) }).compactMap { Int($0) }
             let packed = standard.ahead != nil
             guard v.count == (packed ? 3 : 2), name == "t\(v[0])s\(v[1])" + (packed ? "a\(v[2])" : ""),
                 (packed ? [DFlash2PackedWeights.ks] : [64, 128, 256]).contains(v[0]),
-                [0, 2, 4, 8].contains(v[1]), !packed || (0 ... 2).contains(v[2])
+                (packed ? [0, 2, 4, 8, 16] : [0, 2, 4, 8]).contains(v[1]), !packed || (0 ... 2).contains(v[2])
             else { return nil }
             self.init(kt: v[0], splits: v[1] == 0 ? standard.splits : v[1], ahead: packed ? v[2] : nil)
         }
@@ -2226,8 +2234,9 @@ enum DFlash2TensorMatmul {
     /// The block-width kernels' tiling per drafter projection shape, chosen
     /// at the deferred load warm, on the kernel the record runs there: the
     /// packed 12-bit kernel when `DFlash2PackedWeights` is on (splits 2, 4,
-    /// 8 by look-ahead 0, 1, 2), else the swapped BF16 kernel (K steps 64,
-    /// 128, 256 by splits 2, 4, 8). Each candidate runs on every weight of its
+    /// 8 by look-ahead 0, 1, 2, and split 16 by look-ahead 0 and 1), else
+    /// the swapped BF16 kernel (K steps 64, 128, 256 by splits 2, 4, 8).
+    /// Each candidate runs on every weight of its
     /// shape against the standard (BF16 outputs): bitwise (`=`) or close (`~`:
     /// every value within one BF16 ulp of its row's largest magnitude), else
     /// dropped. A sample is one evaluation of a chain of launches over the
@@ -2267,11 +2276,14 @@ enum DFlash2TensorMatmul {
             return sequence.map { $0.0 }.filter { seen.insert($0).inserted }
         }
 
+        /// DSG2's (splits 2, 4, 8 by look-ahead 0, 1, 2 on the packed kernel,
+        /// by K step on the swapped one), then on the packed kernel split 16
+        /// by look-ahead 0 and 1, where its fold buffer fits (`fits`).
         private static var list: [String] {
             listed ?? [2, 4, 8].flatMap { s in
                 packed
                     ? (0 ... 2).map { "t\(DFlash2PackedWeights.ks)s\(s)a\($0)" } : [64, 128, 256].map { "t\($0)s\(s)" }
-            }
+            } + (packed ? (0 ... 1).map { "t\(DFlash2PackedWeights.ks)s16a\($0)" } : [])
         }
 
         private static func log(_ line: String) {
@@ -2303,7 +2315,7 @@ enum DFlash2TensorMatmul {
             let lines = forced.split(separator: ",").map { entry -> String in
                 let parts = entry.split(separator: "=").map(String.init)
                 guard parts.count == 2, let shape = shapes.first(where: { "\($0)" == parts[0] }),
-                    let t = SwapTiling(name: parts[1], standard: shape.standard(packed: packed)), t.fits(k: shape.k)
+                    let t = SwapTiling(name: parts[1], standard: shape.standard(packed: packed)), t.fits(shape)
                 else { return "\(entry) ignored (not a shape and fitting tiling)" }
                 guard let c = check(t, shape), c.within else { return "\(shape)=\(t) FAILED its check" }
                 swapTilings[shape] = t
@@ -2385,7 +2397,7 @@ enum DFlash2TensorMatmul {
                 let std = shape.standard(packed: packed)
                 var (opts, tags) = ([std], ["="])
                 for name in list {
-                    guard let t = SwapTiling(name: name, standard: std), t.fits(k: shape.k), !opts.contains(t)
+                    guard let t = SwapTiling(name: name, standard: std), t.fits(shape), !opts.contains(t)
                     else { continue }
                     guard let c = check(t, shape) else { errors += 1; continue }
                     guard c.within else { far += 1; continue }
