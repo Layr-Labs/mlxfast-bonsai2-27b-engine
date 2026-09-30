@@ -4,7 +4,6 @@ import MLXFastCore
 
 /// pack's `quantization` block.
 ///
-/// The pack is UNIFORM: MLX affine, 2 bits, group size 128, and the contract
 /// fixture records `mixed_precision: false`. There is no per-tensor override
 /// table, so the three scalars ARE the whole block and a fourth key is
 /// refused rather than half-read.

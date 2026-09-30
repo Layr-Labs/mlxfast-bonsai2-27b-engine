@@ -1424,6 +1424,9 @@ open class ArraysCache: BaseKVCache {
         public let mask: MLXArray?
         public let rowCount: Int
         public let convStateRows: Int
+        /// Gates already formed by this verify's prework; nil for other tapes.
+        public let g: MLXArray?
+        public let beta: MLXArray?
 
         public init(
             convInput: MLXArray,
@@ -1435,7 +1438,9 @@ open class ArraysCache: BaseKVCache {
             ssmPre: MLXArray?,
             mask: MLXArray?,
             rowCount: Int,
-            convStateRows: Int
+            convStateRows: Int,
+            g: MLXArray? = nil,
+            beta: MLXArray? = nil
         ) {
             self.convInput = convInput
             self.q = q
@@ -1447,6 +1452,8 @@ open class ArraysCache: BaseKVCache {
             self.mask = mask
             self.rowCount = rowCount
             self.convStateRows = convStateRows
+            self.g = g
+            self.beta = beta
         }
     }
 
