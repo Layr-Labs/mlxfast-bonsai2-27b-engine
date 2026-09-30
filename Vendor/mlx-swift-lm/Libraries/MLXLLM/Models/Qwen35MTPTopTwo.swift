@@ -3328,96 +3328,6 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
-    // The verify-width kernel for the same toolchain: each simdgroup expands
-    // its own 32 x 128 tile per group into its threadgroup region
-    // (double-buffered, simdgroup-scoped sync). 32 columns, 4 simdgroups.
-    private static let sourceNarrowStaged = """
-        const int K = ksz[0]; const int M = 16; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const int gper = Kg / 4;
-        const int g0 = int(sg) * gper;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)x, dextents<int, 2>(K, M));
-        // per-simdgroup staged tile: 32 columns x 128 codes as nibbles = 2 KB; double-buffered
-        threadgroup uint32_t bs[4][2][32 * 128 / 8];
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)bs[sg][0], dextents<int, 2>(128, 32));
-        tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)bs[sg][1], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, float>();
-        constexpr int CAP = 16;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + n0 + fn);
-        const device half4* sp1 = (const device half4*)(scalesT + n0 + fn + 16);
-        const device half4* bp0 = (const device half4*)(biasesT + n0 + fn);
-        const device half4* bp1 = (const device half4*)(biasesT + n0 + fn + 16);
-        const int NQ = N / 4;
-        // staging: lane l -> column l (32 columns), all 128 codes of the group = 8 words -> 16 nibble words
-        const device uint32_t* wrow = w + (size_t)(n0 + int(lane)) * (K / 16);
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v0 = src[0]; const uint4 v1 = src[1];
-          threadgroup uint32_t* dst = bs[sg][buf] + int(lane) * 16;
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < 8; j++) {
-            const uint32_t wv = (j < 4) ? v0[j] : v1[j - 4];
-            uint32_t lo = wv & 0xFFFFu; uint32_t hi = wv >> 16;
-            lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
-            hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
-            dst[2 * j] = lo; dst[2 * j + 1] = hi;
-          }
-        };
-        stage(g0, 0);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = g0; g < g0 + gper; g++) {
-          const int cur = (g - g0) & 1;
-          if (g + 1 < g0 + gper) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
-          const float rs0 = rowsum[(size_t)fm * Kg + g];
-          const float rs1 = rowsum[(size_t)(fm + 8) * Kg + g];
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            acc[i] = fma(s, cT[i], fma(b, mh ? rs1 : rs0, acc[i]));
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        threadgroup float red[3][16 * 32];
-        if (sg > 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) { red[sg - 1][i * 32 + lane] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const float v = acc[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
-          }
-        }
-        """
-
-    private static let kernelNarrowStaged = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_u4",
-        inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowStaged,
-        header: header,
-        ensureRowContiguous: true)
-
     private static let dimsLock = NSLock()
     nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
     private static func dimsArray(k: Int, m: Int, n: Int) -> MLXArray {
@@ -4730,7 +4640,7 @@ enum Qwen35TensorPackedMatmul {
     /// the record's pick with the family's fastest body on each N = 5120 shape
     /// (k32, wide, acoop, pair, dual, xtg, xtgp), and the record's pick with
     /// the family's fastest body over the wide shapes on all of them and the
-    /// head (k32, wide, acoop; xtg without the head). Every body on a wide
+    /// head (k32, wide, acoop, pair; xtg without the head). Every body on a wide
     /// shape passes the FP32 self-test too.
     /// With the record's own candidates that is more than four sets, so the
     /// in-situ trial runs in two stages (`NarrowInSituTrial`).
@@ -5302,7 +5212,7 @@ enum Qwen35TensorPackedMatmul {
                 }
                 if changed { choices.append(((fallback, map), "\(family)/5120", 1)) }
             }
-            for family in ["k32", "wide", "acoop", "xtg", "rb"] {
+            for family in ["k32", "wide", "acoop", "pair", "xtg", "rb"] {
                 func cost(_ kernel: NarrowKernel) -> Double {
                     shapes.indices.filter { classes[$0] == 2 }.reduce(0) { $0 + perRound[$1] * t[kernel]![$1] }
                 }
@@ -5844,7 +5754,7 @@ extension Qwen35TensorPackedMatmul {
         /// with 32-bit indices (`i32`, narrowZoo32's promoted trick).
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32"
+                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32,p1t,p1c2,p1c2t,p2t,p2c2t,p4t,p4c2t,p8c2,p8c2t,p16,p16t"
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
