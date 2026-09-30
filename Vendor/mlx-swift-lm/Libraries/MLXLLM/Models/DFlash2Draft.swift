@@ -1256,7 +1256,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
 /// Kill switch for the tap-0 convolution joined to its context rows (default on).
 private let dflash2ConvJoinEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_CONV_JOIN"]
-    else { return false }
+    else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
@@ -4736,7 +4736,7 @@ enum DFlash2Concat {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_ONE_LAUNCH_CONCAT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     static let smallEnabled: Bool = {
@@ -5046,7 +5046,7 @@ enum DFlash2StridedRMSNorm {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_STRIDED_NORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -5226,7 +5226,7 @@ enum DFlash2QKPrework {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_QK_PREWORK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let kernel = MLXFast.metalKernel(
@@ -5420,7 +5420,7 @@ enum DFlash2SwiGLU {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SWIGLU"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     /// The trial's verdict per dtype and width (set at bind by `prepare`):
