@@ -770,13 +770,30 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Same fold as the scalar loop; store four consecutive columns as
+          // float4/half4. Layout: i groups of 4 share mh,nq with c=0..3.
+          // Alignment: fn in {0,4,8,12}, n0 multiple of TN, N multiple of 32.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            float v = acc[i];
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float v0 = acc[i];
+            float v1 = acc[i + 1];
+            float v2 = acc[i + 2];
+            float v3 = acc[i + 3];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
+            for (int q = 0; q < 4 - 1; q++) {
+              v0 += red[q][i * 32 + lane];
+              v1 += red[q][(i + 1) * 32 + lane];
+              v2 += red[q][(i + 2) * 32 + lane];
+              v3 += red[q][(i + 3) * 32 + lane];
+            }
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -2928,8 +2945,24 @@ enum Qwen35TensorPackedMatmul {
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint tid = thread_position_in_threadgroup.x;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
-        const int ns0 = int(threadgroup_position_in_grid.x) * (32 * SGN * CT) + 32 * CT * int(sg);
+        // SWZ > 0: the supertile tile order (`sourceStaged8RegBase`) over this
+        // form's column blocks; the same tiles and work per tile.
+        int mtile = int(threadgroup_position_in_grid.y);
+        int cblock = int(threadgroup_position_in_grid.x);
+        if (SWZ > 0) {
+          const int NB = N / (32 * SGN * CT);
+          const int MT = M / 32;
+          const int fid = mtile * NB + cblock;
+          const int per = SWZ * MT;
+          const int st = fid / per;
+          const int rem = NB - st * SWZ;
+          const int wd = rem < SWZ ? rem : SWZ;
+          const int r = fid - st * per;
+          mtile = r / wd;
+          cblock = st * SWZ + (r - mtile * wd);
+        }
+        const int ms = mtile * 32;
+        const int ns0 = cblock * (32 * SGN * CT) + 32 * CT * int(sg);
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
@@ -3038,6 +3071,180 @@ enum Qwen35TensorPackedMatmul {
         source: sourcePlaneForms,
         header: header,
         ensureRowContiguous: true)
+
+    // The forms' `d` variant (`PlaneForm.db`, AT 0 only): two destination
+    // tiles in turn, so each op is issued before the epilogue of the op
+    // before it and the tensor op of one (group, column tile) can run while
+    // the FP32 epilogue of the previous one does. Job j = g CT + t in
+    // ascending order; job j + 1 goes to the other destination. Every
+    // accumulator still takes its groups in ascending order with the same
+    // operands, fma chain and stores, so every output is the forms' (and the
+    // plane kernel's) bit for bit. Derived from `sourcePlaneForms` by one
+    // checked replacement of its group loop; nil if an anchor is missing (no
+    // `d` form is then offered). A separate kernel, so a `d` form that fails
+    // to build is dropped by the trial alone and leaves the other forms.
+    private static let sourcePlaneFormsDB: String? = {
+        let text = sourcePlaneForms
+        let head = "if (AT) {\n  stageA(0, 0);"
+        let tail = "#pragma clang loop unroll(full)\nfor (int t = 0; t < CT; t++) {\n  const int nb = ns0 + 32 * t + fn;"
+        let heads = text.components(separatedBy: head)
+        guard heads.count == 2 else { return nil }
+        let tails = heads[1].components(separatedBy: tail)
+        guard tails.count == 2 else { return nil }
+        let loop = """
+                auto cU = op.template get_destination_cooperative_tensor<AOpT, decltype(bT), int32_t>();
+                // `u` (a constant at every call): 0 the destination cT, 1 cU.
+                auto issue = [&](int g, int t, int u) {
+                  load(t, g); extract();
+                  auto tA = A.template slice<128, 32>(g * 128, ms);
+                  if (u == 0) { op.run(tA, bT, cT); } else { op.run(tA, bT, cU); }
+                };
+                auto epi = [&](int g, int t, int u) {
+                  const float2 a0 = *(const device float2*)(ascale + tb0 + (size_t)g * 64);
+                  const float2 a1 = *(const device float2*)(ascale + tb1 + (size_t)g * 64);
+                  const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);
+                  const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);
+                  const float as[4] = {a0.x, a0.y, a1.x, a1.y};
+                  const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+                  const int nb = ns0 + 32 * t + fn;
+                  const float4 s0 = float4(*(const device half4*)(scalesT + nb + (size_t)g * N));
+                  const float4 s1 = float4(*(const device half4*)(scalesT + nb + 16 + (size_t)g * N));
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i++) {
+                    const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                    const float s = nh ? s1[c] : s0[c];
+                    const int32_t v = u == 0 ? cT[i] : cU[i];
+                    acc[t][i] = fma(s, fma(as[mh], float(v), -rb[mh]), acc[t][i]);
+                  }
+                };
+                // Jobs j = g CT + t; j even in cT, j odd in cU. CT is 1 or 2,
+                // so an even job's column tile is 0 and an odd job's is CT - 1.
+                constexpr int t1 = CT - 1;
+                const int J = Kg * CT;
+                issue(0, 0, 0);
+                for (int j = 0; j < J; j += 2) {
+                  if (j + 1 < J) { issue((j + 1) / CT, t1, 1); }
+                  epi(j / CT, 0, 0);
+                  if (j + 1 < J) {
+                    if (j + 2 < J) { issue((j + 2) / CT, 0, 0); }
+                    epi((j + 1) / CT, t1, 1);
+                  }
+                }
+
+        """
+        return heads[0] + loop + tail + tails[1]
+    }()
+
+    private static let kernelPlaneFormsDB: MLXFast.MLXFastKernel? = sourcePlaneFormsDB.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_q8_rpfd",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
+
+    // The forms' `r` variant (`PlaneForm.rt == 2`, CT 1 and AT 0 only): each
+    // simdgroup takes two row tiles, rows ms ... ms + 31 into cT and
+    // ms + 32 ... ms + 63 into cU, and runs both ops against the one right
+    // operand it loads and extracts per group, so a 512-row prompt streams
+    // and expands each weight tile 8 times instead of 16. The two ops are
+    // independent, so the second can run while the first one's epilogue does.
+    // Each tile's op, epilogue (the second tile's row constants sit 2 further
+    // in the 64-row constant tile) and stores are the forms' own, so every
+    // output is the plane kernel's bit for bit. grid (N / (32 SGN) * 32 SGN,
+    // M / 64, 1). Derived from `sourcePlaneForms` by checked replacements; nil
+    // if an anchor is missing (no `r` form is then offered). A separate
+    // kernel, so an `r` form that fails to build is dropped by the trial alone.
+    private static let sourcePlaneFormsR2: String? = {
+        var text = sourcePlaneForms
+        for (anchor, replacement) in [
+            ("const int MT = M / 32;", "const int MT = M / 64;"),
+            ("const int ms = mtile * 32;", "const int ms = mtile * 64;"),
+        ] {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        let head = "if (AT) {\n  stageA(0, 0);"
+        let heads = text.components(separatedBy: head)
+        guard heads.count == 2 else { return nil }
+        let body = """
+                float acc2[CAP];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < CAP; i++) { acc2[i] = 0.0f; }
+                auto cU = op.template get_destination_cooperative_tensor<AOpT, decltype(bT), int32_t>();
+                const size_t tc0 = tb0 + 2;
+                const size_t tc1 = tb1 + 2;
+                for (int g = 0; g < Kg; g++) {
+                  load(0, g); extract();
+                  auto tA = A.template slice<128, 32>(g * 128, ms);
+                  auto tB = A.template slice<128, 32>(g * 128, ms + 32);
+                  op.run(tA, bT, cT);
+                  op.run(tB, bT, cU);
+                  const int nb = ns0 + fn;
+                  const float4 s0 = float4(*(const device half4*)(scalesT + nb + (size_t)g * N));
+                  const float4 s1 = float4(*(const device half4*)(scalesT + nb + 16 + (size_t)g * N));
+                  {
+                    const float2 a0 = *(const device float2*)(ascale + tb0 + (size_t)g * 64);
+                    const float2 a1 = *(const device float2*)(ascale + tb1 + (size_t)g * 64);
+                    const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);
+                    const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);
+                    const float as[4] = {a0.x, a0.y, a1.x, a1.y};
+                    const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < CAP; i++) {
+                      const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                      const float s = nh ? s1[c] : s0[c];
+                      acc[0][i] = fma(s, fma(as[mh], float(cT[i]), -rb[mh]), acc[0][i]);
+                    }
+                  }
+                  {
+                    const float2 a0 = *(const device float2*)(ascale + tc0 + (size_t)g * 64);
+                    const float2 a1 = *(const device float2*)(ascale + tc1 + (size_t)g * 64);
+                    const float2 r0 = *(const device float2*)(rsb + tc0 + (size_t)g * 64);
+                    const float2 r1 = *(const device float2*)(rsb + tc1 + (size_t)g * 64);
+                    const float as[4] = {a0.x, a0.y, a1.x, a1.y};
+                    const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < CAP; i++) {
+                      const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+                      const float s = nh ? s1[c] : s0[c];
+                      acc2[i] = fma(s, fma(as[mh], float(cU[i]), -rb[mh]), acc2[i]);
+                    }
+                  }
+                }
+                {
+                  const int nb = ns0 + fn;
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < CAP; i += 4) {
+                    const int nh = (i >> 3) & 1;
+                    const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+                    const size_t base = (size_t)mm * N + nb + 16 * nh;
+                    const size_t base2 = base + (size_t)32 * N;
+                    if constexpr (sizeof(OutT) == sizeof(float)) {
+                      *(device float4*)(out + base) = float4(acc[0][i], acc[0][i + 1], acc[0][i + 2], acc[0][i + 3]);
+                      *(device float4*)(out + base2) = float4(acc2[i], acc2[i + 1], acc2[i + 2], acc2[i + 3]);
+                    } else {
+                      *(device half4*)(out + base) = half4(half(acc[0][i]), half(acc[0][i + 1]), half(acc[0][i + 2]), half(acc[0][i + 3]));
+                      *(device half4*)(out + base2) = half4(half(acc2[i]), half(acc2[i + 1]), half(acc2[i + 2]), half(acc2[i + 3]));
+                    }
+                  }
+                }
+
+        """
+        return heads[0] + body
+    }()
+
+    private static let kernelPlaneFormsR2: MLXFast.MLXFastKernel? = sourcePlaneFormsR2.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_q8_rpfr",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
 
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
@@ -5227,10 +5434,12 @@ enum Qwen35TensorPackedMatmul {
                             PlaneFormTrial.note(
                                 key, .init(plane: plane, tiled: words, scalesT: scalesT, biasesT: biasesT,
                                            folded: foldedSums))
-                        } else if let form = PlaneFormTrial.form(key, m: m) {
-                            return launchPlaneForm(
+                        } else if let form = PlaneFormTrial.form(key, m: m),
+                            let out = launchPlaneForm(
                                 form, codes, plane, scalesT, biasesT, foldedSums, activation.scales,
                                 activation.scaledSums, k: k, m: m, n: n, outputDType: outputDType)
+                        {
+                            return out
                         }
                         return planeKernel(
                             [codes, plane, scalesT, biasesT, foldedSums,
@@ -5362,11 +5571,22 @@ extension Qwen35TensorPackedMatmul {
     /// One form of the plane kernel (`sourcePlaneForms`): `p<SGN>` SGN
     /// simdgroups per threadgroup (1 ... 16), `c2` two column tiles per
     /// simdgroup, `t` the activation slice staged in threadgroup memory (e.g.
-    /// `p4`, `p8t`, `p2c2`). `p2` is the plane kernel's own tiling in the
-    /// forms' text (the rows' constants loaded before the op, not after it).
-    /// Every form's outputs are the plane kernel's bit for bit.
+    /// `p4`, `p8t`, `p2c2`), `s<W>` the supertile tile order over W of the
+    /// form's column blocks (`p2s32`; see `sourceStaged8RegBase`; none: the
+    /// stock x-fastest order), `d` (after `c2`, without `t`) two destination
+    /// tiles in turn (`sourcePlaneFormsDB`: each op issued before the previous
+    /// op's epilogue; `p4d`, `p2c2d`, `p4ds8`), `r` (after `d`; without `c2`,
+    /// `t` or `d`) two row tiles per simdgroup against one extracted right
+    /// operand (`sourcePlaneFormsR2`; `p4r`, `p8rs8`). `p2` is the plane kernel's own
+    /// tiling in the forms' text (the rows' constants loaded before the op,
+    /// not after it).
+    /// Every form's outputs are the plane kernel's bit for bit: the tile
+    /// order moves no work between tiles.
     struct PlaneForm: Hashable, CustomStringConvertible {
-        let sgn: Int, ct: Int, at: Int
+        let sgn: Int, ct: Int, at: Int, swz: Int
+        let db: Bool
+        /// Row tiles per simdgroup: 1, or 2 for an `r` form.
+        let rt: Int
         let name: String
 
         init?(name raw: String) {
@@ -5380,15 +5600,35 @@ extension Qwen35TensorPackedMatmul {
             var ct = 1, at = 0
             if rest.hasPrefix("c2") { ct = 2; rest = rest.dropFirst(2) }
             if rest.hasPrefix("t") { at = 1; rest = rest.dropFirst(1) }
+            var db = false
+            if rest.hasPrefix("d") {
+                guard at == 0 else { return nil }
+                db = true
+                rest = rest.dropFirst(1)
+            }
+            var rt = 1
+            if rest.hasPrefix("r") {
+                guard ct == 1, at == 0, !db else { return nil }
+                rt = 2
+                rest = rest.dropFirst(1)
+            }
+            var swz = 0
+            if rest.hasPrefix("s") {
+                rest = rest.dropFirst()
+                let width = rest.prefix { $0.isNumber }
+                guard let value = Int(width), (1 ... 4096).contains(value) else { return nil }
+                swz = value
+                rest = rest.dropFirst(width.count)
+            }
             guard rest.isEmpty, sgn * ct <= 16 else { return nil }
-            (self.sgn, self.ct, self.at) = (sgn, ct, at)
+            (self.sgn, self.ct, self.at, self.swz, self.db, self.rt) = (sgn, ct, at, swz, db, rt)
             self.name = name
         }
 
         var description: String { name }
         /// Columns per threadgroup; a launch needs `n` to be a multiple.
         var columns: Int { 32 * sgn * ct }
-        func fits(n: Int, m: Int) -> Bool { n % columns == 0 && m % 32 == 0 }
+        func fits(n: Int, m: Int) -> Bool { n % columns == 0 && m % (32 * rt) == 0 }
     }
 
     /// One launch of a plane form over the plane copy `plane` (same inputs as
@@ -5397,11 +5637,15 @@ extension Qwen35TensorPackedMatmul {
         _ form: PlaneForm, _ codes: MLXArray, _ plane: MLXArray, _ scalesT: MLXArray,
         _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
         k: Int, m: Int, n: Int, outputDType: DType
-    ) -> MLXArray {
-        kernelPlaneForms(
+    ) -> MLXArray? {
+        guard let kernel = form.rt == 2 ? kernelPlaneFormsR2 : form.db ? kernelPlaneFormsDB : kernelPlaneForms
+        else { return nil }
+        return kernel(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
-            template: [("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at)],
-            grid: (n / form.columns * 32 * form.sgn, m / 32, 1), threadGroup: (32 * form.sgn, 1, 1),
+            template: [
+                ("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at), ("SWZ", form.swz),
+            ],
+            grid: (n / form.columns * 32 * form.sgn, m / (32 * form.rt), 1), threadGroup: (32 * form.sgn, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
     }
 
@@ -5481,7 +5725,7 @@ extension Qwen35TensorPackedMatmul {
 
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p2,p4,p8,p8t"
+                ?? "p2,p4,p8,p8t,p2s16,p2s32,p4s8,p4s16,p8s8,p8ts8,p2d,p4d,p8d,p2c2d,p4c2d,p4ds8,p2r,p4r,p8r,p4rs8,p8rs8"
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
