@@ -9,6 +9,15 @@ import MLX
 
 extension EngineLoopV2 {
 
+    /// `MLXFAST_DEFER_ROUND_RELEASE=0` releases the finished round's arrays
+    /// in place at replacement. Independent of the block-release switch.
+    static let deferRoundRelease: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DEFER_ROUND_RELEASE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+
     /// Execute a plan containing MTP work. Graph construction includes seed
     /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
     /// decode neighbors, and per-request prefill chunks.
@@ -93,6 +102,9 @@ extension EngineLoopV2 {
         if graph.verify != nil || !graph.seedRows.isEmpty
             || !graph.committedObservationRows.isEmpty || !graph.prefillCarries.isEmpty
         {
+            if Self.deferRoundRelease, let previous = step.mtpRound {
+                CBv2MTPDeferredRelease.hold(previous)
+            }
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
