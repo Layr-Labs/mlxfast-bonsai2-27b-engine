@@ -5826,6 +5826,16 @@ enum Qwen35PromptTapJoin {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// `BONSAI_PROMPT_TAP_VEC=0` keeps the per-element join. On (default),
+    /// a width that is a multiple of four reads each tap's four columns with
+    /// one vector load and writes the four BF16 casts with one packed store;
+    /// the same cast of the same value lands at the same index.
+    static let vectorEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_TAP_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_prompt_tap_bf16",
         inputNames: ["x0", "x1", "x2", "x3", "x4"],
@@ -5838,6 +5848,19 @@ enum Qwen35PromptTapJoin {
             if (j >= width) return;
             const uint src = row * width + j;
             const uint dst = (row * 5 + tap) * width + j;
+            if constexpr (VEC) {
+              const device InT* xs = tap == 0 ? x0 : tap == 1 ? x1 : tap == 2 ? x2
+                  : tap == 3 ? x3 : x4;
+              const vec<InT, 4> v = *((const device vec<InT, 4>*)(xs + src));
+              const bfloat16_t b0 = cast_to<bfloat16_t>(v[0]);
+              const bfloat16_t b1 = cast_to<bfloat16_t>(v[1]);
+              const bfloat16_t b2 = cast_to<bfloat16_t>(v[2]);
+              const bfloat16_t b3 = cast_to<bfloat16_t>(v[3]);
+              *((device uint2*)(out + dst)) = uint2(
+                  uint(as_type<ushort>(b0)) | (uint(as_type<ushort>(b1)) << 16u),
+                  uint(as_type<ushort>(b2)) | (uint(as_type<ushort>(b3)) << 16u));
+              return;
+            }
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
               if (j + i < width) {
@@ -5856,8 +5879,10 @@ enum Qwen35PromptTapJoin {
     private static func launch(_ parts: [MLXArray]) -> MLXArray {
         let shape = parts[0].shape
         let columns = (shape[2] + 3) / 4
+        let vector = vectorEnabled && shape[2] % 4 == 0
         return kernel(
-            parts, grid: (columns, shape[0] * shape[1], 5),
+            parts, template: [("InT", parts[0].dtype), ("VEC", vector)],
+            grid: (columns, shape[0] * shape[1], 5),
             threadGroup: (min(256, columns), 1, 1),
             outputShapes: [[shape[0], shape[1], 5 * shape[2]]],
             outputDTypes: [.bfloat16])[0]
@@ -5925,8 +5950,6 @@ enum Qwen35PromptTapJoin {
         }
     }
 }
-
-
 
 // MARK: - Fused gated-delta prework
 
