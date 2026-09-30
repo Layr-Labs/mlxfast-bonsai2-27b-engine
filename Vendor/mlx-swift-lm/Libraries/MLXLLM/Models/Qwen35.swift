@@ -1216,7 +1216,7 @@ enum Qwen35GDNReplayBatch {
         // The operands are read in place, so their strides must be final: a
         // verify's tape is evaluated before its round finalizes (a no-op
         // wait here); an unevaluated tape is waited for, never misread.
-        eval(inputs)
+        Qwen35GDNReplayFused.evalUnlessAvailable(inputs)
         for operand in operands {
             let tape = operand.tape
             guard rowContiguousAfterLeading(tape.k), rowContiguousAfterLeading(tape.v),
@@ -10209,12 +10209,11 @@ extension Qwen35TextModel: DFlash2TapTarget {
             // this 248,320-entry vocabulary is mostly rare multilingual
             // pieces. The drafter scores only the leading rows (the same rows
             // of the same head, computed the same way), which cuts its head
-            // read and its top-k scan by about 60%. A token past the prefix is
-            // never proposed, so that draft position falls to the target's
-            // own token, as any wrong draft does: the target decides every
-            // emitted token. On the public captures 99.9% of the expected
-            // tokens sit below id 100,000. `MLXFAST_DFLASH_VOCAB_ROWS` sets
-            // the prefix; 0 restores the full head.
+            // read and its top-k scan by about 67%. This head cannot draft a
+            // token past the prefix; prompt lookup may still propose one.
+            // The target decides every emitted token. The cutoff can change
+            // draft acceptance. `MLXFAST_DFLASH_VOCAB_ROWS` sets the prefix;
+            // 0 restores the full head.
             let reading =
                 Self.drafterVocabularyRows > 0
                 ? (head.leadingRows(Self.drafterVocabularyRows) ?? head) : head
@@ -10223,11 +10222,11 @@ extension Qwen35TextModel: DFlash2TapTarget {
         return lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
 
-    /// 100,352 = 98 x 1024: the leading rows the drafter scores (see above).
+    /// 81,920 = 80 x 1024: the leading rows the drafter scores (see above).
     static let drafterVocabularyRows: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_VOCAB_ROWS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return max(0, raw.flatMap { Int($0) } ?? 100_352)
+        return max(0, raw.flatMap { Int($0) } ?? 81_920)
     }()
 
     /// The arrays of this target a DFlash 2 decode window reads that its seed
