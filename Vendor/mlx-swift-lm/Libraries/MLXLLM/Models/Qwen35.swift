@@ -5926,8 +5926,6 @@ enum Qwen35PromptTapJoin {
     }
 }
 
-
-
 // MARK: - Fused gated-delta prework
 
 /// The gated-delta layer's prework between the input projection and the
