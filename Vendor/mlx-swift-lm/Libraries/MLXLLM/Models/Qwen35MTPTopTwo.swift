@@ -770,30 +770,13 @@ enum Qwen35TensorPackedMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          // Same fold as the scalar loop; store four consecutive columns as
-          // float4/half4. Layout: i groups of 4 share mh,nq with c=0..3.
-          // Alignment: fn in {0,4,8,12}, n0 multiple of TN, N multiple of 32.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i += 4) {
-            const int mh = (i >> 2) & 1;
-            const int nq = i >> 3;
-            float v0 = acc[i];
-            float v1 = acc[i + 1];
-            float v2 = acc[i + 2];
-            float v3 = acc[i + 3];
+          for (int i = 0; i < CAP; i++) {
+            float v = acc[i];
             #pragma clang loop unroll(full)
-            for (int q = 0; q < 4 - 1; q++) {
-              v0 += red[q][i * 32 + lane];
-              v1 += red[q][(i + 1) * 32 + lane];
-              v2 += red[q][(i + 2) * 32 + lane];
-              v3 += red[q][(i + 3) * 32 + lane];
-            }
-            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nq;
-            if constexpr (sizeof(OutT) == sizeof(float)) {
-              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
-            } else {
-              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
-            }
+            for (int q = 0; q < 4 - 1; q++) { v += red[q][i * 32 + lane]; }
+            const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
+            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nq] = OutT(v);
           }
         }
         """
@@ -2058,25 +2041,6 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
-    // k32pd2 with narrow element offsets; all pointer types stay unchanged.
-    private static let sourceNarrowInt8Zoo32: String? = {
-        guard sourceNarrowInt8Zoo.components(separatedBy: "size_t").count == 15 else { return nil }
-        return sourceNarrowInt8Zoo.replacingOccurrences(of: "size_t", with: "uint")
-    }()
-
-    private static let kernelNarrowInt8Zoo32: MLXFast.MLXFastKernel? = sourceNarrowInt8Zoo32.map {
-        MLXFast.metalKernel(
-            name: "bonsai_tensor_packed_matmul_m16_i8z32",
-            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
-    }
-
-    private static func narrowZoo32Fits(k: Int, n: Int, m: Int) -> Bool {
-        guard m == 16, k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
-        let limit = Int(Int32.max)
-        return k <= limit / 16 && n <= limit / 16 && n <= limit / (k / 16)
-    }
-
     private static let kernelNarrowInt8Zoo = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8z",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -2458,13 +2422,87 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
-    private static let kernelNarrowRB: MLXFast.MLXFastKernel? = MLXFast.metalKernel(
-        name: "bonsai_tensor_packed_matmul_m16_i8rb",
-        inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-        outputNames: ["out"],
-        source: sourceNarrowInt8RB,
-        header: header,
-        ensureRowContiguous: true)
+    private static let kernelNarrowRB: MLXFast.MLXFastKernel? = {
+        let prefetched = narrowRBPrefetch ? sourceNarrowInt8RBPrefetched : nil
+        return MLXFast.metalKernel(
+            name: prefetched != nil ? "bonsai_tensor_packed_matmul_m16_i8rbf" : "bonsai_tensor_packed_matmul_m16_i8rb",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"],
+            source: prefetched ?? sourceNarrowInt8RB,
+            header: header,
+            ensureRowContiguous: true)
+    }()
+
+    /// On unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_RB_PREFETCH=0`: the RB
+    /// body issues the next group's two plane loads before building this
+    /// group's operand and running its op, so their latency overlaps the op
+    /// and the epilogue (a 13-round drafter-driven local window measured
+    /// 370.3/370.3 ms against 373.5/374.3 ms without it, on the same
+    /// register-built plane body). The same loads, values and arithmetic in
+    /// the same order: the body stays bitwise the stock one and is checked
+    /// against it at load exactly as RB is.
+    static let narrowRBPrefetch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_RB_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `sourceNarrowInt8RB` with its plane loads one group ahead: `build`
+    /// takes the loaded words, and the loop loads group g + 1's words before
+    /// building group g's operand. Nil if an anchor is missing (RB as is).
+    private static let sourceNarrowInt8RBPrefetched: String? = {
+        var text = sourceNarrowInt8RB
+        let edits: [(String, String)] = [
+            ("auto build = [&](int g) {\n  const device uint4* src = wpl + (size_t)g * 64;\n  const uint4 lo = src[0]; const uint4 hi = src[1];\n",
+             "auto build = [&](const uint4 lo, const uint4 hi) {\n"),
+            ("for (int g = g0; g < g0 + gper; g++) {\n  build(g);\n",
+             "uint4 nlo = wpl[(size_t)g0 * 64]; uint4 nhi = wpl[(size_t)g0 * 64 + 1];\nfor (int g = g0; g < g0 + gper; g++) {\n  const uint4 clo = nlo; const uint4 chi = nhi;\n  if (g + 1 < g0 + gper) { nlo = wpl[(size_t)(g + 1) * 64]; nhi = wpl[(size_t)(g + 1) * 64 + 1]; }\n  build(clo, chi);\n"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    // VZ (`NarrowVariant.vz`): the zoo body's text (`sourceNarrowInt8Zoo`, at
+    // k32pd2's templates) with VB of its 32-column blocks per threadgroup.
+    // Simdgroup s takes block s / 4 and K quarter s % 4 and runs the zoo body's
+    // code on it unchanged (the words ring, the staging into its own region, the
+    // ops, the epilogue in ascending group order, the quarter fold through its
+    // block's own reduction buffer in simdgroup order, the stores), so every
+    // output is k32pd2's bit for bit with k32pd2's live registers per
+    // simdgroup; the blocks share each group's activation slice through the
+    // core's cache. VBAR = 1 adds an execution barrier (no memory scope) every
+    // CD groups, so the blocks' same-quarter simdgroups load it together (it
+    // holds all of the threadgroup's simdgroups, every quarter). nil if an
+    // anchor is missing (no VZ body is then offered). grid (N / (TN VB) * 128
+    // VB), threadgroup (128 VB); inputs as the zoo body's.
+    private static let sourceNarrowInt8VZ: String? = {
+        var text = sourceNarrowInt8Zoo
+        let edits: [(String, String)] = [
+            ("const int n0 = int(threadgroup_position_in_grid.x) * TN;",
+             "const int n0 = (int(threadgroup_position_in_grid.x) * VB + int(simdgroup_index_in_threadgroup) / 4) * TN;"),
+            ("const uint sg = simdgroup_index_in_threadgroup;", "const uint sg = simdgroup_index_in_threadgroup % 4;"),
+            ("threadgroup uint32_t bs[4 * SWS > RDW ? 4 * SWS : RDW];",
+             "threadgroup uint32_t bsv[VB][4 * SWS > RDW ? 4 * SWS : RDW];\n"
+                + "threadgroup uint32_t* bs = bsv[int(simdgroup_index_in_threadgroup) / 4];"),
+            ("for (int g = g0; g < g1; g += CD) {",
+             "for (int g = g0; g < g1; g += CD) {\n  if (VBAR != 0) { threadgroup_barrier(mem_flags::mem_none); }"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    private static let kernelNarrowVZ: MLXFast.MLXFastKernel? = sourceNarrowInt8VZ.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8vz",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
 
     /// The plane copy (`planeWeight`) of a synthetic operand set's tiled
     /// words for the load-time checks of the RB body (one per words object,
@@ -2778,14 +2816,40 @@ enum Qwen35TensorPackedMatmul {
     // only: signed codes, negated offsets, factored epilogue, row-tiled
     // constants and the tiled word copy. grid (N / 64 * 64, M / 32, 1),
     // threadgroup (64, 1, 1); inputs as `sourceStaged8`. Four-wide stores.
-    private static let sourceStaged8Reg = """
+    //
+    // Tile order (`promptSwizzleWidth`, `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE`):
+    // the grid is walked x fastest, so with the stock map (width 0) every row
+    // tile of the prompt streams the whole word matrix again (the gate|up
+    // words alone are 44.6 MB a pass, more than the last-level cache). The
+    // supertile map keeps the same set of 32 x 64 tiles and the same work per
+    // tile (every output bit is unchanged), but numbers them so that SWZ
+    // column blocks are walked for every row tile before the next SWZ
+    // blocks: the words of those blocks stay cached across the M / 32 row
+    // tiles and the activations of a row tile across its SWZ blocks. The
+    // last supertile may be narrower (N / 64 need not divide by SWZ).
+    private static let sourceStaged8RegBase = """
 
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
-        const int ns = int(threadgroup_position_in_grid.x) * 64 + 32 * int(sg);
+        constexpr int SWZ = __PROMPT_SWZ__;
+        int mtile = int(threadgroup_position_in_grid.y);
+        int cblock = int(threadgroup_position_in_grid.x);
+        if (SWZ > 0) {
+          const int NB = N / 64;
+          const int MT = M / 32;
+          const int fid = mtile * NB + cblock;
+          const int per = SWZ * MT;
+          const int st = fid / per;
+          const int rem = NB - st * SWZ;
+          const int wd = rem < SWZ ? rem : SWZ;
+          const int r = fid - st * per;
+          mtile = r / wd;
+          cblock = st * SWZ + (r - mtile * wd);
+        }
+        const int ms = mtile * 32;
+        const int ns = cblock * 64 + 32 * int(sg);
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
@@ -2860,6 +2924,23 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
+    /// Column blocks per supertile of the register-weight prompt kernels'
+    /// tile order (see `sourceStaged8RegBase`): the stock x-fastest order (0)
+    /// unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE` names a count
+    /// (e.g. 32). Default off: the box read the timed prefill +1.45% slower on
+    /// every pair with the supertile order on (669f2e4e), against a 0.05% spread.
+    static let promptSwizzleWidth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PROMPT_SWIZZLE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
+        else { return 0 }
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        guard let value = Int(raw) else { return 32 }
+        return min(max(value, 0), 4096)
+    }()
+
+    private static let sourceStaged8Reg: String = sourceStaged8RegBase.replacingOccurrences(
+        of: "__PROMPT_SWZ__", with: String(promptSwizzleWidth))
+
     private static let kernelStaged8Reg = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_rb",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
@@ -2924,7 +3005,6 @@ enum Qwen35TensorPackedMatmul {
     // op from there. grid (N / (32 SGN CT) * 32 SGN, M / 32, 1), threadgroup
     // (32 SGN, 1, 1); inputs as the plane kernel's (the plane copy).
     private static let sourcePlaneForms = """
-        typedef typename metal::conditional<IO32 != 0, uint, size_t>::type IndexT;
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
         const uint lane = thread_index_in_simdgroup;
@@ -2954,13 +3034,13 @@ enum Qwen35TensorPackedMatmul {
           for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
         }
         const int NQ = N / 4;
-        const IndexT tb0 = (IndexT)(ms / 64) * (IndexT)Kg * 64 + (IndexT)(fm * 4) + (IndexT)((ms & 32) >> 4);
-        const IndexT tb1 = tb0 + 32;
+        const size_t tb0 = (size_t)(ms / 64) * (size_t)Kg * 64 + (size_t)(fm * 4) + (size_t)((ms & 32) >> 4);
+        const size_t tb1 = tb0 + 32;
         // The plane kernel's words, extracts and epilogue, per column tile t.
         uint4 wv[2];
         auto load = [&](int t, int g) {
-          const device uint4* wcol = (const device uint4*)(w + (IndexT)((ns0 + 32 * t) >> 5) * (IndexT)Kg * 256) + lane * 2;
-          const device uint4* src = wcol + (IndexT)g * 64;
+          const device uint4* wcol = (const device uint4*)(w + (size_t)((ns0 + 32 * t) >> 5) * (size_t)Kg * 256) + lane * 2;
+          const device uint4* src = wcol + (size_t)g * 64;
           #pragma clang loop unroll(full)
           for (int c = 0; c < 2; c++) { wv[c] = src[c]; }
         };
@@ -2978,7 +3058,7 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int e = int(tid); e < 32 * 128 / 16; e += 32 * SGN) {
             const int r = e >> 3; const int q = e & 7;
-            abuf[buf][e] = *(const device uint4*)(xq + (IndexT)(ms + r) * (IndexT)K + (IndexT)g * 128 + 16 * q);
+            abuf[buf][e] = *(const device uint4*)(xq + (size_t)(ms + r) * (size_t)K + (size_t)g * 128 + 16 * q);
           }
         };
         if (AT) {
@@ -2988,10 +3068,10 @@ enum Qwen35TensorPackedMatmul {
         for (int g = 0; g < Kg; g++) {
           const int cur = g & 1;
           if (AT && g + 1 < Kg) { stageA(g + 1, cur ^ 1); }
-          const float2 a0 = *(const device float2*)(ascale + tb0 + (IndexT)g * 64);
-          const float2 a1 = *(const device float2*)(ascale + tb1 + (IndexT)g * 64);
-          const float2 r0 = *(const device float2*)(rsb + tb0 + (IndexT)g * 64);
-          const float2 r1 = *(const device float2*)(rsb + tb1 + (IndexT)g * 64);
+          const float2 a0 = *(const device float2*)(ascale + tb0 + (size_t)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tb1 + (size_t)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tb0 + (size_t)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tb1 + (size_t)g * 64);
           const float as[4] = {a0.x, a0.y, a1.x, a1.y};
           const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
           #pragma clang loop unroll(full)
@@ -3005,8 +3085,8 @@ enum Qwen35TensorPackedMatmul {
               op.run(tA, bT, cT);
             }
             const int nb = ns0 + 32 * t + fn;
-            const float4 s0 = float4(*(const device half4*)(scalesT + nb + (IndexT)g * N));
-            const float4 s1 = float4(*(const device half4*)(scalesT + nb + 16 + (IndexT)g * N));
+            const float4 s0 = float4(*(const device half4*)(scalesT + nb + (size_t)g * N));
+            const float4 s1 = float4(*(const device half4*)(scalesT + nb + 16 + (size_t)g * N));
             #pragma clang loop unroll(full)
             for (int i = 0; i < CAP; i++) {
               const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
@@ -3023,7 +3103,7 @@ enum Qwen35TensorPackedMatmul {
           for (int i = 0; i < CAP; i += 4) {
             const int nh = (i >> 3) & 1;
             const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
-            const IndexT base = (IndexT)mm * N + nb + 16 * nh;
+            const size_t base = (size_t)mm * N + nb + 16 * nh;
             if constexpr (sizeof(OutT) == sizeof(float)) {
               *(device float4*)(out + base) = float4(acc[t][i], acc[t][i + 1], acc[t][i + 2], acc[t][i + 3]);
             } else {
@@ -3040,6 +3120,47 @@ enum Qwen35TensorPackedMatmul {
         source: sourcePlaneForms,
         header: header,
         ensureRowContiguous: true)
+
+    // PF2 (`PlaneForm` q<QR>x<QC>[b][w<QW>]): the plane kernel's own text with
+    // QR x QC of its 32 x 32 tiles per threadgroup. Simdgroup sg takes row
+    // tile sg / QC and column tile sg % QC of its threadgroup's 32 QR x 32 QC
+    // block and runs the plane kernel's code on it unchanged (the op, the right
+    // operand from its own 32 bytes of the plane copy, the epilogue per element
+    // in ascending group order after the op, the stores), so every output is
+    // the plane kernel's bit for bit with the plane kernel's live registers.
+    // The blocks are numbered in the supertile order over QW block columns (0:
+    // x fastest); QB = 1 adds an execution barrier (no memory scope) at the
+    // top of every group, so the simdgroups sharing an activation slice or a
+    // weight block load it together. Only the tile coordinates and that
+    // barrier change; nil if an anchor is missing (no q form is then offered).
+    // grid (N / (32 QC) * 32 QR QC, M / (32 QR), 1), threadgroup (32 QR QC,
+    // 1, 1); inputs as the plane kernel's.
+    private static let sourcePlaneTiles: String? = {
+        guard var text = sourceStaged8RegPlane else { return nil }
+        let edits: [(String, String)] = [
+            ("constexpr int SWZ = \(promptSwizzleWidth);", "constexpr int SWZ = QW;"),
+            ("const int NB = N / 64;", "const int NB = N / (32 * QC);"),
+            ("const int MT = M / 32;", "const int MT = M / (32 * QR);"),
+            ("const int ms = mtile * 32;", "const int ms = mtile * (32 * QR) + 32 * (int(sg) / QC);"),
+            ("const int ns = cblock * 64 + 32 * int(sg);", "const int ns = cblock * (32 * QC) + 32 * (int(sg) % QC);"),
+            ("load(g); extract();", "if (QB != 0) { threadgroup_barrier(mem_flags::mem_none); }\n  load(g); extract();"),
+        ]
+        for (anchor, replacement) in edits {
+            guard text.components(separatedBy: anchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: anchor, with: replacement)
+        }
+        return text
+    }()
+
+    static let kernelPlaneTiles: MLXFast.MLXFastKernel? = sourcePlaneTiles.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_q8_rpq",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
 
     private static let kernelStaged = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u4",
@@ -3255,7 +3376,14 @@ enum Qwen35TensorPackedMatmul {
         // built in registers from the plane copy (family `rb`, every tower
         // shape but the head).
         case rb = 70
-        case k32pd2i32 = 73
+        // VZ (`sourceNarrowInt8VZ`): the base body k32pd2 with VB 32-column
+        // blocks per threadgroup (4 VB simdgroups, each running k32pd2's code
+        // on its own block and K quarter); `b` adds an execution barrier every
+        // CD groups (family `vz`, the tower shapes but the head).
+        case vz2 = 80
+        case vz4 = 81
+        case vz2b = 82
+        case vz4b = 83
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
@@ -3266,7 +3394,7 @@ enum Qwen35TensorPackedMatmul {
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
-                .i4k128pd2, .i4csk128pd2, .k32pd2i32:
+                .i4k128pd2, .i4csk128pd2, .vz2, .vz4, .vz2b, .vz4b:
                 return 2
             case .pd3, .k64pd3: return 3
             case .pd4, .k64pd4, .k32pd4, .k16pd4, .x4k16pd4: return 4
@@ -3283,7 +3411,7 @@ enum Qwen35TensorPackedMatmul {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1, .k32pd2i32:
+                .csk32pd2, .i4p4k32pd1, .vz2, .vz4, .vz2b, .vz4b:
                 return 32
             case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
@@ -3292,7 +3420,7 @@ enum Qwen35TensorPackedMatmul {
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd2i32: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4: return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
@@ -3304,6 +3432,7 @@ enum Qwen35TensorPackedMatmul {
             case .csp4k16x2: return "csp"
             case .i4p4k32pd1: return "i4p"
             case .rb: return "rb"
+            case .vz2, .vz4, .vz2b, .vz4b: return "vz"
             default: return xtg.map { $0.body == 2 ? "xtgp" : "xtg" }
             }
         }
@@ -3326,6 +3455,11 @@ enum Qwen35TensorPackedMatmul {
         var am: Int { [.a128pd2, .a64pd2, .aw64pd1, .csa128pd2].contains(self) ? 2 : 0 }
         /// RB: reads the plane copy of the words (`narrowPlaneWeight`).
         var rb: Bool { self == .rb }
+        /// VZ: column blocks per threadgroup (1 for every other body) and the
+        /// barrier every CD groups.
+        var vb: Int { [.vz2, .vz2b].contains(self) ? 2 : ([.vz4, .vz4b].contains(self) ? 4 : 1) }
+        var vbar: Int { [.vz2b, .vz4b].contains(self) ? 1 : 0 }
+        var vz: Bool { vb > 1 }
         /// Zoo 4: the zoo text's changes (`narrowDerivedSource`) and the body's
         /// kernel (`kernelNarrowDerived`); nil for every other body.
         var derived: (i4: Bool, cs: Bool, index: Int)? {
@@ -3376,6 +3510,7 @@ enum Qwen35TensorPackedMatmul {
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2: return 256
             case .p4k16pd1, .p4k16x1, .csp4k16x2, .i4p4k32pd1: return 512
             case .p5k16pd1: return 640
+            case .vz2, .vz4, .vz2b, .vz4b: return 128 * vb
             default: return 128
             }
         }
@@ -3938,7 +4073,9 @@ enum Qwen35TensorPackedMatmul {
         k: Int, n: Int, outputDType: DType
     ) -> NarrowKernel {
         let choice = narrowByShape[[k, n]] ?? narrowDefault
-        if n % choice.variant.tn != 0 { return .original }
+        if n % (choice.variant.tn * choice.variant.vb) != 0 { return .original }
+        // VZ: the tower's production shapes only (not the head)
+        if choice.variant.vz, !narrowXTGShapes.contains([k, n]) { return .original }
         // zoo 3a: only on the production shapes its self-test ran (not the head)
         if choice.variant.xtg != nil, !narrowXTGShapes.contains([k, n]) { return .original }
         // RB: the tower's production shapes only (not the head)
@@ -4296,6 +4433,16 @@ enum Qwen35TensorPackedMatmul {
                 inputs, template: Array(template.prefix(3)), grid: (n / 32 * 128, 1, 1),
                 threadGroup: (128, 1, 1), outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
         }
+        // VZ: the zoo body at k32pd2's templates, VB blocks a threadgroup.
+        if v.vz, tiled, let body = kernelNarrowVZ {
+            return body(
+                inputs,
+                template: Array(template.prefix(3)) + [
+                    ("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am), ("VB", v.vb), ("VBAR", v.vbar),
+                ],
+                grid: (n / (v.tn * v.vb) * v.threads, 1, 1), threadGroup: (v.threads, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
         // The zoo bodies read the tiled copy only (`original` otherwise).
         if let family = v.family, v.xtg == nil, tiled {
             let zooTemplate = Array(template.prefix(3))
@@ -4320,9 +4467,7 @@ enum Qwen35TensorPackedMatmul {
             }
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
-            let zooKernel = v == .k32pd2i32 && narrowZoo32Fits(k: k, n: n, m: m)
-                ? kernelNarrowInt8Zoo32 ?? kernelNarrowInt8Zoo
-                : v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            let zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
             return zooKernel(
                 inputs, template: zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)],
                 grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4437,10 +4582,10 @@ enum Qwen35TensorPackedMatmul {
     /// Zoo bodies in self-test order (the deadline cuts the last): the zoo's
     /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
-        .k32pd2, .k32pd2i32, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
+        .k32pd2, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
         .aw64pd1, .k32pd1, .pk32pd1,
         .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
-    ].filter { $0 != .k32pd2i32 || kernelNarrowInt8Zoo32 != nil }
+    ]
 
     /// Zoo 3a's bodies (`NarrowVariant.xtg`), self-tested after the zoo's
     /// with a budget of their own, and also on every production shape but the
@@ -4477,6 +4622,19 @@ enum Qwen35TensorPackedMatmul {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
     nonisolated(unsafe) static var narrowRBEvidenceUsed = false
+
+    /// VZ (`NarrowVariant.vz`): k32pd2 with 2 or 4 blocks a threadgroup, with
+    /// and without the barrier, self-tested last with 10 s of their own, FP16
+    /// and FP32, on the synthetic shapes and every tower shape (a mismatch or an
+    /// MLX error at either type drops the body); family `vz` (an N = 5120 set
+    /// and a wide set without the head). `DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_VZ=0`
+    /// drops them (and `..._TZOO_FORCE` cannot name one).
+    static let narrowVZVariants: [NarrowVariant] = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_VZ"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? ""), kernelNarrowVZ != nil else { return [] }
+        return [.vz2, .vz4, .vz2b, .vz4b]
+    }()
 
     static let narrowRBVariants: [NarrowVariant] = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_RB"]?
@@ -4664,12 +4822,12 @@ enum Qwen35TensorPackedMatmul {
                 func zooExact(_ kernel: NarrowKernel, _ outputDType: DType) -> Bool {
                     let bits: DType = outputDType == .float16 ? .uint16 : .uint32
                     // zoo 3a: every production shape but the head as well
-                    if kernel.variant.xtg != nil, xtgOps.isEmpty {
+                    if kernel.variant.xtg != nil || kernel.variant.vz, xtgOps.isEmpty {
                         xtgOps = sets.map { $0[0] } + [NarrowOperands(k: 6144, n: 5120, seed: 200)]
                     }
                     let same = try? withError { scoped -> Bool in
                         var same = true
-                        for ops in testOps + (kernel.variant.xtg != nil ? xtgOps : []) {
+                        for ops in testOps + (kernel.variant.xtg != nil || kernel.variant.vz ? xtgOps : []) {
                             let reference = ops.run(.original, outputDType, tiled: false)
                             let y = ops.run(kernel, outputDType)
                             let differ = (y.view(dtype: bits) .!= reference.view(dtype: bits))
@@ -4689,7 +4847,8 @@ enum Qwen35TensorPackedMatmul {
                 if narrowZoo, let name = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_FORCE"),
                     let variant = NarrowVariant(name: name), variant.family != nil,
                     variant.xtg == nil || narrowXTGVariants.contains(variant),
-                    variant.derived == nil || narrowDerivedVariants.contains(variant)
+                    variant.derived == nil || narrowDerivedVariants.contains(variant),
+                    !variant.vz || narrowVZVariants.contains(variant)
                 {
                     let forced = NarrowKernel(variant: variant, form: zooForm)
                     if zooExact(forced, .float16), zooExact(forced, .float32) {
@@ -4715,7 +4874,8 @@ enum Qwen35TensorPackedMatmul {
                         guard part.count == 2, let index = names.firstIndex(of: part[0]),
                             let variant = NarrowVariant(name: part[1]), variant.family != nil,
                             variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5),
-                            variant.derived == nil || narrowDerivedVariants.contains(variant)
+                            variant.derived == nil || narrowDerivedVariants.contains(variant),
+                            !variant.vz || (narrowVZVariants.contains(variant) && index < 5)
                         else { ok = false; break }
                         let kernel = NarrowKernel(variant: variant, form: zooForm)
                         if !exact16.contains(kernel) {
@@ -4739,18 +4899,15 @@ enum Qwen35TensorPackedMatmul {
                 }
 
                 // A per-shape BASE over the record's pick (`..._TZOO_BASE`, the
-                // per-shape force map's syntax; default k32pd2i32 on the five tower
-                // shapes, the head left to the record): the narrow-offset form
-                // of k32pd2. A same-box reading of sarthakagrawal927's b497a150,
-                // which forced k32pd2 on those five shapes, put
+                // per-shape force map's syntax; default k32pd2 on the five tower
+                // shapes, the head left to the record): a same-box reading of
+                // sarthakagrawal927's b497a150, which forced exactly this map, put
                 // its window 1.85% under the trial's own picks with identical
                 // acceptance. Unlike the force map the trial still runs, over this
                 // base; each body passes FP16, and FP32 on a wide shape, or the
-                // record's pick is kept. The narrow offsets use k32pd2 if either
-                // output check fails. `..._TZOO_BASE=0` keeps the record's pick.
-                let baseBody = kernelNarrowInt8Zoo32 == nil ? "k32pd2" : "k32pd2i32"
+                // record's pick is kept. `..._TZOO_BASE=0` keeps the record's pick.
                 let baseValue = knob("DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO_BASE")
-                    ?? "attn=\(baseBody),qkvz=\(baseBody),gateup=\(baseBody),o=\(baseBody),down=\(baseBody)"
+                    ?? "attn=k32pd2,qkvz=k32pd2,gateup=k32pd2,o=k32pd2,down=k32pd2"
                 if narrowZoo, baseValue.contains("=") {
                     let names = NarrowInSituTrial.perShapeNames.map { $0.replacingOccurrences(of: "|", with: "") } + ["head"]
                     let keys = NarrowInSituTrial.perShapeKeys + [NarrowInSituTrial.headKey]
@@ -4761,17 +4918,10 @@ enum Qwen35TensorPackedMatmul {
                         guard part.count == 2, let index = names.firstIndex(of: part[0]),
                             let variant = NarrowVariant(name: part[1]), variant.family != nil,
                             variant.xtg == nil || (narrowXTGVariants.contains(variant) && index < 5),
-                            variant.derived == nil || narrowDerivedVariants.contains(variant)
+                            variant.derived == nil || narrowDerivedVariants.contains(variant),
+                            !variant.vz || (narrowVZVariants.contains(variant) && index < 5)
                         else { ok = false; break }
-                        var kernel = NarrowKernel(variant: variant, form: zooForm)
-                        if variant == .k32pd2i32, !exact16.contains(kernel) {
-                            if zooExact(kernel, .float16), zooExact(kernel, .float32) {
-                                exact16.insert(kernel)
-                                exact32.insert(kernel)
-                            } else {
-                                kernel = NarrowKernel(variant: .k32pd2, form: zooForm)
-                            }
-                        }
+                        let kernel = NarrowKernel(variant: variant, form: zooForm)
                         if !exact16.contains(kernel) {
                             guard zooExact(kernel, .float16) else { ok = false; break }
                             exact16.insert(kernel)
@@ -4897,7 +5047,23 @@ enum Qwen35TensorPackedMatmul {
                 failed.append(kernel)
             }
         }
+        // VZ: 10 s of their own (8 first compiles on a cold toolchain); FP16
+        // and FP32 (fail-closed at either type).
+        let vzStart = DispatchTime.now().uptimeNanoseconds
+        var vz32: [NarrowKernel] = []
+        for variant in narrowVZVariants {
+            let kernel = NarrowKernel(variant: variant, form: form)
+            if Double(DispatchTime.now().uptimeNanoseconds - vzStart) / 1e6 > 10000 {
+                skipped.append(kernel)
+            } else if exact(kernel, .float16), exact(kernel, .float32) {
+                passed.append(kernel)
+                vz32.append(kernel)
+            } else {
+                failed.append(kernel)
+            }
+        }
         zooExact16 = Set(passed)
+        zooExact32.formUnion(vz32)
         func names(_ kernels: [NarrowKernel]) -> String { kernels.map { "\($0.variant)" }.joined(separator: " ") }
         log += "; tzoo self-test passed [\(names(passed))]"
         if !failed.isEmpty { log += " failed [\(names(failed))]" }
@@ -4955,7 +5121,7 @@ enum Qwen35TensorPackedMatmul {
         let perRound: [Double] = [48, 64, 64, 16, 64]
         func build(_ usable: [NarrowKernel]) -> [(NarrowChoice, String, Int)] {
             var choices: [(NarrowChoice, String, Int)] = []
-            for family in ["k32", "wide", "acoop", "pair", "dual", "xtg", "xtgp", "cs", "csa", "i4", "i4cs", "csp", "i4p", "rb"] {
+            for family in ["k32", "wide", "acoop", "pair", "dual", "xtg", "xtgp", "cs", "csa", "i4", "i4cs", "csp", "i4p", "rb", "vz"] {
                 let members = usable.filter { $0.variant.family == family }
                 var map = byShape
                 var changed = false
@@ -4968,7 +5134,7 @@ enum Qwen35TensorPackedMatmul {
                 }
                 if changed { choices.append(((fallback, map), "\(family)/5120", 1)) }
             }
-            for family in ["k32", "wide", "acoop", "xtg", "rb"] {
+            for family in ["k32", "wide", "acoop", "xtg", "rb", "vz"] {
                 func cost(_ kernel: NarrowKernel) -> Double {
                     shapes.indices.filter { classes[$0] == 2 }.reduce(0) { $0 + perRound[$1] * t[kernel]![$1] }
                 }
@@ -4976,7 +5142,7 @@ enum Qwen35TensorPackedMatmul {
                 guard let best = fit.min(by: { cost($0) < cost($1) }) else { continue }
                 var map = byShape
                 for index in shapes.indices where classes[index] == 2 { map[keys[index]] = best }
-                if best.variant.xtg == nil, !best.variant.rb { map[head] = best }
+                if best.variant.xtg == nil, !best.variant.rb, !best.variant.vz { map[head] = best }
                 choices.append(((fallback, map), "\(family)/wide", 2))
             }
             return choices
@@ -5321,6 +5487,18 @@ extension Qwen35TensorPackedMatmul {
         }
     }
 
+    /// The operands the prompt route binds for `projection`, built ones
+    /// only: under each layout cache it marked, the words it reads (the plane
+    /// copy where marked, the tiled copy otherwise) and tags 1, 2 and 3
+    /// (`Qwen35SeedResidencyTouch`).
+    static func promptResidencyArrays(_ projection: HadamardQuantizedLinear) -> [MLXArray] {
+        projection.tensorRouteLayoutCaches.flatMap { cache -> [MLXArray] in
+            guard cache.residencyMarks & promptReadMark != 0 else { return [] }
+            let words = cache.residencyMarks & promptPlaneMark != 0 ? 6 : 5
+            return cache.existing(tags: [1, 2, 3, words])
+        }
+    }
+
     /// The window-only operands of every recorded site under the kernels
     /// installed now (built ones only; nothing is built here).
     static func windowResidencyArrays() -> [MLXArray] {
@@ -5365,13 +5543,43 @@ extension Qwen35TensorPackedMatmul {
     /// `p4`, `p8t`, `p2c2`). `p2` is the plane kernel's own tiling in the
     /// forms' text (the rows' constants loaded before the op, not after it).
     /// Every form's outputs are the plane kernel's bit for bit.
+    ///
+    /// PF2 (`sourcePlaneTiles`): `q<R>x<C>` R x C of the plane kernel's
+    /// 32 x 32 tiles per threadgroup (R 1, 2, 4; C 1 ... 16; R C <= 16), `b`
+    /// the per-group barrier, `w<W>` the supertile width in threadgroup column
+    /// blocks (default: the plane kernel's supertile columns; `w0` x fastest),
+    /// e.g. `q2x4b`, `q2x2b`, `q1x4`, `q1x2w0` (the plane kernel in the stock order).
+    /// Off with `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS2=0`.
     struct PlaneForm: Hashable, CustomStringConvertible {
-        let sgn: Int, ct: Int, at: Int, io32: Int
+        let sgn: Int, ct: Int, at: Int
         let name: String
+        var tiles = false, r = 1, w = 0, bar = 0
 
         init?(name raw: String) {
             let name = raw.trimmingCharacters(in: .whitespaces).lowercased()
             var rest = Substring(name)
+            if rest.hasPrefix("q") {
+                guard PlaneFormTrial.forms2, kernelPlaneTiles != nil else { return nil }
+                rest = rest.dropFirst()
+                func number() -> Int? {
+                    let digits = rest.prefix { $0.isNumber }
+                    rest = rest.dropFirst(digits.count)
+                    return Int(digits)
+                }
+                guard let r = number(), [1, 2, 4].contains(r), rest.hasPrefix("x") else { return nil }
+                rest = rest.dropFirst()
+                guard let c = number(), [1, 2, 4, 8, 16].contains(c), r * c <= 16 else { return nil }
+                if rest.hasPrefix("b") { bar = 1; rest = rest.dropFirst() }
+                w = promptSwizzleWidth > 0 ? max(1, promptSwizzleWidth * 2 / c) : 0
+                if rest.hasPrefix("w") {
+                    rest = rest.dropFirst()
+                    guard let width = number(), width <= 4096 else { return nil }
+                    w = width
+                }
+                guard rest.isEmpty else { return nil }
+                (sgn, ct, at, tiles, self.r, self.name) = (r * c, 1, 0, true, r, name)
+                return
+            }
             guard rest.hasPrefix("p") else { return nil }
             rest = rest.dropFirst()
             let digits = rest.prefix { $0.isNumber }
@@ -5380,28 +5588,15 @@ extension Qwen35TensorPackedMatmul {
             var ct = 1, at = 0
             if rest.hasPrefix("c2") { ct = 2; rest = rest.dropFirst(2) }
             if rest.hasPrefix("t") { at = 1; rest = rest.dropFirst(1) }
-            var io32 = 0
-            if rest.hasPrefix("i32") { io32 = 1; rest = rest.dropFirst(3) }
             guard rest.isEmpty, sgn * ct <= 16 else { return nil }
-            (self.sgn, self.ct, self.at, self.io32) = (sgn, ct, at, io32)
+            (self.sgn, self.ct, self.at) = (sgn, ct, at)
             self.name = name
         }
 
         var description: String { name }
         /// Columns per threadgroup; a launch needs `n` to be a multiple.
-        var columns: Int { 32 * sgn * ct }
-        func fits(k: Int, n: Int, m: Int) -> Bool {
-            guard n % columns == 0, m % 32 == 0 else { return false }
-            guard io32 != 0 else { return true }
-            // Bound every index in codes, plane words, row constants, scales,
-            // and output. With 32-row alignment, padded row constants
-            // have at most twice as many rows and 1/128 as many columns.
-            let limit = Int(Int32.max)
-            guard k >= 128, k % 128 == 0, n > 0, m > 0,
-                m <= limit / k, m <= limit / n, n <= limit / (k / 16)
-            else { return false }
-            return true
-        }
+        var columns: Int { tiles ? 32 * (sgn / r) : 32 * sgn * ct }
+        func fits(n: Int, m: Int) -> Bool { n % columns == 0 && m % (32 * r) == 0 }
     }
 
     /// One launch of a plane form over the plane copy `plane` (same inputs as
@@ -5411,12 +5606,20 @@ extension Qwen35TensorPackedMatmul {
         _ biasesT: MLXArray, _ folded: MLXArray, _ ascale: MLXArray, _ rsb: MLXArray,
         k: Int, m: Int, n: Int, outputDType: DType
     ) -> MLXArray {
-        kernelPlaneForms(
+        if form.tiles, let kernel = kernelPlaneTiles {
+            return kernel(
+                [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
+                template: [
+                    ("OutT", outputDType), ("QR", form.r), ("QC", form.sgn / form.r), ("QW", form.w),
+                    ("QB", form.bar),
+                ],
+                grid: (n / form.columns * 32 * form.sgn, m / (32 * form.r), 1),
+                threadGroup: (32 * form.sgn, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernelPlaneForms(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
-            template: [
-                ("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at),
-                ("IO32", form.io32),
-            ],
+            template: [("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at)],
             grid: (n / form.columns * 32 * form.sgn, m / 32, 1), threadGroup: (32 * form.sgn, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
     }
@@ -5487,6 +5690,10 @@ extension Qwen35TensorPackedMatmul {
 
         static let enabled = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS", default: true)
         static let evidence = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_EVIDENCE", default: false)
+        /// PF2: the q forms (`sourcePlaneTiles`) in the pool, and parsed at
+        /// all (so `..._FORCE` / `..._LIST` cannot name one when off). A q
+        /// form that fails a bitwise check at any shape is used at none.
+        static let forms2 = flag("DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS2", default: true)
 
         static let forcedName: String? = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_FORCE"]?
@@ -5497,7 +5704,7 @@ extension Qwen35TensorPackedMatmul {
 
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p2,p4,p8,p8t,p2i32,p4i32,p8i32,p8ti32"
+                ?? "p2,p4,p8,p8t" + (forms2 ? ",q2x4b,q2x2b,q1x4,q1x2w0,q1x2w8" : "")
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
@@ -5551,7 +5758,7 @@ extension Qwen35TensorPackedMatmul {
 
         /// The form for one prompt launch, or nil for the plane kernel.
         static func form(_ key: Key, m: Int) -> PlaneForm? {
-            guard let form = adopted[key], form.fits(k: key.k, n: key.n, m: m) else { return nil }
+            guard let form = adopted[key], form.fits(n: key.n, m: m) else { return nil }
             return form
         }
 
@@ -5608,6 +5815,11 @@ extension Qwen35TensorPackedMatmul {
             var checkNanoseconds: UInt64 = 0
             var installedNames: [String] = []
             var acts: [Int: (MLXArray, MLXArray, MLXArray)] = [:]
+            // PF2: shapes each q form passed at, its values compared with the
+            // plane kernel's, and the q forms that failed anywhere (fail-closed).
+            var passed2: [String: Int] = [:]
+            var values2: [String: Int] = [:]
+            var failed2: Set<String> = []
             for key in keys {
                 guard let sets = registry[key], !sets.isEmpty else { continue }
                 let checkStart = DispatchTime.now().uptimeNanoseconds
@@ -5646,7 +5858,9 @@ extension Qwen35TensorPackedMatmul {
                         grid: (key.n / 64 * 128, rows / 64, 1), threadGroup: (128, 1, 1),
                         outputShapes: [[rows, key.n]], outputDTypes: [outputDType])[0]
                 }
-                let pool = (forced.map { [$0] } ?? list.forms).filter { $0.fits(k: key.k, n: key.n, m: rows) }
+                let pool = (forced.map { [$0] } ?? list.forms).filter {
+                    $0.fits(n: key.n, m: rows) && !failed2.contains($0.name)
+                }
                 // Bitwise: each form against the plane kernel and against staged8.
                 let planeRef = launch(nil, sets[0])
                 if let planeRef { eval(planeRef) }
@@ -5661,6 +5875,10 @@ extension Qwen35TensorPackedMatmul {
                     let stagedOK = vsStaged == 0
                     if planeOK && (stagedOK || evidence) {
                         passing.append(form)
+                        if form.tiles {
+                            passed2[form.name, default: 0] += 1
+                            values2[form.name, default: 0] += rows * key.n
+                        }
                         if !stagedOK {
                             notes.append("\(form) = plane bit for bit (\(vsStaged.map { "\($0)" } ?? "?") differ from staged8: evidence mode)")
                         }
@@ -5669,6 +5887,7 @@ extension Qwen35TensorPackedMatmul {
                             ? "did not launch"
                             : "\(vsPlane!) differ from the plane kernel, \(vsStaged!) from staged8"
                         notes.append("\(form) FAILED (\(what))")
+                        if form.tiles { failed2.insert(form.name) }
                     }
                 }
                 checkNanoseconds += DispatchTime.now().uptimeNanoseconds - checkStart
@@ -5750,6 +5969,19 @@ extension Qwen35TensorPackedMatmul {
                     line += " -> plane"
                 }
                 log(line)
+            }
+            // PF2 fail-closed: a q form that failed at any shape is used at none.
+            for (key, form) in adopted where form.tiles && failed2.contains(form.name) {
+                adopted[key] = nil
+                installedNames.removeAll { $0 == "\(key.k)x\(key.n)=\(form)" }
+            }
+            let names2 = (forced.map { [$0] } ?? list.forms).filter(\.tiles).map(\.name)
+            if !names2.isEmpty {
+                log("PF2 q forms bitwise vs the plane kernel" + (evidence ? "" : " and staged8") + ": "
+                    + names2.map { name in
+                        failed2.contains(name) ? "\(name) FAILED (dropped at every shape)"
+                            : "\(name) \(passed2[name] ?? 0)/\(keys.count) shapes, \(values2[name] ?? 0) values"
+                    }.joined(separator: "; "))
             }
             let total = DispatchTime.now().uptimeNanoseconds - start
             log(
@@ -6187,7 +6419,7 @@ extension Qwen35TensorPackedMatmul {
         let v = kernel.variant
         let columns = v == .v0 ? 32 : v.tn
         // zoo 3a and zoo 4 have no fused form (zoo 4 never takes the head)
-        guard n % columns == 0, v.xtg == nil, v.derived == nil, !v.rb else { return nil }
+        guard n % columns == 0, v.xtg == nil, v.derived == nil, !v.rb, !v.vz else { return nil }
         let shapes = [[m, n / columns, 2], [m, n / columns, 2]]
         let dtypes: [DType] = [.int32, .float32]
         let partial: [MLXArray]
