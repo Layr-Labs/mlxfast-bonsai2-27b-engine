@@ -72,7 +72,7 @@ enum Qwen35SmallNMatmul {
         const int k0 = kc * 128;
         const uint t = thread_position_in_threadgroup.x;
         threadgroup float4 xs[16 * 32];
-        threadgroup float red[4 * 16 * 32];
+        threadgroup float red[4 * 16 * 33];
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 4; j++) {
           const uint i = t + 128 * j;
@@ -91,7 +91,7 @@ enum Qwen35SmallNMatmul {
           float acc = 0.0f;
           #pragma clang loop unroll(full)
           for (int j = 0; j < 8; j++) { acc += dot(xs[m * 32 + 8 * s + j], wv[j]); }
-          red[(s * 16 + m) * 32 + c] = acc;
+          red[(s * 16 + m) * 33 + c] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
@@ -99,8 +99,8 @@ enum Qwen35SmallNMatmul {
           const uint o = t + 128 * j;
           const int m = int(o >> 5); const int cc = int(o & 31);
           if (m < M) {
-            const float v = ((red[(0 * 16 + m) * 32 + cc] + red[(1 * 16 + m) * 32 + cc])
-                + red[(2 * 16 + m) * 32 + cc]) + red[(3 * 16 + m) * 32 + cc];
+            const float v = ((red[(0 * 16 + m) * 33 + cc] + red[(1 * 16 + m) * 33 + cc])
+                + red[(2 * 16 + m) * 33 + cc]) + red[(3 * 16 + m) * 33 + cc];
             part[((size_t)kc * M + m) * N + nb + cc] = v;
           }
         }
