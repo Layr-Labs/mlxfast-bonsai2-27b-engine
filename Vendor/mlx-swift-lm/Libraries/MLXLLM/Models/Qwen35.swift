@@ -1216,7 +1216,7 @@ enum Qwen35GDNReplayBatch {
         // The operands are read in place, so their strides must be final: a
         // verify's tape is evaluated before its round finalizes (a no-op
         // wait here); an unevaluated tape is waited for, never misread.
-        eval(inputs)
+        Qwen35GDNReplayFused.evalUnlessAvailable(inputs)
         for operand in operands {
             let tape = operand.tape
             guard rowContiguousAfterLeading(tape.k), rowContiguousAfterLeading(tape.v),
