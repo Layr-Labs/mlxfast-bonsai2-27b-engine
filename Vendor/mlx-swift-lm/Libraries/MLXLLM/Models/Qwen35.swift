@@ -240,10 +240,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   first 8 layers (a LEADING verify submission, the verify's first ~5
 ///   command buffers) and a second after 24: the GPU gets the front of the
 ///   verify as soon as it is built, runs layers 8..23 while the host builds
-///   the other 40, and never waits on the host's ~0.1 ms per layer. Two
-///   boundaries rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   the other 40. This experiment adds a third boundary after layer 40 to
+///   overlap more of the remaining host build. It can lose: every extra
+///   command buffer at verify width has a cost (slices every 2 layers had
+///   lengthened the ranked window). `MLXFAST_VERIFY_SLICE_LAYERS`
 ///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
 ///   again. Both trunk paths honour it: the plain per-layer loop and the
@@ -307,12 +307,14 @@ enum Qwen35TrunkSubmission {
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
-        // 24..63 while the GPU runs 8..23. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
-        // keeps the single boundary; `MLXFAST_VERIFY_SLICE_LAYERS` sets
-        // another plan, `0` turns it off.
+        // 24..63 while the GPU runs 8..23. A third boundary after layer 40
+        // tests whether submitting the tail sooner hides more host work; it
+        // also adds a command-buffer handoff that can cost more than it saves.
+        // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -328,7 +330,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
@@ -379,6 +381,40 @@ enum Qwen35TrunkSubmission {
 }
 
 // MARK: - GatedDeltaNet
+
+/// 32-bit element offsets for this file's custom kernels and the verify
+/// window's GDN prework and attention KV prework (Apple GPUs emulate 64-bit
+/// integer arithmetic). A kernel launches its text with every `size_t`
+/// index / offset as `uint`: the same elements are read and written, and no
+/// arithmetic on values, accumulation order, thread mapping or buffer layout
+/// changes. At this model's shapes every such offset is far below 2^31 (rows
+/// times widths of 5120 / 6144 / 17408, the GDN conv's 10240 channels, 16 x
+/// 128 keys, 48 x 128 values, 24 x 256 queries, prompt and verify rows) and
+/// none is negative. The stored texts stay as they are (other kernels are
+/// derived from them by anchored replacements); only the text handed to
+/// `metalKernel` changes, and only when it holds the expected number of
+/// `size_t` (otherwise the stock text, noted on stderr).
+/// `MLXFAST_IO32_GDN=0` launches the stock texts.
+enum Qwen35IO32 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_IO32_GDN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `text` with its `count` `size_t` as `uint` (`name` labels a mismatch).
+    static func narrow(_ text: String, count: Int, _ name: String) -> String {
+        guard enabled else { return text }
+        let found = text.components(separatedBy: "size_t").count - 1
+        guard found == count else {
+            FileHandle.standardError.write(
+                "qwen35 32-bit offsets: \(name) holds \(found) size_t, expected \(count); 64-bit text kept\n"
+                    .data(using: .utf8)!)
+            return text
+        }
+        return text.replacingOccurrences(of: "size_t", with: "uint")
+    }
+}
 
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
@@ -1067,7 +1103,7 @@ enum Qwen35GDNReplayBatch {
             name: "qwen35_gdn_replay_batch",
             inputNames: inputNames,
             outputNames: ["state_out", "conv_out"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 4, "qwen35_gdn_replay_batch"),
             header: header,
             ensureRowContiguous: false)
     }
@@ -1870,13 +1906,13 @@ enum Qwen35GatedDeltaChunked {
         name: "bonsai_gated_delta_chunk_prep",
         inputNames: ["q", "k", "g", "beta", "T"],
         outputNames: ["tp", "pm", "gf"],
-        source: prepSource)
+        source: Qwen35IO32.narrow(prepSource, count: 6, "bonsai_gated_delta_chunk_prep"))
 
     private static let scanKernel = MLXFast.metalKernel(
         name: "bonsai_gated_delta_chunk_scan",
         inputNames: ["q", "k", "v", "tp", "pm", "gf", "state_in", "T"],
         outputNames: ["y", "state_out"],
-        source: scanSource)
+        source: Qwen35IO32.narrow(scanSource, count: 12, "bonsai_gated_delta_chunk_scan"))
 
     // BEGIN GENERATED CHUNKED GDN SOURCES
     static let prepSource = """
@@ -2190,7 +2226,7 @@ enum Qwen35GatedDeltaChunked {
         name: "bonsai_gated_delta_chunk_scan_fresh",
         inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
         outputNames: ["y", "state_out"],
-        source: scanFreshSource)
+        source: Qwen35IO32.narrow(scanFreshSource, count: 11, "bonsai_gated_delta_chunk_scan_fresh"))
 
     /// `scanFreshSource` with each chunk's K, Q, T' and P loaded into
     /// registers while the previous chunk computes, then stored to the same
@@ -2281,7 +2317,7 @@ enum Qwen35GatedDeltaChunked {
             name: "bonsai_gated_delta_chunk_scan_fresh_pf",
             inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"],
             outputNames: ["y", "state_out"],
-            source: $0)
+            source: Qwen35IO32.narrow($0, count: 11, "bonsai_gated_delta_chunk_scan_fresh_pf"))
     }
 
     static let scanPrefetchEnabled: Bool = {
@@ -5877,7 +5913,7 @@ enum Qwen35GDNPrework {
         name: "qwen35_gdn_prework",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 57, "qwen35_gdn_prework"),
         ensureRowContiguous: true)
 
     /// The concatenated conv input `[cs; qkv]` in FP32 (the replay tape's
@@ -5935,7 +5971,7 @@ enum Qwen35GDNPrework {
         name: "qwen35_gdn_prework_ci",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
-        source: withConvInput(source),
+        source: Qwen35IO32.narrow(withConvInput(source), count: 68, "qwen35_gdn_prework_ci"),
         ensureRowContiguous: true)
 
     /// `source` reading every input through its strides, as
@@ -5992,14 +6028,14 @@ enum Qwen35GDNPrework {
         name: "qwen35_gdn_prework_strided",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
-        source: stridedSource,
+        source: Qwen35IO32.narrow(stridedSource, count: 33, "qwen35_gdn_prework_strided"),
         ensureRowContiguous: false)
 
     private static let stridedConvInputKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prework_ci_strided",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
-        source: withConvInput(stridedSource),
+        source: Qwen35IO32.narrow(withConvInput(stridedSource), count: 44, "qwen35_gdn_prework_ci_strided"),
         ensureRowContiguous: false)
 
     /// The verify window's launch reads its inputs in place (`stridedSource`).
@@ -6103,7 +6139,7 @@ enum Qwen35GDNPrework {
         name: "qwen35_gdn_prework_fresh",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
-        source: freshSource,
+        source: Qwen35IO32.narrow(freshSource, count: 48, "qwen35_gdn_prework_fresh"),
         ensureRowContiguous: true)
 
     /// `freshSource` reading `qkv`, `w`, `a` and `b` through their strides
@@ -6144,7 +6180,7 @@ enum Qwen35GDNPrework {
         name: "qwen35_gdn_prework_fresh_strided",
         inputNames: ["qkv", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "tail"],
-        source: freshStridedSource,
+        source: Qwen35IO32.narrow(freshStridedSource, count: 33, "qwen35_gdn_prework_fresh_strided"),
         ensureRowContiguous: false)
 
     static let freshStridedReads: Bool = {
@@ -6330,7 +6366,7 @@ enum Qwen35AttentionPrework {
         name: "bonsai_attn_prework",
         inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
         outputNames: ["qo", "ko"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 7, "bonsai_attn_prework"),
         ensureRowContiguous: false)
 
     /// `(rope(qNorm(q).transposed(0, 2, 1, 3)), rope(kNorm(k).transposed(0, 2, 1,
@@ -6877,7 +6913,7 @@ enum Qwen35FusedHadamard {
         name: "bonsai_signed_hadamard_1024",
         inputNames: ["inp", "signs"],
         outputNames: ["out"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 3, "bonsai_signed_hadamard_1024"),
         header: header,
         ensureRowContiguous: true)
 
@@ -6933,7 +6969,7 @@ enum Qwen35FusedHadamard {
         name: "bonsai_signed_hadamard_1024_q8",
         inputNames: ["inp", "signs"],
         outputNames: ["out", "qscale", "qsum"],
-        source: sourceInt8,
+        source: Qwen35IO32.narrow(sourceInt8, count: 16, "bonsai_signed_hadamard_1024_q8"),
         header: header,
         ensureRowContiguous: true)
 
@@ -7046,7 +7082,7 @@ enum Qwen35FusedHadamard {
         name: "bonsai_signed_hadamard_1024_q8p",
         inputNames: ["a", "b", "w", "eps", "signs"],
         outputNames: ["out", "qscale", "qsum"],
-        source: sourceInt8Producer,
+        source: Qwen35IO32.narrow(sourceInt8Producer, count: 16, "bonsai_signed_hadamard_1024_q8p"),
         header: headerProducer,
         ensureRowContiguous: false)
 
@@ -7086,7 +7122,7 @@ enum Qwen35FusedHadamard {
         name: "bonsai_signed_hadamard_1024_gsum",
         inputNames: ["inp", "signs"],
         outputNames: ["out", "gsum"],
-        source: sourceWithGroupSums,
+        source: Qwen35IO32.narrow(sourceWithGroupSums, count: 9, "bonsai_signed_hadamard_1024_gsum"),
         header: header,
         ensureRowContiguous: true)
 
@@ -7345,10 +7381,12 @@ extension Qwen35FusedHadamard {
             name: "bonsai_signed_hadamard_1024_inv",
             inputNames: ["inp", "signs"],
             outputNames: ["out"],
-            source: source.replacingOccurrences(
-                of: store,
-                with: "out[rowbase + bcol + uint(index + r)] = "
-                    + "OutT((buf[index + r] * 0.03125f) * signs[bcol + uint(index + r)]);"),
+            source: Qwen35IO32.narrow(
+                source.replacingOccurrences(
+                    of: store,
+                    with: "out[rowbase + bcol + uint(index + r)] = "
+                        + "OutT((buf[index + r] * 0.03125f) * signs[bcol + uint(index + r)]);"),
+                count: 3, "bonsai_signed_hadamard_1024_inv"),
             header: header,
             ensureRowContiguous: true)
     }()
@@ -7660,7 +7698,7 @@ extension Qwen35FusedHadamard {
         name: "bonsai_signed_hadamard_1024_q8pv",
         inputNames: ["a", "b", "w", "eps", "signs"],
         outputNames: ["out", "qscale", "qsum"],
-        source: producerVecSource,
+        source: Qwen35IO32.narrow(producerVecSource, count: 16, "bonsai_signed_hadamard_1024_q8pv"),
         header: headerProducer + producerVecHeader,
         ensureRowContiguous: false)
 
@@ -8101,7 +8139,7 @@ extension Qwen35FusedHadamard {
                 name: "bonsai_signed_hadamard_1024_q8pb\(count)",
                 inputNames: (0 ..< count).map { "a\($0)" } + ["b", "w", "eps", "signs"],
                 outputNames: ["out", "qscale", "qsum"],
-                source: source,
+                source: Qwen35IO32.narrow(source, count: 16, "bonsai_signed_hadamard_1024_q8pb"),
                 header: headerProducer + producerVecHeader,
                 ensureRowContiguous: false)
             rowBlockKernels[count] = kernel
@@ -8786,7 +8824,7 @@ enum Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_q8",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "codes", "qscale", "qsum"],
-        source: "#define BONSAI_STORE_NORMED(e, n)\n" + source,
+        source: Qwen35IO32.narrow("#define BONSAI_STORE_NORMED(e, n)\n" + source, count: 11, "bonsai_boundary_rmsnorm_hadamard_q8"),
         header: header,
         ensureRowContiguous: true)
 
@@ -8794,7 +8832,7 @@ enum Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_q8_normed",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "codes", "qscale", "qsum", "nout"],
-        source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + source,
+        source: Qwen35IO32.narrow("#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + source, count: 11, "bonsai_boundary_rmsnorm_hadamard_q8_normed"),
         header: header,
         ensureRowContiguous: true)
 }
@@ -8877,9 +8915,11 @@ extension Qwen35FusedBoundaryQ8 {
                 name: "bonsai_boundary_rmsnorm_hadamard_q8r1" + (normed ? "_normed" : ""),
                 inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
                 outputNames: ["hout", "codes", "qscale", "qsum"] + (normed ? ["nout"] : []),
-                source: (normed
-                    ? "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n"
-                    : "#define BONSAI_STORE_NORMED(e, n)\n") + text,
+                source: Qwen35IO32.narrow(
+                    (normed
+                        ? "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n"
+                        : "#define BONSAI_STORE_NORMED(e, n)\n") + text,
+                    count: 11, "bonsai_boundary_rmsnorm_hadamard_q8r1"),
                 header: header,
                 ensureRowContiguous: true)
             reduce1Kernels[normed] = kernel
@@ -9059,7 +9099,7 @@ enum Qwen35GatedNormTail {
         name: "bonsai_gdn_gated_norm_signed",
         inputNames: ["x", "z", "w", "eps", "signs"],
         outputNames: ["out"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 2, "bonsai_gdn_gated_norm_signed"),
         header: header,
         ensureRowContiguous: false)
 
@@ -9369,7 +9409,7 @@ extension Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_verify",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "rout"],
-        source: "#define BONSAI_STORE_NORMED(e, n)\n" + verifySource,
+        source: Qwen35IO32.narrow("#define BONSAI_STORE_NORMED(e, n)\n" + verifySource, count: 3, "bonsai_boundary_rmsnorm_hadamard_verify"),
         header: header,
         ensureRowContiguous: true)
 
@@ -9377,7 +9417,7 @@ extension Qwen35FusedBoundaryQ8 {
         name: "bonsai_boundary_rmsnorm_hadamard_verify_normed",
         inputNames: ["xa", "xb", "w", "signs", "eps", "axis_size"],
         outputNames: ["hout", "rout", "nout"],
-        source: "#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + verifySource,
+        source: Qwen35IO32.narrow("#define BONSAI_STORE_NORMED(e, n) nout[base + (e)] = (n)\n" + verifySource, count: 3, "bonsai_boundary_rmsnorm_hadamard_verify_normed"),
         header: header,
         ensureRowContiguous: true)
 }

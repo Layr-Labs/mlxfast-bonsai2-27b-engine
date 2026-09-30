@@ -6,6 +6,31 @@ import Cmlx
 import Foundation
 import MLX
 
+/// A next block built before the readback that the round does not adopt is a
+/// whole drafter forward left unevaluated. Its graph used to be torn down when
+/// `finalizeMTPRound` returned, between the drafter's submission and the next
+/// verify build, on the host path the GPU waits on (about 0.1 ms of array
+/// releases on an M4 Max). It is held here instead and released at the end of
+/// the engine step, after the next round's graph is submitted. Nothing reads
+/// it: the same graphs are built and submitted in the same order, only the
+/// release moves. `MLXFAST_DEFER_BLOCK_RELEASE=0` releases it in place.
+enum CBv2MTPDeferredRelease {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DEFER_BLOCK_RELEASE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Engine-thread confined.
+    nonisolated(unsafe) private static var held: [AnyObject] = []
+
+    static func hold(_ object: AnyObject) { held.append(object) }
+
+    static func drain() {
+        if !held.isEmpty { held.removeAll(keepingCapacity: true) }
+    }
+}
+
 extension EngineLoopV2 {
 
     /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
@@ -652,6 +677,13 @@ extension EngineLoopV2 {
                     kvOffset: rec.numComputedTokens,
                     earlyBlock: earlyBlock)
             }
+        }
+
+        // An unadopted next block is released after the next submission
+        // (`CBv2MTPDeferredRelease`); an adopted one is referenced anyway.
+        if CBv2MTPDeferredRelease.enabled, let block = speculation?.block {
+            CBv2MTPDeferredRelease.hold(block)
+            speculation = nil
         }
 
         // Verify rows emitted tokens without passing through the sampler;

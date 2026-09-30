@@ -2830,7 +2830,7 @@ enum Qwen35PreworkSplit {
         name: "qwen35_gdn_prework_verify_lf_bafold_vsplit",
         inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci", "ao", "bo"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 37, "qwen35_gdn_prework_verify_lf_bafold_vsplit"),
         ensureRowContiguous: false)
 
     private static let lock = NSLock()
