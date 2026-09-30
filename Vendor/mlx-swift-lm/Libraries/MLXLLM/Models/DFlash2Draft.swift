@@ -2532,8 +2532,56 @@ enum DFlash2PackedWeights {
         return !["0", "false", "no", "off"].contains(raw ?? "")
     }()
 
-    /// The K step of a tile.
-    static let kt = 64
+    /// A tile's columns: 16 by default, `[16 columns, 64 K]` tiles of 32
+    /// weights per lane, twice the simdgroups of `[32, 64]` and half the
+    /// registers per lane, so the decode's latency is hidden on every
+    /// weight. `DARKBLOOM_DRAFT_PACK12_COLS=32` keeps the `[32, 64]` tiles.
+    static let cols: Int = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DRAFT_PACK12_COLS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw == "32" ? 32 : 16
+    }()
+
+    /// A tile's K step.
+    static let ks = 64
+
+    /// A lane's weights per tile, the cooperative operand's capacity
+    /// (`cols * ks / 32`).
+    static var kt: Int { cols * ks / 32 }
+
+    private static var geometry: [(String, any KernelTemplateArg)] {
+        [("KT", kt), ("KS", ks), ("COLS", cols)]
+    }
+
+    /// `DARKBLOOM_DRAFT_PACK12_ALL=1` packs every eligible weight, as the
+    /// packed kernel's first form did.
+    private static let packAll: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DRAFT_PACK12_ALL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(raw ?? "")
+    }()
+
+    /// Whether the packed kernel is the faster read of an `[n, k]` weight.
+    /// It reads a quarter fewer bytes but adds decode work to every tile,
+    /// which only enough tiles in flight hide: a wide weight (many column
+    /// blocks, as the gate|up stack) or a deep one (many K tiles per
+    /// simdgroup, as down_proj and fc). A narrow, shallow weight waits on the
+    /// decode instead. On an M5 Max, chained launches over the real weights
+    /// (each launch a different layer's copy, so every read streams), packed
+    /// against the stored layout: gate|up -20%, down_proj -3%, fc +1%, the
+    /// q|k|v stack +2% (32 rows +1%), o_proj +7% (+8%), and the tap
+    /// projections +63% (+64%). A weight left out keeps the swapped kernel
+    /// over its stored layout, whose products the packed kernel matches bit
+    /// for bit, so no value changes either way.
+    ///
+    /// The `[16, 64]` tiles hide it on every weight: on the same probe,
+    /// packed against the stored layout at 16 rows, gate|up -20%, down_proj
+    /// -20%, fc -19%, the q|k|v stack -17% (32 rows -17%), o_proj -17% and
+    /// the tap projections -5% (32 rows -5%), so every eligible weight is
+    /// packed.
+    static func worthPacking(n: Int, k: Int) -> Bool {
+        packAll || cols == 16 || n >= 16384 || k >= 16384
+    }
 
     struct Copy {
         let source: MLXArray
@@ -2675,12 +2723,12 @@ enum DFlash2PackedWeights {
     private static let encodeSource = """
         const int K = ksz[0]; const int N = ksz[2];
         const uint lane = thread_index_in_simdgroup;
-        const int steps = K / KT;
+        const int steps = K / KS;
         const int tile = int(threadgroup_position_in_grid.x);
-        const int n0 = (tile / steps) * 32;
-        const int k = (tile % steps) * KT;
+        const int n0 = (tile / steps) * COLS;
+        const int k = (tile % steps) * KS;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            COLS, 16, KS, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
@@ -2689,7 +2737,7 @@ enum DFlash2PackedWeights {
           if (lane == 0) { count[tile] = 0xffffffffu; }
           return;
         }
-        lw.load(W.template slice<KT, 32>(k, n0));
+        lw.load(W.template slice<KS, COLS>(k, n0));
         uint top = 0u;
         #pragma clang loop unroll(full)
         for (int i = 0; i < KT; i++) {
@@ -2743,17 +2791,17 @@ enum DFlash2PackedWeights {
     private static let escapeSource = """
         const int K = ksz[0]; const int N = ksz[2];
         const uint lane = thread_index_in_simdgroup;
-        const int steps = K / KT;
+        const int steps = K / KS;
         const int tile = int(threadgroup_position_in_grid.x);
-        const int n0 = (tile / steps) * 32;
-        const int k = (tile % steps) * KT;
+        const int n0 = (tile / steps) * COLS;
+        const int k = (tile % steps) * KS;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            COLS, 16, KS, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
         auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
-        lw.load(W.template slice<KT, 32>(k, n0));
+        lw.load(W.template slice<KS, COLS>(k, n0));
         const uint base = bases[tile];
         uint own = 0u;
         #pragma clang loop unroll(full)
@@ -2783,12 +2831,12 @@ enum DFlash2PackedWeights {
     private static let unpackSource = """
         const int K = ksz[0]; const int N = ksz[2];
         const uint lane = thread_index_in_simdgroup;
-        const int steps = K / KT;
+        const int steps = K / KS;
         const int tile = int(threadgroup_position_in_grid.x);
-        const int n0 = (tile / steps) * 32;
-        const int k = (tile % steps) * KT;
+        const int n0 = (tile / steps) * COLS;
+        const int k = (tile % steps) * KS;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            COLS, 16, KS, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> O((device bfloat*)out, dextents<int, 2>(K, N));
@@ -2798,7 +2846,7 @@ enum DFlash2PackedWeights {
             t, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
             tile, lane);
         dflash2_pack12_decode<KT>(lw, t, offsets, escapes, tile, lane);
-        lw.store(O.template slice<KT, 32>(k, n0));
+        lw.store(O.template slice<KS, COLS>(k, n0));
         """
 
     // `sourceSwapped` with the operand rebuilt from the packed tile instead
@@ -2807,21 +2855,21 @@ enum DFlash2PackedWeights {
     private static let source = """
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
-        const int n0 = nb * 32;
+        const int n0 = nb * COLS;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const int kq = K / SPLITS;
         const int k0 = int(sg) * kq;
-        const int steps = K / KT;
+        const int steps = K / KS;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            COLS, 16, KS, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         // `Wt` only names the operand type the destination is built for.
         tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
         tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16));
-        auto tW0 = Wt.template slice<KT, 32>(0, n0);
-        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto tW0 = Wt.template slice<KS, COLS>(0, n0);
+        auto tX0 = X.template slice<KS, 16>(0, 0);
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
         auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
@@ -2832,20 +2880,20 @@ enum DFlash2PackedWeights {
         dflash2_pack12_share<KT> cur, nxt;
         dflash2_pack12_read<KT>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KT, lane);
-        for (int k = k0; k < k0 + kq; k += KT) {
-          const int tile = nb * steps + k / KT;
-          if (k + KT < k0 + kq) {
+            nb * steps + k0 / KS, lane);
+        for (int k = k0; k < k0 + kq; k += KS) {
+          const int tile = nb * steps + k / KS;
+          if (k + KS < k0 + kq) {
             dflash2_pack12_read<KT>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
-          auto tX = X.template slice<KT, 16>(k, 0);
+          auto tX = X.template slice<KS, 16>(k, 0);
           op.run(lw, tX, cT);
           cur = nxt;
         }
-        threadgroup float red[SPLITS - 1][16 * 32];
+        threadgroup float red[SPLITS - 1][16 * COLS];
         if (sg > 0) {
           for (uint16_t i = 0; i < cap; i++) { red[sg - 1][i * 32 + lane] = cT[i]; }
         }
@@ -2870,20 +2918,20 @@ enum DFlash2PackedWeights {
     private static let source32 = """
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
-        const int n0 = nb * 32;
+        const int n0 = nb * COLS;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const int kq = K / SPLITS;
         const int k0 = int(sg) * kq;
-        const int steps = K / KT;
+        const int steps = K / KS;
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-            32, 16, KT, false, true, false,
+            COLS, 16, KS, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
         tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
-        auto tW0 = Wt.template slice<KT, 32>(0, n0);
-        auto tX0 = X.template slice<KT, 16>(0, 0);
+        auto tW0 = Wt.template slice<KS, COLS>(0, n0);
+        auto tX0 = X.template slice<KS, 16>(0, 0);
         auto cT0 = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
         auto cT1 = op.template get_destination_cooperative_tensor<
@@ -2895,26 +2943,26 @@ enum DFlash2PackedWeights {
         dflash2_pack12_share<KT> cur, nxt;
         dflash2_pack12_read<KT>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KT, lane);
-        for (int k = k0; k < k0 + kq; k += KT) {
-          const int tile = nb * steps + k / KT;
-          if (k + KT < k0 + kq) {
+            nb * steps + k0 / KS, lane);
+        for (int k = k0; k < k0 + kq; k += KS) {
+          const int tile = nb * steps + k / KS;
+          if (k + KS < k0 + kq) {
             dflash2_pack12_read<KT>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
           cur = nxt;
-          auto tXlo = X.template slice<KT, 16>(k, 0);
+          auto tXlo = X.template slice<KS, 16>(k, 0);
           op.run(lw, tXlo, cT0);
-          auto tXhi = X.template slice<KT, 16>(k, 16);
+          auto tXhi = X.template slice<KS, 16>(k, 16);
           op.run(lw, tXhi, cT1);
         }
-        threadgroup float red[SPLITS - 1][2 * 16 * 32];
+        threadgroup float red[SPLITS - 1][2 * 16 * COLS];
         if (sg > 0) {
           for (uint16_t i = 0; i < cap; i++) {
             red[sg - 1][i * 32 + lane] = cT0[i];
-            red[sg - 1][(16 + i) * 32 + lane] = cT1[i];
+            red[sg - 1][(COLS / 2 + i) * 32 + lane] = cT1[i];
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2924,11 +2972,11 @@ enum DFlash2PackedWeights {
             float v0, v1;
             if constexpr (SPLITS == 2) {
               v0 = cT0[i] + red[0][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+              v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];
             } else {
               v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
-                  + red[2][(16 + i) * 32 + lane];
+              v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]
+                  + red[2][(COLS / 2 + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
             out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
@@ -2985,17 +3033,17 @@ enum DFlash2PackedWeights {
         let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", kt)],
-            grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            template: [("OutT", outputDType), ("SPLITS", splits)] + geometry,
+            grid: (n / cols * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
 
     /// `w` packed, or nil when the operand's capacity is not KT (the
     /// first pass flags every tile).
     private static func pack(_ w: MLXArray) -> Copy? {
-        let tiles = w.dim(0) / 32 * (w.dim(1) / kt)
+        let tiles = w.dim(0) / cols * (w.dim(1) / ks)
         let first = encodeKernel(
-            [w, dims(w)], template: [("KT", kt)],
+            [w, dims(w)], template: geometry,
             grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[tiles * kt * 8], [tiles * kt * 4], [tiles], [tiles]],
             outputDTypes: [.uint32, .uint32, .uint32, .uint32])
@@ -3008,7 +3056,7 @@ enum DFlash2PackedWeights {
         guard largest.item(UInt32.self) <= UInt32(32 * kt) else { return nil }
         let escapeCount = total.item(Int.self)
         let written = escapeKernel(
-            [w, first[2], offsets, dims(w)], template: [("KT", kt)],
+            [w, first[2], offsets, dims(w)], template: geometry,
             grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[max(escapeCount, 1)], [tiles * 4]], outputDTypes: [.uint32, .uint32])
         eval(written)
@@ -3037,7 +3085,8 @@ enum DFlash2PackedWeights {
         let eligible = (weights + weights32).filter {
             guard $0.dtype == .bfloat16, $0.ndim == 2, $0.dim(0) % 32 == 0 else { return false }
             let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: $0.dim(0))
-            return $0.dim(1) % (splits * kt) == 0 && seen.insert(ObjectIdentifier($0)).inserted
+            return $0.dim(1) % (splits * ks) == 0 && worthPacking(n: $0.dim(0), k: $0.dim(1))
+                && seen.insert(ObjectIdentifier($0)).inserted
         }
         var packed: [Copy] = []
         var escapes = 0
@@ -3056,9 +3105,9 @@ enum DFlash2PackedWeights {
                     }
                     let (n, k) = (w.dim(0), w.dim(1))
                     // Every weight rebuilt, against its stored bits.
-                    let tiles = n / 32 * (k / kt)
+                    let tiles = n / cols * (k / ks)
                     let unpacked = unpackKernel(
-                        c.arrays + [dims(w)], template: [("KT", kt)],
+                        c.arrays + [dims(w)], template: geometry,
                         grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
                         outputShapes: [[n, k]], outputDTypes: [.bfloat16])[0]
                     var differing = [
@@ -3105,7 +3154,8 @@ enum DFlash2PackedWeights {
         FileHandle.standardError.write(
             Data(
                 ("dflash2 packed 12-bit weights: self-test \(passed ? "passed" : "FAILED") "
-                    + "(\(eligible.count) weights; \(rebuilt) values rebuilt bit for bit, \(escapes) escapes; "
+                    + "(\(eligible.count) weights, [\(cols), \(ks)] tiles; \(rebuilt) values rebuilt bit for bit, "
+                    + "\(escapes) escapes; "
                     + "\(products) products bitwise, \(mismatches) mismatches); "
                     + (passed
                         ? String(format: "on, %.2f GB read as %.2f GB", Double(bytes.stored) / 1e9,
