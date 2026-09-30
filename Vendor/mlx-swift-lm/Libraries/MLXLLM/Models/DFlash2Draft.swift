@@ -1453,15 +1453,20 @@ enum DFlash2TensorMatmul {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < 16; i++) {
-            float v;
-            if constexpr (SPLITS == 2) {
-              v = cT[i] + red[0][i * 32 + lane];
-            } else {
-              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+          for (int i = 0; i < 16; i += 4) {
+            float v[4];
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < 4; c++) {
+              if constexpr (SPLITS == 2) {
+                v[c] = cT[(i + c)] + red[0][(i + c) * 32 + lane];
+              } else {
+                v[c] = cT[(i + c)] + red[0][(i + c) * 32 + lane] + red[1][(i + c) * 32 + lane] + red[2][(i + c) * 32 + lane];
+              }
             }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
+            const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            *(device vec<OutT, 4>*)(out + base) = vec<OutT, 4>(
+                OutT(v[0]), OutT(v[1]), OutT(v[2]), OutT(v[3]));
           }
         }
         """
@@ -1512,19 +1517,25 @@ enum DFlash2TensorMatmul {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < 16; i++) {
-            float v0, v1;
-            if constexpr (SPLITS == 2) {
-              v0 = cT0[i] + red[0][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
-            } else {
-              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
-                  + red[2][(16 + i) * 32 + lane];
+          for (int i = 0; i < 16; i += 4) {
+            float v0[4], v1[4];
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < 4; c++) {
+              if constexpr (SPLITS == 2) {
+                v0[c] = cT0[(i + c)] + red[0][(i + c) * 32 + lane];
+                v1[c] = cT1[(i + c)] + red[0][(16 + (i + c)) * 32 + lane];
+              } else {
+                v0[c] = cT0[(i + c)] + red[0][(i + c) * 32 + lane] + red[1][(i + c) * 32 + lane] + red[2][(i + c) * 32 + lane];
+                v1[c] = cT1[(i + c)] + red[0][(16 + (i + c)) * 32 + lane] + red[1][(16 + (i + c)) * 32 + lane]
+                    + red[2][(16 + (i + c)) * 32 + lane];
+              }
             }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v0);
-            out[(size_t)(16 + fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v1);
+            const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            *(device vec<OutT, 4>*)(out + base) = vec<OutT, 4>(
+                OutT(v0[0]), OutT(v0[1]), OutT(v0[2]), OutT(v0[3]));
+            *(device vec<OutT, 4>*)(out + base + 16 * N) = vec<OutT, 4>(
+                OutT(v1[0]), OutT(v1[1]), OutT(v1[2]), OutT(v1[3]));
           }
         }
         """
@@ -1567,6 +1578,7 @@ enum DFlash2TensorMatmul {
     /// weight's output bit for bit at load and keeps `source` on any
     /// mismatch. Stored layout only (no tiled copy is read).
     private static let sourceSwapped = """
+        using OutIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
         const uint lane = thread_index_in_simdgroup;
@@ -1609,7 +1621,7 @@ enum DFlash2TensorMatmul {
             }
             // Destination coordinates: [0] the input row, [1] the column in the block.
             auto idx = cT.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+            out[(OutIndexT)idx[0] * N + n0 + idx[1]] = OutT(v);
           }
         }
         """
@@ -1628,6 +1640,7 @@ enum DFlash2TensorMatmul {
     /// partitions and the same partial order as `source32`, so its bits
     /// (`prepareSwapped` compares them at load).
     private static let sourceSwapped32 = """
+        using OutIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
         const uint lane = thread_index_in_simdgroup;
@@ -1679,8 +1692,8 @@ enum DFlash2TensorMatmul {
                   + red[2][(16 + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
-            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            out[(OutIndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(OutIndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
           }
         }
         """
@@ -1794,18 +1807,24 @@ enum DFlash2TensorMatmul {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < 16; i++) {
-              float v = h == 0 ? cT0[i] : cT1[i];
-              if constexpr (SPLITS == 2) {
-                v = v + red[0][h][i * 32 + lane];
-              } else if constexpr (SPLITS == 4) {
-                v = v + red[0][h][i * 32 + lane] + red[1][h][i * 32 + lane] + red[2][h][i * 32 + lane];
-              } else {
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < SPLITS - 1; j++) { v = v + red[j][h][i * 32 + lane]; }
+            for (int i = 0; i < 16; i += 4) {
+              float v[4];
+              #pragma clang loop unroll(full)
+              for (int c = 0; c < 4; c++) {
+                v[c] = h == 0 ? cT0[(i + c)] : cT1[(i + c)];
+                if constexpr (SPLITS == 2) {
+                  v[c] = v[c] + red[0][h][(i + c) * 32 + lane];
+                } else if constexpr (SPLITS == 4) {
+                  v[c] = v[c] + red[0][h][(i + c) * 32 + lane] + red[1][h][(i + c) * 32 + lane] + red[2][h][(i + c) * 32 + lane];
+                } else {
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < SPLITS - 1; j++) { v[c] = v[c] + red[j][h][(i + c) * 32 + lane]; }
+                }
               }
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nh] = OutT(v);
+              const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nh;
+              *(device vec<OutT, 4>*)(out + base) = vec<OutT, 4>(
+                  OutT(v[0]), OutT(v[1]), OutT(v[2]), OutT(v[3]));
             }
           }
         }
@@ -1928,7 +1947,10 @@ enum DFlash2TensorMatmul {
         if swapped {
             return kernelSwapped32(
                 [a, w, dimsArray(k: k, n: n)],
-                template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+                template: [
+                    ("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT),
+                    ("IO32", n > 0 && n <= Int(Int32.max) / 32 ? 1 : 0),
+                ],
                 grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
                 outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
         }
@@ -1947,7 +1969,10 @@ enum DFlash2TensorMatmul {
         let threads = splits * 32
         return kernelSwapped(
             [a, w, dimsArray(k: k, n: n)],
-            template: [("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT)],
+            template: [
+                ("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT),
+                ("IO32", n > 0 && n <= Int(Int32.max) / 32 ? 1 : 0),
+            ],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
     }
