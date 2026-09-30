@@ -3112,7 +3112,7 @@ enum Qwen35TensorPackedMatmul {
             ensureRowContiguous: true)
     }
 
-    /// On unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_PREFETCH=0`: the plane
+    /// Off unless `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_PREFETCH=1`: the plane
     /// body issues the next group's word pair before extracting this group's
     /// operand and running its op, so the load's latency overlaps the op and
     /// the epilogue (the same hoist `sourceNarrowInt8RBPrefetched` brings to
@@ -3120,10 +3120,12 @@ enum Qwen35TensorPackedMatmul {
     /// arithmetic in the same order: the body stays bitwise the plane
     /// kernel's and is checked against `sourceStaged8Reg` at load by the same
     /// `promptPlaneSelfTest`.
+    // The repaired generators are available for diagnostics; matched M2
+    // streaming probes regressed ~9%, so keep the prior effective route.
     static let planePrefetch: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_PREFETCH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "0")
     }()
 
     /// `sourceStaged8RegPlane` with its plane loads one group ahead: the
@@ -3140,8 +3142,9 @@ enum Qwen35TensorPackedMatmul {
              "uint4 nw0 = wcol[0]; uint4 nw1 = wcol[1];\n        for (int g = 0; g < Kg; g++) {\n          const uint4 cw0 = nw0; const uint4 cw1 = nw1;\n          if (g + 1 < Kg) { nw0 = wcol[(size_t)(g + 1) * 64]; nw1 = wcol[(size_t)(g + 1) * 64 + 1]; }\n          load(cw0, cw1); extract();"),
         ]
         for (anchor, replacement) in edits {
-            guard text.components(separatedBy: anchor).count == 2 else { return nil }
-            text = text.replacingOccurrences(of: anchor, with: replacement)
+            let normalizedAnchor = anchor.replacingOccurrences(of: "\n        ", with: "\n")
+            guard text.components(separatedBy: normalizedAnchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: normalizedAnchor, with: replacement)
         }
         return text
     }()
@@ -3159,18 +3162,18 @@ enum Qwen35TensorPackedMatmul {
 
     // The plane kernel's forms for the load-time per-shape trial
     // (`PlaneFormTrial`): each simdgroup still runs the plane kernel's
-    // 32 x 32 x 128 op over its 32 rows and one 32-column tile, the right
+    // TM x 32 x 128 op over its TM rows and one 32-column tile, the right
     // operand built from its own 32 bytes of the plane copy exactly as there,
     // the same epilogue per element in ascending group order and the same
     // stores, so every output is the plane kernel's bit for bit. What changes
     // is how the activation tile a threadgroup multiplies is shared:
     // SGN simdgroups per threadgroup (the plane kernel's 2; 4 or 8 run more
-    // column tiles against the same 32 x 128 activation slice while it is in
+    // column tiles against the same TM x 128 activation slice while it is in
     // the core's cache); CT column tiles per simdgroup (2: two ops a group
     // against the same slice, the rows' constants loaded once); AT the slice
     // staged in threadgroup memory once a group by the whole threadgroup
     // (uint4 runs, double-buffered, one barrier a group) and read by every
-    // op from there. grid (N / (32 SGN CT) * 32 SGN, M / 32, 1), threadgroup
+    // op from there. grid (N / (32 SGN CT) * 32 SGN, M / TM, 1), threadgroup
     // (32 SGN, 1, 1); inputs as the plane kernel's (the plane copy).
     private static let sourcePlaneForms = """
         typedef typename metal::conditional<IO32 != 0, uint, size_t>::type IndexT;
@@ -3179,20 +3182,34 @@ enum Qwen35TensorPackedMatmul {
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint tid = thread_position_in_threadgroup.x;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
-        const int ns0 = int(threadgroup_position_in_grid.x) * (32 * SGN * CT) + 32 * CT * int(sg);
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        int mtile = int(threadgroup_position_in_grid.y);
+        int cblock = int(threadgroup_position_in_grid.x);
+        if constexpr (SW > 0) {
+          const int NB = N / (32 * SGN * CT);
+          const int MT = M / TM;
+          const int fid = mtile * NB + cblock;
+          const int per = SW * MT;
+          const int st = fid / per;
+          const int rem = NB - st * SW;
+          const int wd = rem < SW ? rem : SW;
+          const int r = fid - st * per;
+          mtile = r / wd;
+          cblock = st * SW + (r - mtile * wd);
+        }
+        const int ms = mtile * TM;
+        const int ns0 = cblock * (32 * SGN * CT) + 32 * CT * int(sg);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(TM, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
         auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         thread uint32_t* bw = (thread uint32_t*)&bT;
-        // AT: the group's 32 x 128 activation slice, rows of 128 bytes.
-        threadgroup uint4 abuf[AT ? 2 : 1][AT ? 32 * 128 / 16 : 1];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> As0((threadgroup int8_t*)abuf[0], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 32>(0, ms);
+        // AT: the group's TM x 128 activation slice, rows of 128 bytes.
+        threadgroup uint4 abuf[AT ? 2 : 1][AT ? TM * 128 / 16 : 1];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> As0((threadgroup int8_t*)abuf[0], dextents<int, 2>(128, TM));
+        auto tA0 = A.template slice<128, TM>(0, ms);
         typedef typename metal::conditional<AT != 0, metal::remove_addrspace_t<decltype(As0)>, metal::remove_addrspace_t<decltype(tA0)>>::type AOpT;
         auto cT = op.template get_destination_cooperative_tensor<AOpT, decltype(bT), int32_t>();
-        constexpr int CAP = 32;
+        constexpr int CAP = TM;
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
         const int mb = ms + fm;
@@ -3203,8 +3220,8 @@ enum Qwen35TensorPackedMatmul {
           for (int i = 0; i < CAP; i++) { acc[t][i] = 0.0f; }
         }
         const int NQ = N / 4;
-        const IndexT tb0 = (IndexT)(ms / 64) * (IndexT)Kg * 64 + (IndexT)(fm * 4) + (IndexT)((ms & 32) >> 4);
-        const IndexT tb1 = tb0 + 32;
+        const IndexT tb0 = (IndexT)(ms / 64) * (IndexT)Kg * 64 + (IndexT)(fm * 4)
+            + (IndexT)((ms & 32) >> 4) + (IndexT)((ms & 16) << 1);
         // The plane kernel's words, extracts and epilogue, per column tile t.
         uint4 wv[2];
         auto load = [&](int t, int g) {
@@ -3225,7 +3242,7 @@ enum Qwen35TensorPackedMatmul {
         };
         auto stageA = [&](int g, int buf) {
           #pragma clang loop unroll(full)
-          for (int e = int(tid); e < 32 * 128 / 16; e += 32 * SGN) {
+          for (int e = int(tid); e < TM * 128 / 16; e += 32 * SGN) {
             const int r = e >> 3; const int q = e & 7;
             abuf[buf][e] = *(const device uint4*)(xq + (IndexT)(ms + r) * (IndexT)K + (IndexT)g * 128 + 16 * q);
           }
@@ -3238,19 +3255,24 @@ enum Qwen35TensorPackedMatmul {
           const int cur = g & 1;
           if (AT && g + 1 < Kg) { stageA(g + 1, cur ^ 1); }
           const float2 a0 = *(const device float2*)(ascale + tb0 + (IndexT)g * 64);
-          const float2 a1 = *(const device float2*)(ascale + tb1 + (IndexT)g * 64);
           const float2 r0 = *(const device float2*)(rsb + tb0 + (IndexT)g * 64);
-          const float2 r1 = *(const device float2*)(rsb + tb1 + (IndexT)g * 64);
-          const float as[4] = {a0.x, a0.y, a1.x, a1.y};
-          const float rb[4] = {r0.x, r0.y, r1.x, r1.y};
+          float as[4] = {a0.x, a0.y, 0.0f, 0.0f};
+          float rb[4] = {r0.x, r0.y, 0.0f, 0.0f};
+          if constexpr (TM == 32) {
+            const IndexT tb1 = tb0 + 32;
+            const float2 a1 = *(const device float2*)(ascale + tb1 + (IndexT)g * 64);
+            const float2 r1 = *(const device float2*)(rsb + tb1 + (IndexT)g * 64);
+            as[2] = a1.x; as[3] = a1.y;
+            rb[2] = r1.x; rb[3] = r1.y;
+          }
           #pragma clang loop unroll(full)
           for (int t = 0; t < CT; t++) {
             load(t, g); extract();
             if (AT) {
-              tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Ag((threadgroup int8_t*)abuf[cur], dextents<int, 2>(128, 32));
+              tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Ag((threadgroup int8_t*)abuf[cur], dextents<int, 2>(128, TM));
               op.run(Ag, bT, cT);
             } else {
-              auto tA = A.template slice<128, 32>(g * 128, ms);
+              auto tA = A.template slice<128, TM>(g * 128, ms);
               op.run(tA, bT, cT);
             }
             const int nb = ns0 + 32 * t + fn;
@@ -3303,8 +3325,9 @@ enum Qwen35TensorPackedMatmul {
              "if (g == 0) { fetch(0, 0); }\n          #pragma clang loop unroll(full)\n          for (int t = 0; t < CT; t++) {\n            const uint4 cw0 = fw0; const uint4 cw1 = fw1;\n            if (t + 1 == CT) { if (g + 1 < Kg) { fetch(0, g + 1); } } else { fetch(t + 1, g); }\n            load(cw0, cw1); extract();"),
         ]
         for (anchor, replacement) in edits {
-            guard text.components(separatedBy: anchor).count == 2 else { return nil }
-            text = text.replacingOccurrences(of: anchor, with: replacement)
+            let normalizedAnchor = anchor.replacingOccurrences(of: "\n        ", with: "\n")
+            guard text.components(separatedBy: normalizedAnchor).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: normalizedAnchor, with: replacement)
         }
         return text
     }()
@@ -5701,12 +5724,13 @@ extension Qwen35TensorPackedMatmul {
 extension Qwen35TensorPackedMatmul {
     /// One form of the plane kernel (`sourcePlaneForms`): `p<SGN>` SGN
     /// simdgroups per threadgroup (1 ... 16), `c2` two column tiles per
-    /// simdgroup, `t` the activation slice staged in threadgroup memory (e.g.
+    /// simdgroup, `r16` a 16-row tile, and `t` the activation slice staged in
+    /// threadgroup memory (e.g.
     /// `p4`, `p8t`, `p2c2`). `p2` is the plane kernel's own tiling in the
     /// forms' text (the rows' constants loaded before the op, not after it).
     /// Every form's outputs are the plane kernel's bit for bit.
     struct PlaneForm: Hashable, CustomStringConvertible {
-        let sgn: Int, ct: Int, at: Int, io32: Int
+        let sgn: Int, ct: Int, at: Int, io32: Int, rows: Int, sw: Int
         let name: String
 
         init?(name raw: String) {
@@ -5717,13 +5741,25 @@ extension Qwen35TensorPackedMatmul {
             let digits = rest.prefix { $0.isNumber }
             guard let sgn = Int(digits), [1, 2, 4, 8, 16].contains(sgn) else { return nil }
             rest = rest.dropFirst(digits.count)
+            var rows = 32
+            if rest.hasPrefix("r16") { rows = 16; rest = rest.dropFirst(3) }
             var ct = 1, at = 0
             if rest.hasPrefix("c2") { ct = 2; rest = rest.dropFirst(2) }
             if rest.hasPrefix("t") { at = 1; rest = rest.dropFirst(1) }
             var io32 = 0
             if rest.hasPrefix("i32") { io32 = 1; rest = rest.dropFirst(3) }
-            guard rest.isEmpty, sgn * ct <= 16 else { return nil }
-            (self.sgn, self.ct, self.at, self.io32) = (sgn, ct, at, io32)
+            var sw = 0
+            if rest.hasPrefix("w") {
+                rest = rest.dropFirst()
+                let digits = rest.prefix { $0.isNumber }
+                guard let width = Int(digits), [8, 32, 128].contains(width) else { return nil }
+                sw = width
+                rest = rest.dropFirst(digits.count)
+            }
+            guard rest.isEmpty, sgn * ct <= 16, rows == 32 || (ct == 1 && at == 0),
+                sw == 0 || (rows == 16 && sgn == 2 && ct == 1 && at == 0)
+            else { return nil }
+            (self.sgn, self.ct, self.at, self.io32, self.rows, self.sw) = (sgn, ct, at, io32, rows, sw)
             self.name = name
         }
 
@@ -5731,11 +5767,20 @@ extension Qwen35TensorPackedMatmul {
         /// Columns per threadgroup; a launch needs `n` to be a multiple.
         var columns: Int { 32 * sgn * ct }
         func fits(k: Int, n: Int, m: Int) -> Bool {
-            guard n % columns == 0, m % 32 == 0 else { return false }
+            guard n % columns == 0, m % rows == 0 else { return false }
+            if sw != 0 {
+                let limit = Int(Int32.max)
+                guard k >= 128, k % 128 == 0, n > 0, m > 0,
+                    k <= limit, n <= limit, m <= limit
+                else { return false }
+                let nb = n / columns
+                let mt = m / rows
+                guard mt <= limit / nb, mt <= limit / sw else { return false }
+            }
             guard io32 != 0 else { return true }
             // Bound every index in codes, plane words, row constants, scales,
-            // and output. With 32-row alignment, padded row constants
-            // have at most twice as many rows and 1/128 as many columns.
+            // and output. With 16-row alignment, padded row constants have at
+            // most four times as many rows and 1/128 as many columns.
             let limit = Int(Int32.max)
             guard k >= 128, k % 128 == 0, n > 0, m > 0,
                 m <= limit / k, m <= limit / n, n <= limit / (k / 16)
@@ -5756,9 +5801,9 @@ extension Qwen35TensorPackedMatmul {
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [
                 ("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("AT", form.at),
-                ("IO32", form.io32),
+                ("IO32", form.io32), ("TM", form.rows), ("SW", form.sw),
             ],
-            grid: (n / form.columns * 32 * form.sgn, m / 32, 1), threadGroup: (32 * form.sgn, 1, 1),
+            grid: (n / form.columns * 32 * form.sgn, m / form.rows, 1), threadGroup: (32 * form.sgn, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
     }
 
@@ -5844,7 +5889,7 @@ extension Qwen35TensorPackedMatmul {
         /// with 32-bit indices (`i32`, narrowZoo32's promoted trick).
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32"
+                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32,p1r16,p2r16,p4r16,p8r16,p2r16i32w32"
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
