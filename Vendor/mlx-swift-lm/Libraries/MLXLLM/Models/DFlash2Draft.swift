@@ -1698,8 +1698,11 @@ enum DFlash2TensorMatmul {
             float v;
             if constexpr (SPLITS == 2) {
               v = cT[i] + red[0][i * 32 + lane];
-            } else {
+            } else if constexpr (SPLITS == 4) {
               v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            } else {
+              v = cT[i];
+              for (int j = 0; j < SPLITS - 1; j++) { v += red[j][i * 32 + lane]; }
             }
             // Destination coordinates: [0] the input row, [1] the column in the block.
             auto idx = cT.get_multidimensional_index(i);
@@ -1768,10 +1771,15 @@ enum DFlash2TensorMatmul {
             if constexpr (SPLITS == 2) {
               v0 = cT0[i] + red[0][i * 32 + lane];
               v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
-            } else {
+            } else if constexpr (SPLITS == 4) {
               v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
               v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
                   + red[2][(16 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i]; v1 = cT1[i];
+              for (int j = 0; j < SPLITS - 1; j++) {
+                v0 += red[j][i * 32 + lane]; v1 += red[j][(16 + i) * 32 + lane];
+              }
             }
             auto idx = cT0.get_multidimensional_index(i);
             out[(OutIndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
@@ -1791,7 +1799,8 @@ enum DFlash2TensorMatmul {
     /// Whether 17-32-row launches take `sourceSwapped32` (set by `prepareSwapped`).
     nonisolated(unsafe) static var swapped32Active = false
 
-    /// The K step of `sourceSwapped` (`MLXFAST_DRAFT_SWAP_KT`: 64 or 128, default 128).
+    /// The standard K step of `sourceSwapped` (`MLXFAST_DRAFT_SWAP_KT`: 64 or
+    /// 128, default 128; `SwapTrial` may set another per shape).
     private static let swappedKT: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_KT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2015,7 +2024,7 @@ enum DFlash2TensorMatmul {
         let splits = Kernel.stockSplits(n: n)
         let threads = splits * 32
         if !tiled && swappedActive {
-            return launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+            return launchSwapped(a, w, k: k, n: n, outputDType: outputDType)
         }
         return kernel(
             [a, w, dimsArray(k: k, n: n)],
@@ -2024,22 +2033,25 @@ enum DFlash2TensorMatmul {
             outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
     }
 
-    /// `source32` (or `sourceSwapped32` when `swapped`) over a 32-row `a`.
+    /// `source32` (or `sourceSwapped32` when `swapped`, with `tiling` or the
+    /// shape's `swapTiling`) over a 32-row `a`.
     private static func launch32(
-        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, swapped: Bool, outputDType: DType
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, swapped: Bool, tiling: SwapTiling? = nil,
+        outputDType: DType
     ) -> MLXArray {
-        let splits = n >= 16384 ? 2 : 4
-        let threads = splits * 32
         if swapped {
+            let t = tiling ?? swapTiling(k: k, n: n, rows32: true)
             return kernelSwapped32(
                 [a, w, dimsArray(k: k, n: n)],
                 template: [
-                    ("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT),
+                    ("OutT", outputDType), ("SPLITS", t.splits), ("KT", t.kt),
                     ("IO32", n > 0 && n <= Int(Int32.max) / 32 ? 1 : 0),
                 ],
-                grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
+                grid: (n / 32 * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
                 outputShapes: [[2 * rowsPerTile, n]], outputDTypes: [outputDType])[0]
         }
+        let splits = n >= 16384 ? 2 : 4
+        let threads = splits * 32
         return kernel32(
             [a, w, dimsArray(k: k, n: n)],
             template: [("OutT", outputDType), ("SPLITS", splits)],
@@ -2048,15 +2060,17 @@ enum DFlash2TensorMatmul {
     }
 
     /// `sourceSwapped` over a 16-row `a` and the stored `[N, K]` weight, with
-    /// the stock kernel's K split.
+    /// `tiling` or the shape's `swapTiling` (the stock kernel's K split unless
+    /// a forced choice or `SwapTrial` set another).
     private static func launchSwapped(
-        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, splits: Int, outputDType: DType
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, tiling: SwapTiling? = nil, outputDType: DType
     ) -> MLXArray {
-        let threads = splits * 32
+        let t = tiling ?? swapTiling(k: k, n: n, rows32: false)
+        let threads = t.splits * 32
         return kernelSwapped(
             [a, w, dimsArray(k: k, n: n)],
             template: [
-                ("OutT", outputDType), ("SPLITS", splits), ("KT", swappedKT),
+                ("OutT", outputDType), ("SPLITS", t.splits), ("KT", t.kt),
                 ("IO32", n > 0 && n <= Int(Int32.max) / 32 ? 1 : 0),
             ],
             grid: (n / 32 * threads, 1, 1), threadGroup: (threads, 1, 1),
@@ -2071,6 +2085,7 @@ enum DFlash2TensorMatmul {
     static func prepareSwapped(_ weights: [MLXArray], rows32 weights32: [MLXArray] = []) -> Bool {
         swappedActive = false
         swapped32Active = false
+        swapTilings = [:]
         guard enabled, Qwen35TensorPackedMatmul.tensorOperandsAvailable, swappedSetting else {
             return false
         }
@@ -2096,7 +2111,7 @@ enum DFlash2TensorMatmul {
                     template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", 0)],
                     grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
                     outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
-                let swapped = launchSwapped(a, w, k: k, n: n, splits: splits, outputDType: outputDType)
+                let swapped = launchSwapped(a, w, k: k, n: n, outputDType: outputDType)
                 differing.append(
                     (stock.view(dtype: bits) .!= swapped.view(dtype: bits)).asType(.int32).sum())
                 values += rowsPerTile * n
@@ -2144,6 +2159,306 @@ enum DFlash2TensorMatmul {
                     + "\(mismatches32) mismatches, " + (swapped32Active ? "on" : "off")
                     + String(format: "; %.0f ms\n", elapsed)).utf8))
         return swappedActive
+    }
+
+    // MARK: The block-width kernels' tiling
+
+    /// A block-width launch's tiling. The swapped BF16 kernel (`sourceSwapped`,
+    /// `sourceSwapped32`; `ahead` nil): the K step `KT` and the K split `SPLITS`
+    /// (simdgroups per 32-column threadgroup, each over one contiguous
+    /// `K / SPLITS` slab). The packed 12-bit kernel (`DFlash2PackedWeights`):
+    /// its K step is the copy's tile (`DFlash2PackedWeights.ks`: another K step
+    /// would need another copy, so it is not a knob), so its knobs are the
+    /// split and `ahead`, how many tiles before its op a simdgroup reads a
+    /// tile's share (the record: one). A K step keeps each slab's products in
+    /// K order and a look-ahead moves only the reads (bit for bit where the op
+    /// accumulates in K order: checked); a split reorders the FP32 sum.
+    struct SwapTiling: Hashable, CustomStringConvertible {
+        var kt: Int, splits: Int, ahead: Int?
+        var description: String { "t\(kt)s\(splits)" + (ahead.map { "a\($0)" } ?? "") }
+        func fits(k: Int) -> Bool { k % splits == 0 && (k / splits) % kt == 0 }
+
+        init(kt: Int, splits: Int, ahead: Int? = nil) { (self.kt, self.splits, self.ahead) = (kt, splits, ahead) }
+
+        /// `t<KT>s<S>` for the swapped kernel (KT 64, 128 or 256) or
+        /// `t<tile>s<S>a<A>` for the packed one (A 0, 1 or 2), `standard`'s
+        /// kernel only; S 2, 4, 8, or 0 for `standard`'s split.
+        init?(name: String, standard: SwapTiling) {
+            let v = name.split(whereSeparator: { "tsa".contains($0) }).compactMap { Int($0) }
+            let packed = standard.ahead != nil
+            guard v.count == (packed ? 3 : 2), name == "t\(v[0])s\(v[1])" + (packed ? "a\(v[2])" : ""),
+                (packed ? [DFlash2PackedWeights.ks] : [64, 128, 256]).contains(v[0]),
+                [0, 2, 4, 8].contains(v[1]), !packed || (0 ... 2).contains(v[2])
+            else { return nil }
+            self.init(kt: v[0], splits: v[1] == 0 ? standard.splits : v[1], ahead: packed ? v[2] : nil)
+        }
+    }
+
+    /// A drafter projection as a block-width launch sees it: `[N, K]`, 16 or 32 rows.
+    struct SwapShape: Hashable, CustomStringConvertible {
+        let k: Int, n: Int, rows32: Bool
+        var description: String { "\(n)x\(k)" + (rows32 ? "r32" : "") }
+        /// The record's tiling of the kernel that runs it: the packed kernel's
+        /// (its tile, the stock split, one tile ahead) or the swapped one's
+        /// (`swappedKT` and the stock split).
+        func standard(packed: Bool) -> SwapTiling {
+            let splits = Kernel.stockSplits(n: n)
+            return packed
+                ? SwapTiling(kt: DFlash2PackedWeights.ks, splits: splits, ahead: 1)
+                : SwapTiling(kt: swappedKT, splits: splits)
+        }
+    }
+
+    /// Each shape's tiling where it is not the standard, read only by its own
+    /// kernel (packed or swapped): set at load (forced) or by `SwapTrial` at
+    /// the deferred warm, before anything is served.
+    nonisolated(unsafe) static var swapTilings: [SwapShape: SwapTiling] = [:]
+
+    static func swapTiling(k: Int, n: Int, rows32: Bool, packed: Bool = false) -> SwapTiling {
+        let shape = SwapShape(k: k, n: n, rows32: rows32)
+        guard !swapTilings.isEmpty, let t = swapTilings[shape], (t.ahead != nil) == packed else {
+            return shape.standard(packed: packed)
+        }
+        return t
+    }
+
+    /// The block-width kernels' tiling per drafter projection shape, chosen
+    /// at the deferred load warm, on the kernel the record runs there: the
+    /// packed 12-bit kernel when `DFlash2PackedWeights` is on (look-ahead 0,
+    /// 1, 2), else the swapped BF16 kernel (K steps 64, 128, 256), at the
+    /// stock split, so every candidate keeps the record's K order and sum;
+    /// `..._CLOSE=1` also offers splits 2, 4, 8 (a reordered FP32 sum) and
+    /// lets a close pick win. Each candidate runs on every weight of its
+    /// shape against the standard (BF16 outputs): bitwise (`=`) or close (`~`:
+    /// every value within one BF16 ulp of its row's largest magnitude), else
+    /// dropped. A sample is one evaluation of a chain of launches over the
+    /// shape's weights in turn, each input plus the previous output's first
+    /// value, so they run one after another streaming distinct weights, as in
+    /// a block forward. Per shape, rotating order, a discarded round and
+    /// `rounds` more; a score is the median ratio to the standard. The pick is
+    /// the fastest bitwise tiling, or a close one faster still by
+    /// `pickMargin`, if it beats the standard by `pickMargin`; the picks are
+    /// adopted only if a chain over every projection weight takes at most
+    /// `1 - adoptMargin` of the standard's. A close tiling changes only the
+    /// drafter's proposals; without `..._CLOSE=1` none is kept, so no draft
+    /// changes. `MLXFAST_DRAFT_TILING_TRIAL=0`: no trial;
+    /// `..._FORCE=<N>x<K>[r32]=<tiling>,...` installs those at load after the
+    /// check; `..._LIST=` replaces the candidates.
+    enum SwapTrial {
+        private static func env(_ suffix: String) -> String? {
+            let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_TILING_TRIAL" + suffix]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return raw?.isEmpty == false ? raw : nil
+        }
+
+        static let enabled = !["0", "false", "no", "off"].contains(env("")?.lowercased() ?? "")
+        static let forced = env("_FORCE")
+        static let listed = env("_LIST")?.split(separator: ",").map(String.init)
+        static let closeAllowed = ["1", "true", "yes", "on"].contains(env("_CLOSE")?.lowercased() ?? "")
+        static let rounds = 8
+        static let adoptMargin = 0.02
+        static let pickMargin = 0.01
+        static let dropMargin = 0.05
+
+        /// Whether the shapes run the packed kernel (set by `note`).
+        nonisolated(unsafe) private static var packed = false
+        nonisolated(unsafe) private static var weights: [SwapShape: [MLXArray]] = [:]
+        nonisolated(unsafe) private static var sequence: [(SwapShape, MLXArray)] = []
+        nonisolated(unsafe) private static var inputs: [SwapShape: MLXArray] = [:]
+        private static var order: [SwapShape] {
+            var seen = Set<SwapShape>()
+            return sequence.map { $0.0 }.filter { seen.insert($0).inserted }
+        }
+
+        /// Split 0 is each shape's stock split.
+        private static var list: [String] {
+            listed ?? (closeAllowed ? [2, 4, 8] : [0]).flatMap { s in
+                packed
+                    ? (0 ... 2).map { "t\(DFlash2PackedWeights.ks)s\(s)a\($0)" } : [64, 128, 256].map { "t\($0)s\(s)" }
+            }
+        }
+
+        private static func log(_ line: String) {
+            FileHandle.standardError.write(Data(("dflash2 drafter GEMM tiling: " + line + "\n").utf8))
+        }
+
+        private static func median(_ values: [Double]) -> Double {
+            let v = values.sorted()
+            return v.isEmpty ? .nan : (v[(v.count - 1) / 2] + v[v.count / 2]) / 2
+        }
+
+        /// The block-width launches' weights by shape and the kernel that runs
+        /// them (after `DFlash2PackedWeights.prepare`), then any forced tilings.
+        static func note(_ ws: [MLXArray], rows32 ws32: [MLXArray]) {
+            (weights, sequence, inputs) = ([:], [], [:])
+            guard swappedActive else { return }
+            packed = DFlash2PackedWeights.active
+            let runs = { (w: MLXArray) -> Bool in
+                w.dtype == .bfloat16 && w.ndim == 2 && w.dim(1) % 1024 == 0 && w.dim(0) % 32 == 0
+                    && (!packed || DFlash2PackedWeights.copy(of: w) != nil)
+            }
+            sequence = ws.filter(runs).map { (SwapShape(k: $0.dim(1), n: $0.dim(0), rows32: false), $0) }
+                + (rows32Enabled && (packed || swapped32Active) ? ws32.filter(runs) : []).map {
+                    (SwapShape(k: $0.dim(1), n: $0.dim(0), rows32: true), $0)
+                }
+            weights = Dictionary(grouping: sequence, by: { $0.0 }).mapValues { $0.map { $0.1 } }
+            guard let forced else { return }
+            let shapes = order
+            let lines = forced.split(separator: ",").map { entry -> String in
+                let parts = entry.split(separator: "=").map(String.init)
+                guard parts.count == 2, let shape = shapes.first(where: { "\($0)" == parts[0] }),
+                    let t = SwapTiling(name: parts[1], standard: shape.standard(packed: packed)), t.fits(k: shape.k)
+                else { return "\(entry) ignored (not a shape and fitting tiling)" }
+                guard let c = check(t, shape), c.within else { return "\(shape)=\(t) FAILED its check" }
+                swapTilings[shape] = t
+                return "\(shape)=\(t) " + (c.exact ? "bitwise" : String(format: "close (%.2f ulp)", c.worst))
+            }
+            log("forced (\(packed ? "packed" : "swapped") kernel): " + lines.joined(separator: ", ")
+                + "; elsewhere the record's; no trial")
+        }
+
+        private static func input(_ shape: SwapShape) -> MLXArray {
+            if let x = inputs[shape] { return x }
+            let x = MLXRandom.normal(
+                [shape.rows32 ? 2 * rowsPerTile : rowsPerTile, shape.k], key: MLXRandom.key(UInt64(9603 + shape.k))
+            ).asType(.bfloat16)
+            eval(x)
+            inputs[shape] = x
+            return x
+        }
+
+        private static func launch(_ x: MLXArray, _ w: MLXArray, _ shape: SwapShape, _ t: SwapTiling) -> MLXArray {
+            if t.ahead != nil, let c = DFlash2PackedWeights.copy(of: w) {
+                return DFlash2PackedWeights.launch(
+                    x, c, rows: shape.rows32 ? 2 * rowsPerTile : rowsPerTile, outputDType: .bfloat16, tiling: t)
+            }
+            return shape.rows32
+                ? launch32(x, w, k: shape.k, n: shape.n, swapped: true, tiling: t, outputDType: .bfloat16)
+                : launchSwapped(x, w, k: shape.k, n: shape.n, tiling: t, outputDType: .bfloat16)
+        }
+
+        /// `t` against the standard on every weight of `shape`: bitwise, the worst
+        /// distance in ulps of the row's largest magnitude, all within one; nil
+        /// on an MLX error.
+        private static func check(_ t: SwapTiling, _ shape: SwapShape) -> (exact: Bool, worst: Float, within: Bool)? {
+            try? withError { error -> (exact: Bool, worst: Float, within: Bool) in
+                var (worst, within, differ) = ([MLXArray](), [MLXArray](), [MLXArray]())
+                for w in weights[shape] ?? [] {
+                    let ref16 = launch(input(shape), w, shape, shape.standard(packed: packed))
+                    let y16 = launch(input(shape), w, shape, t)
+                    let ref = ref16.asType(.float32)
+                    let ulp = MLX.pow(MLXArray(Float(2)), MLX.floor(MLX.log2(MLX.abs(ref).max(axis: -1, keepDims: true))) - 7)
+                    let ratio = MLX.abs(y16.asType(.float32) - ref) / ulp
+                    worst.append(ratio.max())
+                    within.append((ratio .<= Float(1)).all())
+                    differ.append((y16.view(dtype: .uint16) .!= ref16.view(dtype: .uint16)).asType(.int32).sum())
+                }
+                let (w, ok, d) = (stacked(worst).max(), stacked(within).all(), stacked(differ).sum())
+                eval(w, ok, d)
+                try error.check()
+                return (d.item(Int.self) == 0, w.item(Float.self), ok.item(Bool.self))
+            }
+        }
+
+        /// Host nanoseconds of one evaluation of `steps` in turn, each input
+        /// plus the previous output's first value (so they run one after another).
+        private static func time(_ steps: [(SwapShape, MLXArray, SwapTiling)]) -> Double {
+            var outputs: [MLXArray] = []
+            for (shape, w, t) in steps {
+                let x = outputs.last.map { input(shape) + $0[0 ..< 1, 0 ..< 1] } ?? input(shape)
+                outputs.append(launch(x, w, shape, t))
+            }
+            let begin = DispatchTime.now().uptimeNanoseconds
+            eval(outputs)
+            return Double(DispatchTime.now().uptimeNanoseconds - begin)
+        }
+
+        /// The trial (see the type's notes), once; nothing unless `note` ran.
+        static func run() {
+            guard !sequence.isEmpty, swappedActive else { return }
+            defer { (weights, sequence, inputs) = ([:], [], [:]) }
+            guard enabled else { return log("MLXFAST_DRAFT_TILING_TRIAL=0; the record's tiling, no trial") }
+            guard forced == nil else { return }
+            let start = DispatchTime.now().uptimeNanoseconds
+            var picks: [SwapShape: SwapTiling] = [:]
+            var parts: [String] = []
+            var (bitwise, close, far, errors) = (0, 0, 0, 0)
+            // Every shape's checks (and so every first compile) before any timing.
+            var survivors: [SwapShape: (opts: [SwapTiling], tags: [String])] = [:]
+            for shape in order {
+                let std = shape.standard(packed: packed)
+                var (opts, tags) = ([std], ["="])
+                for name in list {
+                    guard let t = SwapTiling(name: name, standard: std), t.fits(k: shape.k), !opts.contains(t)
+                    else { continue }
+                    guard let c = check(t, shape) else { errors += 1; continue }
+                    guard c.within else { far += 1; continue }
+                    if c.exact { bitwise += 1 } else { close += 1 }
+                    guard c.exact || closeAllowed else { continue }
+                    opts.append(t)
+                    tags.append(c.exact ? "=" : "~")
+                }
+                survivors[shape] = (opts, tags)
+            }
+            let checking = Double(DispatchTime.now().uptimeNanoseconds - start)
+            // The checks leave the GPU mostly idle (seconds of first compiles in a fresh
+            // process), so the record's chain keeps it busy for 300 ms (at least 5 chains)
+            // before anything is timed.
+            let record = sequence.map { ($0.0, $0.1, $0.0.standard(packed: packed)) }
+            let settle = DispatchTime.now().uptimeNanoseconds
+            var settled = 0
+            while settled < 5 || DispatchTime.now().uptimeNanoseconds - settle < 300_000_000 {
+                _ = time(record)
+                settled += 1
+            }
+            for shape in order {
+                let std = shape.standard(packed: packed)
+                let (opts, tags) = survivors[shape] ?? ([std], ["="])
+                let ws = weights[shape] ?? []
+                let count = max(ws.count, 10)
+                var times = [[Double]](repeating: [], count: opts.count)
+                var active = Array(opts.indices)
+                func score(_ f: Int) -> Double { median(zip(times[f], times[0]).map { $0 / $1 }) - 1 }
+                for round in 0 ... rounds {
+                    for j in active.indices {
+                        let f = active[(j + round) % active.count]
+                        let t = time((0 ..< count).map { (shape, ws[$0 % ws.count], opts[f]) })
+                        if round > 0 { times[f].append(t) }
+                    }
+                    if round == 2 { active = active.filter { $0 == 0 || score($0) <= dropMargin } }
+                }
+                let ranked = opts.indices.sorted { score($0) < score($1) }
+                var best = ranked.first { tags[$0] == "=" } ?? 0
+                if let c = ranked.first(where: { tags[$0] == "~" }), score(c) < score(best) - pickMargin { best = c }
+                if best > 0, score(best) < -pickMargin { picks[shape] = opts[best] }
+                parts.append("\(shape) x\(count) \(std) " + String(format: "%.3f ms", median(times[0]) / 1e6)
+                    + opts.indices.dropFirst().map { " \(opts[$0])\(tags[$0]) " + String(format: "%+.1f%%", score($0) * 100) }.joined())
+            }
+            var verdict = "the record's kept (no pick)"
+            if !picks.isEmpty {
+                func chain(_ mine: Bool) -> [(SwapShape, MLXArray, SwapTiling)] {
+                    mine ? record.map { ($0.0, $0.1, picks[$0.0] ?? $0.2) } : record
+                }
+                var (base, mine) = ([Double](), [Double]())
+                for round in 0 ... rounds {
+                    let first = round % 2 == 1
+                    let (a, b) = (time(chain(first)), time(chain(!first)))
+                    if round > 0 { base.append(first ? b : a); mine.append(first ? a : b) }
+                }
+                let ratio = median(zip(mine, base).map { $0 / $1 })
+                let adopt = ratio <= 1 - adoptMargin
+                if adopt { swapTilings = picks }
+                verdict = "picks " + order.compactMap { s in picks[s].map { "\(s)=\($0)" } }.joined(separator: ",")
+                    + String(format: ": all %d projections %.3f -> %.3f ms (%+.1f%%) -> ", sequence.count,
+                        median(base) / 1e6, median(mine) / 1e6, (ratio - 1) * 100)
+                    + (adopt ? "adopted" : String(format: "the record's kept (under %.0f%%)", adoptMargin * 100))
+            }
+            let closeTag = closeAllowed ? "close" : "close (dropped)"
+            log("trial on the \(packed ? "packed 12-bit" : "swapped BF16") kernel (\(rounds) rounds; \(bitwise) bitwise, \(close) \(closeTag), \(far) past 1 ulp, \(errors) MLX errors): "
+                + parts.joined(separator: " | ") + " -> " + verdict
+                + String(format: "; %.0f ms (checks and compiles %.0f)",
+                    Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6, checking / 1e6))
+        }
     }
 
     // MARK: Tiled weights
@@ -2534,6 +2849,12 @@ enum DFlash2TensorMatmul {
 /// BF16 outputs. On any mismatch or MLX error nothing is packed and every
 /// weight keeps the stored layout. `MLXFAST_DRAFT_PACK12=0` keeps the stored
 /// layout everywhere.
+///
+/// Tiling (`DFlash2TensorMatmul.SwapTrial`): the K step is the tile's, fixed
+/// by the copy; the split and `AHEAD` (how many tiles ahead of its op a
+/// simdgroup reads a tile's share; the record reads one) are template values.
+/// A look-ahead moves only the reads, a split reorders the FP32 sum; a shape
+/// takes another tiling only if the load-time trial checked and adopted it.
 enum DFlash2PackedWeights {
     private static let setting: Bool = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_PACK12"]?
@@ -2885,22 +3206,32 @@ enum DFlash2PackedWeights {
         const uint16_t cap = cT.get_capacity();
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
-        // The next tile's share is read before this one's op (one tile ahead).
-        dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
-            cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KS, lane);
+        // A tile's share is read AHEAD tiles before its op (the record: one;
+        // 0: just before its decode). The ops are the same for every AHEAD.
+        const device uint4* mp = (const device uint4*)mant;
+        const device uint2* cp = (const device uint2*)code;
+        const device uint4* fp = (const device uint4*)first4;
+        dflash2_pack12_share<KT> cur, nxt, far;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+        }
+        if constexpr (AHEAD > 1) {
+          if (KS < kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+        }
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
-          if (k + KS < k0 + kq) {
-            dflash2_pack12_read<KT>(
-                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
-                bases, tile + 1, lane);
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, tile, lane);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+          } else {
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT>(far, mp, cp, fp, bases, tile + 2, lane); }
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
           auto tX = X.template slice<KS, 16>(k, 0);
           op.run(lw, tX, cT);
-          cur = nxt;
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD > 1) { nxt = far; }
         }
         threadgroup float red[SPLITS - 1][16 * COLS];
         if (sg > 0) {
@@ -2913,8 +3244,11 @@ enum DFlash2PackedWeights {
             float v;
             if constexpr (SPLITS == 2) {
               v = cT[i] + red[0][i * 32 + lane];
-            } else {
+            } else if constexpr (SPLITS == 4) {
               v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+            } else {
+              v = cT[i];
+              for (int j = 0; j < SPLITS - 1; j++) { v += red[j][i * 32 + lane]; }
             }
             auto idx = cT.get_multidimensional_index(i);
             out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
@@ -2949,19 +3283,28 @@ enum DFlash2PackedWeights {
         const uint16_t cap = cT0.get_capacity();
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
-        dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
-            cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
-            nb * steps + k0 / KS, lane);
+        const device uint4* mp = (const device uint4*)mant;
+        const device uint2* cp = (const device uint2*)code;
+        const device uint4* fp = (const device uint4*)first4;
+        dflash2_pack12_share<KT> cur, nxt, far;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+        }
+        if constexpr (AHEAD > 1) {
+          if (KS < kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+        }
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
-          if (k + KS < k0 + kq) {
-            dflash2_pack12_read<KT>(
-                nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
-                bases, tile + 1, lane);
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, tile, lane);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+          } else {
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT>(far, mp, cp, fp, bases, tile + 2, lane); }
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
-          cur = nxt;
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD > 1) { nxt = far; }
           auto tXlo = X.template slice<KS, 16>(k, 0);
           op.run(lw, tXlo, cT0);
           auto tXhi = X.template slice<KS, 16>(k, 16);
@@ -2982,10 +3325,15 @@ enum DFlash2PackedWeights {
             if constexpr (SPLITS == 2) {
               v0 = cT0[i] + red[0][i * 32 + lane];
               v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];
-            } else {
+            } else if constexpr (SPLITS == 4) {
               v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
               v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]
                   + red[2][(COLS / 2 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i]; v1 = cT1[i];
+              for (int j = 0; j < SPLITS - 1; j++) {
+                v0 += red[j][i * 32 + lane]; v1 += red[j][(COLS / 2 + i) * 32 + lane];
+              }
             }
             auto idx = cT0.get_multidimensional_index(i);
             out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
@@ -3036,14 +3384,18 @@ enum DFlash2PackedWeights {
         return launch(a, c, rows: 32, outputDType: outputDType)
     }
 
-    /// The swapped kernel's split and grid (`launch`, `launch32`) over the copy.
-    private static func launch(_ a: MLXArray, _ c: Copy, rows: Int, outputDType: DType) -> MLXArray {
+    /// The swapped kernel's grid (`launch`, `launch32`) over the copy, with
+    /// `tiling` or the shape's (`DFlash2TensorMatmul.swapTiling`: the stock
+    /// split and one tile ahead unless a forced choice or its trial set another).
+    fileprivate static func launch(
+        _ a: MLXArray, _ c: Copy, rows: Int, outputDType: DType, tiling: DFlash2TensorMatmul.SwapTiling? = nil
+    ) -> MLXArray {
         let n = c.source.dim(0)
-        let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
+        let t = tiling ?? DFlash2TensorMatmul.swapTiling(k: c.source.dim(1), n: n, rows32: rows > 16, packed: true)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", splits)] + geometry,
-            grid: (n / cols * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("AHEAD", t.ahead ?? 1)] + geometry,
+            grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
 
@@ -4942,6 +5294,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let qkvWeights = layers.compactMap { $0.selfAttn.stackedQKVWeight() }
         _ = DFlash2TensorMatmul.prepareSwapped(blockWeights, rows32: qkvWeights)
         DFlash2PackedWeights.prepare(blockWeights, rows32: qkvWeights)
+        // The tiling trial's weights, on the kernel the two self-tests left on.
+        DFlash2TensorMatmul.SwapTrial.note(blockWeights, rows32: qkvWeights)
         return DFlash2TensorMatmul.prepareTiled(layerWeights)
     }
 
