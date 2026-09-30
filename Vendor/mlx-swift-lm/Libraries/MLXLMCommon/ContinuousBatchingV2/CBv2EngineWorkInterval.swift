@@ -72,7 +72,16 @@ public final class CBv2EngineWorkInterval: @unchecked Sendable {
         // Off by default on this lineage (the box read it slower); `on` or a deadline in ms turns it on.
         let value = ProcessInfo.processInfo.environment["MLXFAST_PROMPT_WORK_INTERVAL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let value, !value.isEmpty, !["0", "false", "no", "off"].contains(value) else { return nil }
+        // Default ON with a LONG single deadline: one interval joined at the
+        // seed's start, due after the whole ~300 ms forward, with no
+        // finish-and-restart churn at the prompt plan's boundaries. The
+        // lineage's earlier box reading ("slower") was the RENEWAL design
+        // (default 4 ms deadlines, a fresh audio interval per boundary); a
+        // single long interval keeps the thread on a performance core for
+        // the entire build without the renewal's interval-creation cost,
+        // and was never read on the box. `0` restores the crown's off.
+        guard let value, !value.isEmpty, !["0", "false", "no", "off"].contains(value)
+        else { return ticks(milliseconds: 40) }
         let milliseconds = UInt64(value).flatMap { $0 > 0 ? $0 : nil } ?? 4
         return ticks(milliseconds: milliseconds)
     }()
