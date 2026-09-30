@@ -1094,15 +1094,16 @@ final class DFlash2GroupedDynamicCausalConv: Module {
         else { return nil }
         let template: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("KS", kernelSize), ("GS", groupSize), ("TAP", tap),
+            ("QUAD", dflash2ConvQuad(dtype, groupSize)),
         ]
         if let context {
             let rows = context.dim(1) + length
             return dflash2GroupedConvJoinKernel(
                 [hidden, projection, baseKernel, context],
-                template: template, grid: (hiddenSize, rows, batch), threadGroup: (256, 1, 1),
+                template: template, grid: (dflash2ConvColumns(hiddenSize, dtype, groupSize), rows, batch), threadGroup: (256, 1, 1),
                 outputShapes: [[batch, rows, hiddenSize]], outputDTypes: [dtype])[0]
         }
-        let grid = (hiddenSize, length, batch)
+        let grid = (dflash2ConvColumns(hiddenSize, dtype, groupSize), length, batch)
         if let residual {
             return dflash2GroupedConvResidualKernel(
                 [hidden, projection, baseKernel, residual],
@@ -1205,14 +1206,14 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                         let base = draw([2, ks, hs], 2)
                         let context = draw([1, c, hs], 3)
                         let template: [(String, any KernelTemplateArg)] = [
-                            ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0),
+                            ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(dtype, gs)),
                         ]
                         let fused = dflash2GroupedConvJoinKernel(
-                            [h, dyn, base, context], template: template, grid: (hs, c + l, 1),
+                            [h, dyn, base, context], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), c + l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [[1, c + l, hs]],
                             outputDTypes: [dtype])[0]
                         let conv = dflash2GroupedConvKernel(
-                            [h, dyn, base], template: template, grid: (hs, l, 1),
+                            [h, dyn, base], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [h.shape],
                             outputDTypes: [dtype])[0]
                         let reference = DFlash2Concat.concatenate([context, conv], axis: 1)
@@ -1275,6 +1276,15 @@ private let dflash2FusedConvEnabled: Bool = {
 /// each offset `o` the shifted value `v` (zero before the block start) is
 /// multiplied by the base tap and added, then multiplied by the dynamic tap
 /// and added. Every intermediate is a `T`, as each separate launch stores it.
+/// Four adjacent columns share one dynamic tap. Packed 16-bit loads/stores
+/// preserve each T rounding; FP32 and groups narrower than four keep scalar.
+private func dflash2ConvQuad(_ dtype: DType, _ groupSize: Int) -> Bool {
+    [DType.bfloat16, .float16].contains(dtype) && groupSize % 4 == 0
+}
+private func dflash2ConvColumns(_ width: Int, _ dtype: DType, _ groupSize: Int) -> Int {
+    dflash2ConvQuad(dtype, groupSize) ? width / 4 : width
+}
+
 private let dflash2GroupedConvHeader = """
     template <typename T, int KS, int GS, int TAP>
     inline T dflash2_grouped_conv(
@@ -1296,42 +1306,98 @@ private let dflash2GroupedConvHeader = """
       }
       return out;
     }
+    template <typename T, int KS, int GS, int TAP>
+    inline uint2 dflash2_grouped_conv4(
+        const device T* h, const device T* dyn, const device T* base,
+        uint b, uint l, uint c, uint L, uint H) {
+    #pragma clang fp contract(off)
+      const uint G = H / GS;
+      const uint g = c / GS;
+      const size_t row = size_t(b) * L + l;
+      T acc[4] = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
+      #pragma clang loop unroll(full)
+      for (int o = 0; o < KS; ++o) {
+        const uint2 vb = (l >= uint(o)) ? *((const device uint2*)(h + (row - o) * H + c)) : uint2(0u);
+        const uint2 kbb = *((const device uint2*)(base + (size_t(TAP) * KS + o) * H + c));
+        const T d = dyn[row * (2 * KS * G) + (size_t(TAP) * KS + o) * G + g];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < 4u; ++r) {
+          const T v = as_type<T>(ushort((vb[r >> 1] >> ((r & 1u) * 16u)) & 65535u));
+          const T kb = as_type<T>(ushort((kbb[r >> 1] >> ((r & 1u) * 16u)) & 65535u));
+          const T kv = kb * v;
+          acc[r] = acc[r] + kv;
+          const T dv = d * v;
+          acc[r] = acc[r] + dv;
+        }
+      }
+      return uint2(uint(as_type<ushort>(acc[0])) | (uint(as_type<ushort>(acc[1])) << 16u),
+                                 uint(as_type<ushort>(acc[2])) | (uint(as_type<ushort>(acc[3])) << 16u));
+    }
+    template <typename T>
+    inline uint2 dflash2_conv_residual4(uint2 conv, uint2 residual) {
+    #pragma clang fp contract(off)
+      T result[4];
+      #pragma clang loop unroll(full)
+      for (uint r = 0; r < 4u; ++r) {
+        const T cv = as_type<T>(ushort((conv[r >> 1] >> ((r & 1u) * 16u)) & 65535u));
+        const T rv = as_type<T>(ushort((residual[r >> 1] >> ((r & 1u) * 16u)) & 65535u));
+        result[r] = rv + cv;
+      }
+      return uint2(uint(as_type<ushort>(result[0])) | (uint(as_type<ushort>(result[1])) << 16u),
+                   uint(as_type<ushort>(result[2])) | (uint(as_type<ushort>(result[3])) << 16u));
+    }
     """
 
 private let dflash2GroupedConvSource = """
-    const uint c = thread_position_in_grid.x;
+    const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
     const uint l = thread_position_in_grid.y;
     const uint b = thread_position_in_grid.z;
-    const uint H = threads_per_grid.x;
+    const uint H = threads_per_grid.x * (QUAD ? 4u : 1u);
     const uint L = threads_per_grid.y;
-    out[(size_t(b) * L + l) * H + c] =
-        dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    if constexpr (QUAD) {
+      *((device uint2*)(out + (size_t(b) * L + l) * H + c)) =
+          dflash2_grouped_conv4<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    } else {
+      out[(size_t(b) * L + l) * H + c] =
+          dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+    }
     """
 
 private let dflash2GroupedConvResidualSource = """
     #pragma clang fp contract(off)
-    const uint c = thread_position_in_grid.x;
+    const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
     const uint l = thread_position_in_grid.y;
     const uint b = thread_position_in_grid.z;
-    const uint H = threads_per_grid.x;
+    const uint H = threads_per_grid.x * (QUAD ? 4u : 1u);
     const uint L = threads_per_grid.y;
     const size_t i = (size_t(b) * L + l) * H + c;
-    const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
-    out[i] = res[i] + conv;
+    if constexpr (QUAD) {
+      const uint2 conv = dflash2_grouped_conv4<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+      *((device uint2*)(out + i)) = dflash2_conv_residual4<T>(conv, *((const device uint2*)(res + i)));
+    } else {
+      const T conv = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, l, c, L, H);
+      out[i] = res[i] + conv;
+    }
     """
 
 /// `[ctx; conv(h)]`: rows below `ctx`'s count are its rows, the rest the
 /// tap's convolution of the block.
 private let dflash2GroupedConvJoinSource = """
-    const uint c = thread_position_in_grid.x;
+    const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
     const uint r = thread_position_in_grid.y;
     const uint b = thread_position_in_grid.z;
-    const uint H = threads_per_grid.x;
+    const uint H = threads_per_grid.x * (QUAD ? 4u : 1u);
     const uint R = threads_per_grid.y;
     const uint C = uint(ctx_shape[1]);
-    out[(size_t(b) * R + r) * H + c] = r < C
-        ? ctx[(size_t(b) * C + r) * H + c]
-        : dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, r - C, c, R - C, H);
+    if constexpr (QUAD) {
+      const uint2 v = r < C ? *((const device uint2*)(ctx + (size_t(b) * C + r) * H + c))
+          : dflash2_grouped_conv4<T, KS, GS, TAP>(h, dyn, base, b, r - C, c, R - C, H);
+      *((device uint2*)(out + (size_t(b) * R + r) * H + c)) = v;
+    } else {
+      out[(size_t(b) * R + r) * H + c] = r < C
+          ? ctx[(size_t(b) * C + r) * H + c]
+          : dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, r - C, c, R - C, H);
+    }
     """
 
 private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
@@ -5637,23 +5703,31 @@ enum DFlash2SpeculativeFront {
         inputNames: ["h", "dyn", "base", "ctx", "cdev"],
         outputNames: ["out"],
         source: """
-            const uint c = thread_position_in_grid.x;
+            const uint c = thread_position_in_grid.x * (QUAD ? 4u : 1u);
             const uint r = thread_position_in_grid.y;
             const uint b = thread_position_in_grid.z;
-            const uint H = threads_per_grid.x;
+            const uint H = threads_per_grid.x * (QUAD ? 4u : 1u);
             const uint R = threads_per_grid.y;
             const uint L = uint(h_shape[1]);
             const uint C = uint(ctx_shape[1]);
             const uint s = metal::min(uint(cdev[0]), R - L);
-            T v;
-            if (r >= s && r - s < L) {
-              v = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, r - s, c, L, H);
-            } else if (r < C) {
-              v = ctx[(size_t(b) * C + r) * H + c];
+            if constexpr (QUAD) {
+              uint2 v;
+              if (r >= s && r - s < L) {
+                v = dflash2_grouped_conv4<T, KS, GS, TAP>(h, dyn, base, b, r - s, c, L, H);
+              } else if (r < C) {
+                v = *((const device uint2*)(ctx + (size_t(b) * C + r) * H + c));
+              } else { v = uint2(0u); }
+              *((device uint2*)(out + (size_t(b) * R + r) * H + c)) = v;
             } else {
-              v = static_cast<T>(0.0f);
+              T v;
+              if (r >= s && r - s < L) {
+                v = dflash2_grouped_conv<T, KS, GS, TAP>(h, dyn, base, b, r - s, c, L, H);
+              } else if (r < C) {
+                v = ctx[(size_t(b) * C + r) * H + c];
+              } else { v = static_cast<T>(0.0f); }
+              out[(size_t(b) * R + r) * H + c] = v;
             }
-            out[(size_t(b) * R + r) * H + c] = v;
             """,
         header: dflash2GroupedConvHeader,
         ensureRowContiguous: true)
@@ -5706,8 +5780,8 @@ enum DFlash2SpeculativeFront {
         let (b, hs) = (h.dim(0), h.dim(2))
         return joinKernel(
             [h, dyn, base, ctx, c.reshaped([1])],
-            template: [("T", h.dtype), ("KS", ks), ("GS", gs), ("TAP", 0)],
-            grid: (hs, rows, b), threadGroup: (256, 1, 1),
+            template: [("T", h.dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(h.dtype, gs))],
+            grid: (dflash2ConvColumns(hs, h.dtype, gs), rows, b), threadGroup: (256, 1, 1),
             outputShapes: [[b, rows, hs]], outputDTypes: [h.dtype])[0]
     }
 
@@ -5783,7 +5857,7 @@ enum DFlash2SpeculativeFront {
             do {
                 try withError { error in
                     let template: [(String, any KernelTemplateArg)] = [
-                        ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0),
+                        ("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(dtype, gs)),
                     ]
                     for count in [5, l] {
                         let h = draw([1, l, hs], UInt64(600 + count))
@@ -5791,7 +5865,7 @@ enum DFlash2SpeculativeFront {
                         let kernelBase = draw([2, ks, hs], UInt64(620 + count))
                         let context = draw([1, count, hs], UInt64(630 + count))
                         let conv = dflash2GroupedConvKernel(
-                            [h, dyn, kernelBase], template: template, grid: (hs, l, 1),
+                            [h, dyn, kernelBase], template: template, grid: (dflash2ConvColumns(hs, dtype, gs), l, 1),
                             threadGroup: (256, 1, 1), outputShapes: [h.shape],
                             outputDTypes: [dtype])[0]
                         let base = concatenated(
@@ -5866,8 +5940,8 @@ enum DFlash2SpeculativeFront {
                         base,
                         update: dflash2GroupedConvKernel(
                             [h, dyn, kernelBase],
-                            template: [("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0)],
-                            grid: (hs, l, 1), threadGroup: (256, 1, 1), outputShapes: [h.shape],
+                            template: [("T", dtype), ("KS", ks), ("GS", gs), ("TAP", 0), ("QUAD", dflash2ConvQuad(dtype, gs))],
+                            grid: (dflash2ConvColumns(hs, dtype, gs), l, 1), threadGroup: (256, 1, 1), outputShapes: [h.shape],
                             outputDTypes: [dtype])[0],
                         start: c.reshaped([1]), axes: [1])]
                 }
