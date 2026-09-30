@@ -4029,6 +4029,9 @@ extension Qwen35GatedDeltaChunked {
                 ScanForm(name: "kt/16", kernel: ktKernel, simdgroups: 16),
             ]
         }
+        // The record's own text at two, eight and sixteen blocks per threadgroup
+        // (only the staging's sharing changes, as for kt): never offered before.
+        forms += [2, 8, 16].map { ScanForm(name: "record/\($0)", kernel: record, simdgroups: $0) }
         forms = forms.filter { (dv / 8) % $0.simdgroups == 0 }
         guard forms.count > 1, forms[0].simdgroups == 4 else { return }
         let start = DispatchTime.now().uptimeNanoseconds
