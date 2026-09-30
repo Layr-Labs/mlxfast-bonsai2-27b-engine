@@ -760,8 +760,11 @@ enum Qwen35TensorPackedMatmul {
             const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
             acc[i] = fma(sv[nq][c], cT[i], fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
+          if (1 == 1 && g + 1 < g0 + gper) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            stage(g + 1, 0);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
         }
         threadgroup float red[4 - 1][CAP * 32];
         if (sg > 0) {
@@ -885,8 +888,11 @@ enum Qwen35TensorPackedMatmul {
             const int c = i & 3; const int mh = (i >> 2) & 1; const int nq = i >> 3;
             acc[i] = fma(mh ? as1 : as0, sv[nq][c] * float(cT[i]), fma(bv[nq][c], mh ? rs1 : rs0, acc[i]));
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (1 == 1 && g + 1 < g0 + gper) { stage(g + 1, 0); simdgroup_barrier(mem_flags::mem_threadgroup); }
+          if (1 == 1 && g + 1 < g0 + gper) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            stage(g + 1, 0);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
         }
         // The reduction reuses the staging buffers (free after the K loop):
         // 16 KB of threadgroup memory in all, two threadgroups per core.
@@ -1085,8 +1091,8 @@ enum Qwen35TensorPackedMatmul {
               acc[h][i] = fma(mh ? cr[cs][1] : cr[cs][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][3] : cr[cs][2], acc[h][i]));
             }
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
           if (g + 1 < g1) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             const int wn = j % PD;             // slot holding group g + 1 (its lower quad at KH = 64)
             putw(wr[wn], 0, NQ);
             if (g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn], 0, NQ); }
@@ -1340,8 +1346,8 @@ enum Qwen35TensorPackedMatmul {
               acc[h][i] = fma(mh ? cr[cs][1] : cr[cs][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][3] : cr[cs][2], acc[h][i]));
             }
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
           if (g + 1 < g1) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             const int wn = (j + 1) % PD;       // slot holding group g + 1
             putw(wr[wn], 0);
             if (NP == 1 && g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn]); }
@@ -1783,8 +1789,8 @@ enum Qwen35TensorPackedMatmul {
               }
             }
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
           if (u + 1 < nu) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             const int wn = (j + 1) % PD;       // slot holding unit u + 1
             putw(wr[wn], u + 1, 0);
             if (NP == 1 && u + 1 + PD < nu) { getw(u + 1 + PD, wr[wn]); }
