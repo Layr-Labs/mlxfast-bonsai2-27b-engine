@@ -202,11 +202,11 @@ enum CBv2PromptLookupDraft {
     /// `MLXFAST_DFLASH_SPLICE_MIN` sets the shortest alignment the splice
     /// accepts: the drafter's own tokens that equal a prompt span, plus (when
     /// the drafter's block agrees from its first token) the committed suffix
-    /// that already runs along that span. 8 by default, 6 at the least.
+    /// that already runs along that span. 7 by default, 6 at the least.
     static let spliceMinimum: Int = {
         let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_SPLICE_MIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return max(6, raw.flatMap(Int.init) ?? 8)
+        return max(6, raw.flatMap(Int.init) ?? 7)
     }()
 
     /// `DARKBLOOM_DFLASH_SPLICE_ANCHOR_MIN` sets the evidence an ANCHORED
@@ -269,6 +269,96 @@ enum CBv2PromptLookupDraft {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// `DARKBLOOM_DFLASH_SPLICE_OPERAND_MEMO=0` rebuilds the splice's stable
+    /// operands every round.
+    ///
+    /// Two operands of the splice are pure functions of inputs that do not
+    /// change during a quoting run, but are rebuilt on every `override`
+    /// call on the engine thread: `promptIDs` (the prompt prefix as int32,
+    /// O(prompt) host map plus a device upload; the prefix is stable per
+    /// request) and the array path's depth-dependent constant tables
+    /// (`inside`, `shift`, `firstRow`, `steps`; `depth` is fixed by the
+    /// declared draft depth). Each is kept under a content key: FNV-1a-64
+    /// of the prefix for `promptIDs`, the depth for the tables. A key hit
+    /// returns the stored operand, bitwise the same values.
+    static let spliceOperandMemoEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_OPERAND_MEMO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// 64-bit FNV-1a over `history[0 ..< end]` (the whole history when `end`
+    /// is nil). Host-side content key; never a hash of device data.
+    static func historyKey(_ history: [Int], end: Int? = nil) -> UInt64 {
+        let limit = end ?? history.count
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for i in 0 ..< limit {
+            var v = UInt64(bitPattern: Int64(truncatingIfNeeded: history[i]))
+            for _ in 0 ..< 4 {
+                hash ^= v & 0xffff
+                hash &*= 0x0000_0100_0000_01b3
+                v >>= 16
+            }
+        }
+        return hash
+    }
+
+    /// One-slot memo of the splice's `promptIDs` operand.
+    nonisolated(unsafe) private static var promptIDsKey: (prompt: Int, hash: UInt64)?
+    nonisolated(unsafe) private static var promptIDsMemo: MLXArray?
+
+    /// The fused and array splices' `promptIDs` operand: the prompt prefix
+    /// as int32, memoized on (prompt, prefix hash). The prefix cannot change
+    /// without the hash changing, so a hit returns bitwise the same values.
+    static func promptIDsArray(history: [Int], prompt: Int) -> MLXArray {
+        if spliceOperandMemoEnabled {
+            let key = (prompt: prompt, hash: historyKey(history, end: prompt))
+            if let promptIDsKey, let promptIDsMemo, promptIDsKey == key {
+                return promptIDsMemo
+            }
+            let built = MLXArray(history[0 ..< prompt].map { Int32($0) })
+            promptIDsKey = key
+            promptIDsMemo = built
+            return built
+        }
+        return MLXArray(history[0 ..< prompt].map { Int32($0) })
+    }
+
+    /// One-slot memo of the array splice's depth constants: the `inside`
+    /// mask, the `shift` gather indexes, the `firstRow` bonus row and the
+    /// `steps` index array, all pure functions of `depth`.
+    nonisolated(unsafe) private static var depthConstantsKey = -1
+    nonisolated(unsafe) private static var depthConstantsMemo:
+        (inside: [Bool], shift: [Int32], firstRow: [Int32], steps: [Int32])?
+
+    static func depthConstants(_ depth: Int)
+        -> (inside: [Bool], shift: [Int32], firstRow: [Int32], steps: [Int32])
+    {
+        if spliceOperandMemoEnabled, depthConstantsKey == depth, let depthConstantsMemo {
+            return depthConstantsMemo
+        }
+        var shift = [Int32]()
+        var inside = [Bool]()
+        shift.reserveCapacity(depth * depth)
+        inside.reserveCapacity(depth * depth)
+        for j in 0 ..< depth {
+            for t in 0 ..< depth {
+                shift.append(Int32(min(j + t, depth - 1)))
+                inside.append(j + t < depth)
+            }
+        }
+        var firstRow = [Int32](repeating: 0, count: depth)
+        firstRow[0] = 1
+        let steps = (0 ..< depth).map { Int32($0) }
+        let built = (inside: inside, shift: shift, firstRow: firstRow, steps: steps)
+        if spliceOperandMemoEnabled {
+            depthConstantsKey = depth
+            depthConstantsMemo = built
+        }
+        return built
+    }
+
+
     private static let spliceScore = MLXFast.metalKernel(
         name: "cbv2_prompt_splice_score",
         inputNames: ["block", "prompt", "runs", "dims"], outputNames: ["ranked"],
@@ -317,6 +407,58 @@ enum CBv2PromptLookupDraft {
          out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
         """, ensureRowContiguous: true)
+
+    /// `DARKBLOOM_DFLASH_SPLICE_ONE=0` keeps the two-launch fused splice
+    /// (score, then pick). With it on, one threadgroup recomputes each
+    /// alignment's score inline, tree-reduces with the pick kernel's exact
+    /// comparison order (higher score wins, a tie takes the smaller flat
+    /// index), and writes the same proposal: the `ranked` buffer and the
+    /// second launch disappear from every splicing round. The score and
+    /// pick kernels stay compiled for `spliceTrace`'s comparison runs and
+    /// for the kill switch.
+    static let spliceOneLaunchEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_ONE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let spliceFused = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_fused",
+        inputNames: ["block", "prompt", "runs", "dims"], outputNames: ["out"],
+        source: """
+
+        uint tid = thread_position_in_threadgroup.x;
+        int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
+        int floor_ = anchored > 0 && anchored < minimum ? anchored : minimum;
+        int bs = 0, bi = 0;
+        for (int i = int(tid); i < n*d; i += 256) {
+         int j = i/n, c = i%n;
+         int a = 0;
+         while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
+         int s = a + (j == 0 ? runs[c] : 0);
+         bool eligible = s >= minimum || (anchored > 0 && j == 0 && runs[c] >= 1 && s >= anchored);
+         s = a > 0 && eligible ? s : 0;
+         if (s > bs || (s == bs && i < bi)) { bs=s; bi=i; }
+        }
+        threadgroup int scores[256];
+        threadgroup int indices[256];
+        scores[tid]=bs; indices[tid]=bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride=128; stride>0; stride>>=1) {
+         if (tid < stride) {
+          int s=scores[tid+stride], i=indices[tid+stride];
+          if (s > scores[tid] || (s == scores[tid] && i < indices[tid])) {
+           scores[tid]=s; indices[tid]=i;
+          }
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid < uint(d)) {
+         int j=indices[0]/n, c=indices[0]%n;
+         out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
+        }
+        """, ensureRowContiguous: true)
+
 
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
@@ -367,9 +509,15 @@ enum CBv2PromptLookupDraft {
 
         if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
             let block = drafted.reshaped([depth]).asType(.int32)
-            let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
+            let promptIDs = promptIDsArray(history: history, prompt: prompt)
             let anchored = spliceAnchorMinimum > 0 && spliceAnchorMinimum < minimum ? spliceAnchorMinimum : 0
             let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum), Int32(anchored)])
+            if spliceOneLaunchEnabled {
+                return spliceFused(
+                    [block, promptIDs, MLXArray(runs), dims],
+                    grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, depth]], outputDTypes: [.int32])[0].asType(drafted.dtype)
+            }
             let ranked = spliceScore(
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
@@ -387,19 +535,13 @@ enum CBv2PromptLookupDraft {
             for t in 0 ..< depth { table.append(Int32(history[c + 1 + t])) }
         }
         // The drafter's block read from position j, [depth, depth], with -1
-        // (never a token) past its end, and the first row's run bonus.
-        var shift = [Int32]()
-        var inside = [Bool]()
-        shift.reserveCapacity(depth * depth)
-        inside.reserveCapacity(depth * depth)
-        for j in 0 ..< depth {
-            for t in 0 ..< depth {
-                shift.append(Int32(min(j + t, depth - 1)))
-                inside.append(j + t < depth)
-            }
-        }
-        var firstRow = [Int32](repeating: 0, count: depth)
-        firstRow[0] = 1
+        // (never a token) past its end, and the first row's run bonus. The
+        // tables are depth constants (`depthConstants`), memoized while the
+        // operand memo is on.
+        let constants = depthConstants(depth)
+        let inside = constants.inside
+        let shift = constants.shift
+        let firstRow = constants.firstRow
 
         let block = drafted.reshaped([depth]).asType(.int32)
         let continuation = MLXArray(table, [1, candidates, depth])
@@ -430,9 +572,9 @@ enum CBv2PromptLookupDraft {
         let fire = take(ranked, best, axis: 0) .>= MLXArray(Int32(fireFloor))
         let j = floorDivide(best, MLXArray(Int32(candidates)))
         let c = best - j * MLXArray(Int32(candidates))
-        let steps = MLXArray((0 ..< depth).map { Int32($0) })
+        let steps = MLXArray(constants.steps)
         let source = maximum(c + MLXArray(Int32(1)) + steps - j, MLXArray(Int32(0)))
-        let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
+        let promptIDs = promptIDsArray(history: history, prompt: prompt)
         let spliced = which(steps .< j, block, take(promptIDs, source, axis: 0))
         let proposal = which(fire, spliced, block).reshaped([1, depth]).asType(drafted.dtype)
         if spliceTrace {
