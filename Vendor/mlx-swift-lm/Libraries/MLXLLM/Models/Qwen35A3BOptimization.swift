@@ -831,10 +831,12 @@ enum Qwen35WideNMatmul {
 
     private static let stagedPartialKernel = MLXFast.metalKernel(
         name: "qwen35_widen_partial_staged", inputNames: ["x", "w", "dims"], outputNames: ["part"],
-        source: stagedPartialSource, ensureRowContiguous: true)
+        source: Qwen35IO32.narrow(stagedPartialSource, count: 5, "qwen35_widen_partial_staged"),
+        ensureRowContiguous: true)
     private static let stagedReduceKernel = MLXFast.metalKernel(
         name: "qwen35_widen_reduce4", inputNames: ["part", "dims"], outputNames: ["out"],
-        source: stagedReduceSource, ensureRowContiguous: true)
+        source: Qwen35IO32.narrow(stagedReduceSource, count: 3, "qwen35_widen_reduce4"),
+        ensureRowContiguous: true)
 
     /// The staged partial and the four-wide reduce in place of the stock pair
     /// (on by default, after the load-time self-test; a failure keeps stock).
