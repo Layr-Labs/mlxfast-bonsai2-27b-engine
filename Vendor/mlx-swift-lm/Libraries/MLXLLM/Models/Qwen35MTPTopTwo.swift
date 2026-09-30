@@ -5481,7 +5481,7 @@ extension Qwen35TensorPackedMatmul {
 
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p2,p4,p8,p8t"
+                ?? "p2,p4,p8,p8t,p1,p2c2,p4c2"
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
