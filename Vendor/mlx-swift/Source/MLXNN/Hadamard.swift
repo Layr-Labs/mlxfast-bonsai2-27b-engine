@@ -850,6 +850,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// Whether the installed matmul takes a product of this shape.
     nonisolated(unsafe) public static var tensorPackedMatmulApplies:
         ((_ rows: Int, _ n: Int, _ k: Int) -> Bool)?
+    /// `TensorPackedMatmul` evaluated on rectangles of its output only: each
+    /// `(row, rows, column, columns)` returns `[rows, columns]`, every element
+    /// the full product's. Installed by the model file; nil declines.
+    public typealias TensorPackedMatmulRects = (
+        _ activation: SignedBlockHadamard.Int8Activation, _ weight: MLXArray,
+        _ scales: MLXArray, _ biases: MLXArray, _ groupSize: Int, _ outputDType: DType,
+        _ layoutCache: HadamardConstantLayoutCache, _ rects: [(Int, Int, Int, Int)]
+    ) -> [MLXArray]?
+    nonisolated(unsafe) public static var tensorPackedMatmulRects: TensorPackedMatmulRects?
 
     /// The verify-width form of the tensor route: the FP16 rotated activation
     /// (`[16, k]`, rows beyond the real ones zero) with its FP32 group sums
@@ -1131,6 +1140,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return tensorRoutePromptMatmul(
             activation, siblings: siblings, n: n,
             outputDType: widenOutput ? .float32 : .float16, leading: leading)
+    }
+
+    /// `tensorRouteForwardQuantized`'s prompt branch over the stacked
+    /// siblings, on rectangles of the stacked output only
+    /// (`TensorPackedMatmulRects`). Nil when the route or the installed
+    /// matmul does not take them.
+    fileprivate func tensorRouteForwardQuantizedRects(
+        _ activation: SignedBlockHadamard.Int8Activation, rows: Int,
+        siblings: [HadamardQuantizedLinear], rects: [(Int, Int, Int, Int)], widenOutput: Bool
+    ) -> [MLXArray]? {
+        let k = transform.width
+        guard siblings.count > 1, let matmul = Self.tensorPackedMatmulRects,
+            tensorRouteTakesPrompt(rows: rows, siblings: siblings),
+            activation.codes.dtype == .uint8 || activation.codes.dtype == .int8,
+            activation.codes.shape == [rows, k],
+            activation.scales.dtype == .float32, activation.scales.shape == [rows, k / 128],
+            activation.scaledSums.dtype == .float32,
+            activation.scaledSums.shape == [rows, k / 128]
+        else { return nil }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let fusedBiases = fused.biases else { return nil }
+        return matmul(
+            activation, fused.weight, fused.scales, fusedBiases, groupSize,
+            widenOutput ? .float32 : .float16, fused.operands.layoutCache, rects)
     }
 
     /// On unless explicitly disabled: `DARKBLOOM_BONSAI_TENSOR_ROUTE_PRODUCER=0`
@@ -1806,6 +1839,24 @@ public func sharedHadamardProjectionsQuantized(
     return first.tensorRouteForwardQuantized(
         activation, rows: leading.reduce(1, *), leading: leading, siblings: siblings,
         widenOutput: widenOutput)
+}
+
+/// `sharedHadamardProjectionsQuantized` evaluated on rectangles of the
+/// siblings' stacked output only: rect `(row, rows, column, columns)` is rows
+/// `row ..< row + rows` of the `[rows, k]` activation against stacked output
+/// columns `column ..< column + columns`, returned `[rows, columns]`, every
+/// element the one the full product holds there. Nil when the route or the
+/// installed matmul does not take them (the caller runs the full product).
+public func sharedHadamardProjectionsQuantizedRects(
+    _ activation: SignedBlockHadamard.Int8Activation, rows: Int,
+    _ siblings: [HadamardQuantizedLinear], rects: [(Int, Int, Int, Int)],
+    widenOutput: Bool = true
+) -> [MLXArray]? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return nil }
+    return first.tensorRouteForwardQuantizedRects(
+        activation, rows: rows, siblings: siblings, rects: rects, widenOutput: widenOutput)
 }
 
 /// `sharedHadamardProjections` for an activation that already carries the
