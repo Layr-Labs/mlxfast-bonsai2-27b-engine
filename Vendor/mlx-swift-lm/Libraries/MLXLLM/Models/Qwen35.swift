@@ -2412,6 +2412,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),
@@ -5594,6 +5595,9 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    // Set at drafter load only after the prompt join's bitwise self-test.
+    var dFlash2PromptTapBF16 = false
+
     /// `DARKBLOOM_BONSAI_LAST_ROW_FINAL=0` keeps the final layer full width.
     static let lastRowNarrowingEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LAST_ROW_FINAL"]?
@@ -5797,13 +5801,131 @@ public class Qwen35TextModelInner: Module {
         if tapLayerIds == nil {
             dFlash2Tap.tappedHidden = nil
         } else {
-            dFlash2Tap.tappedHidden = DFlash2Concat.concatenate(tapped.map { $0! }, axis: -1)
+            let parts = tapped.map { $0! }
+            // Only the prompt observation changes dtype. Target residuals,
+            // verify observations and context submission boundaries stay put.
+            dFlash2Tap.tappedHidden =
+                (dFlash2PromptTapBF16 && promptForward
+                    ? Qwen35PromptTapJoin.join(parts) : nil)
+                ?? DFlash2Concat.concatenate(parts, axis: -1)
         }
         return hiddenStates
     }
 }
 
 
+
+// MARK: - Prompt observation join
+
+/// Write five prompt taps directly to their BF16 consumer buffer. This removes
+/// the target-dtype concat and its later cast, not any context or target work.
+/// `BONSAI_PROMPT_TAP_BF16=0` restores the original concat/cast path.
+enum Qwen35PromptTapJoin {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_PROMPT_TAP_BF16"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_prompt_tap_bf16",
+        inputNames: ["x0", "x1", "x2", "x3", "x4"],
+        outputNames: ["out"],
+        source: """
+            const uint width = uint(x0_shape[2]);
+            const uint j = thread_position_in_grid.x * 4;
+            const uint row = thread_position_in_grid.y;
+            const uint tap = thread_position_in_grid.z;
+            if (j >= width) return;
+            const uint src = row * width + j;
+            const uint dst = (row * 5 + tap) * width + j;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              if (j + i < width) {
+                switch (tap) {
+                  case 0: out[dst + i] = cast_to<bfloat16_t>(x0[src + i]); break;
+                  case 1: out[dst + i] = cast_to<bfloat16_t>(x1[src + i]); break;
+                  case 2: out[dst + i] = cast_to<bfloat16_t>(x2[src + i]); break;
+                  case 3: out[dst + i] = cast_to<bfloat16_t>(x3[src + i]); break;
+                  default: out[dst + i] = cast_to<bfloat16_t>(x4[src + i]); break;
+                }
+              }
+            }
+            """,
+        ensureRowContiguous: true)
+
+    private static func launch(_ parts: [MLXArray]) -> MLXArray {
+        let shape = parts[0].shape
+        let columns = (shape[2] + 3) / 4
+        return kernel(
+            parts, grid: (columns, shape[0] * shape[1], 5),
+            threadGroup: (min(256, columns), 1, 1),
+            outputShapes: [[shape[0], shape[1], 5 * shape[2]]],
+            outputDTypes: [.bfloat16])[0]
+    }
+
+    static func join(_ parts: [MLXArray]) -> MLXArray? {
+        guard enabled, parts.count == 5, let first = parts.first,
+            first.ndim == 3, first.size > 0, first.size < Int(Int32.max) / 5,
+            [DType.float16, .float32].contains(first.dtype),
+            parts.allSatisfy({ $0.shape == first.shape && $0.dtype == first.dtype })
+        else { return nil }
+        return launch(parts)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// Called at drafter load, never from a timed forward. Both source dtypes
+    /// must pass; errors and mismatches leave the model's opt-in flag false.
+    static func prepare() -> Bool {
+        guard enabled else { return false }
+        return lock.withLock {
+            if let verdict { return verdict }
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    for dtype in [DType.float16, .float32] {
+                        for (rows, width) in [(3, 37), (512, 5120)] {
+                            let parts = (0 ..< 5).map { i in
+                                (MLXRandom.normal(
+                                    [1, rows, width], key: MLXRandom.key(UInt64(901 + i)))
+                                    * Float(i + 1) * 17).asType(dtype)
+                            }
+                            let result = launch(parts)
+                            let reference = concatenated(parts, axis: -1).asType(.bfloat16)
+                            same = same && all(
+                                result.view(dtype: .uint16) .== reference.view(dtype: .uint16)
+                            ).item(Bool.self)
+                            compared += reference.size
+                        }
+                    }
+                    // Exhaustive FP16 encodings, including signed zeros,
+                    // subnormals, infinities and NaN payloads.
+                    let half = MLXArray((0 ..< 65536).map { UInt16($0) })
+                        .view(dtype: .float16).reshaped([1, 128, 512])
+                    let parts = Array(repeating: half, count: 5)
+                    let result = launch(parts)
+                    let reference = concatenated(parts, axis: -1).asType(.bfloat16)
+                    same = same && all(
+                        result.view(dtype: .uint16) .== reference.view(dtype: .uint16)
+                    ).item(Bool.self)
+                    compared += reference.size
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            verdict = same
+            FileHandle.standardError.write(
+                ("bonsai prompt BF16 tap join: "
+                    + (same ? "self-test passed, \(compared) values bitwise, 0 mismatches\n"
+                        : "self-test failed; original concat/cast kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+}
 
 // MARK: - Fused gated-delta prework
 
