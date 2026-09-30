@@ -111,6 +111,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 target: text.configuration.hiddenLayers)
         }
         try drafter.bind(target: text)
+        text.model.dFlash2PromptTapBF16 =
+            drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
@@ -163,6 +165,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 // The plane kernel's per-shape forms, first, so the trials
                 // below and every served prompt run the adopted one.
                 Qwen35TensorPackedMatmul.PlaneFormTrial.run()
+                Stream().synchronize()
+                Memory.clearCache()
+                // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
+                DFlash2TensorMatmul.SwapTrial.run()
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
