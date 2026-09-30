@@ -2,26 +2,10 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
-import Cmlx
 import Foundation
 import MLX
 
 extension EngineLoopV2 {
-
-    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
-    /// event instead of polling it. Ported from ercumentyildirim's `cc0895d`
-    /// (run on the ranked box inside that submission): the step thread polls
-    /// an already-submitted packet so it wakes the instant the verify
-    /// finishes and stays on a clocked-up core for the finalize and the next
-    /// graph build, which sit on the GPU's critical path; the blocking read
-    /// below then returns at once. The spin is DEADLINE-BOUNDED: on a path
-    /// where the packet's graph was never submitted for evaluation, polling
-    /// could never become ready, so after a quarter of a second the poll
-    /// falls through to the blocking read, which forces the evaluation
-    /// exactly as the base does. No GPU work is added and no ordering
-    /// changes; outputs are bit-identical.
-    static let pollsAcceptancePacket: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -182,19 +166,6 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
-        if Self.pollsAcceptancePacket {
-            // Deadline-bounded poll (see `pollsAcceptancePacket`). The
-            // common path's packet is already submitted with the round
-            // graph, so this returns the moment its kernels complete; the
-            // bound only guards the never-submitted corner.
-            let pollDeadline = CFAbsoluteTimeGetCurrent() + 0.25
-            var available = false
-            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
-                !available
-            {
-                if CFAbsoluteTimeGetCurrent() > pollDeadline { break }
-            }
-        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
