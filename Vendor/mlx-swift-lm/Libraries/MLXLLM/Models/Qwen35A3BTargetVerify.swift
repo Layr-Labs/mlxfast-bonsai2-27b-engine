@@ -1051,8 +1051,9 @@ extension Qwen35GDNReplayFused {
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < R; ++i) {
-              state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+            for (int i = 0; i < R; i += 4) {
+              *((device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0 + i)) =
+                  float4(state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
             }
           }
         }
@@ -1154,8 +1155,9 @@ extension Qwen35GDNReplayFused {
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
             #pragma clang loop unroll(full)
-            for (int i = 0; i < R; ++i) {
-              state_final[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+            for (int i = 0; i < R; i += 4) {
+              *((device float4*)(state_final + (n * Dv + dvbase + d) * Dk + dk0 + i)) =
+                  float4(state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
             }
           }
         }
@@ -2349,8 +2351,8 @@ enum Qwen35RotationQ8Blocks {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint row = blk / uint(BPR);
         const uint bcol = (blk % uint(BPR)) * uint(N);
-        const size_t rowbase = size_t(row) * size_t(W);
-        threadgroup float buf[N];
+        const uint rowbase = uint(row) * uint(W);
+        alignas(16) threadgroup float buf[N];
         float x[EPT];
         #pragma clang loop unroll(full)
         for (uint r = 0; r < EPT; r++) {
@@ -2380,8 +2382,8 @@ enum Qwen35RotationQ8Blocks {
           }
         }
         #pragma clang loop unroll(full)
-        for (uint r = 0; r < EPT; r++) {
-          buf[EPT * tid + r] = x[r];
+        for (uint r = 0; r < EPT; r += 4) {
+          *(threadgroup float4*)(buf + EPT * tid + r) = float4(x[r], x[r + 1], x[r + 2], x[r + 3]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (TPB == 256) {
@@ -2419,33 +2421,42 @@ enum Qwen35RotationQ8Blocks {
         #pragma clang loop unroll(full)
         for (uint gi = sg; gi < 8; gi += uint(TPB) / 32) {
           const short index = short(gi * 128 + 4 * lane);
+          const float4 shared = *(const threadgroup float4*)(buf + index);
           float v[4];
           float amax = 0.0f;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
-            v[r] = buf[index + r] * 0.03125f;
+            v[r] = shared[r] * 0.03125f;
             amax = max(amax, fabs(v[r]));
           }
           amax = simd_max(amax);
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = uint(index + r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
-            const size_t g = size_t(bcol / 128) + size_t(gi);
+            const uint g = uint(bcol / 128) + uint(gi);
             const uint ml = row & 63u;
-            const size_t qidx = MPERM
-              ? (size_t(row >> 6) * size_t(W / 128) * 64 + g * 64
-                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
-              : (size_t(row) * size_t(W / 128) + g);
+            const uint qidx = MPERM
+              ? (uint(row >> 6) * uint(W / 128) * 64 + g * 64
+                 + uint(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (uint(row) * uint(W / 128) + g);
             qscale[qidx] = qs;
             qsum[qidx] = qs * part;
           }
@@ -2486,7 +2497,8 @@ enum Qwen35RotationQ8Blocks {
         rows: Int, width: Int, groupShape: [Int], codesDType: DType,
         stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
     ) -> SignedBlockHadamard.Int8Activation? {
-        guard enabled, rows > 0, rows < BonsaiPromptWidth.minimumRows, width % 1024 == 0
+        guard enabled, rows > 0, rows < BonsaiPromptWidth.minimumRows, width > 0,
+            width % 1024 == 0, rows <= Int(Int32.max) / width
         else { return nil }
         func value(_ name: String) -> Int? {
             guard let arg = template.first(where: { $0.0 == name })?.1 else { return nil }
@@ -3049,9 +3061,9 @@ enum Qwen35BoundaryBlocks {
         const uint blk = threadgroup_position_in_grid.x % NB;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const size_t base = size_t(row) * size_t(W);
+        const uint base = uint(row) * uint(W);
 
-        threadgroup float buf[1024];
+        alignas(16) threadgroup float buf[1024];
         threadgroup float local_sums[32];
 
         // Gain and signs of this thread's four block elements, read early.
@@ -3137,9 +3149,7 @@ enum Qwen35BoundaryBlocks {
             x[r] = upper ? (o - x[r]) : (x[r] + o);
           }
         }
-        BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-          buf[el + r] = x[r];
-        }
+        *(threadgroup float4*)(buf + el) = float4(x[0], x[1], x[2], x[3]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < 128) {
           float y8[8];
@@ -3157,30 +3167,39 @@ enum Qwen35BoundaryBlocks {
         {
           const uint g = blk * 8 + sg;
           const uint g0 = sg * 128 + lane * 4;
+          const float4 shared = *(const threadgroup float4*)(buf + g0);
           float v[4];
           float amax = 0.0f;
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-            v[r] = buf[g0 + r] * 0.03125f;
+            v[r] = shared[r] * 0.03125f;
             amax = max(amax, fabs(v[r]));
           }
           amax = simd_max(amax);
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = lane * 4 + uint(r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { codes[base + size_t(g) * 128 + kp] = int8_t(q); } else { codes[base + size_t(g) * 128 + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { codes[base + uint(g) * 128 + kp] = int8_t(q); } else { codes[base + uint(g) * 128 + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
             const uint ml = row & 63u;
-            const size_t qidx = MPERM
-              ? (size_t(row >> 6) * size_t(NG) * 64 + size_t(g) * 64
-                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
-              : (size_t(row) * NG + g);
+            const uint qidx = MPERM
+              ? (uint(row >> 6) * uint(NG) * 64 + uint(g) * 64
+                 + uint(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (uint(row) * NG + g);
             qscale[qidx] = qs;
             qsum[qidx] = qs * part;
           }
@@ -3212,7 +3231,8 @@ enum Qwen35BoundaryBlocks {
         gainSigned: Bool, writeNormed: Bool, perm: Bool
     ) -> Qwen35FusedBoundaryQ8.Output? {
         let width = Qwen35FusedBoundaryQ8.width
-        guard active, width % 1024 == 0, width > 4096, width <= 7168, x.size % width == 0
+        guard active, width % 1024 == 0, width > 4096, width <= 7168, x.size % width == 0,
+            x.size <= Int(Int32.max)
         else { return nil }
         let rows = x.size / width
         guard rows > 0, rows < BonsaiPromptWidth.minimumRows else { return nil }
@@ -3386,12 +3406,12 @@ extension Qwen35RotationQ8Blocks {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint row = blk / uint(BPR);
         const uint bcol = (blk % uint(BPR)) * uint(N);
-        const size_t rowbase = size_t(row) * size_t(W);
+        const uint rowbase = uint(row) * uint(W);
         const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
         const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
         const bool AV = (AHD == 0 ? a_strides[1] : a_strides[3]) == 1;
         const bool BV = (BHD == 0 ? b_strides[1] : b_strides[3]) == 1;
-        threadgroup float buf[N];
+        alignas(16) threadgroup float buf[N];
         float x[EPT];
         #pragma clang loop unroll(full)
         for (uint u = 0; u < EPT / 4; u++) {
@@ -3446,8 +3466,8 @@ extension Qwen35RotationQ8Blocks {
           }
         }
         #pragma clang loop unroll(full)
-        for (uint r = 0; r < EPT; r++) {
-          buf[EPT * tid + r] = x[r];
+        for (uint r = 0; r < EPT; r += 4) {
+          *(threadgroup float4*)(buf + EPT * tid + r) = float4(x[r], x[r + 1], x[r + 2], x[r + 3]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (TPB == 256) {
@@ -3483,33 +3503,42 @@ extension Qwen35RotationQ8Blocks {
         #pragma clang loop unroll(full)
         for (uint gi = sg; gi < 8; gi += uint(TPB) / 32) {
           const short index = short(gi * 128 + 4 * lane);
+          const float4 shared = *(const threadgroup float4*)(buf + index);
           float v[4];
           float amax = 0.0f;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
-            v[r] = buf[index + r] * 0.03125f;
+            v[r] = shared[r] * 0.03125f;
             amax = max(amax, fabs(v[r]));
           }
           amax = simd_max(amax);
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
             const uint kk = uint(index + r);
             const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
+          }
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
           part = simd_sum(part);
           if (lane == 0) {
-            const size_t g = size_t(bcol / 128) + size_t(gi);
+            const uint g = uint(bcol / 128) + uint(gi);
             const uint ml = row & 63u;
-            const size_t qidx = MPERM
-              ? (size_t(row >> 6) * size_t(W / 128) * 64 + g * 64
-                 + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
-              : (size_t(row) * size_t(W / 128) + g);
+            const uint qidx = MPERM
+              ? (uint(row >> 6) * uint(W / 128) * 64 + g * 64
+                 + uint(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u)))
+              : (uint(row) * uint(W / 128) + g);
             qscale[qidx] = qs;
             qsum[qidx] = qs * part;
           }
@@ -3542,7 +3571,9 @@ extension Qwen35RotationQ8Blocks {
         outShape: [Int], groupShape: [Int], codesDType: DType,
         stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
     ) -> SignedBlockHadamard.Int8Activation? {
-        guard producerEnabled, rows > 0, width % 1024 == 0, !producerVerifying else { return nil }
+        guard producerEnabled, rows > 0, width > 0, width % 1024 == 0,
+            rows <= Int(Int32.max) / width, !producerVerifying
+        else { return nil }
         func value(_ name: String) -> Int? {
             guard let arg = template.first(where: { $0.0 == name })?.1 else { return nil }
             if let v = arg as? Int { return v }
