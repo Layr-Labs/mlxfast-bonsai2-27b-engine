@@ -307,14 +307,18 @@ enum Qwen35TrunkSubmission {
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
-        // 24..63 while the GPU runs 8..23. A third boundary after layer 40
-        // tests whether submitting the tail sooner hides more host work; it
-        // also adds a command-buffer handoff that can cost more than it saves.
-        // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
-        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
+        // 24..63 while the GPU runs 8..23, and the third boundary after 40
+        // submitted the tail sooner and won on the box (rube-de's `88e525e0`).
+        // A fourth after layer 56 extends the same series to its last leg:
+        // the host's ~0.8 ms building layers 56..63 hides behind the GPU's
+        // on layers 40..55. Each added command buffer at verify width has a
+        // cost (the slices-every-2 measurements), so this is the last one the
+        // 16-layer spacing supports. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
+        // keeps only the first boundary; `MLXFAST_VERIFY_SLICE_LAYERS` sets
+        // another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40, 56]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -330,7 +334,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
+            verify.explicit == [8, 24, 40, 56] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40, 56]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
@@ -344,14 +348,16 @@ enum Qwen35TrunkSubmission {
     /// builds each layer through `cbv2ForwardPending` and so never reaches
     /// the plain loop's submissions. Newjordan's `9024f66b` pending path
     /// commits after layers 4, 16, 32 and 48; here the front is denser, after
-    /// layers 1, 2, 4, 8, 16, 32 and 48 (ercumentyildirim's promoted
-    /// `6e19fe12`), so the GPU starts on the first layer instead of waiting for
-    /// the host to build four. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan
-    /// (same syntax, `4,16,32,48` restores the previous one); `0` submits the
-    /// forward as one graph.
+    /// layers 1, 2, 4, 8, 16, 32, 48 and 56 (ercumentyildirim's promoted
+    /// `6e19fe12`, plus the tail boundary the verify ladder's `88e525e0`
+    /// pattern extends): the last 16 layers of a prompt forward submit as
+    /// soon as they are built instead of riding the 48-boundary block's
+    /// tail. `MLXFAST_PREFILL_PIPELINE_FUSED` sets the plan (same syntax,
+    /// `4,16,32,48` restores the previous one); `0` submits the forward as
+    /// one graph.
     static let promptFused: Plan = Plan.parse(
         ProcessInfo.processInfo.environment["MLXFAST_PREFILL_PIPELINE_FUSED"],
-        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48]))
+        default: Plan(stride: 0, offset: 0, explicit: [1, 2, 4, 8, 16, 32, 48, 56]))
 
     /// The plan for a prompt-width forward on the pending-residual path, or
     /// nil for a single submission. Never a capture-verify forward (that path
