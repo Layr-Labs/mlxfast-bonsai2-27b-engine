@@ -1714,6 +1714,335 @@ enum DFlash2TensorMatmul {
     /// `prepareSwapped` when every weight's output matched bit for bit.
     nonisolated(unsafe) static var swappedActive = false
 
+    /// The swapped form's other bodies (`MLXFAST_DRAFT_SWAP_ZOO`, default on),
+    /// on the stored layout like `sourceSwapped`. `TN` = 64: a simdgroup owns
+    /// two 32-column blocks (two cooperative weight slices per K step against
+    /// the one input slice). `PF` = 1: the weight slice is double-buffered,
+    /// the next K step's cooperative load issued before the current step's op.
+    /// `RT` = 2: the 32-row form (`sourceSwapped32`'s two row tiles). Every
+    /// accumulator still takes the same `32 x 16 x KT` ops over the same K
+    /// steps of its simdgroup's `K / SPLITS` slab, in K order, and the slabs
+    /// are added in the same order and association as `sourceSwapped`: only
+    /// the loads and the column blocks' grouping move. Each body is compared
+    /// bit for bit with the stock kernel on every weight
+    /// (`prepareSwapZoo`) before it can be timed or run.
+    private static let sourceSwappedZoo = """
+        const int K = ksz[0]; const int N = ksz[2];
+        constexpr int NH = TN / 32;
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        const int k1 = k0 + kq;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            32, 16, KT, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 16 * RT));
+        auto tW0 = W.template slice<KT, 32>(0, n0);
+        auto tX0 = X.template slice<KT, 16>(0, 0);
+        // c<column block><row tile>
+        auto c00 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto c01 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto c10 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto c11 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        // a: the current K step's weight slices, b: the next step's (PF)
+        auto a0 = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        auto a1 = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        auto b0 = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        auto b1 = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = c00.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < c00.get_capacity(); i++) {
+          c00[i] = 0.0f;
+          if constexpr (RT == 2) { c01[i] = 0.0f; }
+          if constexpr (NH == 2) {
+            c10[i] = 0.0f;
+            if constexpr (RT == 2) { c11[i] = 0.0f; }
+          }
+        }
+        if constexpr (PF == 0) {
+          for (int k = k0; k < k1; k += KT) {
+            a0.load(W.template slice<KT, 32>(k, n0));
+            if constexpr (NH == 2) { a1.load(W.template slice<KT, 32>(k, n0 + 32)); }
+            auto xl = X.template slice<KT, 16>(k, 0);
+            op.run(a0, xl, c00);
+            if constexpr (NH == 2) { op.run(a1, xl, c10); }
+            if constexpr (RT == 2) {
+              auto xh = X.template slice<KT, 16>(k, 16);
+              op.run(a0, xh, c01);
+              if constexpr (NH == 2) { op.run(a1, xh, c11); }
+            }
+          }
+        } else {
+          a0.load(W.template slice<KT, 32>(k0, n0));
+          if constexpr (NH == 2) { a1.load(W.template slice<KT, 32>(k0, n0 + 32)); }
+          for (int k = k0; k < k1; k += 2 * KT) {
+            const bool more = k + KT < k1;
+            if (more) {
+              b0.load(W.template slice<KT, 32>(k + KT, n0));
+              if constexpr (NH == 2) { b1.load(W.template slice<KT, 32>(k + KT, n0 + 32)); }
+            }
+            {
+              auto xl = X.template slice<KT, 16>(k, 0);
+              op.run(a0, xl, c00);
+              if constexpr (NH == 2) { op.run(a1, xl, c10); }
+              if constexpr (RT == 2) {
+                auto xh = X.template slice<KT, 16>(k, 16);
+                op.run(a0, xh, c01);
+                if constexpr (NH == 2) { op.run(a1, xh, c11); }
+              }
+            }
+            if (more) {
+              if (k + 2 * KT < k1) {
+                a0.load(W.template slice<KT, 32>(k + 2 * KT, n0));
+                if constexpr (NH == 2) { a1.load(W.template slice<KT, 32>(k + 2 * KT, n0 + 32)); }
+              }
+              auto xl = X.template slice<KT, 16>(k + KT, 0);
+              op.run(b0, xl, c00);
+              if constexpr (NH == 2) { op.run(b1, xl, c10); }
+              if constexpr (RT == 2) {
+                auto xh = X.template slice<KT, 16>(k + KT, 16);
+                op.run(b0, xh, c01);
+                if constexpr (NH == 2) { op.run(b1, xh, c11); }
+              }
+            }
+          }
+        }
+        threadgroup float red[SPLITS - 1][NH * RT][16 * 32];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][0][i * 32 + lane] = c00[i];
+            if constexpr (RT == 2) { red[sg - 1][1][i * 32 + lane] = c01[i]; }
+            if constexpr (NH == 2) {
+              red[sg - 1][RT][i * 32 + lane] = c10[i];
+              if constexpr (RT == 2) { red[sg - 1][RT + 1][i * 32 + lane] = c11[i]; }
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!c00.is_valid_element(i)) continue;
+            // Destination coordinates: [0] the input row, [1] the column in the block.
+            auto idx = c00.get_multidimensional_index(i);
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < NH * RT; t++) {
+              const int h = t / RT;
+              const int r = t % RT;
+              float v = t == 0 ? c00[i] : (RT == 2 && t == 1) ? c01[i] : (t == RT) ? c10[i] : c11[i];
+              if constexpr (SPLITS == 2) {
+                v = v + red[0][t][i * 32 + lane];
+              } else {
+                v = v + red[0][t][i * 32 + lane] + red[1][t][i * 32 + lane] + red[2][t][i * 32 + lane];
+              }
+              out[(size_t)(16 * r + idx[0]) * N + n0 + 32 * h + idx[1]] = OutT(v);
+            }
+          }
+        }
+        """
+
+    private static let kernelSwappedZoo = MLXFast.metalKernel(
+        name: "dflash2_bf16_matmul_szoo",
+        inputNames: ["x", "w", "ksz"],
+        outputNames: ["out"],
+        source: sourceSwappedZoo,
+        header: header,
+        ensureRowContiguous: true)
+
+    /// A swapped-family body (`Kernel.swapKT` > 0) over a 16-row, or with
+    /// `rows32` a 32-row, `a` and the stored `[N, K]` weight, with the stock
+    /// kernel's K split. The forms the record's texts have (32 columns, no
+    /// double buffer) run those texts at the body's K step; the 32-row form
+    /// always takes 32 columns.
+    private static func launchSwapZoo(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, kernel z: Kernel, rows32: Bool,
+        outputDType: DType
+    ) -> MLXArray {
+        let splits = Kernel.stockSplits(n: n)
+        var tn = rows32 ? 32 : z.swapTN
+        if n % tn != 0 { tn = 32 }
+        let rows = rows32 ? 2 * rowsPerTile : rowsPerTile
+        if tn == 32, z.swapPF == 0 {
+            return (rows32 ? kernelSwapped32 : kernelSwapped)(
+                [a, w, dimsArray(k: k, n: n)],
+                template: [("OutT", outputDType), ("SPLITS", splits), ("KT", z.swapKT)],
+                grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+                outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
+        }
+        return kernelSwappedZoo(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [
+                ("OutT", outputDType), ("SPLITS", splits), ("KT", z.swapKT), ("TN", tn),
+                ("PF", z.swapPF), ("RT", rows32 ? 2 : 1),
+            ],
+            grid: (n / tn * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `MLXFAST_DRAFT_SWAP_ZOO=0`: the record's swapped form alone (no other
+    /// body, no trial while it is on).
+    static let swapZooEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_ZOO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// `MLXFAST_DRAFT_SWAP_FORCE=<name>` (`s<KT>x<TN>p<PF>`, e.g. `s64x32p1`):
+    /// that swapped body, no trial, once it passes its self-test (the
+    /// record's swapped form otherwise). Only while the swapped form is on.
+    static let swapForced: Kernel? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SWAP_FORCE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
+        else { return nil }
+        return Kernel(swapName: raw)
+    }()
+
+    /// The record's swapped form (`sourceSwapped` at its K step).
+    static var swapRecord: Kernel { .swapped(kt: swappedKT) }
+
+    /// The swapped family's bodies beside the record's: K step 128 / 64, 32
+    /// or 64 columns per simdgroup, the double buffer off / on; not 128 x 64
+    /// double-buffered (four 64-register weight slices per lane).
+    static var swapZooBodies: [Kernel] {
+        var bodies: [Kernel] = []
+        for kt in [128, 64] {
+            for tn in [32, 64] {
+                for pf in [0, 1] where !(kt == 128 && tn == 64 && pf == 1) {
+                    let z = Kernel.swapped(kt: kt, tn: tn, pf: pf)
+                    if z != swapRecord { bodies.append(z) }
+                }
+            }
+        }
+        return bodies
+    }
+
+    /// The swapped bodies that passed their self-test (the trial's candidates
+    /// beside `swapRecord`).
+    nonisolated(unsafe) static var passedSwapVariants: [Kernel] = []
+
+    /// Self-test time the swapped bodies may take in all (the rest are skipped).
+    static let swapZooBudget: Double = 10000
+
+    /// What a swapped body must match bit for bit: the stock kernel on the
+    /// stored weight (`source`, or `source32` for 32 rows), the record's
+    /// reference for `sourceSwapped` (`prepareSwapped`).
+    private static func swapZooReference(
+        _ a: MLXArray, _ w: MLXArray, k: Int, n: Int, kernel z: Kernel, rows32: Bool,
+        outputDType: DType
+    ) -> MLXArray {
+        if rows32 { return launch32(a, w, k: k, n: n, swapped: false, outputDType: outputDType) }
+        let splits = Kernel.stockSplits(n: n)
+        return kernel(
+            [a, w, dimsArray(k: k, n: n)],
+            template: [("OutT", outputDType), ("SPLITS", splits), ("TILED", 0)],
+            grid: (n / 32 * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
+            outputShapes: [[rowsPerTile, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `z` against `swapZooReference` on every one of `weights` (16 rows) and,
+    /// while the 32-row swapped form is on, every one of `weights32` (32 rows):
+    /// one fixed random BF16 input per K and row count, FP32 and BF16 outputs,
+    /// every bit. In its own error scope: a body that fails to build or run
+    /// fails the test, never the process.
+    static func swapZooTest(_ z: Kernel, _ weights: [MLXArray], _ weights32: [MLXArray]) -> Bool {
+        let result = try? withError { scoped -> Bool in
+            var differing: [MLXArray] = []
+            var inputs: [[Int]: MLXArray] = [:]
+            let sets = [(false, weights), (true, swapped32Active && rows32Enabled ? weights32 : [])]
+            for (rows32, list) in sets {
+                for w in list {
+                    let (n, k) = (w.dim(0), w.dim(1))
+                    let rows = rows32 ? 2 * rowsPerTile : rowsPerTile
+                    let a = inputs[[rows, k]] ?? MLXRandom.normal(
+                        [rows, k], key: MLXRandom.key(UInt64(9601 + rows * 131 + k))
+                    ).asType(.bfloat16)
+                    inputs[[rows, k]] = a
+                    for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                        let reference = swapZooReference(
+                            a, w, k: k, n: n, kernel: z, rows32: rows32, outputDType: outputDType)
+                        let y = launchSwapZoo(
+                            a, w, k: k, n: n, kernel: z, rows32: rows32, outputDType: outputDType)
+                        differing.append(
+                            (reference.view(dtype: bits) .!= y.view(dtype: bits)).asType(.int32).sum())
+                    }
+                    if differing.count >= 16 {
+                        let partial = stacked(differing).sum()
+                        eval(partial)
+                        try scoped.check()
+                        differing = [partial]
+                    }
+                }
+            }
+            guard !differing.isEmpty else { return false }
+            let total = stacked(differing).sum()
+            eval(total)
+            try scoped.check()
+            return total.item(Int.self) == 0
+        }
+        return result ?? false
+    }
+
+    /// After `prepareSwapped` and `prepareTiled`, while the swapped form is on
+    /// (the tiled trial then never runs: no copy, no candidates) and the zoo
+    /// is on: self-tests `swapZooBodies` (`swapZooTest`, bit for bit against
+    /// the stock kernel), then installs a forced body
+    /// (`MLXFAST_DRAFT_SWAP_FORCE`, once it passes) or keeps the passing ones
+    /// as the in-situ trial's candidates (`DFlash2KernelTrial`), where the
+    /// record's swapped form is the reference a body must beat by the trial's
+    /// margin. True when that trial is wanted. One stderr line.
+    static func prepareSwapZoo(_ weights: [MLXArray], rows32 weights32: [MLXArray]) -> Bool {
+        passedSwapVariants = []
+        guard swappedActive, swapZooEnabled else { return false }
+        func fits(_ w: MLXArray) -> Bool {
+            w.dtype == .bfloat16 && w.ndim == 2 && w.dim(1) % 1024 == 0 && w.dim(0) % 32 == 0
+        }
+        let eligible = weights.filter(fits)
+        let eligible32 = weights32.filter(fits)
+        guard !eligible.isEmpty else { return false }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let bodies = swapForced.map { $0 == swapRecord || $0.swapKT == 0 ? [] : [$0] } ?? swapZooBodies
+        var passed: [Kernel] = []
+        var failed: [Kernel] = []
+        var skipped: [Kernel] = []
+        for z in bodies {
+            if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 > swapZooBudget {
+                skipped.append(z)
+            } else if swapZooTest(z, eligible, eligible32) {
+                passed.append(z)
+            } else {
+                failed.append(z)
+            }
+        }
+        func names(_ kernels: [Kernel]) -> String { kernels.map(\.name).joined(separator: " ") }
+        var verdict: String
+        if let forced = swapForced {
+            let usable = forced == swapRecord || passed.contains(forced)
+            current = usable ? forced : .stock
+            verdict = "\(forced.name) forced by MLXFAST_DRAFT_SWAP_FORCE"
+                + (forced == swapRecord ? "" : usable ? ", self-test passed" : ", self-test FAILED, \(swapRecord.name) kept")
+        } else {
+            passedSwapVariants = passed
+            verdict = passed.isEmpty ? "\(swapRecord.name) kept" : "the in-situ trial decides against \(swapRecord.name)"
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 swapped zoo: bitwise against the stock kernel (\(eligible.count) weights"
+                    + (swapped32Active && rows32Enabled ? ", \(eligible32.count) at 32 rows" : "")
+                    + ") passed [\(names(passed))]"
+                    + (failed.isEmpty ? "" : " FAILED [\(names(failed))]")
+                    + (skipped.isEmpty ? "" : " skipped [\(names(skipped))]")
+                    + "; \(verdict)" + String(format: "; %.0f ms\n", elapsed)).utf8))
+        return swapForced == nil && !passed.isEmpty
+    }
+
     // The variant kernel, on the tiled copy only. grid: (N / TN * (32 *
     // SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). Simdgroup s takes K
     // steps [s * steps / SPLITS, (s + 1) * steps / SPLITS) (the record's
@@ -1851,6 +2180,9 @@ enum DFlash2TensorMatmul {
         let n = weight.dim(0)
         guard rows >= 1, rows <= 2 * rowsPerTile, weight.dim(1) == k, k % 1024 == 0, n % 32 == 0
         else { return nil }
+        let chosen = current
+        // A swapped body other than the record's (the trial's or a forced one).
+        let swapBody = swappedActive && chosen.swapKT > 0 && chosen != swapRecord
         if rows > rowsPerTile {
             guard rows32Enabled else { return nil }
             var a = x.reshaped(rows, k)
@@ -1858,7 +2190,9 @@ enum DFlash2TensorMatmul {
                 a = concatenated(
                     [a, MLXArray.zeros([2 * rowsPerTile - rows, k], dtype: .bfloat16)], axis: 0)
             }
-            let y = launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
+            let y = swapBody && swapped32Active
+                ? launchSwapZoo(a, weight, k: k, n: n, kernel: chosen, rows32: true, outputDType: .bfloat16)
+                : launch32(a, weight, k: k, n: n, swapped: swapped32Active, outputDType: .bfloat16)
             let rowsOut = rows < 2 * rowsPerTile ? y[0 ..< rows] : y
             return rowsOut.reshaped(Array(x.shape.dropLast()) + [n])
         }
@@ -1866,11 +2200,12 @@ enum DFlash2TensorMatmul {
         if rows < rowsPerTile {
             a = DFlash2Concat.padRows(a, to: rowsPerTile)
         }
-        let chosen = current
         let y: MLXArray
         if swappedActive {
             // The swapped kernel reads the stored weight (no copy exists while it is on).
-            y = launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
+            y = swapBody
+                ? launchSwapZoo(a, weight, k: k, n: n, kernel: chosen, rows32: false, outputDType: .bfloat16)
+                : launch(a, weight, k: k, n: n, tiled: false, outputDType: .bfloat16)
         } else if chosen.tiled, let tiled = tiledCopy(weight) {
             y = chosen.variant(n: n)
                 ? launchVariant(a, tiled, k: k, n: n, kernel: chosen, outputDType: .bfloat16)
@@ -2063,6 +2398,25 @@ enum DFlash2TensorMatmul {
     struct Kernel: Equatable {
         var tiled: Bool
         var wideSplits = 2, wideTN = 32, narrowSplits = 4, narrowTN = 32, prefetch = 0
+        /// The swapped family (stored layout, `swappedActive` only): its K
+        /// step (0: not swapped), columns per simdgroup and double buffer.
+        var swapKT = 0, swapTN = 32, swapPF = 0
+
+        static func swapped(kt: Int, tn: Int = 32, pf: Int = 0) -> Kernel {
+            var z = Kernel(tiled: false)
+            (z.swapKT, z.swapTN, z.swapPF) = (kt, tn, pf)
+            return z
+        }
+
+        /// `s<KT>x<TN>p<PF>` (KT 64/128, TN 32/64, PF 0/1).
+        init?(swapName name: String) {
+            guard name.hasPrefix("s") else { return nil }
+            let v = name.dropFirst().split(whereSeparator: { "xp".contains($0) }).compactMap { Int($0) }
+            guard v.count == 3, [64, 128].contains(v[0]), [32, 64].contains(v[1]), [0, 1].contains(v[2])
+            else { return nil }
+            self = .swapped(kt: v[0], tn: v[1], pf: v[2])
+            guard self.name == name else { return nil }
+        }
 
         static let stock = Kernel(tiled: false)
         static let tiledStock = Kernel(tiled: true)
@@ -2086,7 +2440,9 @@ enum DFlash2TensorMatmul {
         var bitwise: Bool { wideSplits == 2 && narrowSplits == 4 }
 
         var name: String {
-            !tiled
+            swapKT > 0
+                ? "s\(swapKT)x\(swapTN)p\(swapPF)"
+                : !tiled
                 ? "stock"
                 : self == .tiledStock
                     ? "tiled" : "w\(wideSplits)x\(wideTN)n\(narrowSplits)x\(narrowTN)p\(prefetch)"
@@ -2136,7 +2492,11 @@ enum DFlash2TensorMatmul {
     }()
 
     /// The in-situ trial chooses (nothing forces a kernel).
-    static var trialWanted: Bool { tiledSetting == nil && forcedKernel == nil }
+    static var trialWanted: Bool {
+        swappedActive
+            ? swapForced == nil && !passedSwapVariants.isEmpty
+            : tiledSetting == nil && forcedKernel == nil
+    }
 
     /// The bit-for-bit variants the trial's first request times beside
     /// `stock` and `tiled`: 64 columns on the wide class, the prefetch, both.
@@ -2416,6 +2776,9 @@ enum DFlash2KernelTrial {
     nonisolated(unsafe) private static var tape: [Int: (position: Int, ids: [Int32])] = [:]
     nonisolated(unsafe) private static var onEnough: (() -> Void)?
     nonisolated(unsafe) private static var pick = Kernel.stock
+    /// Stage 1 runs the swapped family (`DFlash2TensorMatmul.swapZooBodies`);
+    /// no stage 2 (its changed splits are tiled-copy variants).
+    nonisolated(unsafe) private static var swapFamily = false
     nonisolated(unsafe) private static var proposalCount = 0
     nonisolated(unsafe) private static var log = ""
     /// Host times: stage 1 begun, its request done, stage 2's self-tests done.
@@ -2487,7 +2850,11 @@ enum DFlash2KernelTrial {
 
     /// Stage 1's candidates, and the budget both requests use.
     static func beginFirstStage() {
-        candidates = [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
+        // With the swapped form on: its bodies, the record's form the reference.
+        swapFamily = DFlash2TensorMatmul.swappedActive
+        candidates = swapFamily
+            ? [DFlash2TensorMatmul.swapRecord] + DFlash2TensorMatmul.passedSwapVariants
+            : [.stock, .tiledStock] + DFlash2TensorMatmul.passedBitwiseVariants
         perCandidate = candidates.count > 2 ? roundsPerVariant : 12
         stage = 1
         pick = .stock
@@ -2496,7 +2863,7 @@ enum DFlash2KernelTrial {
         proposalCount = 0
         marks = [DispatchTime.now().uptimeNanoseconds]
         requestRounds = max(
-            roundsNeeded, DFlash2TensorMatmul.variantsEnabled ? 2 + 4 * roundsPerSplit : 0)
+            roundsNeeded, DFlash2TensorMatmul.variantsEnabled && !swapFamily ? 2 + 4 * roundsPerSplit : 0)
     }
 
     static func begin(onEnough: @escaping () -> Void) {
@@ -2585,7 +2952,7 @@ enum DFlash2KernelTrial {
         guard armed, stage == 1 else { return false }
         marks.append(DispatchTime.now().uptimeNanoseconds)
         concludeFirstStage()
-        guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty else { return false }
+        guard DFlash2TensorMatmul.variantsEnabled, !tape.isEmpty, !swapFamily else { return false }
         var passed: [Kernel] = []
         var tested: [String] = []
         for kernel in DFlash2TensorMatmul.splitVariants(of: pick) {
@@ -2658,7 +3025,7 @@ enum DFlash2KernelTrial {
         FileHandle.standardError.write(
             Data(
                 ("dflash2 kernel trial: \(log); adopted \(adopted.name) "
-                    + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : "stored layout")); "
+                    + "(\(adopted.tiled ? adopted.bitwise ? "bitwise" : "changed split" : adopted.swapKT > 0 ? "swapped, bitwise" : "stored layout")); "
                     + "\(proposalCount) proposals; "
                     + String(format: "%.0f ms", Double(elapsedNanoseconds) / 1e6)
                     + " (\(phases.joined(separator: " + ")))\n").utf8))
@@ -4128,10 +4495,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// resident again at each decode window's first round.
     func prepareTiledWeights() -> Bool {
         let layerWeights = layers.flatMap { $0.tensorWeights() }
-        _ = DFlash2TensorMatmul.prepareSwapped(
-            layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : []),
-            rows32: layers.compactMap { $0.selfAttn.stackedQKVWeight() })
-        return DFlash2TensorMatmul.prepareTiled(layerWeights)
+        let all = layerWeights + layers.flatMap { $0.projectionWeights() } + (fc.bias == nil ? [fc.weight] : [])
+        let rows32 = layers.compactMap { $0.selfAttn.stackedQKVWeight() }
+        _ = DFlash2TensorMatmul.prepareSwapped(all, rows32: rows32)
+        let tiled = DFlash2TensorMatmul.prepareTiled(layerWeights)
+        // With the swapped form on (no copy, so no tiled trial): its own bodies.
+        return DFlash2TensorMatmul.prepareSwapZoo(all, rows32: rows32) || tiled
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
