@@ -97,6 +97,68 @@ template <typename T, int N_READS = RMS_N_READS>
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[SIMD_SIZE];
 
+  // Two-chunk rows: keep each input in a fixed register slot. The input
+  // and output predicates, additions, reductions and casts stay in order.
+  if (axis_size > lsize * N_READS && axis_size <= 2 * lsize * N_READS) {
+    float acc = 0;
+    float thread_x0[N_READS];
+    float thread_x1[N_READS];
+    const uint r1 = lsize * N_READS;
+    x += gid * size_t(axis_size) + lid * N_READS;
+    w += w_stride * lid * N_READS;
+    for (int i = 0; i < N_READS; i++) {
+      thread_x0[i] = x[i];
+      acc += thread_x0[i] * thread_x0[i];
+    }
+    if (r1 + lid * N_READS + N_READS <= axis_size) {
+      for (int i = 0; i < N_READS; i++) {
+        thread_x1[i] = x[r1 + i];
+        acc += thread_x1[i] * thread_x1[i];
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if (r1 + lid * N_READS + i < axis_size) {
+          thread_x1[i] = x[r1 + i];
+          acc += thread_x1[i] * thread_x1[i];
+        }
+      }
+    }
+    acc = simd_sum(acc);
+    if (simd_group_id == 0) {
+      local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+      local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+      acc = simd_sum(local_sums[simd_lane_id]);
+      if (simd_lane_id == 0) {
+        local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    out += gid * size_t(axis_size) + lid * N_READS;
+    for (int i = 0; i < N_READS; i++) {
+      out[i] =
+          w[w_stride * i] * static_cast<T>(thread_x0[i] * local_inv_mean[0]);
+    }
+    if (r1 + lid * N_READS + N_READS <= axis_size) {
+      for (int i = 0; i < N_READS; i++) {
+        out[r1 + i] = w[w_stride * (r1 + i)] *
+            static_cast<T>(thread_x1[i] * local_inv_mean[0]);
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if (r1 + lid * N_READS + i < axis_size) {
+          out[r1 + i] = w[w_stride * (r1 + i)] *
+              static_cast<T>(thread_x1[i] * local_inv_mean[0]);
+        }
+      }
+    }
+    return;
+  }
   float acc = 0;
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
