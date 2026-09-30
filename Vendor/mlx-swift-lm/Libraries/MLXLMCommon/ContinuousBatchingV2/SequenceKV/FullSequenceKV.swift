@@ -330,9 +330,9 @@ enum CBv2KVFirstAppend {
             const uint d = thread_position_in_grid.x;
             const uint r = thread_position_in_grid.y;
             const uint h = thread_position_in_grid.z;
-            const uint o = (h * uint(dims[0]) + r) * uint(dims[1]) + d;
-            ko[o] = k[h * uint(k_strides[1]) + r * uint(k_strides[2]) + d * uint(k_strides[3])];
-            vo[o] = v[h * uint(v_strides[1]) + r * uint(v_strides[2]) + d * uint(v_strides[3])];
+            const size_t o = (size_t(h) * size_t(dims[0]) + size_t(r)) * size_t(dims[1]) + size_t(d);
+            ko[o] = k[int64_t(h) * k_strides[1] + int64_t(r) * k_strides[2] + int64_t(d) * k_strides[3]];
+            vo[o] = v[int64_t(h) * v_strides[1] + int64_t(r) * v_strides[2] + int64_t(d) * v_strides[3]];
             """,
         ensureRowContiguous: false)
 
