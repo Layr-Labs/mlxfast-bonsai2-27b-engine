@@ -1452,16 +1452,36 @@ enum DFlash2TensorMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Destination layout: element i -> n = n0 + fn + (i & 3) + 16 * ((i >> 3) & 1),
+          // m = fm + 8 * ((i >> 2) & 1). Four consecutive i share m and the n decade and
+          // step the column by one, so they are four contiguous output columns: the same
+          // values, written once per group of four instead of four times.
+          // Alignment: n0 is a multiple of 32, fn is a multiple of 4 and N is a multiple
+          // of 32, so each group base is 4-aligned for float4 and for half4.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < 16; i++) {
-            float v;
+          for (int i = 0; i < 16; i += 4) {
+            const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+            float v0, v1, v2, v3;
             if constexpr (SPLITS == 2) {
-              v = cT[i] + red[0][i * 32 + lane];
+              v0 = cT[i] + red[0][i * 32 + lane];
+              v1 = cT[i + 1] + red[0][(i + 1) * 32 + lane];
+              v2 = cT[i + 2] + red[0][(i + 2) * 32 + lane];
+              v3 = cT[i + 3] + red[0][(i + 3) * 32 + lane];
             } else {
-              v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v0 = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT[i + 1] + red[0][(i + 1) * 32 + lane] + red[1][(i + 1) * 32 + lane]
+                  + red[2][(i + 1) * 32 + lane];
+              v2 = cT[i + 2] + red[0][(i + 2) * 32 + lane] + red[1][(i + 2) * 32 + lane]
+                  + red[2][(i + 2) * 32 + lane];
+              v3 = cT[i + 3] + red[0][(i + 3) * 32 + lane] + red[1][(i + 3) * 32 + lane]
+                  + red[2][(i + 3) * 32 + lane];
             }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v);
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+            }
           }
         }
         """
@@ -1511,20 +1531,48 @@ enum DFlash2TensorMatmul {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
+          // Same four-column fold as the 16-row source, for both row tiles: rows 0-15
+          // land at (fm + 8 * mh), rows 16-31 at (16 + fm + 8 * mh). Bases are 4-aligned
+          // by the same N / n0 / fn guards.
           #pragma clang loop unroll(full)
-          for (int i = 0; i < 16; i++) {
-            float v0, v1;
+          for (int i = 0; i < 16; i += 4) {
+            const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+            float v0, v1, v2, v3, w0, w1, w2, w3;
             if constexpr (SPLITS == 2) {
               v0 = cT0[i] + red[0][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane];
+              v1 = cT0[i + 1] + red[0][(i + 1) * 32 + lane];
+              v2 = cT0[i + 2] + red[0][(i + 2) * 32 + lane];
+              v3 = cT0[i + 3] + red[0][(i + 3) * 32 + lane];
+              w0 = cT1[i] + red[0][(16 + i) * 32 + lane];
+              w1 = cT1[i + 1] + red[0][(16 + i + 1) * 32 + lane];
+              w2 = cT1[i + 2] + red[0][(16 + i + 2) * 32 + lane];
+              w3 = cT1[i + 3] + red[0][(16 + i + 3) * 32 + lane];
             } else {
               v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
-              v1 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
+              v1 = cT0[i + 1] + red[0][(i + 1) * 32 + lane] + red[1][(i + 1) * 32 + lane]
+                  + red[2][(i + 1) * 32 + lane];
+              v2 = cT0[i + 2] + red[0][(i + 2) * 32 + lane] + red[1][(i + 2) * 32 + lane]
+                  + red[2][(i + 2) * 32 + lane];
+              v3 = cT0[i + 3] + red[0][(i + 3) * 32 + lane] + red[1][(i + 3) * 32 + lane]
+                  + red[2][(i + 3) * 32 + lane];
+              w0 = cT1[i] + red[0][(16 + i) * 32 + lane] + red[1][(16 + i) * 32 + lane]
                   + red[2][(16 + i) * 32 + lane];
+              w1 = cT1[i + 1] + red[0][(16 + i + 1) * 32 + lane] + red[1][(16 + i + 1) * 32 + lane]
+                  + red[2][(16 + i + 1) * 32 + lane];
+              w2 = cT1[i + 2] + red[0][(16 + i + 2) * 32 + lane] + red[1][(16 + i + 2) * 32 + lane]
+                  + red[2][(16 + i + 2) * 32 + lane];
+              w3 = cT1[i + 3] + red[0][(16 + i + 3) * 32 + lane] + red[1][(16 + i + 3) * 32 + lane]
+                  + red[2][(16 + i + 3) * 32 + lane];
             }
-            const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-            out[(size_t)(fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v0);
-            out[(size_t)(16 + fm + 8 * mh) * N + n0 + fn + c + 16 * nh] = OutT(v1);
+            const size_t base = (size_t)(fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            const size_t base1 = (size_t)(16 + fm + 8 * mh) * N + n0 + fn + 16 * nh;
+            if constexpr (sizeof(OutT) == sizeof(float)) {
+              *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+              *(device float4*)(out + base1) = float4(w0, w1, w2, w3);
+            } else {
+              *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+              *(device half4*)(out + base1) = half4(half(w0), half(w1), half(w2), half(w3));
+            }
           }
         }
         """
@@ -1793,19 +1841,44 @@ enum DFlash2TensorMatmul {
         if (sg == 0) {
           #pragma clang loop unroll(full)
           for (int h = 0; h < NH; h++) {
+            // Four consecutive i share mh and nh (bits 2 and 3) and step c by
+            // one, so they are four contiguous output columns: the same values
+            // in the same accumulation order, written once per group of four
+            // instead of four times. fn is a multiple of 4 and N is a multiple
+            // of 32 (the grid is N / TN with TN in {32, 64}), so each group
+            // base is 4-aligned for float4 and for half4.
             #pragma clang loop unroll(full)
-            for (int i = 0; i < 16; i++) {
-              float v = h == 0 ? cT0[i] : cT1[i];
+            for (int i = 0; i < 16; i += 4) {
+              float v0 = h == 0 ? cT0[i] : cT1[i];
+              float v1 = h == 0 ? cT0[i + 1] : cT1[i + 1];
+              float v2 = h == 0 ? cT0[i + 2] : cT1[i + 2];
+              float v3 = h == 0 ? cT0[i + 3] : cT1[i + 3];
               if constexpr (SPLITS == 2) {
-                v = v + red[0][h][i * 32 + lane];
+                v0 = v0 + red[0][h][i * 32 + lane];
+                v1 = v1 + red[0][h][(i + 1) * 32 + lane];
+                v2 = v2 + red[0][h][(i + 2) * 32 + lane];
+                v3 = v3 + red[0][h][(i + 3) * 32 + lane];
               } else if constexpr (SPLITS == 4) {
-                v = v + red[0][h][i * 32 + lane] + red[1][h][i * 32 + lane] + red[2][h][i * 32 + lane];
+                v0 = v0 + red[0][h][i * 32 + lane] + red[1][h][i * 32 + lane] + red[2][h][i * 32 + lane];
+                v1 = v1 + red[0][h][(i + 1) * 32 + lane] + red[1][h][(i + 1) * 32 + lane] + red[2][h][(i + 1) * 32 + lane];
+                v2 = v2 + red[0][h][(i + 2) * 32 + lane] + red[1][h][(i + 2) * 32 + lane] + red[2][h][(i + 2) * 32 + lane];
+                v3 = v3 + red[0][h][(i + 3) * 32 + lane] + red[1][h][(i + 3) * 32 + lane] + red[2][h][(i + 3) * 32 + lane];
               } else {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < SPLITS - 1; j++) { v = v + red[j][h][i * 32 + lane]; }
+                for (int j = 0; j < SPLITS - 1; j++) {
+                  v0 = v0 + red[j][h][i * 32 + lane];
+                  v1 = v1 + red[j][h][(i + 1) * 32 + lane];
+                  v2 = v2 + red[j][h][(i + 2) * 32 + lane];
+                  v3 = v3 + red[j][h][(i + 3) * 32 + lane];
+                }
               }
-              const int c = i & 3; const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
-              out[(size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + c + 16 * nh] = OutT(v);
+              const int mh = (i >> 2) & 1; const int nh = (i >> 3) & 1;
+              const size_t base = (size_t)(fm + 8 * mh) * N + n0 + 32 * h + fn + 16 * nh;
+              if constexpr (sizeof(OutT) == sizeof(float)) {
+                *(device float4*)(out + base) = float4(v0, v1, v2, v3);
+              } else {
+                *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
+              }
             }
           }
         }
