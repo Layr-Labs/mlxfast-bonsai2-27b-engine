@@ -2592,6 +2592,7 @@ enum DFlash2PackedWeights {
         let offsets: MLXArray
         let escapes: MLXArray
         let escapeCount: Int
+        let index32Safe: Bool
         var arrays: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
     }
 
@@ -2622,13 +2623,13 @@ enum DFlash2PackedWeights {
           uint base;
         };
 
-        template <int KT>
+        template <int KT, typename IndexT = size_t>
         inline void dflash2_pack12_read(
             thread dflash2_pack12_share<KT>& t, const device uint4* mant, const device uint2* code,
             const device uint4* first4, const device uint* bases, int tile, uint lane) {
           constexpr int WORDS = KT / 16;
-          const device uint4* mp = mant + (size_t)tile * WORDS * 32 + lane;
-          const device uint2* cp = code + (size_t)tile * WORDS * 32 + lane;
+          const device uint4* mp = mant + (IndexT)tile * WORDS * 32 + lane;
+          const device uint2* cp = code + (IndexT)tile * WORDS * 32 + lane;
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
             t.m[j] = mp[j * 32];
@@ -2853,6 +2854,7 @@ enum DFlash2PackedWeights {
     // of loaded: the same op, K partitions and reduction. grid: (N / 32 *
     // (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). x bfloat [16, K].
     private static let source = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * COLS;
@@ -2878,13 +2880,13 @@ enum DFlash2PackedWeights {
         for (uint16_t i = 0; i < cT.get_capacity(); i++) { cT[i] = 0.0f; }
         // The next tile's share is read before this one's op (one tile ahead).
         dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_read<KT, IndexT>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
             nb * steps + k0 / KS, lane);
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
           if (k + KS < k0 + kq) {
-            dflash2_pack12_read<KT>(
+            dflash2_pack12_read<KT, IndexT>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
@@ -2908,7 +2910,7 @@ enum DFlash2PackedWeights {
               v = cT[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
             }
             auto idx = cT.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+            out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v);
           }
         }
         """
@@ -2916,6 +2918,7 @@ enum DFlash2PackedWeights {
     // `sourceSwapped32` the same way: one rebuilt operand per K step,
     // multiplied by rows 0-15 and 16-31. x bfloat [32, K].
     private static let source32 = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * COLS;
@@ -2941,13 +2944,13 @@ enum DFlash2PackedWeights {
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
         dflash2_pack12_share<KT> cur, nxt;
-        dflash2_pack12_read<KT>(
+        dflash2_pack12_read<KT, IndexT>(
             cur, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4, bases,
             nb * steps + k0 / KS, lane);
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
           if (k + KS < k0 + kq) {
-            dflash2_pack12_read<KT>(
+            dflash2_pack12_read<KT, IndexT>(
                 nxt, (const device uint4*)mant, (const device uint2*)code, (const device uint4*)first4,
                 bases, tile + 1, lane);
           }
@@ -2979,8 +2982,8 @@ enum DFlash2PackedWeights {
                   + red[2][(COLS / 2 + i) * 32 + lane];
             }
             auto idx = cT0.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
-            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(IndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
           }
         }
         """
@@ -3033,7 +3036,7 @@ enum DFlash2PackedWeights {
         let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: n)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", splits)] + geometry,
+            template: [("OutT", outputDType), ("SPLITS", splits), ("IO32", c.index32Safe ? 1 : 0)] + geometry,
             grid: (n / cols * splits * 32, 1, 1), threadGroup: (splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
@@ -3060,9 +3063,14 @@ enum DFlash2PackedWeights {
             grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[max(escapeCount, 1)], [tiles * 4]], outputDTypes: [.uint32, .uint32])
         eval(written)
+        let limit = Int(Int32.max)
+        let arrays = [first[0], first[1], written[1], first[2], offsets, written[0]]
+        let index32Safe = w.size > 0 && w.size <= limit
+            && w.dim(0) <= limit / 32 && w.dim(1) <= limit / 32
+            && arrays.allSatisfy { $0.size > 0 && $0.size <= limit }
         return Copy(
             source: w, mantissas: first[0], codes: first[1], first: written[1], bases: first[2],
-            offsets: offsets, escapes: written[0], escapeCount: escapeCount)
+            offsets: offsets, escapes: written[0], escapeCount: escapeCount, index32Safe: index32Safe)
     }
 
     /// Packs every eligible one of `weights` (16-row products) and
