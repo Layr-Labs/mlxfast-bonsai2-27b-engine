@@ -314,7 +314,7 @@ enum Qwen35TrunkSubmission {
         // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40, 56]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -330,7 +330,8 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
+            verify.explicit == [8, 24, 40, 56]
+            ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40, 56]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
