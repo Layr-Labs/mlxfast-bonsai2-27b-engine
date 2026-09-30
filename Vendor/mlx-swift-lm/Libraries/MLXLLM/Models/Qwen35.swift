@@ -4171,6 +4171,8 @@ final class Qwen35Attention: Module {
 
         super.init()
 
+        CBv2PromptCausalAttention.prepareJoin(
+            heads: attentionHeads, kvHeads: kvHeads, headDim: headDim, scale: scale)
         if let fusedRope {
             Qwen35AttentionPrework.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
