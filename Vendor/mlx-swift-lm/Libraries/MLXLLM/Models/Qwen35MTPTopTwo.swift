@@ -416,13 +416,32 @@ enum Qwen35TensorPackedMatmul {
             }
           }
           if (ks != 0) { return; }
+          // Same values as the scalar loop: i groups of 4 share row v and
+          // base column c=col0+fn (fn is a multiple of 4), with C0 at c..c+3
+          // and C1 at c+16..c+19. One vec<OutT,4> store per quartet.
           #pragma unroll
-          for (int i = 0; i < 8; i++) {
+          for (int i = 0; i < 8; i += 4) {
             const int v = int(fm) + (i / 4) * 8;
-            const int c = col0 + int(fn) + (i % 4);
+            const int c = col0 + int(fn);
             if (v < rows) {
-              if (c < N) { y[v * N + c] = static_cast<OutT>(C0[i]); }
-              if (c + 16 < N) { y[v * N + c + 16] = static_cast<OutT>(C1[i]); }
+              if (c + 3 < N) {
+                *(device vec<OutT, 4>*)(y + (size_t)v * N + c) = vec<OutT, 4>(
+                    OutT(C0[i]), OutT(C0[i + 1]), OutT(C0[i + 2]), OutT(C0[i + 3]));
+              } else {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                  if (c + r < N) { y[(size_t)v * N + c + r] = OutT(C0[i + r]); }
+                }
+              }
+              if (c + 19 < N) {
+                *(device vec<OutT, 4>*)(y + (size_t)v * N + c + 16) = vec<OutT, 4>(
+                    OutT(C1[i]), OutT(C1[i + 1]), OutT(C1[i + 2]), OutT(C1[i + 3]));
+              } else {
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                  if (c + 16 + r < N) { y[(size_t)v * N + c + 16 + r] = OutT(C1[i + r]); }
+                }
+              }
             }
           }
         }
