@@ -191,10 +191,26 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false, keepMask: MLXArray? = nil,
         metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        packet: CBv2AttentionPacketObservation? = nil,
+        tree: CBv2TreeVerifyLayout? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
+        // A token-tree verify window (one row, causal full attention): its
+        // ancestor mask replaces the window rows' causal visibility; with a
+        // keep mask too, it is folded into the keep mask.
+        var keepMask = keepMask
+        var tree = tree
+        if let layout = tree {
+            precondition(
+                B == 1 && L == layout.count && spanContexts == nil && window(of: kind) == nil
+                    && !kind.isBidirectional,
+                "CBv2AttentionV1: a tree layout serves one causal full-attention window")
+            if let mask = keepMask {
+                keepMask = mask .&& layout.keepMask(keyCount: mask.dim(3))
+                tree = nil
+            }
+        }
         if keepMask != nil {
             precondition(
                 B == 1,
@@ -240,7 +256,7 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[0], keepMask: keepMask,
-                metadata: metadata, packet: packet)
+                metadata: metadata, packet: packet, tree: tree)
         }
 
         if L == 1 {
@@ -383,13 +399,14 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?, keepMask: MLXArray? = nil,
         metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        packet: CBv2AttentionPacketObservation? = nil,
+        tree: CBv2TreeVerifyLayout? = nil
     ) -> MLXArray {
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         return attendRowAfterUpdate(
             kind: kind, queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
             scale: scale, sinks: sinks, softcap: softcap, spanContext: spanContext,
-            keepMask: keepMask, metadata: metadata, packet: packet)
+            keepMask: keepMask, metadata: metadata, packet: packet, tree: tree)
     }
 
     /// `updateAndAttendRow` after the row's update: the same attention over
@@ -401,7 +418,8 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?, keepMask: MLXArray? = nil,
         metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        packet: CBv2AttentionPacketObservation? = nil,
+        tree: CBv2TreeVerifyLayout? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         if let keepMask {
@@ -409,6 +427,24 @@ enum CBv2AttentionV1 {
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
                 "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
                     + "\(L) queries over \(cachedKeys.dim(2)) keys")
+        }
+        // A token-tree window: the verify block with the tree's window
+        // visibility where it applies, else SDPA over the tree's boolean mask.
+        if let tree {
+            precondition(
+                L == tree.count && keepMask == nil && spanContext == nil,
+                "CBv2AttentionV1: a tree layout serves one causal full-attention window")
+            if metadata == nil, packet == nil, sinks == nil, softcap == nil,
+                let composed = CBv2PromptCausalAttention.attend(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    scale: scale, promptRows: L, verify: true, ancestors: tree.ancestors)
+            {
+                return composed
+            }
+            return attend(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: nil, sinks: sinks, softcap: softcap,
+                keepMask: tree.keepMask(keyCount: cachedKeys.dim(2)))
         }
         if shouldBlockQueries(L) && !kind.isBidirectional {
             return attendQueryBlocks(
@@ -1068,7 +1104,10 @@ package enum CBv2PromptCausalAttention {
         name: "bonsai_prompt_causal_scale_select",
         inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
         outputNames: ["out"],
-        source: """
+        source: maskSource,
+        ensureRowContiguous: true)
+
+    private static let maskSource = """
             const uint base = thread_position_in_grid.x * 4;
             const uint kl = uint(c_kl);
             const int j = int(base % kl);
@@ -1078,8 +1117,7 @@ package enum CBv2PromptCausalAttention {
             for (int w = 0; w < 4; w++) {
               out[base + w] = (j + w <= last) ? scores[base + w] * c_scale : c_fill;
             }
-            """,
-        ensureRowContiguous: true)
+            """
 
     /// MLX's `softmax_single_row<float, float, 4>` (the precise FP32
     /// softmax `Softmax::eval_gpu` runs on a row of at most 4096 columns) with
@@ -1095,7 +1133,10 @@ package enum CBv2PromptCausalAttention {
         name: "bonsai_prompt_causal_scale_select_softmax",
         inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
         outputNames: ["out"],
-        source: """
+        source: softmaxSource,
+        ensureRowContiguous: true)
+
+    private static let softmaxSource = """
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -1172,7 +1213,46 @@ package enum CBv2PromptCausalAttention {
                 }
               }
             }
-            """,
+            """
+
+    /// `source` with each pattern replaced (each must occur).
+    private static func derivedSource(_ source: String, _ edits: [(String, String)]) -> String {
+        var derived = source
+        for (pattern, replacement) in edits {
+            precondition(derived.contains(pattern), "CBv2PromptCausalAttention: tree source pattern missing")
+            derived = derived.replacingOccurrences(of: pattern, with: replacement)
+        }
+        return derived
+    }
+
+    /// `maskKernel` and `softmaxKernel` for a token-tree window, one edit
+    /// each: a key among the window's rows (column `c_off + r`) is visible
+    /// to row i only where bit r of `anc[i]` is set. The causal bound stays
+    /// in front, so a chain-shaped tree selects the same values bit for bit.
+    private static let treeMaskKernel = MLXFast.metalKernel(
+        name: "bonsai_tree_causal_scale_select",
+        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill", "anc"],
+        outputNames: ["out"],
+        source: derivedSource(
+            maskSource,
+            [
+                ("const int last = c_off + i;", "const int last = c_off + i;\nconst uint am = uint(anc[i]);"),
+                ("(j + w <= last)", "(j + w <= last && (j + w < c_off || ((am >> uint(j + w - c_off)) & 1u) != 0u))"),
+            ]),
+        ensureRowContiguous: true)
+
+    private static let treeSoftmaxKernel = MLXFast.metalKernel(
+        name: "bonsai_tree_causal_scale_select_softmax",
+        inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill", "anc"],
+        outputNames: ["out"],
+        source: derivedSource(
+            softmaxSource,
+            [
+                ("const int last = c_off + int(gid % uint(c_ql));",
+                 "const int last = c_off + int(gid % uint(c_ql));\nconst uint am = uint(anc[gid % uint(c_ql)]);"),
+                ("(lid * N_READS + i <= last)",
+                 "(lid * N_READS + i <= last && (lid * N_READS + i < c_off || ((am >> uint(lid * N_READS + i - c_off)) & 1u) != 0u))"),
+            ]),
         ensureRowContiguous: true)
 
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
@@ -1204,9 +1284,11 @@ package enum CBv2PromptCausalAttention {
         return outputs
     }
 
+    /// `ancestors` (int32 `[L]`, a tree layout's, verify only) replaces the
+    /// causal block's window-row visibility with the tree's.
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
-        verify: Bool = false
+        verify: Bool = false, ancestors: MLXArray? = nil
     ) -> MLXArray? {
         guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
@@ -1225,6 +1307,11 @@ package enum CBv2PromptCausalAttention {
             kL % 4 == 0 || (verify && kL <= softmaxSingleRowLimit),
             B * H * L * kL < Int(Int32.max)
         else { return nil }
+        if let ancestors {
+            guard verify, B == 1, L <= CBv2TreeVerifyLayout.maximumRows, ancestors.shape == [L],
+                ancestors.dtype == .int32
+            else { return nil }
+        }
         let repeats = H / kvHeads
         var q = queries
         var k = keys
@@ -1240,21 +1327,22 @@ package enum CBv2PromptCausalAttention {
             v = v.expandedDimensions(axis: 2)
         }
         let scores = matmul(q, k.swappedAxes(-1, -2))
-        let operands: [any ScalarOrArray] = [
+        var operands: [any ScalarOrArray] = [
             scores, MLXArray(Int32(kL - L)), MLXArray(Int32(L)), MLXArray(Int32(kL)),
             MLXArray(scale), MLXArray(-Float.greatestFiniteMagnitude),
         ]
+        if let ancestors { operands.append(ancestors) }
         let probabilities: MLXArray
         if kL <= softmaxSingleRowLimit {
             let threads = 32 * (((kL + 3) / 4 + 31) / 32)
-            probabilities = softmaxKernel(
+            probabilities = (ancestors == nil ? softmaxKernel : treeSoftmaxKernel)(
                 operands,
                 grid: ((scores.size / kL) * threads, 1, 1),
                 threadGroup: (threads, 1, 1),
                 outputShapes: [scores.shape],
                 outputDTypes: [.float32])[0]
         } else {
-            let masked = maskKernel(
+            let masked = (ancestors == nil ? maskKernel : treeMaskKernel)(
                 operands,
                 grid: (scores.size / 4, 1, 1),
                 threadGroup: (256, 1, 1),
@@ -1267,5 +1355,118 @@ package enum CBv2PromptCausalAttention {
             out = out.reshaped([B, H, L, out.dim(-1)])
         }
         return out
+    }
+}
+
+// MARK: - Token-tree verify window
+
+/// A verify window laid out as a token tree (tree speculative verify). Rows
+/// are in topological order: row 0 is the anchor and every other row's parent
+/// precedes it. Query row i attends every key cached before the window plus
+/// the window rows in anc(i) (its ancestors and itself), and rotates at
+/// `offset + depth(i)`; the window's K/V rows are still appended at
+/// `offset + i`, so row i's K row holds what a chain over its root-to-node
+/// path writes at depth(i) and accepting a path is a gather of its rows. A
+/// chain-shaped tree is today's causal window. Bound on each full-attention
+/// `CBv2LayerCache` and the row's recurrent transaction for one verify
+/// forward and cleared after it.
+public final class CBv2TreeVerifyLayout {
+    /// The widest window the int32 ancestor masks can state.
+    public static let maximumRows = 32
+
+    public let count: Int
+    /// int32 `[count]`: bit j of entry i is set iff row j is row i or one of
+    /// its ancestors (0 for a padding row).
+    public let ancestors: MLXArray
+    /// int32 `[count]`: each row's depth (the anchor's is 0).
+    public let depths: MLXArray
+    /// The host parents (-1 for the anchor), when built from them.
+    public let parents: [Int]?
+
+    public init(parents: [Int]) {
+        let n = parents.count
+        precondition(
+            n >= 1 && n <= Self.maximumRows && parents[0] < 0,
+            "CBv2TreeVerifyLayout: 1...\(Self.maximumRows) rows rooted at row 0")
+        var masks = [UInt32](repeating: 1, count: n)
+        var levels = [Int32](repeating: 0, count: n)
+        for i in 1 ..< n {
+            let p = parents[i]
+            precondition(p >= 0 && p < i, "CBv2TreeVerifyLayout: row \(i) has parent \(p)")
+            masks[i] = masks[p] | (UInt32(1) << UInt32(i))
+            levels[i] = levels[p] + 1
+        }
+        self.count = n
+        self.parents = parents
+        self.ancestors = MLXArray(masks.map { Int32(bitPattern: $0) })
+        self.depths = MLXArray(levels)
+    }
+
+    /// A drafter tree's device layout (int32 `[count]` each; parents -1 for
+    /// the anchor and padding rows), a valid tree by construction.
+    public init(parents: MLXArray, ancestors: MLXArray, depths: MLXArray) {
+        precondition(
+            ancestors.ndim == 1 && ancestors.dtype == .int32 && depths.dtype == .int32
+                && parents.dtype == .int32 && depths.shape == ancestors.shape
+                && parents.shape == ancestors.shape
+                && ancestors.dim(0) >= 1 && ancestors.dim(0) <= Self.maximumRows,
+            "CBv2TreeVerifyLayout: parents, ancestors and depths must be int32 [1...\(Self.maximumRows)]")
+        self.count = ancestors.dim(0)
+        self.parents = nil
+        self.ancestors = ancestors
+        self.depths = depths
+        self.parentsOnDevice = parents
+    }
+
+    private var parentsOnDevice: MLXArray?
+
+    /// int32 `[count]` parents on the device (-1 for the anchor and padding).
+    public var deviceParents: MLXArray? {
+        parentsOnDevice ?? parents.map { MLXArray($0.map { Int32($0) }) }
+    }
+
+    /// The accepted path's window rows, root first, set at the round's
+    /// finalize before the recurrent commit, which compacts each recurrent
+    /// layer's replay tape to them.
+    public var acceptedRows: [Int]?
+
+    private var tapTables: [Int: MLXArray] = [:]
+
+    /// The depthwise conv's tap rows of every window row, int32
+    /// `[count * kernelSize]`, as rows of `[committed conv rows
+    /// (kernelSize - 1); window rows]`: tap j of row i is the row at distance
+    /// d = kernelSize - 1 - j up i's path (index kernelSize - 1 + anc_d(i))
+    /// when d <= depth(i), else committed row depth(i) + j; a chain reads
+    /// i + j, the row-order window. Built on device once per layout.
+    public func convTapTable(kernelSize ks: Int) -> MLXArray? {
+        if let table = tapTables[ks] { return table }
+        guard ks >= 1, let parents = deviceParents else { return nil }
+        let nk = ks - 1
+        let clamped = maximum(parents, Int32(0))
+        var up: [MLXArray] = [MLXArray(Int32(0) ..< Int32(count))]
+        for _ in 0 ..< nk { up.append(take(clamped, up.last!, axis: 0)) }
+        let ancestorsUp = stacked((0 ... nk).map { up[nk - $0] }, axis: 1)
+        let distance = MLXArray((0 ... nk).map { Int32(nk - $0) }).reshaped([1, ks])
+        let column = MLXArray((0 ... nk).map { Int32($0) }).reshaped([1, ks])
+        let depth = depths.reshaped([count, 1])
+        let table = which(distance .<= depth, ancestorsUp + Int32(nk), depth + column)
+            .asType(.int32).reshaped([count * ks])
+        tapTables[ks] = table
+        return table
+    }
+
+    public static func chain(_ count: Int) -> CBv2TreeVerifyLayout {
+        CBv2TreeVerifyLayout(parents: (0 ..< count).map { $0 - 1 })
+    }
+
+    /// bool `[count, keyCount]` (true == attend) over a row's keys after the
+    /// window's append (window rows last): every earlier key, plus the
+    /// window rows in anc(i) for row i.
+    public func keepMask(keyCount: Int) -> MLXArray {
+        precondition(keyCount >= count, "CBv2TreeVerifyLayout: fewer keys than window rows")
+        let columns = MLXArray(Int32(0) ..< Int32(count)).reshaped([1, count])
+        let bits = ((ancestors.reshaped([count, 1]) >> columns) & Int32(1)) .!= Int32(0)
+        guard keyCount > count else { return bits }
+        return concatenated([MLXArray.ones([count, keyCount - count], dtype: .bool), bits], axis: 1)
     }
 }

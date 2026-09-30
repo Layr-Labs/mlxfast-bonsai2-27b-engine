@@ -2898,6 +2898,15 @@ final class DFlash2CandidateSelector: Module {
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
+        selectProposal(hidden: hidden, logits: logits, anchor: anchor).tokens
+    }
+
+    /// The greedy path and, when the tree verify's proposal tree is on
+    /// (self-tested at load), the conditional proposal tree over the same
+    /// candidate scores (`DFlash2TreeProposal`).
+    func selectProposal(hidden: MLXArray, logits: MLXArray, anchor: MLXArray)
+        -> (tokens: MLXArray, tree: DFlash2TreeProposal?)
+    {
         let vocabularySize = logits.dim(-1)
         let candidates: MLXArray
         let unary: MLXArray
@@ -2910,11 +2919,21 @@ final class DFlash2CandidateSelector: Module {
         }
         let projected = hiddenProjection(hidden)
 
+        // The tree is built only when tree rounds are on (the load-time
+        // warm passed): with them off no round reads it, and its edge-table
+        // walk costs more than the fused walk it replaces (same path).
+        if DFlash2GreedyWalk.treeActive, CBv2TreeVerify.modelReady,
+            let proposal = DFlash2GreedyWalk.selectTree(
+                candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+                predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        {
+            return (proposal.path, proposal.tree)
+        }
         if let path = DFlash2GreedyWalk.select(
             candidates: candidates, unary: unary, projected: projected, anchor: anchor,
             predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
         {
-            return path
+            return (path, nil)
         }
 
         var predecessor = anchor
@@ -2937,7 +2956,7 @@ final class DFlash2CandidateSelector: Module {
         }
         // `argPartition` indexes in UInt32, so the path inherits that dtype.
         // Draft tokens are token ids, and the engine reads them as Int32.
-        return stacked(path, axis: 1).asType(.int32)
+        return (stacked(path, axis: 1).asType(.int32), nil)
     }
 }
 
@@ -3368,8 +3387,21 @@ enum DFlash2GreedyWalk {
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
     ) -> MLXArray? {
         let length = candidates.dim(1)
-        let k = candidates.dim(2)
-        let rank = projected.dim(-1)
+        let operands = wideOperands(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        return walkWide(operands, length: length, k: candidates.dim(2), rank: projected.dim(-1))
+            .reshaped([1, length])
+    }
+
+    /// The widened walk's operands: anchor predecessor row, previous
+    /// positions' predecessor rows, successor rows, projections, unary scores
+    /// (FP32, flat) and candidate ids.
+    private static func wideOperands(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> [MLXArray] {
+        let length = candidates.dim(1)
         // Reuse the narrow path's singleton-batch views while keeping this
         // path's FP32 widening and stock kernel. Preserve general indexing.
         let c = candidates.dim(0) == 1 ? candidates.squeezed(axis: 0) : candidates[0]
@@ -3386,12 +3418,14 @@ enum DFlash2GreedyWalk {
         let unaryBatch = unary.dim(0) == 1 ? unary.squeezed(axis: 0) : unary[0]
         let scores = unaryBatch.asType(.float32).reshaped([-1])
         let candidateIds = c.asType(.uint32).reshaped([-1])
-        let operands = [anchorPredecessor, previous, next, projectedRows, scores, candidateIds]
-        let path =
-            parallelActive
+        return [anchorPredecessor, previous, next, projectedRows, scores, candidateIds]
+    }
+
+    /// The widened walk as `select` takes it (parallel edges when checked).
+    private static func walkWide(_ operands: [MLXArray], length: Int, k: Int, rank: Int) -> MLXArray {
+        parallelActive
             ? walkParallel(operands, length: length, k: k, rank: rank)
             : walkSerial(operands, length: length, k: k, rank: rank)
-        return path.reshaped([1, length])
     }
 
     /// The recorded walk: one simdgroup scores each position's candidates
@@ -3610,6 +3644,7 @@ enum DFlash2GreedyWalk {
     /// Runs the narrow walk's self-test for these dtypes now (load time).
     static func prepare(codebook: DType, projected: DType, unary: DType) {
         _ = parallelVerified()
+        _ = treeVerified()
         guard enabled, narrowOperands else { return }
         _ = narrowVerified(codebook: codebook, projected: projected, unary: unary)
     }
@@ -4021,6 +4056,344 @@ public enum DFlash2ResidencyPrefetch {
     }
 }
 
+// MARK: - Proposal tree
+
+/// A conditional proposal tree over the drafter's candidate lists, built on
+/// the device from the candidate selector's own scores (tree verify).
+///
+/// The selector scores candidate `c` of position `i` after candidate `p` of
+/// position `i - 1` (the anchor before position 0) as `unary[i][c] +
+/// edge[i][p][c]`. The tree reads the same scores as a chain model: a child
+/// `c` of a node at position `i - 1` with slot `p` has conditional
+/// probability `softmax_c(unary[i][c] + edge[i][p][c])` over the `K`
+/// candidates. Best first by cumulative log-probability: the anchor's
+/// `children` best children enter a frontier, then `nodes` times the best
+/// frontier entry becomes the next row and its `children` best children
+/// enter (ties: the earlier entry; children in score order, equal scores by
+/// lower slot).
+///
+/// Columns are tree rows in pop order, parents before children (row 0 = the
+/// anchor). `layout` rows: token id, parent row (-1 for the anchor and
+/// padding), depth, ancestor mask (bit j set when row j is on the row's root
+/// path, itself included; 0 for padding), position (= depth), candidate slot
+/// (-1 for the anchor and padding).
+public final class DFlash2TreeProposal {
+    public static let layoutRows = 6
+
+    /// `[layoutRows, rows]` int32.
+    public let layout: MLXArray
+    /// `[rows]` float32 cumulative log-probabilities (0 at the anchor, -inf
+    /// for padding), non-increasing in row order.
+    public let logProb: MLXArray
+
+    public var rows: Int { layout.dim(1) }
+    public var ids: MLXArray { layout[0] }
+    public var parent: MLXArray { layout[1] }
+    public var depth: MLXArray { layout[2] }
+    public var ancestors: MLXArray { layout[3] }
+
+    init(layout: MLXArray, logProb: MLXArray) {
+        (self.layout, self.logProb) = (layout, logProb)
+    }
+}
+
+extension DFlash2GreedyWalk {
+    /// The tree verify (`CBv2TreeVerify`) builds this tree beside the greedy path.
+    static let treeSetting: Bool = enabled && CBv2TreeVerify.requested
+
+    /// Children per node (`MLXFAST_TREE_TOPK`, default 6) and nodes besides
+    /// the anchor (`MLXFAST_TREE_NODES`, default 15: a 16-row verify block).
+    static let treeChildren: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_TREE_TOPK"] ?? ""
+        return min(max(Int(raw.trimmingCharacters(in: .whitespaces)) ?? 6, 1), 8)
+    }()
+    static let treeNodes: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_TREE_NODES"] ?? ""
+        return min(max(Int(raw.trimmingCharacters(in: .whitespaces)) ?? 15, 1), 31)
+    }()
+
+    /// Set once by `treeVerified` (load time).
+    nonisolated(unsafe) static var treeActive = false
+    nonisolated(unsafe) private static var treeChecked = false
+    private static let treeLock = NSLock()
+
+    /// The greedy path and the tree from the edge table and one tree launch; batch 1.
+    static func selectTree(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> (path: MLXArray, tree: DFlash2TreeProposal)? {
+        guard treeActive, candidates.ndim == 3, candidates.dim(0) == 1, anchor.size == 1,
+            unary.dtype == .float32 || unary.dtype == .float16 || unary.dtype == .bfloat16
+        else { return nil }
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(-1)
+        guard length >= 2, length <= 31, k >= treeChildren, k <= 32, rank > 0 else { return nil }
+        let operands = wideOperands(
+            candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+            predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        let built = walkTree(
+            operands, anchor: anchor, length: length, k: k, rank: rank,
+            children: treeChildren, nodes: treeNodes)
+        return (built.path.reshaped([1, length]), built.tree)
+    }
+
+    private static func walkTree(
+        _ operands: [MLXArray], anchor: MLXArray, length: Int, k: Int, rank: Int,
+        children: Int, nodes: Int
+    ) -> (path: MLXArray, tree: DFlash2TreeProposal) {
+        let edges = k + (length - 1) * k * k
+        let table = edgeKernel(
+            operands,
+            template: [
+                ("L", length), ("K", k), ("R", rank),
+                ("WALKVEC", vectorRank && rank % 4 == 0 ? 1 : 0),
+            ],
+            grid: (edges, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[edges]], outputDTypes: [.float32])[0]
+        let out = treeKernel(
+            [table, operands[4], operands[5], anchor.reshaped([1]).asType(.int32)],
+            template: [("L", length), ("K", k), ("CHILD", children), ("NODES", nodes)],
+            grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[length], [DFlash2TreeProposal.layoutRows, nodes + 1], [nodes + 1]],
+            outputDTypes: [.int32, .int32, .float32])
+        return (out[0], DFlash2TreeProposal(layout: out[1], logProb: out[2]))
+    }
+
+    /// Runs the tree kernel on random walk operands (64 walks of 15 positions
+    /// over 16 candidates at rank 256; a third with tied unary scores, a
+    /// third with small projections) and requires: its path equal to the
+    /// greedy walk's, id for id; with one child per node, the chain layout;
+    /// with the configured children and nodes, a best-first tree (parents
+    /// earlier, depth = parent's + 1, ancestors = parent's plus itself, ids
+    /// the slots' candidates, no repeated child, log-probabilities
+    /// non-increasing). Only then is the tree on. One stderr line.
+    static func treeVerified() -> Bool {
+        treeLock.withLock {
+            if treeChecked { return treeActive }
+            treeChecked = true
+            guard treeSetting else { return false }
+            var same = true
+            var walks = 0
+            do {
+                try withError { error in
+                    let (vocab, length, k, rank) = (4096, 15, 16, 256)
+                    guard treeChildren <= k else { same = false; return }
+                    for seed in 0 ..< 64 {
+                        func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x71e3 + seed * 8 + salt)) }
+                        let pred = MLXRandom.normal([vocab, rank], key: key(0)).asType(.bfloat16)
+                        let succ = MLXRandom.normal([vocab, rank], key: key(1)).asType(.bfloat16)
+                        var proj = MLXRandom.normal([length, rank], key: key(2))
+                        if seed % 3 == 1 { proj = proj * 0.001 }
+                        var una = (MLXRandom.normal([length, k], key: key(3)) * 4).asType(.float16)
+                        if seed % 3 == 2 { una = MLX.floor(una) }
+                        let cand = MLXRandom.randInt(Int32(0) ..< Int32(vocab), [length, k], key: key(4))
+                            .asType(.uint32)
+                        let anchorID = seed * 97 % vocab
+                        let anchor = MLXArray([Int32(anchorID)])
+                        let operands = [
+                            take(pred, anchor, axis: 0).asType(.float32).reshaped([-1]),
+                            take(pred, cand[0 ..< (length - 1)], axis: 0).asType(.float32).reshaped([-1]),
+                            take(succ, cand, axis: 0).asType(.float32).reshaped([-1]),
+                            proj.asType(.bfloat16).asType(.float32).reshaped([-1]),
+                            una.asType(.float32).reshaped([-1]),
+                            cand.reshaped([-1]),
+                        ]
+                        let reference = walkWide(operands, length: length, k: k, rank: rank)
+                        let chain = walkTree(
+                            operands, anchor: anchor, length: length, k: k, rank: rank,
+                            children: 1, nodes: length)
+                        let tree = walkTree(
+                            operands, anchor: anchor, length: length, k: k, rank: rank,
+                            children: treeChildren, nodes: treeNodes)
+                        eval(reference, chain.path, chain.tree.layout, tree.path, tree.tree.layout,
+                             tree.tree.logProb)
+                        try error.check()
+                        let path = reference.asArray(Int32.self).map(Int.init)
+                        let ids = cand.asArray(UInt32.self).map(Int.init)
+                        if chain.path.asArray(Int32.self).map(Int.init) != path { same = false }
+                        if tree.path.asArray(Int32.self).map(Int.init) != path { same = false }
+                        // One child per node: the chain layout.
+                        let c = chain.tree.layout.asArray(Int32.self).map(Int.init)
+                        let cr = length + 1
+                        for r in 0 ..< cr {
+                            let expected = [
+                                r == 0 ? anchorID : path[r - 1], r - 1, r, (1 << (r + 1)) - 1, r,
+                                r == 0 ? -1 : c[5 * cr + r],
+                            ]
+                            for f in 0 ..< DFlash2TreeProposal.layoutRows where c[f * cr + r] != expected[f] {
+                                same = false
+                            }
+                        }
+                        // The configured tree: best-first structure.
+                        let t = tree.tree.layout.asArray(Int32.self).map(Int.init)
+                        let lp = tree.tree.logProb.asArray(Float.self)
+                        let tr = treeNodes + 1
+                        if t[0] != anchorID || t[tr] != -1 || t[2 * tr] != 0 || t[3 * tr] != 1
+                            || t[4 * tr] != 0 || t[5 * tr] != -1 || lp[0] != 0
+                        {
+                            same = false
+                        }
+                        var seen = Set<Int>()
+                        for r in 1 ..< tr {
+                            let p = t[tr + r]
+                            let d = t[2 * tr + r]
+                            let slot = t[5 * tr + r]
+                            guard p >= 0, p < r, d >= 1, d <= length, slot >= 0, slot < k else {
+                                same = false
+                                break
+                            }
+                            if d != t[2 * tr + p] + 1 || t[4 * tr + r] != d
+                                || t[3 * tr + r] != (t[3 * tr + p] | (1 << r))
+                                || t[r] != ids[(d - 1) * k + slot]
+                            {
+                                same = false
+                            }
+                            if !seen.insert(p * 64 + slot).inserted { same = false }
+                            if !lp[r].isFinite || lp[r] > lp[r - 1] || lp[r] > lp[p] { same = false }
+                        }
+                        walks += 1
+                    }
+                }
+            } catch {
+                same = false
+            }
+            treeActive = same
+            FileHandle.standardError.write(
+                Data(("dflash2 proposal tree (\(treeChildren) children, \(treeNodes) nodes): "
+                    + (same
+                        ? "self-test passed: \(walks) walks, paths identical to the greedy walk, chain layout exact; on\n"
+                        : "self-test FAILED; greedy path only\n")).utf8))
+            return same
+        }
+    }
+
+    /// The tree scores `unary + w * edge` with the chain walk's edge weight
+    /// (`MLXFAST_DFLASH_EDGE_WEIGHT`), the same `scored` rewrite as the
+    /// walk's own kernels, so its greedy path equals the weighted walk its
+    /// load-time check compares it with, and its conditional probabilities
+    /// rank children by the same weighted score.
+    private static let treeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_tree" + weightSuffix,
+        inputNames: ["edges", "unary", "cand", "anchor"],
+        outputNames: ["path", "layout", "logp"],
+        source: scored("""
+            // One simdgroup. The greedy path first (the fused walk's selection
+            // over the edge table), then the best-first tree over the same scores.
+            static_assert(CHILD >= 1 && CHILD <= K && K <= 32, "children within a candidate list");
+            static_assert(NODES >= 1 && NODES + 1 <= 32 && L <= 31, "rows fit a lane and a mask bit");
+            const uint lane = thread_index_in_simdgroup;
+            {
+                uint c = lane;
+                uint previous_slot = 0;
+                for (uint i = 0; i < L; i++) {
+                    float score = -INFINITY;
+                    if (c < K) {
+                        const float edge = i == 0
+                            ? edges[c] : edges[K + ((i - 1) * K + previous_slot) * K + c];
+                        score = unary[i * K + c] + edge;
+                    }
+                    float m = simd_max(score);
+                    uint sel = simd_min((c < K && score == m) ? c : 0xffffffffu);
+                    previous_slot = sel;
+                    if (c == 0) path[i] = int(cand[i * K + sel]);
+                }
+            }
+            constexpr uint ROWS = NODES + 1;
+            // Frontier entry e lives in lane e % 32, register e / 32; pushed
+            // in order, never reused (at most CHILD * NODES entries).
+            constexpr uint FH = (CHILD * NODES + 31) / 32;
+            float flp[FH];
+            uint finfo[FH];
+            for (uint h = 0; h < FH; h++) { flp[h] = -INFINITY; finfo[h] = 0u; }
+            uint pushes = 0;
+            uint my_anc = lane == 0 ? 1u : 0u;  // lane r: row r's ancestor mask
+            if (lane == 0) {
+                layout[0 * ROWS] = anchor[0];
+                layout[1 * ROWS] = -1;
+                layout[2 * ROWS] = 0;
+                layout[3 * ROWS] = 1;
+                layout[4 * ROWS] = 0;
+                layout[5 * ROWS] = -1;
+                logp[0] = 0.0f;
+            }
+            uint rows = 1;
+            uint cur_depth = 0, cur_slot = 0;
+            float cur_lp = 0.0f;
+            for (uint n = 0; n < NODES; n++) {
+                // Row n's children: position cur_depth after slot cur_slot.
+                if (cur_depth < L) {
+                    const uint i = cur_depth;
+                    float s = -INFINITY;
+                    if (lane < K) {
+                        const float edge = i == 0
+                            ? edges[lane] : edges[K + ((i - 1) * K + cur_slot) * K + lane];
+                        s = unary[i * K + lane] + edge;
+                    }
+                    const float m = simd_max(s);
+                    const float lse = m + log(simd_sum(lane < K ? exp(s - m) : 0.0f));
+                    for (uint t = 0; t < CHILD; t++) {
+                        const float mx = simd_max(s);
+                        const uint sel = simd_min((lane < K && s == mx) ? lane : 0xffffffffu);
+                        const uint e = pushes + t;
+                        for (uint h = 0; h < FH; h++) {
+                            if (e == h * 32u + lane) {
+                                flp[h] = cur_lp + min(mx - lse, 0.0f);
+                                finfo[h] = i | (sel << 5) | (n << 10);
+                            }
+                        }
+                        if (lane == sel) s = -INFINITY;
+                    }
+                    pushes += CHILD;
+                }
+                // Pop the best entry (ties: the earliest) as row n + 1.
+                float best = flp[0];
+                for (uint h = 1; h < FH; h++) best = max(best, flp[h]);
+                best = simd_max(best);
+                if (best == -INFINITY) break;
+                uint mine = 0xffffffffu;
+                for (uint h = FH; h-- > 0;) {
+                    if (flp[h] == best) mine = h * 32u + lane;
+                }
+                const uint e = simd_min(mine);
+                uint held = finfo[0];
+                for (uint h = 1; h < FH; h++) {
+                    if ((e >> 5) == h) held = finfo[h];
+                }
+                const uint info = simd_shuffle(held, ushort(e & 31u));
+                for (uint h = 0; h < FH; h++) {
+                    if (e == h * 32u + lane) flp[h] = -INFINITY;
+                }
+                const uint i = info & 31u, c = (info >> 5) & 31u, p = info >> 10;
+                const uint r = n + 1;
+                const uint a = simd_shuffle(my_anc, ushort(p)) | (1u << r);
+                if (lane == r) my_anc = a;
+                if (lane == 0) {
+                    layout[0 * ROWS + r] = int(cand[i * K + c]);
+                    layout[1 * ROWS + r] = int(p);
+                    layout[2 * ROWS + r] = int(i + 1);
+                    layout[3 * ROWS + r] = int(a);
+                    layout[4 * ROWS + r] = int(i + 1);
+                    layout[5 * ROWS + r] = int(c);
+                    logp[r] = best;
+                }
+                cur_depth = i + 1;
+                cur_slot = c;
+                cur_lp = best;
+                rows = r + 1;
+            }
+            for (uint r = rows + lane; r < ROWS; r += 32u) {
+                layout[0 * ROWS + r] = 0;
+                layout[1 * ROWS + r] = -1;
+                layout[2 * ROWS + r] = 0;
+                layout[3 * ROWS + r] = 0;
+                layout[4 * ROWS + r] = 0;
+                layout[5 * ROWS + r] = -1;
+                logp[r] = -INFINITY;
+            }
+            """))
+}
+
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
@@ -4364,11 +4737,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
             submittingLeadingLayers: leadingLayers)
-        return candidateSelector.selectGreedy(
+        let proposal = candidateSelector.selectProposal(
             hidden: hidden,
             logits: try logits(hidden),
             anchor: MLXArray(anchor.map { Int32($0) }))
+        latestTree = proposal.tree
+        return proposal.tokens
     }
+
+    /// The last `propose`'s proposal tree (tree verify, batch 1), nil
+    /// otherwise; lazy, evaluated with the returned tokens.
+    public private(set) var latestTree: DFlash2TreeProposal?
 
     /// Enter `targetHidden` (`[B, contextLength, targetHiddenSize]`, committed
     /// positions' fused target hidden state) into every layer's cache without a
@@ -4488,15 +4867,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             if index + 1 == stageAt { stage = h }
         }
         let hidden = norm(h[0..., 1..., 0...])
-        let tokens = candidateSelector.selectGreedy(
+        let proposal = candidateSelector.selectProposal(
             hidden: hidden, logits: try logits(hidden), anchor: anchor.reshaped([1]))
         if let lead {
             for i in 0 ..< leadAt { caches[i].installSpeculative(keys: writes[i].keys, values: writes[i].values) }
             asyncEval([lead])
         }
         return DFlash2SpeculativeBlock(
-            tokens: tokens, writes: writes, installedLayers: leadAt, contextRows: contextRows,
-            stage: stage)
+            tokens: proposal.tokens, tree: proposal.tree, writes: writes, installedLayers: leadAt,
+            contextRows: contextRows, stage: stage)
     }
 
     /// Install the remaining writes; cursors advance as today's block's do.
@@ -4586,6 +4965,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// A block proposed before its round's readback.
 public final class DFlash2SpeculativeBlock {
     public let tokens: MLXArray
+    /// The block's proposal tree (tree verify), nil otherwise.
+    public let tree: DFlash2TreeProposal?
     let writes: [(keys: MLXArray, values: MLXArray)]
     let installedLayers: Int
     public let contextRows: Int  // its row class
@@ -4594,11 +4975,11 @@ public final class DFlash2SpeculativeBlock {
     let stage: MLXArray?
 
     init(
-        tokens: MLXArray, writes: [(keys: MLXArray, values: MLXArray)], installedLayers: Int,
-        contextRows: Int, stage: MLXArray? = nil
+        tokens: MLXArray, tree: DFlash2TreeProposal?, writes: [(keys: MLXArray, values: MLXArray)],
+        installedLayers: Int, contextRows: Int, stage: MLXArray? = nil
     ) {
-        (self.tokens, self.writes, self.installedLayers, self.contextRows, self.stage) =
-            (tokens, writes, installedLayers, contextRows, stage)
+        (self.tokens, self.tree, self.writes, self.installedLayers, self.contextRows, self.stage) =
+            (tokens, tree, writes, installedLayers, contextRows, stage)
     }
 }
 

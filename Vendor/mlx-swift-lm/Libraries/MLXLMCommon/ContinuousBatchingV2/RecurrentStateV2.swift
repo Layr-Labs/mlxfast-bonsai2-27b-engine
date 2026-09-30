@@ -672,6 +672,11 @@ public final class CBv2RecurrentStateEvaluation {
         stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
     }
 
+    /// The verify window's token tree (tree verify), bound by the engine
+    /// around one forward; nil: a chain. A recurrent layer then stages a
+    /// replay tape the commit compacts to `acceptedRows`, with no final state.
+    public var treeVerify: CBv2TreeVerifyLayout?
+
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
         input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>

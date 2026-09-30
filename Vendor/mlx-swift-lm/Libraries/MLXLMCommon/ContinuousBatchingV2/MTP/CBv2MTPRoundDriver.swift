@@ -66,6 +66,8 @@ struct CBv2MTPEarlyBlockProposal {
     let depth: Int
     let anchor: Int
     let kvOffset: Int
+    /// The drafter's proposal tree for the round (tree verify), else nil.
+    var tree: CBv2MTPProposalTree? = nil
 }
 
 // MARK: - In-flight round payload
@@ -131,6 +133,10 @@ final class CBv2MTPRoundInFlight {
         let blockContext: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// The window's token tree when this round verified a proposal tree:
+        /// `draftIDs` are the tree's rows 1...k, the scores its rows'
+        /// argmaxes, and the packet ends with the rows' parents. nil: a chain.
+        var tree: CBv2TreeVerifyLayout? = nil
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

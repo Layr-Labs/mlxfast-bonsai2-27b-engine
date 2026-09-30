@@ -4032,3 +4032,1078 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
         languageModel.cbv2PrefetchPromptEmbedding(tokens)
     }
 }
+
+// MARK: - Tree speculative verify: the GDN tree block
+
+/// Host helpers for token-tree layouts (rows in topological order, `parent[0]
+/// == -1`, `parent[i] < i`); the self-tests use them.
+enum Qwen35TreeLayout {
+    static let maxRows = 16
+
+    static func isValid(_ parent: [Int]) -> Bool {
+        guard !parent.isEmpty, parent.count <= maxRows, parent[0] == -1 else { return false }
+        for i in 1 ..< parent.count where parent[i] < 0 || parent[i] >= i { return false }
+        return true
+    }
+
+    static func depths(_ parent: [Int]) -> [Int] {
+        var depth = [Int](repeating: 0, count: parent.count)
+        for i in 1 ..< max(parent.count, 1) { depth[i] = depth[parent[i]] + 1 }
+        return depth
+    }
+
+    /// Rows root ... `node`.
+    static func path(to node: Int, parent: [Int]) -> [Int] {
+        var rows: [Int] = []
+        var n = node
+        while n >= 0 {
+            rows.append(n)
+            n = parent[n]
+        }
+        return rows.reversed()
+    }
+
+    static func leaves(_ parent: [Int]) -> [Int] {
+        var hasChild = [Bool](repeating: false, count: parent.count)
+        for i in 1 ..< max(parent.count, 1) { hasChild[parent[i]] = true }
+        return (0 ..< parent.count).filter { !hasChild[$0] }
+    }
+}
+
+/// The gated-delta recurrence of one speculative tree block (T <= 16 rows in
+/// topological order, one launch, output rows only): every row's output is
+/// the output that row gets with its root-to-row path run as a chain from the
+/// block's input state. Chunkwise (WY) form with one chunk, restricted to
+/// ancestors: with `anc(i)` the ancestor mask of row i (itself included) and
+/// `Gam_i` the sum of `log g` along its path,
+///
+///     A_ij  = beta_i (k_i . k_j) exp(Gam_i - Gam_j)   (j in anc(i), j != i)
+///     P_ij  = (q_i . k_j) exp(Gam_i - Gam_j)          (j in anc(i))
+///     T'    = (I + A)^-1 diag(beta)                  (forward substitution)
+///     Delta = T' (V - diag(exp Gam) K S0^T)
+///     Y     = diag(exp Gam) Q S0^T + P Delta
+///
+/// A is strictly lower triangular and ancestry is transitive, so row i of
+/// (I + A)^-1 is supported on anc(i) and siblings never interact. Masks and
+/// path sums come from `parent` by pointer jumping on device; non-ancestor
+/// terms are skipped by a branch (their exponents are unbounded), never
+/// multiplied by zero. grid (32, Dv / 8, Hv), threadgroup (32, NS, 1). No
+/// state output: the committed state is the replay's job.
+enum Qwen35GatedDeltaTree {
+    /// Simdgroups per threadgroup (`MLXFAST_TREE_GDN_NS`: 1, 2, 4, 8 or 16).
+    static let simdgroups: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_TREE_GDN_NS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let raw, let value = Int(raw), [1, 2, 4, 8, 16].contains(value) { return value }
+        return 8
+    }()
+
+    static let source = """
+        // grid (32, Dv / 8, Hv), threadgroup (32, NS, 1); B == 1; T <= C rows.
+        constexpr int CT = C / 8;
+        constexpr int DT = Dk / 8;
+        constexpr int LC = C + 8;
+        constexpr int LD = C + 1;
+        constexpr int NJ = CT * (CT + 1) / 2;
+        static_assert(C == 8 || C == 16, "one chunk of 8 or 16 rows");
+        threadgroup float KK[C * LD];
+        threadgroup float QK[C * LD];
+        threadgroup float Ah[C * LD];
+        threadgroup float Mh[C * LD];
+        threadgroup float TPsh[2 * C * LC];
+        threadgroup float EG[C];
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int T_ = T;
+        const int r0 = int(thread_position_in_grid.y) * 8;
+        const int hv = int(thread_position_in_grid.z);
+        const int hk = hv / (Hv / Hk);
+        const int ks = Hk * Dk;
+        const int vs = Hv * Dv;
+        const short qid = lane / 4;
+        const short fm = (qid & 4) + ((lane / 2) % 4);
+        const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+        const device float* kbase = k + hk * Dk;
+        const device float* qbase = q + hk * Dk;
+
+        // This simdgroup's 8 state rows (S0^T columns), loaded first.
+        simdgroup_float8x8 St[DT];
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; ++d)
+          simdgroup_load(St[d], state_in + ((size_t)hv * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
+
+        // Lower tiles of K K^T and Q K^T, one tile per simdgroup; q and k
+        // hold C rows (zero padding past T).
+        for (int job = int(sg); job < NJ; job += NS) {
+          int ti = 0;
+          int tj = job;
+          while (tj > ti) { tj -= ti + 1; ++ti; }
+          simdgroup_float8x8 akk = simdgroup_float8x8(0);
+          simdgroup_float8x8 aqk = simdgroup_float8x8(0);
+          _Pragma("clang loop unroll(full)")
+          for (int d = 0; d < Dk / 8; ++d) {
+            simdgroup_float8x8 ka, qa, kb;
+            simdgroup_load(ka, kbase + (ti * 8) * ks + d * 8, ks);
+            simdgroup_load(qa, qbase + (ti * 8) * ks + d * 8, ks);
+            simdgroup_load(kb, kbase + (tj * 8) * ks + d * 8, ks, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(akk, ka, kb, akk);
+            simdgroup_multiply_accumulate(aqk, qa, kb, aqk);
+          }
+          simdgroup_store(akk, KK + (ti * 8) * LD + tj * 8, LD);
+          simdgroup_store(aqk, QK + (ti * 8) * LD + tj * 8, LD);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Row work in simdgroup 0, lane = row: ancestor masks and path sums of
+        // log g by pointer jumping, decay factors, P and A rows.
+        float bet = 0.0f;
+        if (sg == 0) {
+          const int row = int(lane);
+          const bool live = row < C;
+          const bool real = row < T_;
+          int jump = -1;
+          uint anc = live ? (1u << row) : 0u;
+          float gam = 0.0f;
+          bool zero = false;
+          if (live) {
+            // Padding rows (>= T) continue a chain from row - 1.
+            const int p = real ? parent[row] : row - 1;
+            jump = (p >= 0 && p < row) ? p : -1;
+            const float gv = real ? g[(size_t)row * Hv + hv] : 1.0f;
+            zero = !(gv >= FLT_MIN);
+            gam = zero ? 0.0f : metal::precise::log(zero ? 1.0f : gv);
+            bet = real ? beta[(size_t)row * Hv + hv] : 0.0f;
+          }
+          const uint zr = uint(static_cast<simd_vote::vote_t>(simd_ballot(zero))) & ((1u << C) - 1u);
+          _Pragma("clang loop unroll(full)")
+          for (int off = 1; off < C; off <<= 1) {
+            const ushort src = ushort(jump >= 0 ? jump : int(lane));
+            const float up = simd_shuffle(gam, src);
+            const uint upa = simd_shuffle(anc, src);
+            const int upj = simd_shuffle(jump, src);
+            gam += jump >= 0 ? up : 0.0f;
+            if (jump >= 0) {
+              anc |= upa;
+              jump = upj;
+            }
+          }
+          // exp(Gam_i) unless i's path crosses an underflowed row.
+          if (live) EG[row] = (zr & anc) == 0u ? metal::precise::exp(gam) : 0.0f;
+          threadgroup float* P_ = TPsh + C * LC;
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < C; ++j) {
+            const float gj = simd_shuffle(gam, ushort(j));
+            const uint aj = simd_shuffle(anc, ushort(j));
+            if (live) {
+              float pv = 0.0f;
+              float av = 0.0f;
+              if (((anc >> j) & 1u) != 0u) {
+                // rows (j, i] of i's path
+                const uint span = anc & ~aj;
+                const float e = (zr & span) == 0u ? metal::precise::exp(gam - gj) : 0.0f;
+                pv = QK[row * LD + j] * e;
+                if (j != row) av = bet * KK[row * LD + j] * e;
+              }
+              P_[row * LC + j] = pv;
+              Ah[row * LD + j] = av;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // T = (I + A)^-1 by forward substitution over the topological order,
+        // column m = row per lane (stored transposed in Mh[m][i]); T' = T diag(beta).
+        if (sg == 0 && int(lane) < C) {
+          const int m = int(lane);
+          for (int i = 0; i < C; ++i) Mh[m * LD + i] = (i == m) ? 1.0f : 0.0f;
+          for (int i = m + 1; i < C; ++i) {
+            float s0 = 0.0f, s1 = 0.0f;
+            int j = m;
+            for (; j + 1 < i; j += 2) {
+              s0 = metal::fma(Ah[i * LD + j], Mh[m * LD + j], s0);
+              s1 = metal::fma(Ah[i * LD + j + 1], Mh[m * LD + j + 1], s1);
+            }
+            if (j < i) s0 = metal::fma(Ah[i * LD + j], Mh[m * LD + j], s0);
+            Mh[m * LD + i] = -(s0 + s1);
+          }
+          for (int i = 0; i < C; ++i) TPsh[i * LC + m] = Mh[m * LD + i] * bet;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // X = K S0^T, Xq = Q S0^T (C x 8 each)
+        simdgroup_float8x8 Xk[CT];
+        simdgroup_float8x8 Xq[CT];
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          Xk[ti] = simdgroup_float8x8(0);
+          Xq[ti] = simdgroup_float8x8(0);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; ++d) {
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            simdgroup_float8x8 ka, qa;
+            simdgroup_load(ka, kbase + (ti * 8) * ks + d * 8, ks);
+            simdgroup_load(qa, qbase + (ti * 8) * ks + d * 8, ks);
+            simdgroup_multiply_accumulate(Xk[ti], ka, St[d], Xk[ti]);
+            simdgroup_multiply_accumulate(Xq[ti], qa, St[d], Xq[ti]);
+          }
+        }
+        // Z = V - diag(exp Gam) Xk (in Xk); Xq <- diag(exp Gam) Xq
+        const device float* v_ = v + hv * Dv + r0;
+        device float* y_ = y + hv * Dv + r0;
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          const int row = ti * 8 + fm;
+          const float eg = EG[row];
+          thread auto& zk = Xk[ti].thread_elements();
+          thread auto& zq = Xq[ti].thread_elements();
+          const float2 vv = row < T_ ? *(const device float2*)(v_ + row * vs + fn) : float2(0.0f);
+          zk[0] = vv.x - eg * zk[0];
+          zk[1] = vv.y - eg * zk[1];
+          zq[0] = eg * zq[0];
+          zq[1] = eg * zq[1];
+        }
+        // Delta = T' Z (T' lower triangular)
+        simdgroup_float8x8 Dl[CT];
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          Dl[ti] = simdgroup_float8x8(0);
+          _Pragma("clang loop unroll(full)")
+          for (int tj = 0; tj <= ti; ++tj) {
+            simdgroup_float8x8 ta;
+            simdgroup_load(ta, TPsh + (ti * 8) * LC + tj * 8, LC);
+            simdgroup_multiply_accumulate(Dl[ti], ta, Xk[tj], Dl[ti]);
+          }
+        }
+        // Y = diag(exp Gam) Q S0^T + P Delta
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          _Pragma("clang loop unroll(full)")
+          for (int tj = 0; tj <= ti; ++tj) {
+            simdgroup_float8x8 pa;
+            simdgroup_load(pa, TPsh + C * LC + (ti * 8) * LC + tj * 8, LC);
+            simdgroup_multiply_accumulate(Xq[ti], pa, Dl[tj], Xq[ti]);
+          }
+          const int row = ti * 8 + fm;
+          thread auto& ye = Xq[ti].thread_elements();
+          if (row < T_) *(device float2*)(y_ + row * vs + fn) = float2(ye[0], ye[1]);
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_tree_block",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "parent", "T"],
+        outputNames: ["y"],
+        source: source)
+
+    static func supports(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+        parent: MLXArray, simdgroups ns: Int
+    ) -> Bool {
+        guard q.ndim == 4, k.ndim == 4, v.ndim == 4, q.shape == k.shape, k.dim(0) == 1
+        else { return false }
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        return T >= 1 && T <= Qwen35TreeLayout.maxRows && k.dim(3) == 128 && Dv % 8 == 0
+            && (Dv / 8) % ns == 0 && Hv % Hk == 0 && v.dim(1) == T
+            && g.shape == [1, T, Hv] && beta.shape == [1, T, Hv]
+            && state.shape == [1, Hv, Dv, 128] && parent.shape == [T]
+            && parent.dtype == .int32
+            && [q, k, v, g, beta, state].allSatisfy { $0.dtype == .float32 }
+    }
+
+    /// The output rows `[1, T, Hv, Dv]` of the tree block `q ... beta` (FP32,
+    /// rows in topological order) from `state` `[1, Hv, Dv, Dk]`; `parent`
+    /// int32 `[T]` (an out-of-range parent is a root). Nil when unfit.
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray,
+        parent: MLXArray, simdgroups: Int? = nil
+    ) -> MLXArray? {
+        let ns = simdgroups ?? Self.simdgroups
+        guard supports(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, parent: parent, simdgroups: ns)
+        else { return nil }
+        let T = k.dim(1)
+        let Hk = k.dim(2)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        // The tiles read whole 8-row tiles of q and k: a short block pads them
+        // with zero rows (read, never stored).
+        let C = Qwen35TreeLayout.maxRows
+        let pad = { (x: MLXArray) -> MLXArray in
+            T == C ? x : concatenated([x, MLXArray.zeros([1, C - T, Hk, 128], dtype: .float32)], axis: 1)
+        }
+        return kernel(
+            [pad(q), pad(k), v, g, beta, state, parent, MLXArray(Int32(T))],
+            template: [("C", C), ("Dk", 128), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("NS", ns)],
+            grid: (32, Dv / 8, Hv), threadGroup: (32, ns, 1),
+            outputShapes: [[1, T, Hv, Dv]],
+            outputDTypes: [.float32])[0]
+    }
+}
+
+/// The verify prework of a tree block: the verify's prework launch (the
+/// reads-first kernel where its check passed, else `qwen35_gdn_prework_ci_strided`)
+/// with row t's conv tap j read from row `tap[t * KS + j] - NK` of
+/// `[conv state; qkv]` instead of `t + j - NK` (`CBv2TreeVerifyLayout.convTapTable`).
+/// One checked text replacement, so every path's rows get the chain launch's
+/// values bit for bit. The conv input it writes is `[convState; qkv]` in row
+/// order (row 0 is the anchor, whose taps are the row-order ones); its `tail`
+/// is the last rows' (unused: the commit takes the accepted path's rows).
+extension Qwen35GDNPrework {
+    static let rowOrderTap = "const int r = int(t) + j - NK;"
+
+    private static func withTreeTaps(_ text: String) -> String {
+        precondition(
+            text.components(separatedBy: rowOrderTap).count == 2 && !text.contains("tap["),
+            "Qwen35 GDN prework: the tap loop no longer matches the stock kernel")
+        return text.replacingOccurrences(
+            of: rowOrderTap,
+            with: "const int r = int(tap[(int64_t(t) * KS + j) * tap_strides[0]]) - NK;")
+    }
+
+    private static let treeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_ci_strided_tree",
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S", "tap"],
+        outputNames: ["q", "k", "v", "g", "beta", "tail", "ci"],
+        source: withTreeTaps(withConvInput(stridedSource)),
+        ensureRowContiguous: false)
+
+    private static let treeLoadsFirstKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prework_verify_lf_tree",
+        inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S", "tap"],
+        outputNames: ["q", "k", "v", "g", "beta", "ci"],
+        source: withTreeTaps(verifyLoadsFirstSource),
+        ensureRowContiguous: false)
+
+    /// `run(..., writeConvInput: true, stridedReads: true)` with tree taps
+    /// (`tapTable` int32 `[S * KS]`); B == 1. Nil exactly when unfit.
+    static func runTree(
+        qkv: MLXArray, convState: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aDecay: MLXArray, dtBias: MLXArray, normScales: (q: MLXArray, k: MLXArray),
+        keyHeads: Int, valueHeads: Int, headKDim: Int, headVDim: Int, tapTable: MLXArray
+    ) -> Outputs? {
+        guard enabled, qkv.ndim == 3, convState.ndim == 3, convWeight.ndim == 3, qkv.dim(0) == 1
+        else { return nil }
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        guard headKDim == 128, headVDim == 128, valueHeads % keyHeads == 0,
+            CD == 2 * keyHeads * headKDim + valueHeads * headVDim,
+            convState.shape == [1, KS - 1, CD], convWeight.shape == [CD, KS, 1],
+            [DType.float32, .float16, .bfloat16].contains(qkv.dtype),
+            convState.dtype == .float32, convWeight.dtype == .float32,
+            a.dtype == .float32, b.dtype == .float32,
+            a.shape == [1, S, valueHeads], b.shape == [1, S, valueHeads],
+            aDecay.shape == [valueHeads], aDecay.dtype == .float32,
+            dtBias.shape == [valueHeads],
+            normScales.q.dtype == .float32, normScales.k.dtype == .float32,
+            normScales.q.shape == [headKDim], normScales.k.shape == [headKDim],
+            tapTable.shape == [S * KS], tapTable.dtype == .int32,
+            S > 0, S <= Qwen35TreeLayout.maxRows
+        else { return nil }
+        let dtb = dtBias.dtype == .float32 ? dtBias : dtBias.asType(.float32)
+        let geometry = LoadsFirstGeometry(
+            hk: keyHeads, hv: valueHeads, cd: CD, ks: KS, dtype: "\(qkv.dtype)")
+        let loadsFirst =
+            verifyLoadsFirstEnabled && loadsFirstLock.withLock { loadsFirstVerdicts[geometry] ?? false }
+        let shapes: [[Int]] = [
+            [1, S, keyHeads, headKDim], [1, S, keyHeads, headKDim],
+            [1, S, valueHeads, headVDim], [1, S, valueHeads], [1, S, valueHeads],
+        ]
+        let outputs = (loadsFirst ? treeLoadsFirstKernel : treeKernel)(
+            [qkv, convState, convWeight, a, b, aDecay, dtb, normScales.q, normScales.k,
+             MLXArray(Int32(S)), tapTable],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS),
+            ],
+            grid: (128 * keyHeads, S, 1), threadGroup: (128, 1, 1),
+            outputShapes: shapes + (loadsFirst ? [] : [[1, KS - 1, CD]]) + [[1, KS - 1 + S, CD]],
+            outputDTypes: [DType](repeating: .float32, count: loadsFirst ? 6 : 7))
+        let ci = outputs[outputs.count - 1]
+        return Outputs(
+            q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
+            tail: loadsFirst ? ci[0..., S..., 0...] : outputs[5], convInput: ci)
+    }
+}
+
+/// The tree verify's load-time kernel checks (also `MLXFAST_TREE_SELFTEST=1`),
+/// once per process at the first GDN layer's construction: (a) every tree
+/// row against its root-to-row path run as a chain on the verify's
+/// sequential kernel from S0 (tolerance 1e-3); (c) the tap-table prework
+/// against each path's stock verify prework, bit for bit. Tree rounds need
+/// `passed`. One stderr line per check.
+enum Qwen35TreeVerifySelfTest {
+    static let requested: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_TREE_SELFTEST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var done = false
+    nonisolated(unsafe) static var passed = false
+    nonisolated(unsafe) private static var passA = false
+    nonisolated(unsafe) private static var passC = false
+
+    static var wanted: Bool { requested || CBv2TreeVerify.requested }
+
+    private static func report(_ line: String) {
+        FileHandle.standardError.write(Data(("qwen35 tree verify self-test: " + line + "\n").utf8))
+    }
+
+    /// Deterministic tree shapes of `T` rows.
+    static func shapes(T: Int, seed: UInt64) -> [(String, [Int])] {
+        var state = seed &* 0x9E37_79B9_7F4A_7C15 | 1
+        func next(_ n: Int) -> Int {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Int((state >> 33) % UInt64(n))
+        }
+        return [
+            ("chain", (0 ..< T).map { $0 - 1 }),
+            ("star", (0 ..< T).map { $0 == 0 ? -1 : 0 }),
+            ("binary", (0 ..< T).map { $0 == 0 ? -1 : ($0 - 1) / 2 }),
+            ("random", (0 ..< T).map { $0 == 0 ? -1 : next($0) }),
+            ("deep", (0 ..< T).map { $0 == 0 ? -1 : (next(4) == 0 ? next($0) : $0 - 1) }),
+            ("twochains", (0 ..< T).map { $0 == 0 ? -1 : max($0 - 2, 0) }),
+            ("chain+sib", (0 ..< T).map { $0 == 0 ? -1 : ($0 == T - 1 ? 0 : $0 - 1) }),
+        ]
+    }
+
+    static func runIfRequested(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int) {
+        guard wanted, dk == 128, dv == 128, hk > 0, hv % hk == 0, ks > 1 else { return }
+        let first = lock.withLock { () -> Bool in
+            if done { return false }
+            done = true
+            return true
+        }
+        guard first else { return }
+        gdnCheck(hk: hk, hv: hv, dv: dv)
+        convCheck(hk: hk, hv: hv, ks: ks)
+        passed = passA && passC
+        Memory.clearCache()
+    }
+
+    struct Tape {
+        let q, k, v, g, beta, state: MLXArray
+    }
+
+    static func tape(_ seed: UInt64, hk: Int, hv: Int, dv: Int, T: Int) -> Tape {
+        let dk = 128
+        let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 10)
+        let specials: [Float] = [60, -60, 25, -25, .infinity, -.infinity, 1e-8, -1e-8]
+        let marks = MLXArray((0 ..< (2 * hv)).map { specials[$0 % specials.count] })
+            .reshaped([1, 1, 2 * hv])
+        // One row of saturating and infinite gate inputs (underflowed decays).
+        let special = Int(seed % UInt64(T))
+        var ab = MLXRandom.normal([1, T, 2 * hv], key: keys[0]) * 4
+        ab = MLX.where((MLXArray.arange(T) .== special).reshaped([1, T, 1]), marks, ab)
+        let aLog = log(MLXRandom.uniform(Float(1) ..< Float(16), [hv], key: keys[1]))
+        let dtBias = MLXRandom.normal([hv], key: keys[2])
+        let gates = Qwen35FusedElementwise.gatedDeltaGates(
+            [ab[0..., 0..., hv...], ab[0..., 0..., ..<hv], aLog, dtBias])
+        let spread = exp(MLXRandom.normal([1, hv, dv, dk], key: keys[3]))
+        let state = MLXRandom.normal([1, hv, dv, dk], key: keys[4]) * spread * 0.05
+        let q = MLXRandom.normal([1, T, hk, dk], key: keys[5]) * 0.09
+        let k = MLXRandom.normal([1, T, hk, dk], key: keys[6]) * 0.09
+        let v = MLXRandom.normal([1, T, hv, dv], key: keys[7])
+            * exp(MLXRandom.normal([1, T, hv, dv], key: keys[8]))
+        let t = Tape(q: q, k: k, v: v, g: gates[0], beta: gates[1], state: state)
+        eval(t.q, t.k, t.v, t.g, t.beta, t.state)
+        return t
+    }
+
+    static func rows(_ x: MLXArray, _ idx: [Int]) -> MLXArray {
+        take(x, MLXArray(idx.map { Int32($0) }), axis: 1)
+    }
+
+    /// The verify's chain recurrence output rows (`qwen35GatedDelta`'s kernel).
+    private static func chain(_ t: Tape, _ path: [Int]) -> MLXArray {
+        let (q, k, v, g, b) = (rows(t.q, path), rows(t.k, path), rows(t.v, path), rows(t.g, path), rows(t.beta, path))
+        return (Qwen35GatedDeltaV3.run(q: q, k: k, v: v, g: g, beta: b, state: t.state)
+            ?? gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: b, state: t.state, mask: nil)).0
+    }
+
+    /// (a) every row vs its path as a chain.
+    private static func gdnCheck(hk: Int, hv: Int, dv: Int) {
+        var (maxAbs, maxMixed, trees, paths, control): (Float, Float, Int, Int, Float) = (0, 0, 0, 0, 0)
+        var failure: String? = nil
+        do {
+            try withError { error in
+                // Negative control: a star tree's path against a chain-parent
+                // launch (siblings interacting) must differ.
+                let t0 = tape(0x636F_6E74, hk: hk, hv: hv, dv: dv, T: 16)
+                let star = shapes(T: 16, seed: 1)[1].1
+                if let wrong = Qwen35GatedDeltaTree.run(
+                    q: t0.q, k: t0.k, v: t0.v, g: t0.g, beta: t0.beta, state: t0.state,
+                    parent: MLXArray((0 ..< 16).map { Int32($0 - 1) }))
+                {
+                    let d = abs(rows(wrong, Qwen35TreeLayout.path(to: 5, parent: star)) - chain(t0, [0, 5])).max()
+                    control = d.item(Float.self)
+                }
+                for tapeIndex in 0 ..< 6 {
+                    let T = tapeIndex == 5 ? 11 : 16
+                    let tp = tape(0x7472_6565 &+ UInt64(tapeIndex) &* 7919, hk: hk, hv: hv, dv: dv, T: T)
+                    for (name, parent) in shapes(T: T, seed: UInt64(tapeIndex + 1)) {
+                        guard Qwen35TreeLayout.isValid(parent),
+                            let y = Qwen35GatedDeltaTree.run(
+                                q: tp.q, k: tp.k, v: tp.v, g: tp.g, beta: tp.beta, state: tp.state,
+                                parent: MLXArray(parent.map { Int32($0) }))
+                        else {
+                            failure = "no tree launch (\(name), T \(T))"
+                            return
+                        }
+                        trees += 1
+                        var diffs: [MLXArray] = []
+                        var mixed: [MLXArray] = []
+                        for leaf in Qwen35TreeLayout.leaves(parent) {
+                            let path = Qwen35TreeLayout.path(to: leaf, parent: parent)
+                            let reference = chain(tp, path)
+                            let d = abs(rows(y, path) - reference)
+                            diffs.append(d.max())
+                            mixed.append((d / maximum(abs(reference), MLXArray(Float(1)))).max())
+                            paths += 1
+                        }
+                        let stats = [stacked(diffs).max(), stacked(mixed).max()]
+                        eval(stats)
+                        try error.check()
+                        let a = stats[0].item(Float.self)
+                        let m = stats[1].item(Float.self)
+                        if !(a.isFinite && m.isFinite) { failure = "non-finite (\(name))" }
+                        maxAbs = max(maxAbs, a.isNaN ? .infinity : a)
+                        maxMixed = max(maxMixed, m.isNaN ? .infinity : m)
+                    }
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        let tol: Float = 1e-3
+        passA = failure == nil && maxMixed <= tol && control > tol
+        report(
+            "(a) tree rows vs root-to-row paths as chains on the sequential kernel: "
+                + (passA ? "PASSED" : "FAILED") + " (\(trees) trees, \(paths) paths, max abs \(maxAbs), "
+                + "max abs/max(1,|ref|) \(maxMixed), tolerance \(tol); control \(control)"
+                + (failure.map { "; \($0)" } ?? "") + ")")
+    }
+
+    /// (c) the tap-table prework vs each path's stock verify prework, bitwise.
+    private static func convCheck(hk: Int, hv: Int, ks: Int) {
+        let (dk, dv, nk, T) = (128, 128, ks - 1, 16)
+        let cd = 2 * hk * dk + hv * dv
+        let width = cd + hv * dv
+        var (values, mismatches, trees, paths) = (0, 0, 0, 0)
+        var failure: String? = nil
+        do {
+            try withError { error in
+                for (di, dtype) in [DType.float32, .float16].enumerated() {
+                    let keys = MLXRandom.split(key: MLXRandom.key(0x7461_7073 &+ UInt64(di)), into: 10)
+                    let spread = MLXRandom.normal([1, T, width], key: keys[0])
+                        * exp(MLXRandom.normal([1, T, width], key: keys[1]))
+                    // A column slice of a wider product, as the verify's qkv.
+                    let qkv = spread.asType(dtype)[.ellipsis, ..<cd]
+                    let convState = MLXRandom.normal([1, nk, cd], key: keys[2])
+                    let ba = MLXRandom.normal([1, T, 2 * hv], key: keys[3]) * 4
+                    let b = ba[.ellipsis, ..<hv]
+                    let a = ba[.ellipsis, hv...]
+                    let convWeight = MLXRandom.normal([cd, ks, 1], key: keys[4]) * 0.5
+                    let aDecay = -exp(MLXRandom.normal([hv], key: keys[5]) * 0.5)
+                    let dtb = MLXRandom.normal([hv], key: keys[6])
+                    let norms = (q: MLXRandom.normal([dk], key: keys[7]), k: MLXRandom.normal([dk], key: keys[8]))
+                    eval(qkv, convState, a, b, convWeight, aDecay, dtb, norms.q, norms.k)
+                    for (name, parent) in shapes(T: T, seed: UInt64(11 + di)) {
+                        guard
+                            let table = CBv2TreeVerifyLayout(parents: parent).convTapTable(kernelSize: ks),
+                            let tree = Qwen35GDNPrework.runTree(
+                                qkv: qkv, convState: convState, convWeight: convWeight, a: a, b: b,
+                                aDecay: aDecay, dtBias: dtb, normScales: norms, keyHeads: hk,
+                                valueHeads: hv, headKDim: dk, headVDim: dv, tapTable: table),
+                            let treeCI = tree.convInput
+                        else {
+                            failure = "no tree prework launch (\(name))"
+                            return
+                        }
+                        trees += 1
+                        var counts: [MLXArray] = []
+                        func compare(_ x: MLXArray, _ y: MLXArray) {
+                            counts.append((x.view(dtype: .uint32) .!= y.view(dtype: .uint32)).asType(.int32).sum())
+                            values += x.size
+                        }
+                        for leaf in Qwen35TreeLayout.leaves(parent) {
+                            let path = Qwen35TreeLayout.path(to: leaf, parent: parent)
+                            guard
+                                let chain = Qwen35GDNPrework.run(
+                                    qkv: rows(qkv, path), convState: convState, convWeight: convWeight,
+                                    a: rows(a, path), b: rows(b, path), aDecay: aDecay, dtBias: dtb,
+                                    normScales: norms, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                                    headVDim: dv, writeConvInput: true, stridedReads: true),
+                                let chainCI = chain.convInput
+                            else {
+                                failure = "no stock prework launch"
+                                return
+                            }
+                            compare(rows(tree.q, path), chain.q)
+                            compare(rows(tree.k, path), chain.k)
+                            compare(rows(tree.v, path), chain.v)
+                            compare(rows(tree.g, path), chain.g)
+                            compare(rows(tree.beta, path), chain.beta)
+                            compare(rows(treeCI, Array(0 ..< nk) + path.map { nk + $0 }), chainCI)
+                            paths += 1
+                        }
+                        let count = stacked(counts).sum()
+                        eval(count)
+                        try error.check()
+                        mismatches += Int(count.item(Int32.self))
+                    }
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        passC = failure == nil && mismatches == 0 && trees > 0
+        report(
+            "(c) conv tap table vs each path's stock verify prework (q, k, v, g, beta, conv input), bitwise: "
+                + (passC ? "PASSED" : "FAILED")
+                + " (FP32 and FP16 qkv, \(trees) trees, \(paths) paths, \(values) values, \(mismatches) mismatches"
+                + (failure.map { "; \($0)" } ?? "") + ")")
+    }
+}
+
+// MARK: - Tree speculative verify: a GDN layer's token-tree window
+
+/// A GDN layer's token-tree verify window (`CBv2TreeVerifyLayout` bound on
+/// the row's recurrent transaction): the tap-table prework, S0 = the
+/// committed state (the previous commit's replay), the tree block from S0.
+/// The staged replay tape is the window's; the commit compacts it to the
+/// accepted path (`Qwen35TreePathTape`) and the chain replay runs unchanged.
+enum Qwen35TreeVerifyGDN {
+    /// In the load-time warm, a declined window sets `declined` (tree rounds stay off).
+    nonisolated(unsafe) static var warming = false
+    nonisolated(unsafe) static var declined = false
+    nonisolated(unsafe) static var taken = 0
+
+    /// Output rows `[1, S, Hv, Dv]`, replay staged; nil (nothing staged) if unfit.
+    static func forward(
+        layer: Qwen35GatedDeltaNet, tree: CBv2TreeVerifyLayout, qkv: MLXArray, a: MLXArray,
+        b: MLXArray, convState: MLXArray, aDecay: MLXArray,
+        normScales: (q: MLXArray, k: MLXArray), evaluation: CBv2RecurrentStateEvaluation,
+        modelLayerIndex: Int
+    ) -> MLXArray? {
+        let S = qkv.dim(1)
+        let nKeep = layer.convKernelSize - 1
+        guard qkv.ndim == 3, qkv.dim(0) == 1, S == tree.count, S >= 2, nKeep >= 1,
+            let parents = tree.deviceParents,
+            let taps = tree.convTapTable(kernelSize: layer.convKernelSize),
+            let pre = Qwen35GDNPrework.runTree(
+                qkv: qkv, convState: convState, convWeight: layer.conv1d.weight, a: a, b: b,
+                aDecay: aDecay, dtBias: layer.dtBias, normScales: normScales,
+                keyHeads: layer.numKHeads, valueHeads: layer.numVHeads,
+                headKDim: layer.headKDim, headVDim: layer.headVDim, tapTable: taps),
+            let convInput = pre.convInput
+        else { return nil }
+        let inputSSM = evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
+        let s0 =
+            inputSSM
+            ?? MLXArray.zeros([1, layer.numVHeads, layer.headVDim, layer.headKDim], dtype: .float32)
+        guard
+            let y = Qwen35GatedDeltaTree.run(
+                q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, state: s0, parent: parents)
+        else { return nil }
+        let tape = ArraysCache.PrefixReplayTape(
+            convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b, ssmPre: s0,
+            mask: nil, rowCount: S, convStateRows: nKeep)
+        let path = Qwen35TreePathTape(tape: tape, layout: tree)
+        var roots = [convInput, pre.q, pre.k, pre.v, a, b]
+        if inputSSM == nil { roots.append(s0) }
+        let strictRoots = inputSSM.map { roots + [$0] } ?? roots
+        func bytes(_ arrays: [MLXArray]) -> Int {
+            arrays.reduce(0) { total, array in
+                let (sum, overflow) = total.addingReportingOverflow(array.nbytes)
+                return overflow ? Int.max : sum
+            }
+        }
+        do {
+            try evaluation.stagePrefixReplay(
+                modelLayerIndex: modelLayerIndex,
+                positions: S,
+                finalConv: convInput[0..., S ..< (S + nKeep), 0...],
+                finalSSM: nil,
+                materializedByteCount: bytes(roots + [s0]),
+                evaluationRoots: strictRoots,
+                strictReplayRetainedByteCount: bytes(strictRoots),
+                strictReplayRetainedRoots: strictRoots,
+                fullAcceptanceRetainedByteCount: bytes(strictRoots),
+                fullAcceptanceRetainedRoots: strictRoots,
+                fullAcceptance: { [unowned layer] in
+                    layer.replayedPrefixState(tape: path.compacted, committedRows: S, fullWindow: true)
+                },
+                replay: { [unowned layer] keep in
+                    layer.replayedPrefixState(tape: path.compacted, committedRows: keep)
+                })
+        } catch {
+            preconditionFailure(
+                "Qwen35 tree verify: replay stage failed at layer \(modelLayerIndex): \(error)")
+        }
+        taken += 1
+        return y
+    }
+}
+
+/// A tree window's replay tape compacted to `acceptedRows` (path rows first,
+/// then the rest; the replay never reads q). A path that is the window's
+/// leading chain is the tape itself.
+final class Qwen35TreePathTape {
+    let tape: ArraysCache.PrefixReplayTape
+    let layout: CBv2TreeVerifyLayout
+    private var built: ArraysCache.PrefixReplayTape?
+
+    init(tape: ArraysCache.PrefixReplayTape, layout: CBv2TreeVerifyLayout) {
+        (self.tape, self.layout) = (tape, layout)
+    }
+
+    var compacted: ArraysCache.PrefixReplayTape {
+        if let built { return built }
+        let S = tape.rowCount
+        guard let rows = layout.acceptedRows, rows.allSatisfy({ $0 >= 0 && $0 < S }),
+            Set(rows).count == rows.count
+        else {
+            preconditionFailure("Qwen35 tree verify: the commit read a tape with no accepted path")
+        }
+        let chosen = Set(rows)
+        let order = rows + (0 ..< S).filter { !chosen.contains($0) }
+        let result: ArraysCache.PrefixReplayTape
+        if order == Array(0 ..< S) {
+            result = tape
+        } else {
+            let nk = tape.convStateRows
+            let index = MLXArray(order.map { Int32($0) })
+            let convIndex = MLXArray((0 ..< nk).map { Int32($0) } + order.map { Int32(nk + $0) })
+            result = ArraysCache.PrefixReplayTape(
+                convInput: take(tape.convInput, convIndex, axis: 1), q: tape.q,
+                k: take(tape.k, index, axis: 1), v: take(tape.v, index, axis: 1),
+                a: take(tape.a, index, axis: 1), b: take(tape.b, index, axis: 1),
+                ssmPre: tape.ssmPre, mask: nil, rowCount: S, convStateRows: nk)
+        }
+        built = result
+        return result
+    }
+}
+
+// MARK: - Tree speculative verify: the attention check
+
+/// The fused attention prework's token-tree form: row t rotates at
+/// `offs + tdep[t]` (int32 `[L]`, the rows' depths) instead of `offs + t`. One
+/// edit keeping the types (`uint + int`, then to float), so a chain's depths
+/// give the same bits.
+extension Qwen35AttentionPrework {
+    private static let treeKernel: MLXFast.MLXFastKernel = {
+        let pattern = "static_cast<float>(t + off)"
+        precondition(
+            source.components(separatedBy: pattern).count == 2,
+            "qwen35 tree rotary: the rotary position must occur once in the source")
+        return MLXFast.metalKernel(
+            name: "bonsai_attn_prework_tree",
+            inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale", "tdep"],
+            outputNames: ["qo", "ko"],
+            source: source.replacingOccurrences(
+                of: pattern, with: "static_cast<float>(uint(tdep[int64_t(t) * tdep_strides[0]]) + off)"),
+            ensureRowContiguous: false)
+    }()
+
+    /// `run` for a token-tree window (one row); the same verdict.
+    static func runTree(
+        q: MLXArray, k: MLXArray, qNorm: RMSNorm, kNorm: RMSNorm,
+        offsets: MLXArray, depths: MLXArray, ropeDims: Int, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, q.ndim == 4, k.ndim == 4,
+            verified(
+                Geometry(hq: q.dim(2), hk: k.dim(2), d: q.dim(3), rd: ropeDims, dtype: "\(q.dtype)"))
+        else { return nil }
+        return runTreeUnchecked(
+            q: q, k: k, wq: qNorm.weight, wk: kNorm.weight, epsQ: qNorm.eps, epsK: kNorm.eps,
+            offsets: offsets, depths: depths, ropeDims: ropeDims, ropeBase: ropeBase)
+    }
+
+    static func runTreeUnchecked(
+        q: MLXArray, k: MLXArray, wq: MLXArray, wk: MLXArray, epsQ: Float, epsK: Float,
+        offsets: MLXArray, depths: MLXArray, ropeDims: Int, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        let (L, HQ, HK, D) = (q.dim(1), q.dim(2), k.dim(2), q.dim(3))
+        guard q.dim(0) == 1, k.dim(0) == 1, k.dim(1) == L, k.dim(3) == D,
+            q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
+            wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
+            offsets.dtype == .int32, offsets.ndim <= 1, offsets.size == 1,
+            depths.dtype == .int32, depths.shape == [L], L > 0, L <= CBv2TreeVerifyLayout.maximumRows
+        else { return nil }
+        let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let outputs = treeKernel(
+            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
+             MLXArray(log2(ropeBase)), MLXArray(Float(1)), depths],
+            template: [("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK), ("OB", 1)],
+            grid: ((D / 4) * (HQ + HK), L, 1), threadGroup: (D / 4, 1, 1),
+            outputShapes: [[1, HQ, L, D], [1, HK, L, D]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+}
+
+/// The tree verify's attention check (also `MLXFAST_TREE_ATTN_SELFTEST=1`),
+/// once per attention geometry at model construction, FP32 at the layer's
+/// real shapes, through both verify routes (the fused prework with the
+/// cache's slice updates, and the op chain) over the verify attention's
+/// three key-count forms (the verify block's fused softmax, its mask kernel,
+/// SDPA over the tree's boolean mask): a chain-shaped tree against the
+/// unbound window, bit for bit (outputs, stored K/V, offsets); 7 trees, each
+/// row against the last row of its root-to-node path run as an unbound chain
+/// (max |diff| <= 1e-3 * max(1, max |ref|)) and each stored K/V row against
+/// that chain's row at its depth, bit for bit; a control (a star tree's rows
+/// differ from the causal window's). Tree rounds need `verdict == true`.
+enum Qwen35TreeAttentionSelfTest {
+    static let requested: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_TREE_ATTN_SELFTEST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var tested: Set<String> = []
+    /// Every geometry checked passed (nil: none checked).
+    nonisolated(unsafe) static var verdict: Bool?
+
+    private enum Route: String, CaseIterable {
+        case slices = "prework + slice updates"
+        case opChain = "op chain"
+    }
+
+    private struct Geometry {
+        let hq: Int, hk: Int, d: Int, rd: Int
+        let ropeBase: Float, epsQ: Float, epsK: Float
+    }
+
+    private typealias Operands = (q: MLXArray, k: MLXArray, v: MLXArray)
+
+    static func runIfRequested(
+        hq: Int, hk: Int, d: Int, ropeDims rd: Int, ropeBase: Float, epsQ: Float, epsK: Float
+    ) {
+        guard requested || CBv2TreeVerify.requested,
+            lock.withLock({ tested.insert("\(hq) \(hk) \(d) \(rd)").inserted })
+        else { return }
+        let geo = Geometry(hq: hq, hk: hk, d: d, rd: rd, ropeBase: ropeBase, epsQ: epsQ, epsK: epsK)
+        var (failures, ran) = (0, 0)
+        var details: [String] = []
+        for route in Route.allCases {
+            for prefix in [611, 4200, 4201] {
+                let result = check(route, geo, prefix: prefix)
+                if result.ran { ran += 1 }
+                if result.ran && !result.passed { failures += 1 }
+                details.append(
+                    "[\(route.rawValue); \(prefix)+16 keys] \(result.detail): "
+                        + (result.ran ? (result.passed ? "ok" : "FAILED") : "not run"))
+            }
+        }
+        let passed = failures == 0 && ran > 0
+        verdict = (verdict ?? true) && passed
+        FileHandle.standardError.write(
+            Data(("qwen35 tree attention self-test (hq \(hq), hk \(hk), d \(d), rotary \(rd)): "
+                + "\(ran) checks, \(failures) failed; " + (passed ? "PASSED" : "FAILED")
+                + (passed && !requested ? "" : "\n  " + details.joined(separator: "\n  ")) + "\n").utf8))
+        Memory.clearCache()
+    }
+
+    private static func trees() -> [[Int]] {
+        var trees: [[Int]] = [
+            (0 ..< 16).map { $0 - 1 },
+            [-1] + [Int](repeating: 0, count: 15),
+            (0 ..< 16).map { $0 == 0 ? -1 : ($0 - 1) / 2 },
+            [-1, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 8, 9, 12, 4],
+        ]
+        var state: UInt64 = 0x7472_6565_5f61_7474
+        for _ in 0 ..< 3 {
+            var parents = [-1]
+            for i in 1 ..< 16 {
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                parents.append(Int((state >> 33) % UInt64(i)))
+            }
+            trees.append(parents)
+        }
+        return trees
+    }
+
+    private static func check(_ route: Route, _ geo: Geometry, prefix: Int)
+        -> (ran: Bool, passed: Bool, detail: String)
+    {
+        if route == .slices, !Qwen35AttentionPrework.enabled {
+            return (false, false, "fused prework off")
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7472_6565 + prefix)), into: 6)
+        let wq = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[0])
+        let wk = 1 + 0.25 * MLXRandom.normal([geo.d], key: keys[1])
+        let scale = pow(Float(geo.d), -0.5)
+        let rows = 16
+        let pk = MLXRandom.normal([1, geo.hk, prefix, geo.d], key: keys[2])
+        let pv = MLXRandom.normal([1, geo.hk, prefix, geo.d], key: keys[3])
+        let kind = CBv2LayerKind(attention: .full, headDim: geo.d, kvHeads: geo.hk, queryHeads: geo.hq)
+        func makeLayer() -> CBv2LayerCache {
+            let row = CBv2FullSequenceKV(
+                promptLength: prefix, maxLength: 1 << 16, kvHeads: geo.hk, headDim: geo.d)
+            _ = row.update(keys: pk, values: pv)
+            return CBv2LayerCache(layerIndex: 0, kind: kind, rows: [row])
+        }
+        func rollback(_ layer: CBv2LayerCache, _ n: Int) {
+            let bound = layer.rows
+            for row in bound { row.rollback(n) }
+            layer.setRows(bound)
+        }
+        let width = geo.hq * 2 * geo.d + 2 * geo.hk * geo.d
+        let wide = MLXRandom.normal([1, rows, width], key: keys[4])
+            * exp(MLXRandom.normal([1, rows, width], key: keys[5]))
+        let parts = MLX.split(
+            wide, indices: [geo.hq * 2 * geo.d, geo.hq * 2 * geo.d + geo.hk * geo.d], axis: -1)
+        let o: Operands = (
+            parts[0].reshaped(1, rows, geo.hq, -1).split(parts: 2, axis: -1)[0],
+            parts[1].reshaped(1, rows, geo.hk, -1),
+            parts[2].reshaped(1, rows, geo.hk, -1)
+        )
+        func differing(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum()
+        }
+        var (chainMismatches, kvMismatches, comparedRows) = (0, 0, 0)
+        var (worst, control): (Float, Float) = (0, 0)
+        do {
+            try withError { error in
+                // 1. A chain-shaped tree against the unbound window.
+                let plainLayer = makeLayer()
+                let chainLayer = makeLayer()
+                let plain = forward(route, plainLayer, o, tree: nil, geo, wq: wq, wk: wk, scale: scale)
+                let chained = forward(
+                    route, chainLayer, o, tree: .chain(rows), geo, wq: wq, wk: wk, scale: scale)
+                let a = plainLayer.rows[0].snapshot()
+                let b = chainLayer.rows[0].snapshot()
+                let count = stacked([
+                    differing(plain, chained), differing(a.keys, b.keys), differing(a.values, b.values),
+                    (plainLayer.positionOffsets .!= chainLayer.positionOffsets).asType(.int32).sum(),
+                ]).sum()
+                eval(count)
+                try error.check()
+                chainMismatches = Int(count.item(Int32.self))
+                // 2. Trees against each row's root-to-node path as a plain chain.
+                let treeLayer = makeLayer()
+                let pathLayer = makeLayer()
+                for (treeIndex, parents) in trees().enumerated() {
+                    let out = forward(
+                        route, treeLayer, o, tree: CBv2TreeVerifyLayout(parents: parents), geo,
+                        wq: wq, wk: wk, scale: scale)
+                    let tree = treeLayer.rows[0].snapshot()
+                    eval(out, tree.keys, tree.values)
+                    try error.check()
+                    if treeIndex == 1 {
+                        let causal = plain[0..., 0..., 2..., 0...]
+                        let apart: MLXArray = abs(out[0..., 0..., 2..., 0...] - causal).max()
+                            / maximum(abs(causal).max(), MLXArray(Float(1)))
+                        control = apart.item(Float.self)
+                    }
+                    for i in 0 ..< rows {
+                        let path = Qwen35TreeLayout.path(to: i, parent: parents)
+                        let depth = path.count - 1
+                        // The reference is a full-width chain window: the
+                        // path's rows first, then the other rows as filler
+                        // (causal, so row `depth` sees exactly the path). A
+                        // path-length chain of 8 rows or fewer leaves the
+                        // verify block for MLX's SDPA (its vector kernel at
+                        // few rows), exact FP32, while the 16-row window's
+                        // FP32 GEMMs run as TF32 on the M5 generation's
+                        // neural accelerators (MLX `MLX_ENABLE_TF32`, default
+                        // on): there the shallow rows differed by the TF32
+                        // rounding, not by the tree. At the window's width
+                        // both sides take the same kernels, so the tolerance
+                        // measures the tree's masking and depths alone.
+                        let filler = (0 ..< rows).filter { !path.contains($0) }
+                        let index = MLXArray((path + filler).map { Int32($0) })
+                        let po: Operands = (
+                            o.q.take(index, axis: 1), o.k.take(index, axis: 1), o.v.take(index, axis: 1)
+                        )
+                        let reference = forward(
+                            route, pathLayer, po, tree: nil, geo, wq: wq, wk: wk, scale: scale)
+                        let chain = pathLayer.rows[0].snapshot()
+                        let expected = reference[0..., 0..., depth ..< (depth + 1), 0...]
+                        let actual = out[0..., 0..., i ..< (i + 1), 0...]
+                        let (slot, chainSlot) = (prefix + i, prefix + depth)
+                        let kvDiff =
+                            differing(
+                                tree.keys[0..., 0..., slot ..< (slot + 1), 0...],
+                                chain.keys[0..., 0..., chainSlot ..< (chainSlot + 1), 0...])
+                            + differing(
+                                tree.values[0..., 0..., slot ..< (slot + 1), 0...],
+                                chain.values[0..., 0..., chainSlot ..< (chainSlot + 1), 0...])
+                        let metrics = stacked([
+                            abs(actual - expected).max(), abs(expected).max(), kvDiff.asType(.float32),
+                        ])
+                        eval(metrics)
+                        try error.check()
+                        let m = metrics.asArray(Float.self)
+                        let normalized = m[0] / max(1, m[1])
+                        worst = normalized.isFinite ? max(worst, normalized) : .infinity
+                        kvMismatches += Int(m[2])
+                        comparedRows += 1
+                        rollback(pathLayer, rows)
+                    }
+                    rollback(treeLayer, rows)
+                }
+            }
+        } catch {
+            return (true, false, "\(error)")
+        }
+        let passed = chainMismatches == 0 && kvMismatches == 0 && worst <= 1e-3
+            && comparedRows == 7 * rows && control > 1e-2
+        return (
+            true, passed,
+            "chain tree vs unbound \(chainMismatches) differ; \(comparedRows) rows vs path chains max err "
+                + String(format: "%.3g", worst) + ", K/V at depth \(kvMismatches) differ; control "
+                + String(format: "%.3g", control))
+    }
+
+    /// One attention layer's verify window through `route`, `tree` bound for the call.
+    private static func forward(
+        _ route: Route, _ layer: CBv2LayerCache, _ o: Operands, tree: CBv2TreeVerifyLayout?,
+        _ geo: Geometry, wq: MLXArray, wk: MLXArray, scale: Float
+    ) -> MLXArray {
+        layer.bindTreeVerify(tree)
+        defer { layer.bindTreeVerify(nil) }
+        let values = o.v.transposed(0, 2, 1, 3)
+        let offsets = layer.positionOffsets
+        switch route {
+        case .slices:
+            let rotated =
+                tree.flatMap {
+                    Qwen35AttentionPrework.runTreeUnchecked(
+                        q: o.q, k: o.k, wq: wq, wk: wk, epsQ: geo.epsQ, epsK: geo.epsK,
+                        offsets: offsets, depths: $0.depths, ropeDims: geo.rd, ropeBase: geo.ropeBase)
+                }
+                ?? Qwen35AttentionPrework.runUnchecked(
+                    q: o.q, k: o.k, wq: wq, wk: wk, epsQ: geo.epsQ, epsK: geo.epsK,
+                    offsets: offsets, ropeDims: geo.rd, ropeBase: geo.ropeBase)!
+            return layer.updateAndAttend(
+                queries: rotated.0, keys: rotated.1, values: values, scale: scale, sinks: nil)
+        case .opChain:
+            // As `Qwen35Attention.cbv2Forward` composes it.
+            func rotate(_ x: MLXArray, _ w: MLXArray, _ eps: Float) -> MLXArray {
+                let normed = MLXFast.rmsNorm(x, weight: w, eps: eps).transposed(0, 2, 1, 3)
+                guard let tree else {
+                    return MLXFast.RoPE(
+                        normed, dimensions: geo.rd, traditional: false, base: geo.ropeBase,
+                        scale: 1, offset: offsets + 0)
+                }
+                return MLXFast.RoPE(
+                    normed.transposed(2, 1, 0, 3), dimensions: geo.rd, traditional: false,
+                    base: geo.ropeBase, scale: 1, offset: (offsets + 0) + tree.depths
+                ).transposed(2, 1, 0, 3)
+            }
+            return layer.updateAndAttend(
+                queries: rotate(o.q, wq, geo.epsQ), keys: rotate(o.k, wk, geo.epsK),
+                values: values, scale: scale, sinks: nil)
+        }
+    }
+}

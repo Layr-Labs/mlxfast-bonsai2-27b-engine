@@ -275,6 +275,27 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         pendingWrite = nil
     }
 
+    /// Tree verify commit: the last `windowCount` rows are a token-tree
+    /// window; its rows `rows` (window-relative, root first) become the
+    /// window's first rows (each K row already carries its depth's rotation,
+    /// so a path is a plain row gather). The caller rolls back the rest.
+    /// Rows already in place stay.
+    public func compactTreeWindow(windowCount: Int, rows: [Int]) {
+        precondition(
+            windowCount >= rows.count && windowCount <= absoluteOffset,
+            "CBv2FullSequenceKV: tree window of \(windowCount) rows keeps \(rows.count)")
+        guard let first = rows.indices.first(where: { rows[$0] != $0 }), let keys, let values
+        else { return }
+        precondition(rows.allSatisfy { $0 >= 0 && $0 < windowCount })
+        let start = absoluteOffset - windowCount
+        let source = MLXArray(rows[first...].map { Int32(start + $0) })
+        let movedKeys = take(keys, source, axis: 2)
+        let movedValues = take(values, source, axis: 2)
+        let destination = (start + first) ..< (start + rows.count)
+        self.keys![.ellipsis, destination, 0...] = movedKeys
+        self.values![.ellipsis, destination, 0...] = movedValues
+    }
+
     // MARK: - Private
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {

@@ -240,10 +240,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 ///   first 8 layers (a LEADING verify submission, the verify's first ~5
 ///   command buffers) and a second after 24: the GPU gets the front of the
 ///   verify as soon as it is built, runs layers 8..23 while the host builds
-///   the other 40, and never waits on the host's ~0.1 ms per layer. Two
-///   boundaries rather than periodic slices, because every extra command
-///   buffer at verify width has measured as a cost on the ranked box (slices
-///   every 2 layers lengthened the window). `MLXFAST_VERIFY_SLICE_LAYERS`
+///   the other 40. This experiment adds a third boundary after layer 40 to
+///   overlap more of the remaining host build. It can lose: every extra
+///   command buffer at verify width has a cost (slices every 2 layers had
+///   lengthened the ranked window). `MLXFAST_VERIFY_SLICE_LAYERS`
 ///   sets another plan (same syntax); `MLXFAST_VERIFY_SLICE_LAYERS=0` or
 ///   `DARKBLOOM_QWEN35_VERIFY_SLICES=0` submits the verify as one graph
 ///   again. Both trunk paths honour it: the plain per-layer loop and the
@@ -307,12 +307,14 @@ enum Qwen35TrunkSubmission {
         // verify at about 0.1 ms per layer, so the 56 layers behind the first
         // boundary outlast the GPU's ~3 ms on the first 8 and the GPU idled
         // ~1.3 ms per round in between; after 24 the host is building layers
-        // 24..63 while the GPU runs 8..23. `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0`
-        // keeps the single boundary; `MLXFAST_VERIFY_SLICE_LAYERS` sets
-        // another plan, `0` turns it off.
+        // 24..63 while the GPU runs 8..23. A third boundary after layer 40
+        // tests whether submitting the tail sooner hides more host work; it
+        // also adds a command-buffer handoff that can cost more than it saves.
+        // `DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE=0` keeps only the first boundary;
+        // `MLXFAST_VERIFY_SLICE_LAYERS` sets another plan, `0` turns it off.
         let second = env["DARKBLOOM_QWEN35_VERIFY_SECOND_SLICE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24]
+        let leading = ["0", "false", "no", "off"].contains(second ?? "") ? [8] : [8, 24, 40]
         return Plan.parse(
             env["MLXFAST_VERIFY_SLICE_LAYERS"],
             default: Plan(stride: 0, offset: 0, explicit: leading))
@@ -328,7 +330,7 @@ enum Qwen35TrunkSubmission {
     static let verifyUnqueued: Plan = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_VERIFY_UNQUEUED_SLICES"]
         let fallback =
-            verify.explicit == [8, 24] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24]) : verify
+            verify.explicit == [8, 24, 40] ? Plan(stride: 0, offset: 0, explicit: [2, 8, 24, 40]) : verify
         let plan = Plan.parse(raw, default: fallback)
         return plan.isOff ? verify : plan
     }()
@@ -2930,6 +2932,8 @@ final class Qwen35GatedDeltaNet: Module {
         Qwen35GDNFullAcceptStore.prepare(layer: self)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
+        Qwen35TreeVerifySelfTest.runIfRequested(
+            hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize)
     }
 
     private func exactQuantizedInputProjections() -> (
@@ -3725,8 +3729,10 @@ final class Qwen35GatedDeltaNet: Module {
         // The b|a stack's chunk partials for the prework to sum
         // (`Qwen35SplitKFold`); nil keeps the reduce launch.
         let foldEligible: Bool = !exactTargetVerify && S >= 3 && convKernelSize == 4
+        // A token-tree window (`Qwen35TreeVerifyGDN`) reads the reduced b|a.
+        let tree = B == 1 && !exactTargetVerify ? recurrentState[0].treeVerify : nil
         let baCapture: Qwen35BAPartialsCapture? =
-            foldEligible && Qwen35SplitKFold.active(rows: B * S)
+            foldEligible && tree == nil && Qwen35SplitKFold.active(rows: B * S)
             ? Qwen35BAPartialsCapture() : nil
         if exactTargetVerify {
             let exact = qwen35A3BExactW4G64ProjectionQuad(
@@ -3749,6 +3755,18 @@ final class Qwen35GatedDeltaNet: Module {
                 ?? MLXArray.zeros([1, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
         let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+        if let tree {
+            if let y = Qwen35TreeVerifyGDN.forward(
+                layer: self, tree: tree, qkv: qkv, a: a, b: b, convState: convState,
+                aDecay: derived.decay(aLog),
+                normScales: derived.normScales(headKDim: headKDim, dtype: .float32),
+                evaluation: recurrentState[0], modelLayerIndex: modelLayerIndex)
+            {
+                return projectGatedOut(y, gate: z, B: B, S: S)
+            }
+            precondition(Qwen35TreeVerifyGDN.warming, "Qwen35 tree verify: a GDN window declined")
+            Qwen35TreeVerifyGDN.declined = true
+        }
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -4143,6 +4161,9 @@ final class Qwen35Attention: Module {
             Qwen35AttentionPreworkKV.prepare(
                 hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
                 ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
+            Qwen35TreeAttentionSelfTest.runIfRequested(
+                hq: attentionHeads, hk: kvHeads, d: headDim, ropeDims: fusedRope.dims,
+                ropeBase: fusedRope.base, epsQ: args.rmsNormEps, epsK: args.rmsNormEps)
         }
     }
 
@@ -4175,14 +4196,20 @@ final class Qwen35Attention: Module {
     }
 
     /// q/k RMSNorm, the head transpose and the partial rotary embedding in one
-    /// launch (`Qwen35AttentionPrework`); nil keeps the op chain.
-    private func fusedPrework(_ q: MLXArray, _ k: MLXArray, offsets: MLXArray)
+    /// launch (`Qwen35AttentionPrework`); nil keeps the op chain. `depths` (a
+    /// token-tree window's) rotates row t at `offsets + depths[t]`.
+    private func fusedPrework(_ q: MLXArray, _ k: MLXArray, offsets: MLXArray, depths: MLXArray?)
         -> (MLXArray, MLXArray)?
     {
         guard let fusedRope,
             ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
             ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self)
         else { return nil }
+        if let depths {
+            return Qwen35AttentionPrework.runTree(
+                q: q, k: k, qNorm: qNorm, kNorm: kNorm, offsets: offsets, depths: depths,
+                ropeDims: fusedRope.dims, ropeBase: fusedRope.base)
+        }
         return Qwen35AttentionPrework.run(
             q: q, k: k, qNorm: qNorm, kNorm: kNorm, offsets: offsets,
             ropeDims: fusedRope.dims, ropeBase: fusedRope.base)
@@ -4264,6 +4291,12 @@ final class Qwen35Attention: Module {
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
+        // A token-tree verify window (bound on the cache): row t rotates at
+        // offset + depth(t); the cache applies the tree's mask.
+        let tree = cache.treeVerify
+        precondition(
+            tree == nil || (B == 1 && L == tree!.count && !lastQueryOnly && positionIds == nil),
+            "Qwen35 attention: a bound tree layout serves one text verify window")
         // Final-layer prompt narrowing: commit every position's K/V, attend
         // only the newest query (see LastQueryPrefillV2: the newest causal
         // query sees every key the chunk wrote, so its row is the same
@@ -4314,7 +4347,7 @@ final class Qwen35Attention: Module {
             // before the cache advances (the value the copy below captures).
             let fused = fusedPrework(
                 qSplit[0], kProjection.reshaped(B, L, kvHeads, -1),
-                offsets: cache.positionOffsets)
+                offsets: cache.positionOffsets, depths: tree?.depths)
         {
             (queries, keys) = fused
         } else if let positionIds, !exactTargetVerify,
@@ -4336,6 +4369,13 @@ final class Qwen35Attention: Module {
             if let positionIds {
                 (queries, keys) = mrope.apply(
                     queries: queries, keys: keys, positionIds: positionIds)
+            } else if let tree {
+                // One offset per row: the rows on the batch axis of the rope.
+                let positions = (cache.positionOffsets + 0) + tree.depths
+                queries = rope(queries.transposed(2, 1, 0, 3), offset: positions)
+                    .transposed(2, 1, 0, 3)
+                keys = rope(keys.transposed(2, 1, 0, 3), offset: positions)
+                    .transposed(2, 1, 0, 3)
             } else {
                 let offsets = cache.positionOffsets + 0
                 queries = rope(queries, offset: offsets)
@@ -6245,7 +6285,7 @@ enum Qwen35AttentionPrework {
     // wq/wk [D] FP32, offs [1] or [B] int32 (any stride), epsq/epsk/scale/
     // lbase (log2 of the rope base) FP32 scalars, axis (= D) uint32 scalar.
     // Outputs qo [B, HQ, L, D], ko [B, HK, L, D] FP32.
-    private static let source = """
+    static let source = """
         constexpr int NR = 4;
         constexpr int HALF = RD / 2;
         const uint lid = thread_position_in_threadgroup.x;
@@ -6380,14 +6420,14 @@ enum Qwen35AttentionPrework {
         return (outputs[0], outputs[1])
     }
 
-    private struct Geometry: Hashable {
+    struct Geometry: Hashable {
         let hq: Int, hk: Int, d: Int, rd: Int, dtype: String
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
 
-    private static func verified(_ geometry: Geometry) -> Bool {
+    static func verified(_ geometry: Geometry) -> Bool {
         lock.withLock { verdicts[geometry] ?? false }
     }
 
