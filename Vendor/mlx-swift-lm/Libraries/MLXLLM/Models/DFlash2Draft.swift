@@ -2535,6 +2535,30 @@ enum DFlash2PackedWeights {
     /// The K step of a tile.
     static let kt = 64
 
+    /// `DARKBLOOM_DRAFT_PACK12_ALL=1` packs every eligible weight, as the
+    /// packed kernel's first form did.
+    private static let packAll: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DRAFT_PACK12_ALL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(raw ?? "")
+    }()
+
+    /// Whether the packed kernel is the faster read of an `[n, k]` weight.
+    /// It reads a quarter fewer bytes but adds decode work to every tile,
+    /// which only enough tiles in flight hide: a wide weight (many column
+    /// blocks, as the gate|up stack) or a deep one (many K tiles per
+    /// simdgroup, as down_proj and fc). A narrow, shallow weight waits on the
+    /// decode instead. On an M5 Max, chained launches over the real weights
+    /// (each launch a different layer's copy, so every read streams), packed
+    /// against the stored layout: gate|up -20%, down_proj -3%, fc +1%, the
+    /// q|k|v stack +2% (32 rows +1%), o_proj +7% (+8%), and the tap
+    /// projections +63% (+64%). A weight left out keeps the swapped kernel
+    /// over its stored layout, whose products the packed kernel matches bit
+    /// for bit, so no value changes either way.
+    static func worthPacking(n: Int, k: Int) -> Bool {
+        packAll || n >= 16384 || k >= 16384
+    }
+
     struct Copy {
         let source: MLXArray
         let mantissas: MLXArray
@@ -3037,7 +3061,8 @@ enum DFlash2PackedWeights {
         let eligible = (weights + weights32).filter {
             guard $0.dtype == .bfloat16, $0.ndim == 2, $0.dim(0) % 32 == 0 else { return false }
             let splits = DFlash2TensorMatmul.Kernel.stockSplits(n: $0.dim(0))
-            return $0.dim(1) % (splits * kt) == 0 && seen.insert(ObjectIdentifier($0)).inserted
+            return $0.dim(1) % (splits * kt) == 0 && worthPacking(n: $0.dim(0), k: $0.dim(1))
+                && seen.insert(ObjectIdentifier($0)).inserted
         }
         var packed: [Copy] = []
         var escapes = 0
