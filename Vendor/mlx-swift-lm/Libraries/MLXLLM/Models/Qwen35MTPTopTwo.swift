@@ -1323,8 +1323,8 @@ enum Qwen35TensorPackedMatmul {
               acc[h][i] = fma(mh ? cr[cs][1] : cr[cs][0], sv[nq][c] * float(ci), fma(bv[nq][c], mh ? cr[cs][3] : cr[cs][2], acc[h][i]));
             }
           }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
           if (g + 1 < g1) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             const int wn = (j + 1) % PD;       // slot holding group g + 1
             putw(wr[wn], 0);
             if (NP == 1 && g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn]); }
@@ -2040,6 +2040,105 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         """
+
+    // K32 fragments loaded at staging; optionally retain only the next first pair.
+    private static func narrowFragmentSource(firstPair: Bool, oneConstantsSlot: Bool) -> String? {
+        var source = sourceNarrowInt8Zoo
+        guard let begin = source.range(of: "// all 8 words of group gg"),
+            let end = source.range(of: "// epilogue constants", range: begin.upperBound..<source.endIndex)
+        else { return nil }
+        source.replaceSubrange(begin.lowerBound..<end.lowerBound, with: """
+            // Two words per K32 fragment; original staging layout.
+            static_assert(KH == 32 && AM == 0, "direct K32 weight fragments");
+            auto putw = [&](int g, int p) {
+              #pragma clang loop unroll(full)
+              for (int h = 0; h < NH; h++) {
+                const uint2 words = *(const device uint2*)(wrow + h * hstride + (size_t)g * 256 + 2u * p);
+                threadgroup uint32_t* dst = sb + h * (32 * KH / 4) + int(lane) * (KH / 4);
+                #pragma clang loop unroll(full)
+                for (int jj = 0; jj < KW; jj++) {
+                  const uint32_t wv = words[jj];
+                  *(threadgroup uint4*)(dst + 4 * jj) = uint4(
+                      wv & 0x03030303u, (wv >> 2) & 0x03030303u,
+                      (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+                }
+              }
+            };
+
+            """)
+        let changes = [
+            ("uint32_t wr[PD][NH][8];", ""),
+            ("const int ws = j % PD;", ""),
+            ("const int wn = (j + 1) % PD;       // slot holding group g + 1", ""),
+            ("if (p == NP - 1 && g + PD < g1) { getw(g + PD, wr[ws]); }", ""),
+            ("if (NP == 1 && g + 1 + PD < g1) { getw(g + 1 + PD, wr[wn]); }", ""),
+            ("if (NP == 1 && g0 + PD < g1) { getw(g0 + PD, wr[0]); }", ""),
+            ("""
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < PD; i++) {
+              if (g0 + i < g1) { getw(g0 + i, wr[i]); }
+            }
+            """, ""),
+            ("putw(wr[ws], p);", "putw(g, p);"),
+            ("putw(wr[wn], 0);", "putw(g + 1, 0);"),
+            ("putw(wr[0], 0);", "putw(g0, 0);")
+        ]
+        for (old, new) in changes {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        if firstPair {
+            let changes = [
+                ("auto putw = [&](int g, int p) {", """
+                uint2 firstWords[NH];
+                auto prefetch = [&](int g) {
+                  #pragma clang loop unroll(full)
+                  for (int h = 0; h < NH; h++) {
+                    firstWords[h] = *(const device uint2*)(wrow + h * hstride + (size_t)g * 256);
+                  }
+                };
+                auto putw = [&](int g, int p) {
+                """),
+                ("const uint2 words = *(const device uint2*)(wrow + h * hstride + (size_t)g * 256 + 2u * p);",
+                 "const uint2 words = p == 0 ? firstWords[h] : *(const device uint2*)(wrow + h * hstride + (size_t)g * 256 + 2u * p);"),
+                ("mm(g, p);", "if (p == NP - 1 && g + 1 < g1) { prefetch(g + 1); }\n    mm(g, p);"),
+                ("putw(g0, 0);", "prefetch(g0);\nputw(g0, 0);")
+            ]
+            for (old, new) in changes {
+                guard source.components(separatedBy: old).count == 2 else { return nil }
+                source = source.replacingOccurrences(of: old, with: new)
+            }
+        }
+        if oneConstantsSlot {
+            let old = "constexpr int CD = PD < 2 ? 2 : PD;   // constants ring depth = group-loop unroll"
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: "constexpr int CD = 1;")
+        }
+        guard source.components(separatedBy: "size_t").count == (firstPair ? 16 : 15) else { return nil }
+        return source.replacingOccurrences(of: "size_t", with: "uint")
+    }
+
+    private static let narrowFragmentSources = [
+        narrowFragmentSource(firstPair: false, oneConstantsSlot: false),
+        narrowFragmentSource(firstPair: false, oneConstantsSlot: true),
+        narrowFragmentSource(firstPair: true, oneConstantsSlot: false),
+        narrowFragmentSource(firstPair: true, oneConstantsSlot: true)
+    ]
+
+    private static let narrowFragmentKernels = narrowFragmentSources.enumerated().map { index, source in
+        source.map {
+            MLXFast.metalKernel(
+                name: "bonsai_tensor_packed_matmul_m16_frag\(index)",
+                inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+                outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+        }
+    }
+
+    private static func narrowFragmentOffsetsFit(k: Int, n: Int, m: Int) -> Bool {
+        guard m == 16, k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
+        let limit = Int(Int32.max)
+        return k <= limit / 16 && n <= limit / 16 && n <= limit / (k / 16)
+    }
 
     private static let kernelNarrowInt8Zoo = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8z",
@@ -3253,13 +3352,27 @@ enum Qwen35TensorPackedMatmul {
         // built in registers from the plane copy (family `rb`, every tower
         // shape but the head).
         case rb = 70
+        case k32FragmentIO32 = 100
+        case k32FragmentC1IO32 = 101
+        case k32FirstPairIO32 = 102
+        case k32FirstPairC1IO32 = 103
+
+        var fragmentIndex: Int? {
+            switch self {
+            case .k32FragmentIO32: return 0
+            case .k32FragmentC1IO32: return 1
+            case .k32FirstPairIO32: return 2
+            case .k32FirstPairC1IO32: return 3
+            default: return nil
+            }
+        }
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
                 .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
-                .i4p4k32pd1, .rb:
+                .i4p4k32pd1, .rb, .k32FragmentIO32, .k32FragmentC1IO32, .k32FirstPairIO32, .k32FirstPairC1IO32:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
@@ -3280,7 +3393,7 @@ enum Qwen35TensorPackedMatmul {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1:
+                .csk32pd2, .i4p4k32pd1, .k32FragmentIO32, .k32FragmentC1IO32, .k32FirstPairIO32, .k32FirstPairC1IO32:
                 return 32
             case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
@@ -3289,7 +3402,9 @@ enum Qwen35TensorPackedMatmul {
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4,
+                .k32FragmentIO32, .k32FragmentC1IO32, .k32FirstPairIO32, .k32FirstPairC1IO32:
+                return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
@@ -4320,7 +4435,13 @@ enum Qwen35TensorPackedMatmul {
             }
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
-            let zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            let zooKernel: MLXFast.MLXFastKernel
+            if let index = v.fragmentIndex, narrowFragmentOffsetsFit(k: k, n: n, m: m),
+                let body = narrowFragmentKernels[index] {
+                zooKernel = body
+            } else {
+                zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            }
             return zooKernel(
                 inputs, template: zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)],
                 grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4435,10 +4556,11 @@ enum Qwen35TensorPackedMatmul {
     /// Zoo bodies in self-test order (the deadline cuts the last): the zoo's
     /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
+        .k32FragmentIO32, .k32FragmentC1IO32, .k32FirstPairIO32, .k32FirstPairC1IO32,
         .k32pd2, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
         .aw64pd1, .k32pd1, .pk32pd1,
         .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
-    ]
+    ].filter { $0.fragmentIndex.map { narrowFragmentKernels[$0] != nil } ?? true }
 
     /// Zoo 3a's bodies (`NarrowVariant.xtg`), self-tested after the zoo's
     /// with a budget of their own, and also on every production shape but the
@@ -6114,6 +6236,9 @@ extension Qwen35TensorPackedMatmul {
     // The zoo bodies' fused forms (the head on a zoo body, zoo 2).
     private static let kernelNarrowInt8ZooTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8z_top2", sourceNarrowInt8Zoo, columns: "TN")
+    private static let narrowFragmentTop2Kernels = narrowFragmentSources.enumerated().map { index, source in
+        source.flatMap { headTop2Kernel("bonsai_tensor_packed_matmul_m16_frag\(index)_top2", $0, columns: "TN") }
+    }
     private static let kernelNarrowInt8PairTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8x_top2", sourceNarrowInt8Pair, columns: "32")
     private static let kernelNarrowInt8Zoo2Top2 = headTop2Kernel(
@@ -6193,7 +6318,12 @@ extension Qwen35TensorPackedMatmul {
                 t = zooTemplate + [("PD", v.pd), ("KH", v.kh)]
                 (grid, threads) = ((n / 32 * 256, 1, 1), 256)
             } else {
-                launch = kernelNarrowInt8ZooTop2
+                if let index = v.fragmentIndex {
+                    guard narrowFragmentOffsetsFit(k: k, n: n, m: m) else { return nil }
+                    launch = narrowFragmentTop2Kernels[index]
+                } else {
+                    launch = kernelNarrowInt8ZooTop2
+                }
                 t = zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)]
             }
             guard let launch else { return nil }
