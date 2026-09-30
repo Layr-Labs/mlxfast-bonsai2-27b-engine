@@ -4261,17 +4261,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         let submitAfter = DFlash2DraftSubmission.layers
         let leadAt = leadingLayers > 0 ? min(leadingLayers, layers.count) : 0
-        // A leading submission of several layers also submits its first
-        // layer on its own (`DFlash2DraftSubmission.firstLayerAhead`).
-        let firstAt =
-            DFlash2DraftSubmission.firstLayerAhead && leadAt > 1 ? 1 : 0
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
             // EARLY SUBMISSION: hand the GPU the drafter layers built so far
             // while the host builds the rest and the head. Same kernels, same
             // order; only command-buffer boundaries move. One submission per
             // layer at most, whichever of the two asks for it.
-            if index + 1 == leadAt || index + 1 == firstAt
+            if index + 1 == leadAt
                 || (!submitAfter.isEmpty && submitAfter.contains(index + 1))
             {
                 asyncEval([h])
@@ -4682,25 +4678,6 @@ enum DFlash2ExactRowClasses {
 /// overrides it with a `,`/`;` list of counts (a count equal to the layer
 /// count submits the trunk before the head); `0`/`off` turns it off.
 enum DFlash2DraftSubmission {
-    /// The block a round proposes after its readback (the early block whose
-    /// speculative twin was not adopted) submits its leading layers once they
-    /// are built (`EngineLoopV2.earlyDraftLeadingLayers`, 3). The GPU sits idle
-    /// from the verify's end until that first submission, and building the
-    /// three layers delays it. With this on, the first of those layers (and
-    /// the context projection it reads) is also submitted as soon as it is
-    /// built. The leading submission still follows after the third layer, so
-    /// the GPU never has less work queued than before. The same kernels run
-    /// in the same order on the same inputs; only a command-buffer boundary
-    /// moves earlier, so every value is bit-identical. On an M4 Max it
-    /// commits the block's first command buffer 69 us sooner after the
-    /// readback (median of 39 rounds). `MLXFAST_DRAFT_FIRST_LAYER_AHEAD=0`
-    /// submits the leading layers together, as before.
-    static let firstLayerAhead: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_FIRST_LAYER_AHEAD"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     static let layers: [Int] = {
         guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DRAFT_SLICE_LAYERS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),

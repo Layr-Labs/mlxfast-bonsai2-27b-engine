@@ -1308,7 +1308,7 @@ enum Qwen35AttentionPreworkKV {
             "prev", "kc", "vc",
         ],
         outputNames: ["qo", "fence"],
-        source: Qwen35IO32.narrow(source, count: 4, "bonsai_attn_prework_kv"),
+        source: source,
         ensureRowContiguous: false,
         mutableInputs: ["kc", "vc"])
 

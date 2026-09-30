@@ -2192,8 +2192,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         let signpostState = signposter.isEnabled ? signposter.beginInterval("step") : nil
         defer {
             if let signpostState { signposter.endInterval("step", signpostState) }
-            // Behind this step's submission (`CBv2MTPDeferredRelease`).
-            CBv2MTPDeferredRelease.drain()
             markStepEnded()
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(

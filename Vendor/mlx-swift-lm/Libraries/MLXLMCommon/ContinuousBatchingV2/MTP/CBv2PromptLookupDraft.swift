@@ -75,10 +75,99 @@ enum CBv2PromptLookupDraft {
 
     /// Records where `id`'s newest proposal came from; `host` when it is a host
     /// lookup's continuation (`lookup`, or `override`'s own match).
+
+    /// `DARKBLOOM_DFLASH_LOOKUP_MEMO=0` rescans the prompt on every call.
+    ///
+    /// A finalize asks for the same continuation two or three times on one
+    /// unchanged history (`lookupPreempts` before the block decision, `lookup`
+    /// after it on a prompt round, `override` behind the drafter on a draft
+    /// round). The scan is O(longest x prompt) on the engine thread, inside
+    /// the decode window. It is a pure function, so the last result is kept
+    /// under a content key: the history count, its suffix length (which is
+    /// all the scan may read) and a 64-bit FNV-1a of that suffix. A key miss
+    /// rescans; a key hit returns the stored result, bitwise the same ids.
+    static let memoEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_LOOKUP_MEMO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `DARKBLOOM_DFLASH_LOOKUP_CHAIN=0` rescans the prompt every round.
+    ///
+    /// A lookup hit proposes `history[start + 1 ...]` verbatim. When the
+    /// verified emission then equals that proposal on its first `emitted`
+    /// tokens (the hit's own `Hit.ids` prefix is compared against the new
+    /// committed suffix, no prompt comparison needed), the next round's
+    /// unique continuation sits `emitted` positions further along the same
+    /// span: `newStart = start + emitted`. The rescan is skipped.
+    ///
+    /// The chain's continuation need not equal the rescan's chosen one (the
+    /// rescan may pick a longer alternative match on another span): a
+    /// proposal is a draft only. The target verifies every proposed id, so
+    /// the emitted stream is unchanged whichever span the proposal quotes;
+    /// only the hit's acceptance can differ, and a wrong continuation fails
+    /// the verifier, never the tokens. `match` is reported as `emitted`
+    /// (the proven run); it feeds only the log line.
+    static let chainEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_LOOKUP_CHAIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `DARKBLOOM_DFLASH_SPLICE_PROMPT_MEMO=0` re-uploads the prompt ids on
+    /// every splice.
+    ///
+    /// The fused splice's `promptIDs` operand is `history[0 ..< prompt]` as
+    /// int32: an O(prompt) host map plus a device upload on the engine
+    /// thread, rebuilt on every `override` call while the prompt prefix is
+    /// byte-identical across rounds. The array is kept under the same kind
+    /// of content key (prefix count + FNV-1a); a miss rebuilds it.
+    static let splicePromptMemoEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_SPLICE_PROMPT_MEMO"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// 64-bit FNV-1a over `history[0 ..< end]` (whole history when `end` is
+    /// nil). Host-side content key; never a hash of device data.
+    static func historyKey(_ history: [Int], end: Int? = nil) -> UInt64 {
+        let limit = end ?? history.count
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for i in 0 ..< limit {
+            var v = UInt64(bitPattern: Int64(truncatingIfNeeded: history[i]))
+            for _ in 0 ..< 4 {
+                hash ^= v & 0xffff
+                hash &*= 0x0000_0100_0000_01b3
+                v >>= 16
+            }
+        }
+        return hash
+    }
+
+    /// One-slot memo of `continuation`'s result: (count, prompt, depth,
+    /// suffix hash) -> the hit, or a stored miss (start < 0).
+    nonisolated(unsafe) private static var memoKey: (count: Int, prompt: Int, depth: Int, hash: UInt64)?
+    nonisolated(unsafe) private static var memoHit: Hit?
+    nonisolated(unsafe) private static var memoIsHit = false
+
+    /// The pending chain: the last host-lookup hit's continuation base (the
+    /// prompt index right after its matching span, where its proposed ids
+    /// start), its logged match length, and the history count and prompt it
+    /// was proposed at. Consumed by `chainedContinuation`, refreshed on
+    /// every continuation hit, cleared when a round's proposal did not come
+    /// from a host lookup (`noteProposal`, `host: false`).
+    nonisolated(unsafe) private static var pendingChain:
+        (base: Int, match: Int, historyCount: Int, prompt: Int)?
+
+    /// One-slot memo of the fused splice's `promptIDs` operand.
+    nonisolated(unsafe) private static var promptIDsKey: (prompt: Int, hash: UInt64)?
+    nonisolated(unsafe) private static var promptIDsMemo: MLXArray?
+
     static func noteProposal(_ id: CBv2RequestID, fromPrompt prompt: Bool, host: Bool = false) {
         guard enabled else { return }
         lock.withLock {
             if host { hostLookup.insert(id) } else { hostLookup.remove(id) }
+            if !host { pendingChain = nil }
             guard skipEnabled else { return }
             if prompt { fromPrompt.insert(id) } else { fromPrompt.remove(id) }
         }
@@ -176,9 +265,32 @@ enum CBv2PromptLookupDraft {
         }
         guard chosen >= 0 else { return nil }
         let ids = Array(history[(chosen + 1) ... (chosen + depth)])
+        if chainEnabled {
+            // The proposed ids are history[chosen + 1 ...], so the span's
+            // continuation base is chosen + 1 (see `continuation`).
+            pendingChain = (base: chosen + 1, match: 2, historyCount: count, prompt: prompt)
+        }
         FileHandle.standardError.write(
             Data("dflash2 first-round lookup: position=\(chosen) depth=\(depth), drafter skipped\n".utf8))
         return MLXArray(ids, [1, depth])
+    }
+
+    /// The fused and array splices' `promptIDs` operand: the prompt prefix
+    /// as int32, memoized on (prompt, prefix hash) while
+    /// `splicePromptMemoEnabled` holds. The prefix cannot change without the
+    /// hash changing, so a hit returns bitwise the same values.
+    static func promptIDsArray(history: [Int], prompt: Int) -> MLXArray {
+        if splicePromptMemoEnabled {
+            let key = (prompt: prompt, hash: historyKey(history, end: prompt))
+            if let promptIDsKey, let promptIDsMemo, promptIDsKey == key {
+                return promptIDsMemo
+            }
+            let built = MLXArray(history[0 ..< prompt].map { Int32($0) })
+            promptIDsKey = key
+            promptIDsMemo = built
+            return built
+        }
+        return MLXArray(history[0 ..< prompt].map { Int32($0) })
     }
 
     /// The next round's ids from the prompt, or nil (then the drafter runs).
@@ -367,7 +479,7 @@ enum CBv2PromptLookupDraft {
 
         if fusedSpliceEnabled && !spliceTrace && depth <= 256 {
             let block = drafted.reshaped([depth]).asType(.int32)
-            let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
+            let promptIDs = promptIDsArray(history: history, prompt: prompt)
             let anchored = spliceAnchorMinimum > 0 && spliceAnchorMinimum < minimum ? spliceAnchorMinimum : 0
             let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum), Int32(anchored)])
             let ranked = spliceScore(
@@ -432,7 +544,7 @@ enum CBv2PromptLookupDraft {
         let c = best - j * MLXArray(Int32(candidates))
         let steps = MLXArray((0 ..< depth).map { Int32($0) })
         let source = maximum(c + MLXArray(Int32(1)) + steps - j, MLXArray(Int32(0)))
-        let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
+        let promptIDs = promptIDsArray(history: history, prompt: prompt)
         let spliced = which(steps .< j, block, take(promptIDs, source, axis: 0))
         let proposal = which(fire, spliced, block).reshaped([1, depth]).asType(drafted.dtype)
         if spliceTrace {
@@ -466,7 +578,89 @@ enum CBv2PromptLookupDraft {
     /// The continuation has to lie entirely inside the prompt. Two prompt
     /// spans of the same length with different continuations are ambiguous,
     /// and this length is skipped rather than guessed.
+    ///
+    /// Three ways to the same answer, cheapest first:
+    /// - the chain: a prior hit's proposed ids were emitted verbatim, so the
+    ///   continuation sits `emitted` positions along the same span (its ids
+    ///   need not equal the rescan's chosen ones — the target verifies
+    ///   either way, so only the hit's acceptance rides on the choice);
+    /// - the memo: the same (history, prompt, depth) just scanned;
+    /// - the rescan (`scanContinuation`).
+    /// On a hit the memo and the pending chain are refreshed with the hit's
+    /// span base; on a miss both drop to the miss/stale state.
     static func continuation(history: [Int], promptLength: Int, depth: Int) -> Hit? {
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard enabled else { pendingChain = nil; return nil }
+        if chainEnabled, let chain = chainedContinuation(
+            history: history, count: count, prompt: prompt, depth: depth) {
+            return chain
+        }
+        if memoEnabled,
+            let key = memoKey,
+            key == (count: count, prompt: prompt, depth: depth,
+                    hash: historyKey(history))
+        {
+            if memoIsHit, let memoHit {
+                return memoHit
+            }
+            return nil
+        }
+        let scanned = scanContinuation(history: history, promptLength: promptLength, depth: depth)
+        if memoEnabled, count >= 1 {
+            memoKey = (count: count, prompt: prompt, depth: depth, hash: historyKey(history))
+            memoIsHit = scanned != nil
+            memoHit = scanned?.hit
+        }
+        if let scanned {
+            pendingChain = (
+                base: scanned.base, match: scanned.hit.match,
+                historyCount: count, prompt: prompt)
+        } else {
+            pendingChain = nil
+        }
+        return scanned?.hit
+    }
+
+    /// The chain's continuation (see `chainEnabled`): the new committed
+    /// suffix equals the pending hit's first `count - historyCount` tokens
+    /// (read straight out of the prompt, the same slice the hit proposed),
+    /// so the next span is that hit's own extended. Returns nil, and drops
+    /// the chain, on any disagreement — the rescan answers instead.
+    private static func chainedContinuation(
+        history: [Int], count: Int, prompt: Int, depth: Int
+    ) -> Hit? {
+        guard depth >= 1, let pending = pendingChain,
+            pending.prompt == prompt, count > pending.historyCount
+        else { return nil }
+        let emitted = count - pending.historyCount
+        let base = pending.base + emitted
+        guard base + depth <= prompt,
+            history[base - emitted ..< base]
+                .elementsEqual(history[count - emitted ..< count])
+        else {
+            pendingChain = nil
+            return nil
+        }
+        let hit = Hit(
+            match: pending.match + emitted,
+            ids: Array(history[base ..< (base + depth)]))
+        if memoEnabled {
+            memoKey = (count: count, prompt: prompt, depth: depth, hash: historyKey(history))
+            memoIsHit = true
+            memoHit = hit
+        }
+        pendingChain = (
+            base: base, match: hit.match, historyCount: count, prompt: prompt)
+        return hit
+    }
+
+    /// The rescan behind `continuation`. On a hit also returns the
+    /// continuation's base index in `history` (the position right after the
+    /// matching span), which the caller chains from.
+    private static func scanContinuation(
+        history: [Int], promptLength: Int, depth: Int
+    ) -> (hit: Hit, base: Int)? {
         let minimum = minimumMatch
         let count = history.count
         let prompt = min(max(promptLength, 0), count)
@@ -487,6 +681,7 @@ enum CBv2PromptLookupDraft {
             let lastStart = prompt - length - depth
             if lastStart < 0 { continue }
             var chosen: [Int]?
+            var chosenBase = 0
             var ambiguous = false
             var start = lastStart
             while start >= 0 {
@@ -510,12 +705,13 @@ enum CBv2PromptLookupDraft {
                             break
                         }
                         chosen = ids
+                        chosenBase = from
                     }
                 }
                 start -= 1
             }
             if let chosen, !ambiguous {
-                return Hit(match: length, ids: chosen)
+                return (Hit(match: length, ids: chosen), chosenBase)
             }
         }
         return nil
