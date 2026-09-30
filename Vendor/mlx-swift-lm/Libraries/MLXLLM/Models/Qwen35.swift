@@ -718,8 +718,9 @@ enum Qwen35GatedDeltaV3 {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          for (int i = 0; i < R; i += 4) {
+            *((device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0 + i)) =
+                float4(state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
           }
         }
         """
@@ -796,8 +797,9 @@ enum Qwen35GatedDeltaV3 {
             #pragma clang loop unroll(full)
             for (int d = 0; d < DVPL; ++d) {
               #pragma clang loop unroll(full)
-              for (int i = 0; i < R; ++i) {
-                state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+              for (int i = 0; i < R; i += 4) {
+                *((device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0 + i)) =
+                    float4(state[d][i], state[d][i + 1], state[d][i + 2], state[d][i + 3]);
               }
             }
             """

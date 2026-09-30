@@ -2041,6 +2041,46 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
+    // One constants slot and bounded element offsets; pointer types stay wide.
+    private static let sourceNarrowInt8ZooC1IO32: String? = {
+        let old = "constexpr int CD = PD < 2 ? 2 : PD;"
+        guard sourceNarrowInt8Zoo.components(separatedBy: old).count == 2,
+            sourceNarrowInt8Zoo.components(separatedBy: "size_t").count == 15
+        else { return nil }
+        return sourceNarrowInt8Zoo.replacingOccurrences(of: old, with: "constexpr int CD = 1;")
+            .replacingOccurrences(of: "size_t", with: "uint")
+    }()
+
+    // Two ascending groups per loop, using that same single constants slot.
+    private static let sourceNarrowInt8ZooC1U2IO32: String? = {
+        guard var source = sourceNarrowInt8ZooC1IO32 else { return nil }
+        for (old, new) in [("g += CD", "g += 2"), ("j < CD", "j < 2")] {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return source
+    }()
+
+    private static let kernelNarrowInt8ZooC1IO32 = sourceNarrowInt8ZooC1IO32.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1io32",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let kernelNarrowInt8ZooC1U2IO32 = sourceNarrowInt8ZooC1U2IO32.map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1u2io32",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static func narrowZooIO32Fits(k: Int, n: Int, m: Int) -> Bool {
+        guard m == 16, k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
+        let limit = Int(Int32.max)
+        return k <= limit / 16 && n <= limit / 16 && n <= limit / (k / 16)
+    }
+
     private static let kernelNarrowInt8Zoo = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8z",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -3253,13 +3293,15 @@ enum Qwen35TensorPackedMatmul {
         // built in registers from the plane copy (family `rb`, every tower
         // shape but the head).
         case rb = 70
+        case k32pd1C1IO32 = 76
+        case k32pd1C1U2IO32 = 77
 
         /// Words ring depth, columns per threadgroup, K per op.
         var pd: Int {
             switch self {
             case .v0, .pd1, .tn64, .k64pd1, .k32pd1, .w64k64pd1, .w64k32pd1, .aw64pd1, .pk32pd1,
                 .w128k32pd1, .g2k32pd1, .p4k16pd1, .p4k16x1, .p5k16pd1, .x4p4k16pd1, .csp4k16x2,
-                .i4p4k32pd1, .rb:
+                .i4p4k32pd1, .rb, .k32pd1C1IO32, .k32pd1C1U2IO32:
                 return 1
             case .pd2, .k64pd2, .k32pd2, .a128pd2, .a64pd2, .pk32pd2, .pk64pd2, .k16pd2, .pk16pd2,
                 .x4k32pd2, .x4k128pd2, .x2k32pd2, .x4p2k32pd2, .x2p2k32pd2, .csk32pd2, .csa128pd2,
@@ -3280,7 +3322,7 @@ enum Qwen35TensorPackedMatmul {
             switch self {
             case .k64pd1, .k64pd2, .k64pd3, .k64pd4, .w64k64pd1, .a64pd2, .aw64pd1, .pk64pd2: return 64
             case .k32pd1, .k32pd2, .k32pd4, .w64k32pd1, .pk32pd1, .pk32pd2, .w128k32pd1, .g2k32pd1,
-                .csk32pd2, .i4p4k32pd1:
+                .csk32pd2, .i4p4k32pd1, .k32pd1C1IO32, .k32pd1C1U2IO32:
                 return 32
             case .k16pd2, .k16pd4, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1, .csp4k16x2: return 16
             default: return 128
@@ -3289,7 +3331,7 @@ enum Qwen35TensorPackedMatmul {
         /// The zoo family (nil: the record's bodies and K3).
         var family: String? {
             switch self {
-            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4: return "k32"
+            case .k32pd1, .k32pd2, .k32pd4, .k16pd2, .k16pd4, .k32pd1C1IO32, .k32pd1C1U2IO32: return "k32"
             case .w64k64pd1, .w64k32pd1, .w128k32pd1: return "wide"
             case .a128pd2, .a64pd2, .aw64pd1: return "acoop"
             case .pk32pd1, .pk32pd2, .pk64pd2, .pk16pd2, .p4k16pd1, .p4k16x1, .p5k16pd1: return "pair"
@@ -4320,7 +4362,16 @@ enum Qwen35TensorPackedMatmul {
             }
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
-            let zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            let zooKernel: MLXFast.MLXFastKernel
+            if v == .k32pd1C1IO32, narrowZooIO32Fits(k: k, n: n, m: m),
+                let body = kernelNarrowInt8ZooC1IO32 {
+                zooKernel = body
+            } else if v == .k32pd1C1U2IO32, narrowZooIO32Fits(k: k, n: n, m: m),
+                let body = kernelNarrowInt8ZooC1U2IO32 {
+                zooKernel = body
+            } else {
+                zooKernel = v.derived.flatMap { kernelNarrowDerived[$0.index] } ?? kernelNarrowInt8Zoo
+            }
             return zooKernel(
                 inputs, template: zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)],
                 grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4435,10 +4486,15 @@ enum Qwen35TensorPackedMatmul {
     /// Zoo bodies in self-test order (the deadline cuts the last): the zoo's
     /// eleven, then zoo 2's eight.
     static let narrowZooVariants: [NarrowVariant] = [
+        .k32pd1C1IO32, .k32pd1C1U2IO32,
         .k32pd2, .pk32pd2, .w64k64pd1, .a128pd2, .k32pd4, .pk64pd2, .w64k32pd1, .a64pd2,
         .aw64pd1, .k32pd1, .pk32pd1,
         .p4k16pd1, .g2k32pd1, .k16pd2, .w128k32pd1, .p5k16pd1, .p4k16x1, .pk16pd2, .k16pd4,
-    ]
+    ].filter {
+        if $0 == .k32pd1C1IO32 { return kernelNarrowInt8ZooC1IO32 != nil }
+        if $0 == .k32pd1C1U2IO32 { return kernelNarrowInt8ZooC1U2IO32 != nil }
+        return true
+    }
 
     /// Zoo 3a's bodies (`NarrowVariant.xtg`), self-tested after the zoo's
     /// with a budget of their own, and also on every production shape but the
@@ -6114,6 +6170,12 @@ extension Qwen35TensorPackedMatmul {
     // The zoo bodies' fused forms (the head on a zoo body, zoo 2).
     private static let kernelNarrowInt8ZooTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8z_top2", sourceNarrowInt8Zoo, columns: "TN")
+    private static let kernelNarrowInt8ZooC1IO32Top2 = sourceNarrowInt8ZooC1IO32.flatMap {
+        headTop2Kernel("bonsai_tensor_packed_matmul_m16_i8zc1io32_top2", $0, columns: "TN")
+    }
+    private static let kernelNarrowInt8ZooC1U2IO32Top2 = sourceNarrowInt8ZooC1U2IO32.flatMap {
+        headTop2Kernel("bonsai_tensor_packed_matmul_m16_i8zc1u2io32_top2", $0, columns: "TN")
+    }
     private static let kernelNarrowInt8PairTop2 = headTop2Kernel(
         "bonsai_tensor_packed_matmul_m16_i8x_top2", sourceNarrowInt8Pair, columns: "32")
     private static let kernelNarrowInt8Zoo2Top2 = headTop2Kernel(
@@ -6193,7 +6255,13 @@ extension Qwen35TensorPackedMatmul {
                 t = zooTemplate + [("PD", v.pd), ("KH", v.kh)]
                 (grid, threads) = ((n / 32 * 256, 1, 1), 256)
             } else {
-                launch = kernelNarrowInt8ZooTop2
+                if v == .k32pd1C1IO32 || v == .k32pd1C1U2IO32 {
+                    guard narrowZooIO32Fits(k: k, n: n, m: m) else { return nil }
+                    launch = v == .k32pd1C1IO32
+                        ? kernelNarrowInt8ZooC1IO32Top2 : kernelNarrowInt8ZooC1U2IO32Top2
+                } else {
+                    launch = kernelNarrowInt8ZooTop2
+                }
                 t = zooTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh), ("AM", v.am)]
             }
             guard let launch else { return nil }
