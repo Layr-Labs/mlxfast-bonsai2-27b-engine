@@ -2635,11 +2635,6 @@ enum Qwen35RotationQ8Blocks {
 /// mismatch or an MLX error keeps the stock launch. The fold's own self-test
 /// then runs through this launch too. `BONSAI_PREWORK_VSPLIT=0` keeps the
 /// stock launch.
-///
-/// The launch takes this kernel's 32-bit twin (`fastSource`) where its own
-/// self-test passed for the dtype: the same text with 32-bit element offsets,
-/// every expression and order unchanged (M4, T 16, serialized: 29.3 -> 23.4
-/// us). `BONSAI_GDN_PREWORK_FAST=0` keeps the 64-bit text.
 enum Qwen35PreworkSplit {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_PREWORK_VSPLIT"]?
@@ -2850,71 +2845,8 @@ enum Qwen35PreworkSplit {
         source: Qwen35IO32.narrow(source, count: 37, "qwen35_gdn_prework_verify_lf_bafold_vsplit"),
         ensureRowContiguous: false)
 
-    static let fastEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_FAST"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    // `source` with its 37 size_t and 32 int64_t as uint and its 17 stride
-    // reads (not the float4 test's) as uint(...); nil if a count moved. It
-    // runs only where every element offset is below 2^31: B and S at most 16
-    // (the launch checks), KS at most 16, each stride, as unsigned (a
-    // negative one fails), under its cap. Else the launch runs `source`.
-    private static let fastSource: String? = {
-        guard let reads = try? NSRegularExpression(pattern: #"(\w+_strides\[\d\])(?! ==)"#)
-        else { return nil }
-        let all = NSRange(source.startIndex..., in: source)
-        guard source.components(separatedBy: "size_t").count == 38,
-            source.components(separatedBy: "int64_t").count == 33,
-            reads.numberOfMatches(in: source, range: all) == 17
-        else { return nil }
-        let narrow = reads.stringByReplacingMatches(
-            in: source, range: all, withTemplate: "uint($1)"
-        ).replacingOccurrences(of: "size_t", with: "uint")
-            .replacingOccurrences(of: "int64_t", with: "uint")
-        return """
-            const bool fits32 = (KS <= 16)
-                & (ulong(qkv_strides[0]) <= (1ul << 26)) & (ulong(qkv_strides[1]) <= (1ul << 26))
-                & (ulong(qkv_strides[2]) <= (1ul << 26) / CD)
-                & (ulong(cs_strides[0]) <= (1ul << 26)) & (ulong(cs_strides[1]) <= (1ul << 26))
-                & (ulong(cs_strides[2]) <= (1ul << 26) / CD)
-                & (ulong(w_strides[0]) <= (1ul << 29) / CD) & (ulong(w_strides[1]) <= (1ul << 29) / KS)
-                & (ulong(abp_strides[0]) <= (1ul << 29) / KSP) & (ulong(abp_strides[1]) <= (1ul << 26))
-                & (ulong(abp_strides[2]) <= (1ul << 29) / (AOFF + BOFF + HV))
-                & (ulong(wq_strides[0]) <= (1ul << 30) / DK) & (ulong(wk_strides[0]) <= (1ul << 30) / DK)
-                & (ulong(dtb_strides[0]) <= (1ul << 30) / HV) & (ulong(decay_strides[0]) <= (1ul << 30) / HV);
-            if (fits32) {
-            \(narrow)
-            } else {
-            \(source)
-            }
-            """
-    }()
-
-    private static let fastKernel: MLXFast.MLXFastKernel? = fastSource.map {
-        MLXFast.metalKernel(
-            name: "qwen35_gdn_prework_verify_lf_bafold_vsplit32",
-            inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"],
-            outputNames: ["q", "k", "v", "g", "beta", "ci", "ao", "bo"],
-            source: $0, ensureRowContiguous: false)
-    }
-
-    /// Fewer than 2^31 elements, checked by division.
-    private static func fits32(_ shape: [Int]) -> Bool {
-        var n = 1
-        for d in shape {
-            guard d >= 0, d == 0 || n <= Int(Int32.max) / d else { return false }
-            n *= d
-        }
-        return true
-    }
-
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
-    nonisolated(unsafe) private static var fastVerdicts: [String: Bool] = [:]
-    /// Set while the twin's self-test runs the 64-bit text.
-    nonisolated(unsafe) private static var forceWide = false
     nonisolated(unsafe) private static var prepared: Set<String> = []
     /// Set while the self-test runs the stock launch through the fold.
     nonisolated(unsafe) private static var forceStock = false
@@ -2928,10 +2860,7 @@ enum Qwen35PreworkSplit {
         guard enabled, !forceStock, keyHeads > 0, valueHeads % keyHeads == 0,
             lock.withLock({ verdicts["\(dtype)"] ?? false })
         else { return nil }
-        let fast =
-            !forceWide && B * S <= 16 && lock.withLock({ fastVerdicts["\(dtype)"] ?? false })
-            && outputShapes.allSatisfy(fits32)
-        return ((fast ? fastKernel : nil) ?? kernel)(
+        return kernel(
             inputs, template: template,
             grid: (128 * 2 * keyHeads, S, B), threadGroup: (128, 1, 1),
             outputShapes: outputShapes,
@@ -3054,115 +2983,6 @@ enum Qwen35PreworkSplit {
         FileHandle.standardError.write(
             ("qwen35 GDN verify prework, value threadgroups apart: self-test "
                 + report.joined(separator: "; ") + "\n").data(using: .utf8)!)
-        fastSelfTest(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden)
-    }
-
-    /// The twin against the 64-bit text, every output bit, per dtype that
-    /// passed above, at 16, 9 and 3 rows on four operand forms: fresh; a tail
-    /// view conv state, strided conv weights and partials sliced from a wider
-    /// product; qkv with a negative column stride (the 64-bit branch); edge
-    /// values (+-inf partials, no sum mixing signs; 6e4 and zero qkv blocks).
-    /// A mismatch or an MLX error keeps the 64-bit text for the dtype. The
-    /// fold's self-test then runs through the twin too.
-    private static func fastSelfTest(hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, hidden: Int) {
-        guard fastEnabled, fastKernel != nil else { return }
-        var report: [String] = []
-        for dtype in [DType.float32, .float16] where lock.withLock({ verdicts["\(dtype)"] ?? false }) {
-            var n = [0, 0, 0, 0]  // values, mismatches, inf, NaN
-            var detail = ""
-            lock.withLock { fastVerdicts["\(dtype)"] = true }
-            do {
-                try withError { error in
-                    for S in [16, 9, 3] {
-                        for form in 0 ..< 4 {
-                            let (counts, values) = try fastCase(
-                                hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden, S: S, form: form,
-                                dtype: dtype)
-                            eval(counts)
-                            try error.check()
-                            let c = counts.asArray(Int32.self)
-                            n = [n[0] + values, n[1] + Int(c[0]), n[2] + Int(c[1]), n[3] + Int(c[2])]
-                        }
-                    }
-                }
-            } catch {
-                detail = " (\(error))"
-                n[1] = max(n[1], 1)
-            }
-            lock.withLock { fastVerdicts["\(dtype)"] = n[1] == 0 }
-            report.append(
-                "\(dtype): \(n[1] == 0 ? "passed" : "FAILED") (\(n[0]) values, \(n[1]) mismatches, "
-                    + "\(n[2]) inf, \(n[3]) NaN\(detail))")
-        }
-        Memory.clearCache()
-        FileHandle.standardError.write(
-            ("qwen35 GDN verify prework, 32-bit offsets: self-test " + report.joined(separator: "; ")
-                + "\n").data(using: .utf8)!)
-    }
-
-    /// One `fastSelfTest` case: [mismatches, inf, NaN] (of the 64-bit
-    /// outputs) and the value count.
-    private static func fastCase(
-        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, hidden: Int, S: Int, form: Int, dtype: DType
-    ) throws -> (MLXArray, Int) {
-        let cd = 2 * hk * dk + hv * dv
-        let width = cd + hv * dv
-        let nab = 2 * hv
-        let keys = MLXRandom.split(key: MLXRandom.key(0x7077_3332), into: 8)
-        func normal(_ shape: [Int], _ i: Int) -> MLXArray { MLXRandom.normal(shape, key: keys[i]) }
-        let x = normal([1, S, hidden], 0)
-        guard var abp = Qwen35SmallNMatmul.partials(x, normal([nab, hidden], 1) * Float(0.02))?.part
-        else { throw SelfTestFailure.message("no partials") }
-        var stack = normal([1, S, width], 2) * exp(normal([1, S, width], 3))
-        if form == 1 { abp = concatenated([abp, abp], axis: 2)[0..., 0..., ..<nab] }
-        if form == 3 {
-            let flat = MLXArray(0 ..< abp.size).reshaped(abp.shape)
-            for (f, v) in [
-                (hv, Float.infinity), (5 * S * nab + nab + hv + 1, -Float.infinity),
-                (2 * S * nab + 2 * nab + 2, Float.infinity), (7 * S * nab + 3, -Float.infinity),
-            ] {
-                abp = which(flat .== MLXArray(f), MLXArray(v), abp)
-            }
-            let col = MLXArray(0 ..< width).reshaped([1, 1, width])
-            func band(_ lo: Int, _ n: Int) -> MLXArray { (col .>= MLXArray(lo)) .&& (col .< MLXArray(lo + n)) }
-            stack = which(
-                band(dk, dk) .|| band(hk * dk + dk, dk), MLXArray(Float(0)),
-                which(band(2 * hk * dk, dv) .|| band(2 * dk, dk), sign(stack) * Float(6e4), stack))
-        }
-        let typed = stack.asType(dtype)
-        let norms = normal([2, dk], 7) * Float(0.3) + Float(1)
-        let inputs = [
-            (form == 2 ? typed[0..., 0..., .stride(by: -1)] : typed)[.ellipsis, ..<cd],
-            form == 1 ? normal([1, S + ks - 1, cd], 4)[0..., S..., 0...] : normal([1, ks - 1, cd], 4),
-            form == 1
-                ? (normal([cd, 2 * ks, 1], 5) * Float(0.5))[0..., .stride(by: 2), 0...]
-                : normal([cd, ks, 1], 5) * Float(0.5),
-            abp, Qwen35GDNDerived().decay(normal([hv], 6) * Float(0.5)), normal([hv], 7), norms[0], norms[1],
-            MLXArray(Int32(S)),
-        ]
-        let template: [(String, any KernelTemplateArg)] = [
-            ("InT", dtype), ("HK", hk), ("HV", hv), ("DK", dk), ("DV", dv), ("CD", cd), ("KS", ks),
-            ("KSP", abp.dim(0)), ("AOFF", hv), ("BOFF", 0),
-        ]
-        let shapes = [
-            [1, S, hk, dk], [1, S, hk, dk], [1, S, hv, dv], [1, S, hv], [1, S, hv], [1, ks - 1 + S, cd],
-            [1, S, hv], [1, S, hv],
-        ]
-        func run(wide: Bool) -> [MLXArray]? {
-            forceWide = wide
-            defer { forceWide = false }
-            return launch(
-                inputs, template: template, keyHeads: hk, valueHeads: hv, S: S, B: 1, outputShapes: shapes,
-                dtype: dtype)
-        }
-        guard let ref = run(wide: true), let new = run(wide: false) else {
-            throw SelfTestFailure.message("a launch declined")
-        }
-        let counts = [
-            zip(ref, new).map { ($0.view(dtype: .uint32) .!= $1.view(dtype: .uint32)).asType(.int32).sum() },
-            ref.map { isInf($0).asType(.int32).sum() }, ref.map { isNaN($0).asType(.int32).sum() },
-        ]
-        return (stacked(counts.map { stacked($0).sum() }), ref.reduce(0) { $0 + $1.size })
     }
 }
 
