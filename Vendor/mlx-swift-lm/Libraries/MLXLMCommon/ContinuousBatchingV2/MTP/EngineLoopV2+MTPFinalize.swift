@@ -2,26 +2,10 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
-import Cmlx
 import Foundation
 import MLX
 
 extension EngineLoopV2 {
-
-    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
-    /// event instead of polling it. Ported from ercumentyildirim's `cc0895d`
-    /// (run on the ranked box inside that submission): the step thread polls
-    /// an already-submitted packet so it wakes the instant the verify
-    /// finishes and stays on a clocked-up core for the finalize and the next
-    /// graph build, which sit on the GPU's critical path; the blocking read
-    /// below then returns at once. The spin is DEADLINE-BOUNDED: on a path
-    /// where the packet's graph was never submitted for evaluation, polling
-    /// could never become ready, so after a quarter of a second the poll
-    /// falls through to the blocking read, which forces the evaluation
-    /// exactly as the base does. No GPU work is added and no ordering
-    /// changes; outputs are bit-identical.
-    static let pollsAcceptancePacket: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -82,10 +66,12 @@ extension EngineLoopV2 {
         guard Self.submitsCommittedRecurrentStateEarly,
             let snapshot = recurrentStates[id]?.confirmedStateSnapshot()
         else { return }
-        let arrays = snapshot.keys.sorted().flatMap { index -> [MLXArray] in
-            let layer = snapshot[index]!
-            if layer.deferredReplay?.isPending == true { return [] }
-            return [layer.conv, layer.ssm].compactMap { $0 }
+        var arrays = [MLXArray]()
+        arrays.reserveCapacity(snapshot.count * 2)
+        for layer in snapshot.values {
+            if layer.deferredReplay?.isPending == true { continue }
+            if let conv = layer.conv { arrays.append(conv) }
+            if let ssm = layer.ssm { arrays.append(ssm) }
         }
         if !arrays.isEmpty { asyncEval(arrays) }
     }
@@ -182,19 +168,6 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
-        if Self.pollsAcceptancePacket {
-            // Deadline-bounded poll (see `pollsAcceptancePacket`). The
-            // common path's packet is already submitted with the round
-            // graph, so this returns the moment its kernels complete; the
-            // bound only guards the never-submitted corner.
-            let pollDeadline = CFAbsoluteTimeGetCurrent() + 0.25
-            var available = false
-            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
-                !available
-            {
-                if CFAbsoluteTimeGetCurrent() > pollDeadline { break }
-            }
-        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
@@ -265,14 +238,17 @@ extension EngineLoopV2 {
                     accepted: accepted))
         }
 
-        round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
+        round.finalizedVerifyIDs = outcomes.count == 1 ? [outcomes[0].metadata.id] : Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
             finalizedVerifyIDs: round.finalizedVerifyIDs,
             measurement: step.mtpMeasurement)
 
         if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
+            let stepAccepted =
+                outcomes.count == 1
+                ? min(outcomes[0].accepted, commonEmitted)
+                : (outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0)
             let observedDrafts =
                 commonEmitted <= stepAccepted
                 ? commonEmitted : min(k, stepAccepted + 1)
@@ -297,6 +273,7 @@ extension EngineLoopV2 {
             let detokenizer = detokenizers[id]
             let hasStopStrings = !rec.request.stopStrings.isEmpty
             var kept: [Int] = []
+            kept.reserveCapacity(emitted.count)
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
             for token in emitted {
@@ -321,9 +298,15 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
-            round.committedVerifyTokenCount += kept.filter {
-                !rec.request.stopTokens.contains($0)
-            }.count
+            if rec.request.stopTokens.isEmpty {
+                round.committedVerifyTokenCount += confirmed
+            } else {
+                var valid = 0
+                for token in kept where !rec.request.stopTokens.contains(token) {
+                    valid += 1
+                }
+                round.committedVerifyTokenCount += valid
+            }
             for packet in verify.diagnostics where packet.requestID == id {
                 let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
                 packet.reconcile(
@@ -488,7 +471,8 @@ extension EngineLoopV2 {
                 // drafter's cache is untouched and the context rows
                 // `finalizeRound` just queued stay pending for the next block.
                 let promptProposal =
-                    adoptedProposal == nil && CBv2PromptLookupDraft.expectsPromptProposal(id)
+                    adoptedProposal == nil
+                    && (CBv2PromptLookupDraft.expectsPromptProposal(id) || CBv2PromptLookupDraft.skipEnabled)
                     ? CBv2PromptLookupDraft.lookup(
                         history: rec.tokens, promptLength: rec.request.promptTokens.count,
                         depth: k)
