@@ -109,11 +109,22 @@ enum Qwen35TensorPackedMatmul {
             acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
           }
         }
+        // v0..v3 are the same four accumulator columns the scalar loop wrote one at
+        // a time: c = i & 3 steps 0..3 across the group, while mm (bits 2 and 4 of i)
+        // and nh (bit 3) are constant inside it, so the four addresses are contiguous.
+        // nb = n0 + 16 * (sg & 1) + fn is a multiple of 4 (n0 = tgid.x * 64 and fn is
+        // a multiple of 4) and N is a multiple of 64 (the grid is (N / 64 * 128, ..)),
+        // so the group base is 4-aligned for float4 and half4.
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          } else {
+            *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
+          }
         }
         """
 
@@ -6377,7 +6388,7 @@ extension Qwen35TensorPackedMatmul {
     private static let headTop2Insert = """
         {
                       // TOP2: the four columns enter this lane's top two of the row.
-                      const uint ht2col = uint(base - (size_t)(fm + 8 * mh) * (size_t)N);
+                      const uint ht2col = uint(base - (uint)(fm + 8 * mh) * (uint)N);
                       bonsai_head_top2_insert(ht2[mh], v0, ht2col);
                       bonsai_head_top2_insert(ht2[mh], v1, ht2col + 1u);
                       bonsai_head_top2_insert(ht2[mh], v2, ht2col + 2u);
@@ -6403,11 +6414,9 @@ extension Qwen35TensorPackedMatmul {
             const int ht2block = n0 / (HT2COLS);
             #pragma clang loop unroll(full)
             for (int mh = 0; mh < 2; mh++) {
-              const size_t o = ((size_t)(fm + 8 * mh) * (size_t)ht2blocks + (size_t)ht2block) * 2;
-              top_ids[o] = int(ht2[mh].first_id);
-              top_ids[o + 1] = int(ht2[mh].second_id);
-              top_values[o] = ht2[mh].first_value;
-              top_values[o + 1] = ht2[mh].second_value;
+              const uint o = (uint(fm + 8 * mh) * uint(ht2blocks) + uint(ht2block)) * 2u;
+              *(device int2*)(top_ids + o) = int2(int(ht2[mh].first_id), int(ht2[mh].second_id));
+              *(device float2*)(top_values + o) = float2(ht2[mh].first_value, ht2[mh].second_value);
             }
           }
         }
@@ -6492,19 +6501,20 @@ extension Qwen35TensorPackedMatmul {
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
             bonsai_head_top2 st = bonsai_head_top2_empty();
-            for (uint b = lane; b < blocks; b += 32) {
-              const size_t o = (size_t(row) * size_t(blocks) + size_t(b)) * 2;
-              bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
-              bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+            const uint row_base = (row * blocks) * 2u;
+            for (uint b = lane; b < blocks; b += 32u) {
+              const uint o = row_base + b * 2u;
+              const float2 pv = *(const device float2*)(pval + o);
+              const uint2 pi = *(const device uint2*)(pid + o);
+              bonsai_head_top2_insert(st, pv.x, pi.x);
+              bonsai_head_top2_insert(st, pv.y, pi.y);
             }
             for (ushort m = 16; m > 0; m >>= 1) {
               bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
             }
             if (lane == 0) {
-              top_ids[row * 2] = int(st.first_id);
-              top_ids[row * 2 + 1] = int(st.second_id);
-              top_values[row * 2] = st.first_value;
-              top_values[row * 2 + 1] = st.second_value;
+              *(device int2*)(top_ids + row * 2) = int2(int(st.first_id), int(st.second_id));
+              *(device float2*)(top_values + row * 2) = float2(st.first_value, st.second_value);
             }
             """,
         header: headTop2Header,
