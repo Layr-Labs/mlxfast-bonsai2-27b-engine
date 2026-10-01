@@ -5804,7 +5804,22 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            hiddenStates = hiddenStates + p
+            // The capture's final residual, norm and head rotation use the
+            // same boundary tuple as the interior verify boundaries.
+            if captureRecurrentWindow, !exactTargetVerify,
+                hiddenStates.shape == [1, 16, Qwen35FusedBoundaryQ8.width],
+                let head = dFlash2Tap.head,
+                ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+                sharedHadamardTensorRouteTakesNarrowInt8([head], rows: 16),
+                let boundary = Qwen35FusedBoundaryQ8.apply(
+                    hiddenStates, p, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
+                    transform: head.transform, gainSigned: false, writeNormed: false)
+            {
+                hiddenStates = boundary.h
+                dFlash2Tap.headInput = (boundary.h, boundary.activation)
+            } else {
+                hiddenStates = hiddenStates + p
+            }
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -6446,6 +6461,33 @@ enum Qwen35GDNPrework {
 /// (a disagreeing device keeps the op chain). `BONSAI_FUSED_ATTN_PREWORK=0`
 /// keeps the op chain.
 enum Qwen35AttentionPrework {
+    private struct ScalarKey: Equatable {
+        let epsQ: UInt32
+        let epsK: UInt32
+        let dimension: UInt32
+        let log2Base: UInt32
+    }
+
+    private static let scalarLock = NSLock()
+    nonisolated(unsafe) private static var lastScalars:
+        (ScalarKey, (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray))?
+
+    static func scalarInputs(epsQ: Float, epsK: Float, D: Int, ropeBase: Float)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)
+    {
+        let dimension = UInt32(D)
+        let log2Base = log2(ropeBase)
+        let key = ScalarKey(epsQ: epsQ.bitPattern, epsK: epsK.bitPattern,
+            dimension: dimension, log2Base: log2Base.bitPattern)
+        scalarLock.lock()
+        defer { scalarLock.unlock() }
+        if let (previous, inputs) = lastScalars, previous == key { return inputs }
+        let inputs = (MLXArray(epsQ), MLXArray(epsK), MLXArray(dimension),
+            MLXArray(log2Base), MLXArray(Float(1)))
+        lastScalars = (key, inputs)
+        return inputs
+    }
+
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_ATTN_PREWORK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -6470,7 +6512,7 @@ enum Qwen35AttentionPrework {
         const bool isq = hh < uint(HQ);
         const uint h = isq ? hh : hh - uint(HQ);
 
-        threadgroup float local_sums[32];
+        threadgroup float local_sums[D / 128];
         threadgroup float local_inv[1];
         threadgroup float rot[RD];
 
@@ -6487,16 +6529,12 @@ enum Qwen35AttentionPrework {
           acc += thread_x[i] * thread_x[i];
         }
         acc = simd_sum(acc);
-        if (sg == 0) {
-          local_sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
           local_sums[sg] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          acc = simd_sum(local_sums[lane]);
+          acc = simd_sum(lane < uint(D / 128) ? local_sums[lane] : 0.0f);
           if (lane == 0) {
             const float eps = isq ? epsq : epsk;
             local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
@@ -6579,9 +6617,9 @@ enum Qwen35AttentionPrework {
             L > 0, L < 65536
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -6690,6 +6728,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6727,7 +6767,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
@@ -6771,9 +6811,9 @@ extension Qwen35AttentionPrework {
             offsets.dtype == .int32, offsets.ndim <= 1, offsets.size == 1 || offsets.size == B
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -7475,6 +7515,7 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
+        Qwen35RotationQ8Blocks.installPadded()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7612,7 +7653,7 @@ enum Qwen35FusedHadamard {
                 guard x.shape == gate.shape, weight.dtype == .float32, weight.ndim == 1,
                     weight.dim(0) == 128
                 else { return nil }
-                a = x; b = gate; w = weight; eps = MLXArray([epsilon]); prod = 3
+                a = x; b = gate; w = weight; eps = Qwen35GatedNormTail.epsilonInput(epsilon); prod = 3
             case .sigmoidGateRowBlocks(let blocks, let gate):
                 return rowBlockActivation(
                     blocks: blocks, gate: gate, signs: signs, gdnLayout: gdnLayout)
@@ -9391,6 +9432,21 @@ extension Qwen35FusedBoundaryQ8 {
 /// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
 /// too.
 enum Qwen35GatedNormTail {
+    nonisolated(unsafe) private static let defaultEpsilonInput = MLXArray([Float(1e-6)])
+    private static let epsilonLock = NSLock()
+    nonisolated(unsafe) private static var lastEpsilon: (UInt32, MLXArray)?
+
+    static func epsilonInput(_ epsilon: Float) -> MLXArray {
+        let bits = epsilon.bitPattern
+        if bits == Float(1e-6).bitPattern { return defaultEpsilonInput }
+        return epsilonLock.withLock {
+            if let (previous, input) = lastEpsilon, previous == bits { return input }
+            let input = MLXArray([epsilon])
+            lastEpsilon = (bits, input)
+            return input
+        }
+    }
+
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -9475,7 +9531,7 @@ enum Qwen35GatedNormTail {
         let rows = x.dim(0) * x.dim(1)
         let heads = x.dim(2)
         return kernel(
-            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            [x, z, weight, epsilonInput(eps), signs.reshaped(-1)],
             template: [("H", heads), ("InZ", z.dtype)],
             grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
@@ -10149,26 +10205,170 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        let fusedHead =
+            !model.exactTargetVerify && tokens.shape == [1, 16]
+            ? (lmHead as? HadamardQuantizedLinear).flatMap {
+                Qwen35HeadBoundary.verified($0, norm: model.norm) ? $0 : nil
+            } : nil
+        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (fusedHead, nil)
+        defer { (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (nil, nil) }
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
             captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
+        let headInput = model.dFlash2Tap.headInput
+        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (nil, nil)
         let logits: MLXArray
         if let lmHead {
             // The head's fused top two rides beside the lazy logits where the
             // int8 route takes the rows and it is on (`Qwen35HeadTopTwo`).
-            logits = model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : Qwen35HeadTopTwo.capture { lmHead(normalized) }
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
+            if model.exactTargetVerify {
+                logits = qwen35A3BExactW4G64Projection(lmHead, model.norm(hidden))
+            } else {
+                logits = Qwen35HeadTopTwo.capture {
+                    if let fusedHead, let input = headInput, input.h === hidden,
+                        let routed = sharedHadamardProjectionsQuantized(
+                            input.activation, leading: Array(hidden.shape.dropLast()), [fusedHead])
+                    {
+                        return routed[0]
+                    }
+                    return lmHead(model.norm(hidden))
+                }
             }
         } else {
-            logits = model.embedTokens.asLinear(normalized)
+            let normalized = model.norm(hidden)
+            if model.exactTargetVerify, normalized.dim(1) > 1 {
+                logits = qwen35A3BTimewiseProjection(normalized) {
+                    model.embedTokens.asLinear($0)
+                }
+            } else {
+                logits = model.embedTokens.asLinear(normalized)
+            }
         }
         return (logits, hidden)
+    }
+}
+
+/// Final capture boundary: actual head/norm admission before any call uses
+/// the tuple. `BONSAI_VERIFY_HEAD_BOUNDARY=0` keeps the composed path. The
+/// immutable loaded tensors own each bounded, weak verdict; no hidden state
+/// or synthetic logit remains cached. This does not select a matmul form.
+enum Qwen35HeadBoundary {
+    private static let lock = NSLock()
+    private static let enabled: Bool = {
+        let v = ProcessInfo.processInfo.environment["BONSAI_VERIFY_HEAD_BOUNDARY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(v ?? "")
+    }()
+    private struct Key: Hashable {
+        let ids: [ObjectIdentifier]
+        let eps: UInt32
+    }
+    private final class WeakOwner {
+        weak var owner: AnyObject?
+        init(_ owner: AnyObject) { self.owner = owner }
+    }
+    private struct Entry {
+        let owners: [WeakOwner]
+        let passed: Bool
+        func matches(_ current: [AnyObject]) -> Bool {
+            owners.count == current.count
+                && zip(owners, current).allSatisfy { $0.0.owner === $0.1 }
+        }
+    }
+    nonisolated(unsafe) private static var verdicts: [Key: Entry] = [:]
+
+    static func verified(_ head: HadamardQuantizedLinear, norm: RMSNorm) -> Bool {
+        let width = Qwen35FusedBoundaryQ8.width
+        guard enabled, !Qwen35HeadTopTwo.capturing,
+            ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            norm.weight.dtype == .float32, norm.weight.shape == [width],
+            head.transform.width == width, head.transform.blockSize == 1024,
+            sharedHadamardTensorRouteTakesNarrowInt8([head], rows: 16)
+        else { return false }
+        var owners: [AnyObject] = [head, norm, head.weight, head.scales,
+            norm.weight, head.transform.signVector]
+        if let b = head.biases { owners.append(b) }
+        if let b = head.bias { owners.append(b) }
+        let key = Key(ids: owners.map { ObjectIdentifier($0) }, eps: norm.eps.bitPattern)
+        return lock.withLock {
+            if let cached = verdicts[key], cached.matches(owners) { return cached.passed }
+            var same = false
+            do {
+                try withError { error in
+                    let shape = [1, 16, width]
+                    let keys = MLXRandom.split(key: MLXRandom.key(0x6862_6f75), into: 3)
+                    let a = MLXRandom.normal(shape, key: keys[0])
+                    let b = MLXRandom.normal(shape, key: keys[1])
+                    let rowScale = MLXRandom.uniform(
+                        Float(0.01) ..< Float(8), [1, 16, 1], key: keys[2])
+                    for pattern in 0 ..< 3 {
+                        let x: MLXArray, r: MLXArray
+                        if pattern == 0 {
+                            x = (a * 2).asType(.float16)
+                            r = (b * rowScale).asType(.float16)
+                        } else if pattern == 1 {
+                            x = (a * 128).asType(.float16)
+                            r = (b * Float(0.03125)).asType(.float16)
+                        } else {
+                            x = (MLXArray.zeros(shape, dtype: .float16) * Float(-1))
+                                .asType(.float16)
+                            r = MLXArray.zeros(shape, dtype: .float16)
+                        }
+                        let h = x + r
+                        let normalized = norm(h)
+                        let reference = head(normalized)
+                        guard normalized.dtype == .float32,
+                            let original = head.transform.forwardInt8(
+                                normalized.reshaped(16, width), gdnLayout: nil,
+                                preSigned: false, groupSize: 128),
+                            let boundary = Qwen35FusedBoundaryQ8.apply(
+                                x, r, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
+                                transform: head.transform, gainSigned: false, writeNormed: false),
+                            let fused = sharedHadamardProjectionsQuantized(
+                                boundary.activation, leading: [1, 16], [head])?.first,
+                            fused.shape == reference.shape, fused.dtype == .float32,
+                            reference.dtype == .float32, boundary.h.shape == h.shape,
+                            boundary.h.dtype == .float16, h.dtype == .float16,
+                            original.codes.dtype == boundary.activation.codes.dtype,
+                            [.uint8, .int8].contains(original.codes.dtype),
+                            original.codes.shape == [16, width],
+                            boundary.activation.codes.shape == original.codes.shape,
+                            original.scales.dtype == .float32,
+                            boundary.activation.scales.dtype == .float32,
+                            original.scaledSums.dtype == .float32,
+                            boundary.activation.scaledSums.dtype == .float32,
+                            original.scales.shape == [16, width / 128],
+                            original.scaledSums.shape == original.scales.shape,
+                            boundary.activation.scales.shape == original.scales.shape,
+                            boundary.activation.scaledSums.shape == original.scaledSums.shape
+                        else { return }
+                        let checks = [
+                            all(boundary.h.view(dtype: .uint16) .== h.view(dtype: .uint16)),
+                            all(boundary.activation.codes.view(dtype: .uint8)
+                                .== original.codes.view(dtype: .uint8)),
+                            all(boundary.activation.scales.view(dtype: .uint32)
+                                .== original.scales.view(dtype: .uint32)),
+                            all(boundary.activation.scaledSums.view(dtype: .uint32)
+                                .== original.scaledSums.view(dtype: .uint32)),
+                            all(fused.view(dtype: .uint32) .== reference.view(dtype: .uint32)),
+                        ]
+                        eval(checks)
+                        guard checks.allSatisfy({ $0.item(Bool.self) }) else { return }
+                        try error.check()
+                    }
+                    same = true
+                    try error.check()
+                }
+            } catch { same = false }
+            verdicts = verdicts.filter { $0.value.owners.allSatisfy { $0.owner != nil } }
+            if verdicts.count >= 32 { verdicts.removeAll(keepingCapacity: true) }
+            verdicts[key] = Entry(owners: owners.map { WeakOwner($0) }, passed: same)
+            FileHandle.standardError.write(Data(("bonsai verify head boundary: "
+                + (same ? "actual head/norm h, Q8 tuple and 16-row raw logits bitwise; fused\n"
+                    : "admission failed; composed final norm kept\n")).utf8))
+            return same
+        }
     }
 }
 

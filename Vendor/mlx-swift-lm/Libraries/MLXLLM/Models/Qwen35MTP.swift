@@ -1214,7 +1214,7 @@ enum Qwen35AttentionPreworkKV {
         const int Ln = int(q_shape[1]);
         const int64_t row = int64_t(wr) + int64_t(t);
 
-        threadgroup float local_sums[32];
+        threadgroup float local_sums[D / 128];
         threadgroup float local_inv[1];
         threadgroup float rot[RD];
 
@@ -1248,16 +1248,12 @@ enum Qwen35AttentionPreworkKV {
           acc += thread_x[i] * thread_x[i];
         }
         acc = simd_sum(acc);
-        if (sg == 0) {
-          local_sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
           local_sums[sg] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          acc = simd_sum(local_sums[lane]);
+          acc = simd_sum(lane < uint(D / 128) ? local_sums[lane] : 0.0f);
           if (lane == 0) {
             const float eps = isq ? epsq : epsk;
             local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
@@ -1361,6 +1357,7 @@ enum Qwen35AttentionPreworkKV {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [Geometry: Bool] = [:]
+    nonisolated(unsafe) private static var lastRowInput: (Int32, MLXArray)?
     /// The FP32 geometry (HQ, HK, D, RD) whose twin passed its self-test.
     nonisolated(unsafe) private static var fastPassed: (Int, Int, Int, Int)?
 
@@ -1424,16 +1421,27 @@ enum Qwen35AttentionPreworkKV {
         return layer.attendAfterInPlaceAppend(queries: outputs[0], fence: outputs[1], scale: scale)
     }
 
+    private static func rowInput(_ row: Int32) -> MLXArray {
+        lock.withLock {
+            if let (previous, input) = lastRowInput, previous == row { return input }
+            let input = MLXArray(row)
+            lastRowInput = (row, input)
+            return input
+        }
+    }
+
     private static func encode(
         _ kern: MLXFast.MLXFastKernel, q: MLXArray, k: MLXArray, v: MLXArray, wq: MLXArray,
         wk: MLXArray, offs: MLXArray, epsQ: Float, epsK: Float, ropeDims: Int, ropeBase: Float,
         row: Int, prev: MLXArray, kc: MLXArray, vc: MLXArray
     ) -> [MLXArray] {
         let (L, HQ, HK, D) = (q.dim(1), q.dim(2), k.dim(2), q.dim(3))
+        let scalars = Qwen35AttentionPrework.scalarInputs(
+            epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         return kern(
             [
-                q, k, v, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-                MLXArray(log2(ropeBase)), MLXArray(Float(1)), MLXArray(Int32(row)), prev, kc, vc,
+                q, k, v, wq, wk, offs, scalars.0, scalars.1, scalars.2,
+                scalars.3, scalars.4, rowInput(Int32(row)), prev, kc, vc,
             ],
             template: [("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK)],
             grid: ((D / 4) * (HQ + 2 * HK), L, 1), threadGroup: (D / 4, 1, 1),

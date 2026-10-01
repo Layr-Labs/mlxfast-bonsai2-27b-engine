@@ -16,6 +16,16 @@
 import Foundation
 import MLX
 
+/// Exact retained-zero, shifted-mask and splice-flag removals. The independent
+/// switch keeps the existing composed paths without the donor's other changes.
+public enum CBv2CompactDecodeDeadWork {
+    public static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_COMPACT_DECODE_DW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// What the model may know about the verify being built: whether its
 /// proposal came from the prompt (the lookup or the splice). Set by the
 /// engine around a single-row block verify's graph build, false otherwise.
@@ -335,7 +345,17 @@ enum CBv2PromptLookupDraft {
     private static let splicePick = MLXFast.metalKernel(
         name: "cbv2_prompt_splice_pick",
         inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out"],
-        source: """
+        source: splicePickSource, ensureRowContiguous: true)
+
+    // The same reduction already ends with ranked.max() in scores[0]. Keep
+    // minimum for this flag even when an anchored proposal takes floor_.
+    private static let splicePickFlag = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_pick_flag",
+        inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out", "found"],
+        source: splicePickSource + "if (tid == 0) { found[0] = scores[0] >= minimum; }\n",
+        ensureRowContiguous: true)
+
+    private static let splicePickSource = """
 
         uint tid = thread_position_in_threadgroup.x;
         int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
@@ -362,7 +382,7 @@ enum CBv2PromptLookupDraft {
          int j=indices[0]/n, c=indices[0]%n;
          out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
-        """, ensureRowContiguous: true)
+        """
 
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
@@ -420,6 +440,14 @@ enum CBv2PromptLookupDraft {
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
+            if CBv2CompactDecodeDeadWork.enabled {
+                let picked = splicePickFlag(
+                    [ranked, block, promptIDs, dims],
+                    grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, depth], []], outputDTypes: [.int32, .bool])
+                lastSpliceFound = picked[1]
+                return picked[0].asType(drafted.dtype)
+            }
             // `splicePick` fires on the best score; a score is 0 or at least
             // `minimum`.
             lastSpliceFound = ranked.max() .>= MLXArray(Int32(minimum))

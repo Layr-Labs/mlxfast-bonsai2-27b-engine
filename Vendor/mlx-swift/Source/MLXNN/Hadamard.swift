@@ -85,6 +85,18 @@ public struct SignedBlockHadamard {
     ) -> Int8Activation?
     nonisolated(unsafe) public static var fusedTransformInt8: FusedTransformInt8?
 
+    /// One FP32 row quantized into the same sixteen-row tuple as zero padding
+    /// followed by `forwardInt8`. Nil keeps that composed path.
+    nonisolated(unsafe) public static var fusedTransformInt8Padded: FusedTransformInt8?
+
+    public func forwardInt8Padded(_ x: MLXArray, preSigned: Bool) -> Int8Activation? {
+        validate(x)
+        guard x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+            let fused = Self.fusedTransformInt8Padded
+        else { return nil }
+        return fused(x, signs, blockSize, preSigned, nil, 128)
+    }
+
     /// `forward` (or `applyPreSigned` when `preSigned`) quantized per group;
     /// nil when no fused implementation provides it.
     public func forwardInt8(
@@ -882,6 +894,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ layoutCache: HadamardConstantLayoutCache
     ) -> MLXArray?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8: TensorPackedMatmulNarrowInt8?
+
     static var narrowRouteInstalled: Bool {
         (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
             && tensorPackedMatmulNarrowApplies != nil
@@ -1318,15 +1331,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
         else { return nil }
         let padded = Self.tensorRouteMaximumNarrowRows
-        let input =
-            rows < padded
-            ? concatenated(
-                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
-            : x
-        guard
-            let activation = transform.forwardInt8(
+        let activation: SignedBlockHadamard.Int8Activation
+        if rows == 1, padded == 16, gdnLayout == nil,
+            let direct = transform.forwardInt8Padded(x, preSigned: preSigned)
+        {
+            activation = direct
+        } else {
+            let input =
+                rows < padded
+                ? concatenated(
+                    [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
+                : x
+            guard let composed = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
-        else { return nil }
+            else { return nil }
+            activation = composed
+        }
         if siblings.count == 1 {
             guard let y = matmul(
                 activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)

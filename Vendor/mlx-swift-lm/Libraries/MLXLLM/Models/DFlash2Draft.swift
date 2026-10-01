@@ -336,6 +336,10 @@ public final class DFlash2TapSlot {
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
+    // Capture-call scratch in this reflection-ignored box; cleared on exit.
+    var head: HadamardQuantizedLinear?
+    var headInput: (h: MLXArray, activation: SignedBlockHadamard.Int8Activation)?
+
     public init() {}
 }
 
@@ -811,6 +815,12 @@ extension DFlash2Attention {
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 
+    func prepareQueryWindow() -> Bool {
+        qkv.prepareQueryWindow(q: qProj, k: kProj, v: vProj)
+    }
+
+    func disableQueryWindow() { qkv.disableQueryWindow() }
+
     /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
     func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
 
@@ -840,7 +850,8 @@ extension DFlash2Attention {
         else { return nil }
         let start = confirmed.reshaped([1])
         let rows = joined ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
-        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
+        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(
+            rows, q: qProj, k: kProj, v: vProj, confirmed: confirmed)
         else { return nil }
         let queries: MLXArray
         let allKeys: MLXArray
@@ -890,11 +901,13 @@ private final class DFlash2QKVStack {
     private var weight: MLXArray?
     private var qEnd = 0
     private var kEnd = 0
+    private var queryWindowChoice: DFlash2PackedWeights.QueryWindowChoice?
 
     func clear() {
         weight = nil
         qEnd = 0
         kEnd = 0
+        queryWindowChoice = nil
     }
 
     /// The stacked weight once built (nil before its first use).
@@ -954,11 +967,26 @@ private final class DFlash2QKVStack {
     /// The stacked weight (built on first use), or nil when the stack does not apply.
     func stackWeight(q: Linear, k: Linear, v: Linear) -> MLXArray? { stacked(q: q, k: k, v: v) }
 
+    func prepareQueryWindow(q: Linear, k: Linear, v: Linear) -> Bool {
+        queryWindowChoice = nil
+        guard let w = stacked(q: q, k: k, v: v) else { return false }
+        queryWindowChoice = DFlash2PackedWeights.prepareQueryWindow(weight: w, qColumns: qEnd)
+        return queryWindowChoice != nil
+    }
+
+    func disableQueryWindow() { queryWindowChoice = nil }
+
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
-        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
+        _ rows: MLXArray, q: Linear, k: Linear, v: Linear, confirmed: MLXArray? = nil
     ) -> (y: MLXArray, qEnd: Int, kEnd: Int)? {
         guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
+        if let confirmed, let choice = queryWindowChoice, choice.qColumns == qEnd,
+            let y = DFlash2PackedWeights.applyQueryWindow(
+                rows, weight: weight, confirmed: confirmed, choice: choice)
+        {
+            return (y, qEnd, kEnd)
+        }
         // The same route as `apply`, so every row matches today's block forward.
         return (DFlash2TensorMatmul.apply(rows, weight: weight) ?? matmul(rows, weight.T), qEnd, kEnd)
     }
@@ -1414,14 +1442,18 @@ private let dflash2GroupedConvJoinSource = """
 /// threshold and merge passes, and the four-wide concat. Every narrowed offset
 /// is a non-negative element / word index below 2^31: at most (262144 context
 /// + 64) rows x 6144 columns, 32 rows x the 248320-entry vocabulary, a
-/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The headers keep
-/// their `size_t`.
+/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The grouped
+/// conv header's eight (block row, h / dyn / base offsets) stay below each
+/// operand's element count: (262144 + 64) rows x 5120 at most.
+private let dflash2GroupedConvHeaderIO32 = Qwen35IO32.narrow(
+    dflash2GroupedConvHeader, count: 8, "dflash2_grouped_conv_header")
+
 private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv_join",
     inputNames: ["h", "dyn", "base", "ctx"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvJoinSource, count: 4, "dflash2_grouped_conv_join"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvKernel = MLXFast.metalKernel(
@@ -1429,7 +1461,7 @@ private let dflash2GroupedConvKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvSource, count: 2, "dflash2_grouped_conv"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
@@ -1437,7 +1469,7 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base", "res"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvResidualSource, count: 2, "dflash2_grouped_conv_residual"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 // MARK: - The decoder layer
@@ -1641,7 +1673,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_bf16_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1927,7 +1959,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: Qwen35IO32.narrow(variantSource, count: 4, "dflash2_bf16_matmul_m16_kvar"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1940,6 +1972,10 @@ enum DFlash2TensorMatmul {
             dims[[k, n]] = array
             return array
         }
+    }
+
+    static var packed32Available: Bool {
+        enabled && rows32Enabled && Qwen35TensorPackedMatmul.tensorOperandsAvailable
     }
 
     /// `apply` for context rows that enter the cache ahead of their block:
@@ -3338,6 +3374,140 @@ enum DFlash2PackedWeights {
           }
         }
         """
+
+
+    /// One16-row tensor op for Q, two unchanged ops for K/V. This factory
+    /// derives from the active pack12 body; an unfamiliar body declines.
+    /// Never skip or initialize a barrier non-uniformly across a threadgroup.
+    private static let queryWindowKernel: MLXFast.MLXFastKernel? = {
+        var body = source32
+        let substitutions: [(String, String)] = [
+            ("const int n0 = nb * COLS;", "const int n0 = nb * COLS;\n// Uniform Q tile: only [confirmed, confirmed+16) is consumed.\nstatic_assert(QCOLS % COLS == 0, \"Q/KV boundary must be a whole tile\");\nconst bool query = n0 < QCOLS;\nconst int firstRow = query ? clamp(int(confirmed[0]), 0, 16) : 0;"),
+            ("auto tXlo = X.template slice<KS, 16>(k, 0);", "auto tXlo = X.template slice<KS, 16>(k, firstRow);"),
+            ("  auto tXhi = X.template slice<KS, 16>(k, 16);\n  op.run(lw, tXhi, cT1);", "  if (!query) {\n    auto tXhi = X.template slice<KS, 16>(k, 16);\n    op.run(lw, tXhi, cT1);\n  }"),
+            ("red[sg - 1][(COLS / 2 + i) * 32 + lane] = cT1[i];", "if (!query) red[sg - 1][(COLS / 2 + i) * 32 + lane] = cT1[i];"),
+            ("float v0, v1;", "float v0, v1 = 0.0f;"),
+            ("v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];", "if (!query) v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];"),
+            ("      v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]\n          + red[2][(COLS / 2 + i) * 32 + lane];", "      if (!query) v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]\n          + red[2][(COLS / 2 + i) * 32 + lane];"),
+            ("v0 = cT0[i]; v1 = cT1[i];", "v0 = cT0[i]; if (!query) v1 = cT1[i];"),
+            ("v0 += red[j][i * 32 + lane]; v1 += red[j][(COLS / 2 + i) * 32 + lane];", "v0 += red[j][i * 32 + lane]; if (!query) v1 += red[j][(COLS / 2 + i) * 32 + lane];"),
+            ("    out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);\n    out[(IndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);", "    if (query) {\n      // These two disjoint row sets cover all32 rows exactly once.\n      const int r = int(idx[0]);\n      const int unused = r < firstRow ? r : r + 16;\n      out[(IndexT)(firstRow + r) * N + n0 + idx[1]] = OutT(v0);\n      out[(IndexT)unused * N + n0 + idx[1]] = OutT(0.0f);\n    } else {\n      out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);\n      out[(IndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);\n    }")
+        ]
+        for (from, to) in substitutions {
+            guard body.components(separatedBy: from).count == 2 else { return nil }
+            body = body.replacingOccurrences(of: from, with: to)
+        }
+        return MLXFast.metalKernel(
+            name: "dflash2_pack12_query_window_m32",
+            inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "confirmed"],
+            outputNames: ["out"], source: body, header: header, ensureRowContiguous: true)
+    }()
+
+    static let queryWindowEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_DFLASH_QUERY_WINDOW"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    struct QueryWindowChoice {
+        let source: MLXArray
+        let qColumns: Int
+        let tiling: DFlash2TensorMatmul.SwapTiling
+    }
+
+    private static func queryWindowLaunch(
+        _ a: MLXArray, _ c: Copy, confirmed: MLXArray, qColumns: Int,
+        tiling t: DFlash2TensorMatmul.SwapTiling, outputDType: DType
+    ) -> MLXArray? {
+        guard let kernel = queryWindowKernel else { return nil }
+        let n = c.source.dim(0)
+        return kernel(
+            [a] + c.arrays + [dims(c.source), confirmed.reshaped([1])],
+            template: [("OutT", outputDType), ("SPLITS", t.splits),
+                ("IO32", c.index32Safe ? 1 : 0), ("QCOLS", qColumns)]
+                + geometry + [("AHEAD", t.ahead ?? 1)],
+            grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
+            outputShapes: [[32, n]], outputDTypes: [outputDType])[0]
+    }
+
+    static func applyQueryWindow(
+        _ x: MLXArray, weight: MLXArray, confirmed: MLXArray, choice: QueryWindowChoice
+    ) -> MLXArray? {
+        guard queryWindowEnabled, DFlash2TensorMatmul.packed32Available,
+            choice.source === weight, weight.ndim == 2,
+            x.dtype == .bfloat16, weight.dtype == .bfloat16,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) == 32, x.dim(2) == weight.dim(1),
+            confirmed.size == 1, confirmed.dtype == .int32, let c = copy(of: weight),
+            DFlash2TensorMatmul.swapTiling(k: weight.dim(1), n: weight.dim(0), rows32: true, packed: true)
+                == choice.tiling
+        else { return nil }
+        // The caller constructs confirmed as 1+ the prefix accept count of
+        // the15 draft tokens, so it is device-valued in1...16, without readback.
+        return queryWindowLaunch(x.reshaped(32, -1), c, confirmed: confirmed,
+            qColumns: choice.qColumns, tiling: choice.tiling, outputDType: .bfloat16)?
+            .reshaped(1, 32, weight.dim(0))
+    }
+
+    /// Remote load-time admission after accepted tiling is settled. Every
+    /// actual stacked weight, all16 device counts, BF16/FP32 output raw bits,
+    /// random/large/signed-zero input. No public prompt or expected token.
+    /// Any unsupported body/geometry/error/mismatch keeps the original m32.
+    static func prepareQueryWindow(weight: MLXArray, qColumns q: Int) -> QueryWindowChoice? {
+        guard queryWindowEnabled, DFlash2TensorMatmul.packed32Available,
+            weight.ndim == 2, weight.dtype == .bfloat16, q > 0, q < weight.dim(0),
+            q % cols == 0, weight.dim(0) % 32 == 0, weight.dim(1) % 1024 == 0,
+            let c = copy(of: weight), queryWindowKernel != nil
+        else { return nil }
+        let (k, n) = (weight.dim(1), weight.dim(0))
+        let t = DFlash2TensorMatmul.swapTiling(k: k, n: n, rows32: true, packed: true)
+        guard t.kt == ks, [2, 4, 8].contains(t.splits), t.fits(k: k), (0 ... 2).contains(t.ahead ?? 1),
+            n <= Int(Int32.max) / 32
+        else { return nil }
+        var same = true
+        do {
+            try withError { error in
+                for pattern in 0 ..< 3 {
+                    let a: MLXArray
+                    if pattern == 0 {
+                        a = MLXRandom.normal([32, k], key: MLXRandom.key(0x715eed)).asType(.bfloat16)
+                    } else if pattern == 1 {
+                        a = (MLXRandom.normal([32, k], key: MLXRandom.key(0x716eed)) * 8).asType(.bfloat16)
+                    } else {
+                        let parity = MLXArray(0 ..< Int32(32)).reshaped(32, 1) % 2
+                        a = broadcast(MLX.where(parity .== 0, MLXArray(Float(-0.0)), MLXArray(Float(0.0))),
+                            to: [32, k]).asType(.bfloat16)
+                    }
+                    for dtype in [DType.bfloat16, .float32] {
+                        let bits: DType = dtype == .bfloat16 ? .uint16 : .uint32
+                        let stock = launch(a, c, rows: 32, outputDType: dtype, tiling: t)
+                        eval(a, stock)
+                        for count in 1 ... 16 {
+                            guard let fast = queryWindowLaunch(a, c, confirmed: MLXArray([Int32(count)]),
+                                qColumns: q, tiling: t, outputDType: dtype)
+                            else { same = false; return }
+                            same = all(stock[count ..< (count + 16), ..<q].view(dtype: bits)
+                                .== fast[count ..< (count + 16), ..<q].view(dtype: bits)).item(Bool.self)
+                                && all(stock[0..., q...].view(dtype: bits)
+                                    .== fast[0..., q...].view(dtype: bits)).item(Bool.self)
+                                && all(fast[..<count, ..<q].view(dtype: bits) .== 0).item(Bool.self)
+                            if count < 16 {
+                                same = same && all(fast[(count + 16)..., ..<q].view(dtype: bits) .== 0).item(Bool.self)
+                            }
+                            if !same { return }
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        guard same else {
+            FileHandle.standardError.write("dflash2 query window: bit check failed; stock kept\n".data(using: .utf8)!)
+            return nil
+        }
+        FileHandle.standardError.write(
+            "dflash2 query window: all16 counts and actual weight BF16/FP32 consumed bits matched; Q32->16 on\n"
+                .data(using: .utf8)!)
+        return QueryWindowChoice(source: weight, qColumns: q, tiling: t)
+    }
 
     private static let encodeKernel = MLXFast.metalKernel(
         name: "dflash2_pack12_encode", inputNames: ["w", "ksz"],
@@ -5207,6 +5377,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// propose round repeats an identical geometry graph.
     private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
 
+    private static let zerosLock = NSLock()
+    nonisolated(unsafe) private static var retainedZeros: [DType: MLXArray] = [:]
+
+    private func retainedZero(_ dtype: DType) -> MLXArray {
+        guard CBv2CompactDecodeDeadWork.enabled else { return MLXArray.zeros([1, 1, 1], dtype: dtype) }
+        return Self.zerosLock.withLock {
+            if let zero = Self.retainedZeros[dtype] { return zero }
+            let zero = MLXArray.zeros([1, 1, 1], dtype: dtype)
+            Self.retainedZeros[dtype] = zero
+            return zero
+        }
+    }
+
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
     /// the target into the drafter — the embedded block and the fused target
@@ -5299,6 +5482,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // The tiling trial's weights, on the kernel the two self-tests left on.
         DFlash2TensorMatmul.SwapTrial.note(blockWeights, rows32: qkvWeights)
         return DFlash2TensorMatmul.prepareTiled(layerWeights)
+    }
+
+    /// After accepted tiling, before served requests; preserve row classes.
+    func prepareQueryWindows() -> Bool {
+        var chosen = false
+        for layer in layers { chosen = layer.selfAttn.prepareQueryWindow() || chosen }
+        return chosen
+    }
+
+    func disableQueryWindows() {
+        for layer in layers { layer.selfAttn.disableQueryWindow() }
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
@@ -5629,14 +5823,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             maskUnconfirmed
                 ? which(
                     (MLXArray(Int32(0) ..< Int32(contextRows)) .< c).reshaped([1, contextRows, 1]),
-                    verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
+                    verifyRows, retainedZero(verifyRows.dtype))
                 : verifyRows)
         let base = concatenated(
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        let bound = Int32(geometry.rows + blockSize)
+        let keyMask = (CBv2CompactDecodeDeadWork.enabled
+            ? MLXArray(-bound ..< Int32(keys) - bound) .< c
+            : MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(bound) + c))
             .reshaped([1, keys])
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         // The front's one-launch forms read `context` and `c` themselves;
@@ -6836,7 +7033,7 @@ enum DFlash2SpeculativeFront {
               out[(size_t(b) * R + r) * H + c] = v;
             }
             """, count: 4, "dflash2_grouped_conv_join_at"),
-        header: dflash2GroupedConvHeader,
+        header: dflash2GroupedConvHeaderIO32,
         ensureRowContiguous: true)
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its
