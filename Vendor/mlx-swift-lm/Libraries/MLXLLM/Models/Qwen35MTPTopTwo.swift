@@ -121,7 +121,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_q8",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 12, "bonsai_tensor_packed_matmul_q8"),
         header: header,
         ensureRowContiguous: true)
 
@@ -213,7 +213,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16",
         inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrow,
+        source: Qwen35IO32.narrow(sourceNarrow, count: 6, "bonsai_tensor_packed_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2654,7 +2654,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8p",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8Pipelined,
+        source: Qwen35IO32.narrow(sourceNarrowInt8Pipelined, count: 16, "bonsai_tensor_packed_matmul_m16_i8p"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2662,7 +2662,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8,
+        source: Qwen35IO32.narrow(sourceNarrowInt8, count: 14, "bonsai_tensor_packed_matmul_m16_i8"),
         header: header,
         ensureRowContiguous: true)
 
