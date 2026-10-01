@@ -2151,9 +2151,27 @@ enum FusedInputHadamardKernel {
                 && bonsai_row_packed<LEAD, TRAIL>(b_shape, b_strides) && signs_strides[0] == 1) {
               const device InT* ap = a + ra;
               const device InT* bp = b + rb;
-              fill([&](uint p) { return static_cast<float>(ap[p]); },
-                   [&](uint p) { return static_cast<float>(bp[p]); },
-                   [&](uint p) { return signs[p]; });
+              // Packed rows: load four consecutive columns as one float4-widened
+              // vector (same values/order as scalar ap[p+r] / bp[p+r] / signs[p+r]).
+              BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+                short index = j * 4 * NT + i * 4;
+                uint p = col0 + index;
+                float4 av = bonsai_fused_ld4(ap + p);
+                float4 bv = bonsai_fused_ld4(bp + p);
+                float4 sv = *(const device float4*)(signs + p);
+                BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                  float af = av[r];
+                  float bf = bv[r];
+                  float v;
+                  if (MODE == 1) {
+                    float t = af * bonsai_sigmoid(af);
+                    v = t * bf;
+                  } else {
+                    v = af * bonsai_sigmoid(bf);
+                  }
+                  buf[index + r] = v * sv[r];
+                }
+              }
             } else {
               fill([&](uint p) { return static_cast<float>(a[ra + bonsai_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
                    [&](uint p) { return static_cast<float>(b[rb + bonsai_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },
@@ -2222,6 +2240,19 @@ enum FusedInputHadamardKernel {
             METAL_FUNC float bonsai_sigmoid(float x) {
               auto y = 1 / (1 + metal::exp(metal::abs(x)));
               return (x < 0) ? y : 1 - y;
+            }
+
+            // Packed-row four-wide load (FP32/FP16 one vector op; other T
+            // falls back to four scalars). Same values as scalar p[0..3].
+            inline float4 bonsai_fused_ld4(const device float* p) {
+              return *(const device float4*)p;
+            }
+            inline float4 bonsai_fused_ld4(const device half* p) {
+              return float4(*(const device half4*)p);
+            }
+            template <typename T>
+            inline float4 bonsai_fused_ld4(const device T* p) {
+              return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
             }
 
             """ + HadamardStridedInputs.header,
@@ -2315,8 +2346,42 @@ extension FusedInputHadamardKernel {
                 && w_strides[0] == 1 && signs_strides[0] == 1) {
               const auto xp = x + rx;
               const auto zp = z + rz;
-              fill([&](uint c) { return float(xp[c]); }, [&](uint c) { return float(zp[c]); },
-                   [&](uint c) { return w[c]; }, [&](uint c) { return signs[c]; });
+              // Packed rows: vec4 loads on contiguous quartets (HEAD_DIM=128,
+              // index%4==0 ⇒ no head-boundary cross; remapped src stays contiguous).
+              BONSAI_UNROLL for (uint hh = sg; hh < HEADS_PER_BLOCK; hh += 2) {
+                uint p0 = col0 + hh * HEAD_DIM;
+                uint kh = p0 / (REPEATS * HEAD_DIM);
+                uint rep = (p0 % (REPEATS * HEAD_DIM)) / HEAD_DIM;
+                uint src_head = rep * KEY_HEADS + kh;
+                uint xh = src_head * HEAD_DIM + lane * 4;
+                float4 tx4 = bonsai_fused_ld4(xp + xh);
+                float acc = tx4[0] * tx4[0] + tx4[1] * tx4[1] + tx4[2] * tx4[2] + tx4[3] * tx4[3];
+                acc = simd_sum(acc);
+                if (lane == 0) {
+                  inv_rms[hh] = metal::precise::rsqrt(acc / HEAD_DIM + eps);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+
+              BONSAI_UNROLL for (short j = 0; j < 4; j++) {
+                short index = j * 4 * NT + i * 4;
+                uint p = col0 + index;
+                uint kh = p / (REPEATS * HEAD_DIM);
+                uint rem = p % (REPEATS * HEAD_DIM);
+                uint src = ((rem / HEAD_DIM) * KEY_HEADS + kh) * HEAD_DIM + rem % HEAD_DIM;
+                float4 x4 = bonsai_fused_ld4(xp + src);
+                float4 z4 = bonsai_fused_ld4(zp + src);
+                float4 w4 = *(const device float4*)(w + (src % HEAD_DIM));
+                float4 s4 = *(const device float4*)(signs + p);
+                float inv = inv_rms[index / HEAD_DIM];
+                BONSAI_UNROLL for (short r = 0; r < 4; r++) {
+                  float xn = w4[r] * (x4[r] * inv);
+                  float zv = z4[r];
+                  float gz = zv * bonsai_sigmoid(zv);
+                  float v = gz * xn;
+                  buf[index + r] = v * s4[r];
+                }
+              }
             } else {
               fill([&](uint c) { return float(x[rx + bonsai_col_off<2, 2>(c, x_shape, x_strides)]); },
                    [&](uint c) { return float(z[rz + bonsai_col_off<2, 2>(c, z_shape, z_strides)]); },
@@ -2386,6 +2451,19 @@ extension FusedInputHadamardKernel {
             METAL_FUNC float bonsai_sigmoid(float x) {
               auto y = 1 / (1 + metal::exp(metal::abs(x)));
               return (x < 0) ? y : 1 - y;
+            }
+
+            // Packed-row four-wide load (FP32/FP16 one vector op; other T
+            // falls back to four scalars). Same values as scalar p[0..3].
+            inline float4 bonsai_fused_ld4(const device float* p) {
+              return *(const device float4*)p;
+            }
+            inline float4 bonsai_fused_ld4(const device half* p) {
+              return float4(*(const device half4*)p);
+            }
+            template <typename T>
+            inline float4 bonsai_fused_ld4(const device T* p) {
+              return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
             }
 
             """ + HadamardStridedInputs.header,
