@@ -2421,6 +2421,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),
@@ -5049,14 +5050,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5183,8 +5190,12 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -5333,10 +5344,9 @@ enum Qwen35PromptEmbeddingHostGather {
 
     static func embed(_ table: HadamardQuantizedEmbedding, _ inputs: MLXArray) -> MLXArray? {
         guard let rows = hostRows(table, inputs) else { return nil }
-        let dequantizedRows = dequantized(
+        return table.transform.inverseDequantized(
             rows.weight, scales: rows.scales, biases: rows.biases,
             groupSize: table.groupSize, bits: table.bits)
-        return table.transform.inverse(dequantizedRows)
             .reshaped(inputs.shape + [table.transform.width])
     }
 
@@ -5625,7 +5635,8 @@ public class Qwen35TextModelInner: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        lastRowOnly: Bool = false
+        lastRowOnly: Bool = false,
+        finalAdd: ((MLXArray, MLXArray) -> MLXArray?)? = nil
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -5804,7 +5815,8 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            hiddenStates = hiddenStates + p
+            // A verify window's last add may also form its final norm (`finalAdd`).
+            hiddenStates = (verifyPending ? finalAdd?(hiddenStates, p) : nil) ?? (hiddenStates + p)
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -5850,6 +5862,13 @@ enum Qwen35PromptTapJoin {
             if (j >= width) return;
             const uint src = row * width + j;
             const uint dst = (row * 5 + tap) * width + j;
+            if ((width & 3u) == 0) {
+              auto input = tap == 0 ? x0 : tap == 1 ? x1 : tap == 2 ? x2 : tap == 3 ? x3 : x4;
+              *(device vec<bfloat16_t, 4>*)(out + dst) = vec<bfloat16_t, 4>(
+                  cast_to<bfloat16_t>(input[src]), cast_to<bfloat16_t>(input[src + 1]),
+                  cast_to<bfloat16_t>(input[src + 2]), cast_to<bfloat16_t>(input[src + 3]));
+              return;
+            }
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
               if (j + i < width) {
@@ -6470,7 +6489,7 @@ enum Qwen35AttentionPrework {
         const bool isq = hh < uint(HQ);
         const uint h = isq ? hh : hh - uint(HQ);
 
-        threadgroup float local_sums[32];
+        threadgroup float local_sums[D / 128];
         threadgroup float local_inv[1];
         threadgroup float rot[RD];
 
@@ -6487,16 +6506,12 @@ enum Qwen35AttentionPrework {
           acc += thread_x[i] * thread_x[i];
         }
         acc = simd_sum(acc);
-        if (sg == 0) {
-          local_sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
           local_sums[sg] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          acc = simd_sum(local_sums[lane]);
+          acc = simd_sum(lane < uint(D / 128) ? local_sums[lane] : 0.0f);
           if (lane == 0) {
             const float eps = isq ? epsq : epsk;
             local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
@@ -6579,9 +6594,9 @@ enum Qwen35AttentionPrework {
             L > 0, L < 65536
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -6690,6 +6705,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6727,7 +6744,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
@@ -6771,9 +6788,9 @@ extension Qwen35AttentionPrework {
             offsets.dtype == .int32, offsets.ndim <= 1, offsets.size == 1 || offsets.size == B
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -7126,7 +7143,7 @@ enum Qwen35FusedHadamard {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
-    private static let header = """
+    static let header = """
         // MLX `Sigmoid` (unary_ops.h), verbatim.
         METAL_FUNC float bonsai_sigmoid(float x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -7158,7 +7175,7 @@ enum Qwen35FusedHadamard {
     // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
     // 1024-wide block. Template: InT, OutT, W (row width), BPR (blocks per
     // row), PRESIGNED, GR (GDN repeats, 1 = identity), GKH, GD.
-    private static let source = """
+    static let source = """
         constexpr short N = 1024;
         constexpr short NT = 64;
         const uint blk = threadgroup_position_in_grid.x;
@@ -7244,10 +7261,11 @@ enum Qwen35FusedHadamard {
               out[rowbase + bcol + uint(index + r)] = OutT(q * qs);
             }
           } else {
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 4; r++) {
-              out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);
-            }
+            *(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(
+                OutT(buf[index] * 0.03125f),
+                OutT(buf[index + 1] * 0.03125f),
+                OutT(buf[index + 2] * 0.03125f),
+                OutT(buf[index + 3] * 0.03125f));
           }
         }
         """
@@ -7271,25 +7289,38 @@ enum Qwen35FusedHadamard {
         #pragma clang loop unroll(full)
         for (short j = 0; j < 4; j++) {
           const short index = j * 4 * NT + i * 4;
-          float v[4];
+          float4 v = *(const threadgroup float4*)(buf + index);
           float amax = 0.0f;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
-            v[r] = buf[index + r] * 0.03125f;
+            v[r] = v[r] * 0.03125f;
             amax = max(amax, fabs(v[r]));
           }
           amax = simd_max(amax);
           const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
           const float iqs = amax > 0.0f ? 127.0f / amax : 0.0f;
           float part = 0.0f;
+          uchar4 packed;
           #pragma clang loop unroll(full)
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = uint(index + r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
+          if (PERM) {
+            const uint lane = uint(i) & 31u;
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
+          }
+          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if ((i & 31) == 0) {
             const uint ml = row & 63u;
@@ -7305,7 +7336,36 @@ enum Qwen35FusedHadamard {
         // The multi-line literal strips its closing delimiter's indentation.
         guard let cut = source.range(of: "threadgroup_barrier(mem_flags::mem_threadgroup);\n#pragma clang loop unroll(full)\nfor (short j = 0; j < 4; j++) {\n  const short index = j * 4 * NT + i * 4;\n  if (QSIM) {")
         else { preconditionFailure("fused rotation source changed") }
-        return String(source[source.startIndex ..< cut.lowerBound]) + tail
+        guard let finalPass = source.range(of:
+            "#pragma clang loop unroll(full)\nfor (int t = 0; t < 4; t++) {"),
+            finalPass.lowerBound < cut.lowerBound
+        else { preconditionFailure("quantizing rotation final pass changed") }
+        var prefix = String(source[source.startIndex ..< finalPass.lowerBound])
+        precondition(prefix.components(separatedBy: "threadgroup float buf[N];").count == 2,
+            "quantizing rotation shared buffer changed")
+        prefix = prefix.replacingOccurrences(
+            of: "threadgroup float buf[N];", with: "alignas(16) threadgroup float buf[N];")
+        let final = """
+        // All 64 threads hold four adjacent positions of the final radix-4.
+        // Each vector is aligned: buf is 16-byte aligned and 4*i + 256*k is a multiple of four.
+        {
+          static_assert(N == 1024 && NT == 64, "final radix-4 layout");
+          const uint e = 4u * uint(i);
+          const float4 y0 = *(const threadgroup float4*)(buf + e);
+          const float4 y1 = *(const threadgroup float4*)(buf + e + 256u);
+          const float4 y2 = *(const threadgroup float4*)(buf + e + 512u);
+          const float4 y3 = *(const threadgroup float4*)(buf + e + 768u);
+          const float4 a0 = y0 + y1;
+          const float4 a1 = y0 - y1;
+          const float4 a2 = y2 + y3;
+          const float4 a3 = y2 - y3;
+          *(threadgroup float4*)(buf + e) = a0 + a2;
+          *(threadgroup float4*)(buf + e + 256u) = a1 + a3;
+          *(threadgroup float4*)(buf + e + 512u) = a0 - a2;
+          *(threadgroup float4*)(buf + e + 768u) = a1 - a3;
+        }
+        """
+        return prefix + final + "\n" + tail
     }()
 
     private static let kernelInt8 = MLXFast.metalKernel(
@@ -7335,6 +7395,37 @@ enum Qwen35FusedHadamard {
           }
           return int64_t(c / uint(HD)) * st[2] + int64_t(c % uint(HD)) * st[3];
         }
+        // The 32-bit twins: every element offset below 2^31 (a negative
+        // stride or a span at or above it picks the 64-bit path), so the
+        // 32-bit forms address the same elements.
+        template <int NDIM>
+        inline bool bonsai_q8p_fits32(
+            const constant int* shape, const constant int64_t* st) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (st[d] < 0 || st[d] >= (int64_t(1) << 31)) { return false; }
+              span += ulong(shape[d] - 1) * ulong(st[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_row32(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return row * uint(st[0]);
+          }
+          const uint L = uint(shape[1]);
+          return (row / L) * uint(st[0]) + (row % L) * uint(st[1]);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_col32(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return c * uint(st[1]);
+          }
+          return (c / uint(HD)) * uint(st[2]) + (c % uint(HD)) * uint(st[3]);
+        }
 
         """
 
@@ -7358,9 +7449,13 @@ enum Qwen35FusedHadamard {
         // of each q|gate head, and the GDN z is a slice of qkv|z. None is
         // copied into a row-contiguous array first.
         const size_t rowbase = size_t(row) * size_t(W);
-        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
-        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
-        threadgroup float buf[N];
+        const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)
+            && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);
+        const int64_t arow64 = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
+        const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const uint arow = uint(arow64);
+        const uint brow = uint(brow64);
+        alignas(16) threadgroup float buf[N];
         threadgroup float inv_rms[8];
         if (PROD == 3) {
           // Per-head RMS as rms_single_row: lane l sums elements 4l..4l+3 of
@@ -7377,7 +7472,7 @@ enum Qwen35FusedHadamard {
             float acc = 0.0f;
             #pragma clang loop unroll(full)
             for (int r = 0; r < 4; r++) {
-              const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
+              const float tx = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, c0 + uint(r))) : arow64 + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r)))]);
               acc += tx * tx;
             }
             acc = simd_sum(acc);
@@ -7401,8 +7496,8 @@ enum Qwen35FusedHadamard {
               const uint rr = hr % uint(GR);
               src = (rr * uint(GKH) + h) * uint(GD) + d;
             }
-            const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
-            const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
+            const float av = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, src)) : arow64 + bonsai_q8p_col<AHD>(a_strides, src))]);
+            const float bv = float(b[(p32 ? int64_t(brow + bonsai_q8p_col32<BHD>(b_strides, src)) : brow64 + bonsai_q8p_col<BHD>(b_strides, src))]);
             float v;
             if (PROD == 1) {
               v = (av * bonsai_sigmoid(av)) * bv;
@@ -7475,6 +7570,7 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
+        Qwen35EmbeddingRows.install()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7559,6 +7655,28 @@ enum Qwen35FusedHadamard {
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
         }
+        // The drafter head's BF16 rows, padded to `paddedRows` in the read
+        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
+        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
+        // the zero-row concatenation.
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, groupSize, paddedRows in
+            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
+                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
+            ]
+            return Qwen35RotationQ8Blocks.launchPadded(
+                x, signs, template: template, paddedRows: paddedRows, width: width,
+                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
+        }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
             guard groupSize == 128, blockSize == 1024, x.ndim >= 1,
@@ -7612,7 +7730,7 @@ enum Qwen35FusedHadamard {
                 guard x.shape == gate.shape, weight.dtype == .float32, weight.ndim == 1,
                     weight.dim(0) == 128
                 else { return nil }
-                a = x; b = gate; w = weight; eps = MLXArray([epsilon]); prod = 3
+                a = x; b = gate; w = weight; eps = Qwen35GatedNormTail.epsilonInput(epsilon); prod = 3
             case .sigmoidGateRowBlocks(let blocks, let gate):
                 return rowBlockActivation(
                     blocks: blocks, gate: gate, signs: signs, gdnLayout: gdnLayout)
@@ -7717,22 +7835,117 @@ extension Qwen35FusedHadamard {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The forward quartet store with the inverse's sign multiply, checked once per factory.
+    static func inverseSource(_ text: String) -> String? {
+        let store = """
+            *(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(
+                    OutT(buf[index] * 0.03125f),
+                    OutT(buf[index + 1] * 0.03125f),
+                    OutT(buf[index + 2] * 0.03125f),
+                    OutT(buf[index + 3] * 0.03125f));
+            """
+        guard text.components(separatedBy: store).count == 2 else { return nil }
+        let inverseStore = """
+            *(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(
+                    OutT((buf[index] * 0.03125f) * signs[bcol + uint(index)]),
+                    OutT((buf[index + 1] * 0.03125f) * signs[bcol + uint(index + 1)]),
+                    OutT((buf[index + 2] * 0.03125f) * signs[bcol + uint(index + 2)]),
+                    OutT((buf[index + 3] * 0.03125f) * signs[bcol + uint(index + 3)]));
+            """
+        return text.replacingOccurrences(of: store, with: inverseStore)
+    }
+
     private static let inverseKernel: MLXFast.MLXFastKernel? = {
-        let store = "out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);"
-        guard source.components(separatedBy: store).count == 2 else { return nil }
+        guard let text = inverseSource(source) else { return nil }
         return MLXFast.metalKernel(
             name: "bonsai_signed_hadamard_1024_inv",
-            inputNames: ["inp", "signs"],
-            outputNames: ["out"],
-            source: Qwen35IO32.narrow(
-                source.replacingOccurrences(
-                    of: store,
-                    with: "out[rowbase + bcol + uint(index + r)] = "
-                        + "OutT((buf[index + r] * 0.03125f) * signs[bcol + uint(index + r)]);"),
-                count: 3, "bonsai_signed_hadamard_1024_inv"),
+            inputNames: ["inp", "signs"], outputNames: ["out"],
+            source: Qwen35IO32.narrow(text, count: 3, "bonsai_signed_hadamard_1024_inv"),
             header: header,
             ensureRowContiguous: true)
     }()
+
+    private static let dequantizedInverseKernel: MLXFast.MLXFastKernel? = {
+        let begin = "#pragma clang loop unroll(full)\nfor (short j = 0; j < 4; j++) {"
+        let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        guard let load = source.range(of: begin), let end = source.range(of: barrier),
+            load.lowerBound < end.lowerBound
+        else { return nil }
+        let producer = """
+            const device uchar* bytes = (const device uchar*)w;
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; j++) {
+              const short index = j * 4 * NT + i * 4;
+              const uint p = uint(rowbase) + bcol + uint(index);
+              const uint val = bytes[p >> 2];
+              const half scale = scales[p >> 7];
+              const half bias = biases[p >> 7];
+              #pragma clang loop unroll(full)
+              for (short r = 0; r < 4; r++) {
+                const uchar d = uchar((val >> (2 * r)) & 3);
+                const half v = scale * d + bias;
+                buf[index + r] = float(v);
+              }
+            }
+            """ + "\n"
+        guard let text = inverseSource(
+            String(source[..<load.lowerBound]) + producer + String(source[end.lowerBound...]))
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "bonsai_dequantized_hadamard_1024_inv",
+            inputNames: ["w", "scales", "biases", "signs"], outputNames: ["out"],
+            source: Qwen35IO32.narrow(text, count: 3, "bonsai_dequantized_hadamard_1024_inv"),
+            header: header, ensureRowContiguous: true)
+    }()
+
+    private static let dequantizedInverseLock = NSLock()
+    nonisolated(unsafe) private static var dequantizedInverseVerdict: (width: Int, passed: Bool)?
+
+    private static func dequantizedInverseLaunch(
+        _ kernel: MLXFast.MLXFastKernel,
+        _ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ signs: MLXArray
+    ) -> MLXArray {
+        let width = signs.size
+        return kernel(
+            [w, scales, biases, signs],
+            template: [("OutT", DType.float16), ("W", width), ("BPR", width / 1024),
+                ("PRESIGNED", 1), ("GR", 1), ("GKH", 1), ("GD", 1), ("QSIM", 0)],
+            grid: (64 * w.dim(0) * (width / 1024), 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[w.dim(0), width]], outputDTypes: [.float16])[0]
+    }
+
+    private static func dequantizedInverseSelfTest(
+        _ kernel: MLXFast.MLXFastKernel, _ signs: MLXArray
+    ) -> Bool {
+        let width = signs.size
+        let edges: [UInt16] = [0, 0x8000, 1, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400,
+            0x3555, 0xb555, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e01, 0xfe01]
+        var same = MLXArray(true)
+        do {
+            try withError { error in
+                for rows in [1, 16] {
+                    let w = MLXArray((0 ..< rows * width / 16).map {
+                        UInt32($0) &* 1_664_525 &+ 1_013_904_223
+                    }, [rows, width / 16])
+                    let shape = [rows, width / 128]
+                    let scales = MLXArray((0 ..< rows * width / 128).map {
+                        edges[$0 % edges.count]
+                    }, shape).view(dtype: .float16)
+                    let biases = MLXArray((0 ..< rows * width / 128).map {
+                        edges[($0 * 7 + 5) % edges.count]
+                    }, shape).view(dtype: .float16)
+                    guard let stock = inverseLaunch(
+                        dequantized(w, scales: scales, biases: biases, groupSize: 128, bits: 2), signs)
+                    else { same = MLXArray(false); return }
+                    let fused = dequantizedInverseLaunch(kernel, w, scales, biases, signs)
+                    same = same .&& all(stock.view(dtype: .uint16) .== fused.view(dtype: .uint16))
+                }
+                eval(same)
+                try error.check()
+            }
+        } catch { return false }
+        return same.item(Bool.self)
+    }
 
     private static let inverseLock = NSLock()
     nonisolated(unsafe) private static var inverseVerdict: Bool?
@@ -7773,6 +7986,29 @@ extension Qwen35FusedHadamard {
                 guard passed else { return nil }
             }
             return inverseLaunch(x, signs)
+        }
+        guard let kernel = dequantizedInverseKernel else { return }
+        SignedBlockHadamard.fusedDequantizedInverse = { w, scales, biases, signs, block, group, bits in
+            let width = signs.size
+            guard block == 1024, group == 128, bits == 2, width > 0, width % 1024 == 0,
+                w.ndim == 2, w.dtype == .uint32, w.dim(0) > 0, w.dim(1) == width / 16,
+                w.dim(0) <= Int(UInt32.max) / width,
+                scales.dtype == .float16, biases.dtype == .float16,
+                scales.shape == [w.dim(0), width / 128], biases.shape == scales.shape,
+                signs.ndim == 1, signs.dtype == .float32,
+                inverseLock.withLock({ inverseVerdict == true })
+            else { return nil }
+            let passed = dequantizedInverseLock.withLock {
+                if let verdict = dequantizedInverseVerdict, verdict.width == width { return verdict.passed }
+                let passed = dequantizedInverseSelfTest(kernel, signs)
+                dequantizedInverseVerdict = (width, passed)
+                FileHandle.standardError.write(
+                    ("bonsai dequantized inverse (\(width)): self-test "
+                        + (passed ? "passed; fused\n" : "FAILED; separate kernels kept\n")).data(using: .utf8)!)
+                return passed
+            }
+            guard passed else { return nil }
+            return dequantizedInverseLaunch(kernel, w, scales, biases, signs)
         }
     }
 
@@ -7899,6 +8135,21 @@ extension Qwen35FusedHadamard {
           }
           return v;
         }
+        // The 32-bit twin (`p32` proven at the kernel's head): the same
+        // elements, addressed through 32-bit offsets.
+        template <int HD, typename T>
+        inline float4 bonsai_q8p_ld4_32(
+            const device T* p, uint rowoff, const constant int64_t* st, uint c, bool vec) {
+          if (vec) {
+            return bonsai_ld4(p + int64_t(rowoff + bonsai_q8p_col32<HD>(st, c)));
+          }
+          float4 v;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            v[r] = float(p[int64_t(rowoff + bonsai_q8p_col32<HD>(st, c + uint(r)))]);
+          }
+          return v;
+        }
 
         """
 
@@ -7910,7 +8161,7 @@ extension Qwen35FusedHadamard {
             return text.replacingOccurrences(of: target, with: replacement)
         }
         var text = sourceInt8Producer
-        let brow = "const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+        let brow = "const uint brow = uint(brow64);\n"
         text = replacing(
             text, brow,
             brow + """
@@ -7937,7 +8188,7 @@ extension Qwen35FusedHadamard {
                 float acc = 0.0f;
                 #pragma clang loop unroll(full)
                 for (int r = 0; r < 4; r++) {
-                  const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
+                  const float tx = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, c0 + uint(r))) : arow64 + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r)))]);
                   acc += tx * tx;
                 }
                 acc = simd_sum(acc);
@@ -7967,8 +8218,8 @@ extension Qwen35FusedHadamard {
                   const uint rr = hr % uint(GR);
                   src = (rr * uint(GKH) + h) * uint(GD) + d;
                 }
-                const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
-                const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
+                const float av = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, src)) : arow64 + bonsai_q8p_col<AHD>(a_strides, src))]);
+                const float bv = float(b[(p32 ? int64_t(brow + bonsai_q8p_col32<BHD>(b_strides, src)) : brow64 + bonsai_q8p_col<BHD>(b_strides, src))]);
                 float v;
                 if (PROD == 1) {
                   v = (av * bonsai_sigmoid(av)) * bv;
@@ -8003,8 +8254,12 @@ extension Qwen35FusedHadamard {
                 const uint rr = hr % uint(GR);
                 src = (rr * uint(GKH) + h) * uint(GD) + d;
               }
-              const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
-              const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
+              const float4 a4 = p32
+                  ? bonsai_q8p_ld4_32<AHD>(a, arow, a_strides, src, AV)
+                  : bonsai_q8p_ld4<AHD>(a, arow64, a_strides, src, AV);
+              const float4 b4 = p32
+                  ? bonsai_q8p_ld4_32<BHD>(b, brow, b_strides, src, BV)
+                  : bonsai_q8p_ld4<BHD>(b, brow64, b_strides, src, BV);
               const float4 s4 = bonsai_ld4(signs + col);
               float inv = 0.0f;
               if (PROD == 3) {
@@ -8448,23 +8703,32 @@ extension Qwen35FusedHadamard {
     /// inputs `a0 ..`, at local row `row % BLR`; nil when the q8pv text no
     /// longer matches.
     private static func rowBlocksSource(_ count: Int) -> String? {
-        let arow = "const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);\n"
+        let arow = "const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)\n"
+            + "    && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);\n"
+            + "const int64_t arow64 = bonsai_q8p_row<AHD>(a_shape, a_strides, row);\n"
+            + "const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+            + "const uint arow = uint(arow64);\n"
         let text = producerVecSource
         guard count >= 1, text.components(separatedBy: arow).count == 2,
-            text.components(separatedBy: "bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV)").count == 2
+            text.components(separatedBy: "bonsai_q8p_ld4<AHD>(a, arow64, a_strides, src, AV)").count == 2
         else { return nil }
         var select = """
             // The attention output as `count` row blocks of BLR rows, one shape
             // and one set of strides: row r is local row r % BLR of block r / BLR.
             const uint ablk = row / uint(BLR);
             const constant int64_t* a_strides = a0_strides;
+            const constant int* a_shape = a0_shape;
             auto a = a0;
 
             """
         for i in 1 ..< count {
             select += "if (ablk == \(i)u) { a = a\(i); }\n"
         }
-        select += "const int64_t arow = bonsai_q8p_row<AHD>(a0_shape, a_strides, row % uint(BLR));\n"
+        select += "const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)\n"
+            + "    && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);\n"
+            + "const int64_t arow64 = bonsai_q8p_row<AHD>(a0_shape, a_strides, row % uint(BLR));\n"
+            + "const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+            + "const uint arow = uint(arow64);\n"
         return text.replacingOccurrences(of: arow, with: select)
     }
 
@@ -9391,6 +9655,19 @@ extension Qwen35FusedBoundaryQ8 {
 /// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
 /// too.
 enum Qwen35GatedNormTail {
+    private static let epsilonLock = NSLock()
+    nonisolated(unsafe) private static var lastEpsilon: (UInt32, MLXArray)?
+
+    static func epsilonInput(_ epsilon: Float) -> MLXArray {
+        let bits = epsilon.bitPattern
+        return epsilonLock.withLock {
+            if let (previous, input) = lastEpsilon, previous == bits { return input }
+            let input = MLXArray([epsilon])
+            lastEpsilon = (bits, input)
+            return input
+        }
+    }
+
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -9475,7 +9752,7 @@ enum Qwen35GatedNormTail {
         let rows = x.dim(0) * x.dim(1)
         let heads = x.dim(2)
         return kernel(
-            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            [x, z, weight, epsilonInput(eps), signs.reshaped(-1)],
             template: [("H", heads), ("InZ", z.dtype)],
             grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]
@@ -10149,11 +10426,21 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        // The last residual add, its FP32 promotion and the final norm in one
+        // launch (`Qwen35FinalNormGlue`); the forward returns the kernel's sum.
+        var glued: MLXArray? = nil
+        let norm = model.norm
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
+            captureRecurrentWindow: true,
+            finalAdd: Qwen35FinalNormGlue.enabled
+                ? { h, p in
+                    guard let out = Qwen35FinalNormGlue.apply(h, p, norm) else { return nil }
+                    glued = out.normed
+                    return out.sum
+                } : nil)
+        let normalized = glued ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             // The head's fused top two rides beside the lazy logits where the
