@@ -2421,6 +2421,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),

@@ -1018,8 +1018,13 @@ extension Qwen35GDNReplayFused {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+            const float4 x = *(const device float4*)(ps + base);
+            state[d][i] = x.x;
+            state[d][i + 1] = x.y;
+            state[d][i + 2] = x.z;
+            state[d][i + 3] = x.w;
           }
         }
 
@@ -2274,7 +2279,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -4154,7 +4159,9 @@ extension Qwen35GatedDeltaChunked {
             guard text.components(separatedBy: target).count == 2 else { return nil }
             text = text.replacingOccurrences(of: target, with: replacement)
         }
-        return text
+        guard text.components(separatedBy: "size_t").count == 9 else { return nil }
+        return "using ScanIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;\n"
+            + text.replacingOccurrences(of: "size_t", with: "ScanIndexT")
     }
 
     private static let ktKernel: MLXFast.MLXFastKernel? = {
@@ -4181,6 +4188,14 @@ extension Qwen35GatedDeltaChunked {
         let simdgroups: Int
     }
 
+    static func scanOffsetsFitIO32(batch: Int, rows: Int, hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let limit = Int(Int32.max)
+        let rowWidth = max(hk * dk, hv * dv, hv * chunk)
+        return Qwen35IO32.enabled && batch > 0 && rows > 0
+            && rows <= limit / rowWidth && batch <= limit / (rows * rowWidth)
+            && batch <= limit / (hv * dv * dk)
+    }
+
     private static func scanFormLaunch(
         _ form: ScanForm, q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray],
         stateShape: [Int]
@@ -4191,6 +4206,7 @@ extension Qwen35GatedDeltaChunked {
             template: [
                 ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", form.simdgroups),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, form.simdgroups, 1),
@@ -4471,6 +4487,13 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// - `rowkernel`: the verify boundary on the per-row kernel instead of
 ///   `Qwen35BoundaryBlocks` (80 threadgroups of 256); offered only when the
 ///   16-row self-test passed through both.
+/// - `unfold`: the verify block's attention GEMMs as `kvHeads * repeats`
+///   broadcast batches of 16 rows instead of `kvHeads` folded batches
+///   (`CBv2PromptCausalAttention.verifyFoldRepeats`, fixed from the M4 Max):
+///   three times the threadgroups at 64-row tiles. Offered only when
+///   `checkVerifyUnfold` found the probabilities and the output of both forms
+///   equal bit for bit at every key count the verify warm covered, which also
+///   builds the unfolded pipelines before any timed round.
 /// Round 0 and each arm's first round warm up; then the arms rotate for
 /// `roundsPerArm` rounds each, rounds above 1.5x their arm's median dropped,
 /// and an alternative is kept only when its median round beats the record's
@@ -4485,10 +4508,10 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// `BONSAI_EXACT_TRIALS=0` keeps every record form (no trial, no extra
 /// self-test). Per item (default on): `BONSAI_TRIAL_GDN_DVPL`,
 /// `BONSAI_TRIAL_ROTATION_TPB`, `BONSAI_TRIAL_BOUNDARY`,
-/// `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced form skips its item:
-/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
+/// `BONSAI_TRIAL_VERIFY_UNFOLD`, `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced
+/// form skips its item: `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
 /// `BONSAI_ROTATION_Q8_TPB_SMALL=128`, `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
-/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
+/// `BONSAI_VERIFY_FOLD_REPEATS` (either way), `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
 enum Qwen35ExactFormTrial {
     private static func on(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
@@ -4500,6 +4523,7 @@ enum Qwen35ExactFormTrial {
     static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
     static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
     static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
+    static let unfoldWanted = enabled && on("BONSAI_TRIAL_VERIFY_UNFOLD")
     static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
 
     /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
@@ -4577,6 +4601,22 @@ enum Qwen35ExactFormTrial {
                     Qwen35BoundaryBlocks.stock = $0
                 })
             }
+        }
+        if unfoldWanted, CBv2PromptCausalAttention.verifyFoldRepeats,
+            !CBv2PromptCausalAttention.verifyFoldRepeatsForced
+        {
+            if let check = CBv2PromptCausalAttention.checkVerifyUnfold() {
+                checks.append(
+                    "unfold " + (check.passed ? "passed" : "FAILED") + " (\(check.detail))")
+                if check.passed {
+                    list.append(Arm(name: "unfold", knob: "fold") {
+                        CBv2PromptCausalAttention.verifyFoldRepeats = !$0
+                    })
+                }
+            } else {
+                checks.append("unfold not offered (no verify block warm)")
+            }
+            Memory.clearCache()
         }
         guard list.count > 1 else {
             if !checks.isEmpty || enabled {
