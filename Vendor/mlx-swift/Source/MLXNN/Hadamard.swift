@@ -85,6 +85,18 @@ public struct SignedBlockHadamard {
     ) -> Int8Activation?
     nonisolated(unsafe) public static var fusedTransformInt8: FusedTransformInt8?
 
+    /// One FP32 row quantized into the same sixteen-row tuple as zero padding
+    /// followed by `forwardInt8`. Nil keeps that composed path.
+    nonisolated(unsafe) public static var fusedTransformInt8Padded: FusedTransformInt8?
+
+    public func forwardInt8Padded(_ x: MLXArray, preSigned: Bool) -> Int8Activation? {
+        validate(x)
+        guard x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+            let fused = Self.fusedTransformInt8Padded
+        else { return nil }
+        return fused(x, signs, blockSize, preSigned, nil, 128)
+    }
+
     /// `forward` (or `applyPreSigned` when `preSigned`) quantized per group;
     /// nil when no fused implementation provides it.
     public func forwardInt8(
@@ -291,6 +303,25 @@ public struct SignedBlockHadamard {
         _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
     ) -> MLXArray?
     nonisolated(unsafe) public static var fusedInverse: FusedInverse?
+
+    /// A packed embedding lookup, `inverse(dequantized(gathered rows))`, as
+    /// one kernel: the tables, the flat ids, the signs, the block size, the
+    /// group size and bits, and `chain`, the lookup's own path (the same
+    /// function of the ids, for a self-test). It must return exactly what
+    /// `chain` returns. Installed by the model file; nil declines.
+    public typealias FusedLookup = (
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ signs: MLXArray, _ blockSize: Int, _ groupSize: Int, _ bits: Int,
+        _ chain: (MLXArray) -> MLXArray
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedLookup: FusedLookup?
+
+    func lookupRows(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        groupSize: Int, bits: Int, chain: (MLXArray) -> MLXArray
+    ) -> MLXArray? {
+        Self.fusedLookup?(codes, scales, biases, ids, signs, blockSize, groupSize, bits, chain)
+    }
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -1318,15 +1349,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
         else { return nil }
         let padded = Self.tensorRouteMaximumNarrowRows
-        let input =
-            rows < padded
-            ? concatenated(
-                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
-            : x
-        guard
-            let activation = transform.forwardInt8(
+        let activation: SignedBlockHadamard.Int8Activation
+        if rows == 1, padded == 16, gdnLayout == nil,
+            let direct = transform.forwardInt8Padded(x, preSigned: preSigned)
+        {
+            activation = direct
+        } else {
+            let input =
+                rows < padded
+                ? concatenated(
+                    [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
+                : x
+            guard let composed = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
-        else { return nil }
+            else { return nil }
+            activation = composed
+        }
         if siblings.count == 1 {
             guard let y = matmul(
                 activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
@@ -1962,10 +2000,21 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let indices = x.flattened()
-        let rows = dequantized(
-            weight[indices], scales: scales[indices],
-            biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
-        return transform.inverse(rows).reshaped(x.shape + [transform.width])
+        // The reference closes over the original three gathers, without
+        // recursively entering the optional lookup hook during admission.
+        func chain(_ ids: MLXArray) -> MLXArray {
+            let rows = dequantized(
+                weight[ids], scales: scales[ids], biases: biases.map { $0[ids] },
+                groupSize: groupSize, bits: bits)
+            return transform.inverse(rows)
+        }
+        if let biases,
+            let rows = transform.lookupRows(
+                weight, scales, biases, indices, groupSize: groupSize, bits: bits, chain: chain)
+        {
+            return rows.reshaped(x.shape + [transform.width])
+        }
+        return chain(indices).reshaped(x.shape + [transform.width])
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {

@@ -4840,3 +4840,336 @@ enum Qwen35ExactFormTrial {
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
     }
 }
+
+
+// MARK: - Guarded direct Decode embedding rows
+
+// Isolated pending lookup fusion. Exact pinned affine tables and source order;
+// no request result cache. Unsupported forms or a failed raw-bit gate decline.
+enum Qwen35EmbeddingRows {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_EMB_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let chunk = 4096
+    private static let lock = NSLock()
+    private struct Verdict {
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        let signs: MLXArray
+        let passed: Bool
+    }
+    nonisolated(unsafe) private static var verdicts: [String: Verdict] = [:]
+
+    static func install() {
+        guard enabled, kernel != nil else { return }
+        SignedBlockHadamard.fusedLookup = {
+            codes, scales, biases, ids, signs, blockSize, groupSize, bits, chain in
+            guard blockSize == 1024, groupSize == 128, bits == 2, ids.ndim == 1, ids.size > 0,
+                ids.size <= 16, ids.dtype == .int32 || ids.dtype == .uint32,
+                codes.dtype == .uint32, codes.ndim == 2, codes.dim(0) >= 2, codes.dim(0) <= Int(Int32.max),
+                scales.dtype == .float16, biases.dtype == .float16, scales.ndim == 2,
+                biases.shape == scales.shape, scales.dim(0) == codes.dim(0),
+                signs.dtype == .float32, signs.ndim == 1, signs.size == 5120,
+                codes.dim(1) * 16 == signs.size, scales.dim(1) * 128 == signs.size,
+                verified(codes, scales, biases, ids.dtype, signs, chain)
+            else { return nil }
+            return launch(codes, scales, biases, ids, signs)
+        }
+    }
+
+    private static func launch(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ signs: MLXArray
+    ) -> MLXArray {
+        let (rows, width) = (ids.size, signs.size)
+        return kernel!(
+            [codes, scales, biases, ids, signs],
+            template: [
+                ("OutT", DType.float16), ("W", width), ("BPR", width / 1024),
+                ("WC", codes.dim(1)), ("GC", scales.dim(1)), ("V", codes.dim(0)),
+                ("PRESIGNED", 1), ("GR", 1), ("GKH", 1), ("GD", 1), ("QSIM", 0),
+            ],
+            grid: (64 * rows * (width / 1024), 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[rows, width]], outputDTypes: [.float16])[0]
+    }
+
+    private static func verified(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ idType: DType,
+        _ signs: MLXArray, _ chain: (MLXArray) -> MLXArray
+    ) -> Bool {
+        lock.withLock {
+            let key = "\(idType) \(codes.shape) \(scales.shape) \(signs.size)"
+            if let verdict = verdicts[key], verdict.codes === codes,
+                verdict.scales === scales, verdict.biases === biases, verdict.signs === signs
+            { return verdict.passed }
+            let (passed, summary) = selfTest(codes, scales, biases, idType, signs, chain)
+            verdicts[key] = Verdict(
+                codes: codes, scales: scales, biases: biases, signs: signs, passed: passed)
+            FileHandle.standardError.write(
+                ("qwen35 embedding rows (EMBROWS): " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).data(using: .utf8)!)
+            return passed
+        }
+    }
+
+    private static func selfTest(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ idType: DType,
+        _ signs: MLXArray, _ chain: (MLXArray) -> MLXArray
+    ) -> (Bool, String) {
+        let vocab = codes.dim(0)
+        var values = 0
+        var mismatches = 0
+        var failure: String? = nil
+        let start = Date()
+        do {
+            try withError { error in
+                // The FP16 values in which the kernel and the chain differ.
+                func differ(_ ids: MLXArray) -> MLXArray {
+                    let ids = ids.asType(idType)
+                    let chained = chain(ids)
+                    let fused = launch(codes, scales, biases, ids, signs)
+                    guard chained.dtype == fused.dtype, chained.shape == fused.shape else {
+                        failure = "output \(fused.dtype) \(fused.shape) vs \(chained.dtype) \(chained.shape)"
+                        return MLXArray(Int32(0))
+                    }
+                    values += chained.size
+                    return (chained.view(dtype: .uint16) .!= fused.view(dtype: .uint16))
+                        .asType(.int32).sum()
+                }
+                func count(_ differences: [MLXArray]) throws {
+                    let total = differences.dropFirst().reduce(differences[0], +)
+                    eval(total)
+                    try error.check()
+                    mismatches += Int(total.item(Int32.self))
+                }
+                let v = Int32(vocab)
+                let random = MLXRandom.randInt(
+                    Int32(0) ..< v, [64 + 65 * 16 + 17], key: MLXRandom.key(0x656d_6272))
+                var edge: [Int32] = [0, v - 1, v / 2, 1, v - 2]
+                if idType == .int32 { edge += [-1, -v] }
+                var differences = [Int32(0), v - 1, v / 2].map { differ(MLXArray([$0])) }
+                for k in 0 ..< 64 { differences.append(differ(random[k ..< (k + 1)])) }
+                differences.append(
+                    differ(concatenated([MLXArray(edge), random[64 ..< (80 - edge.count)]], axis: 0)))
+                for k in 1 ... 64 { differences.append(differ(random[(64 + 16 * k) ..< (80 + 16 * k)])) }
+                differences.append(differ(random[(64 + 65 * 16)...]))
+                guard failure == nil else { return }
+                try count(differences)
+                // Every vocabulary row, in chunks.
+                var first = 0
+                while first < vocab, failure == nil {
+                    let n = min(chunk, vocab - first)
+                    let ids = MLXArray((first ..< (first + n)).map { Int32($0) })
+                    try count([differ(ids)])
+                    first += n
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && values > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(values) values compared bitwise "
+                + "(1-row, 16-row and 17-row lookups, every vocabulary row), \(mismatches) mismatches, "
+                + String(format: "%.0f ms", Date().timeIntervalSince(start) * 1000))
+    }
+
+    /// MLX `affine_dequantize` (quantized.h) at 2 bits for the value in
+    /// column `col` of one packed row, with the kernel's own types and
+    /// expression: the byte as `uint val`, `uint8_t d`, `T scale`, `T bias`,
+    /// and `scale * d + bias` in `T`.
+    private static let dequantizeHeader = """
+        template <typename T>
+        METAL_FUNC T bonsai_affine_dequantize_2(
+            const device uint8_t* w, const device T* scales, const device T* biases, uint col) {
+          constexpr int bits = 2;
+          const int i = int(col % 4);
+          uint val = w[col / 4];
+          uint8_t d = (val >> (bits * i)) & 0x03;
+          T scale = scales[col / 128];
+          T bias = biases[col / 128];
+          return scale * d + bias;
+        }
+
+        """
+
+    // grid (64 * rows * BPR, 1, 1), threadgroup (64, 1, 1): one threadgroup
+    // per 1024-wide block of a row, as the inverse rotation. Inputs: codes
+    // uint32 [V, WC], scale_table and bias_table half [V, GC], ids [rows],
+    // signs float [W]. Output: out half [rows, W].
+    private static let kernel: MLXFast.MLXFastKernel? = {
+        let source = Qwen35FusedHadamard.source
+        let rowStart = "threadgroup float buf[N];"
+        let load = "float v = float(inp[rowbase + src]);"
+        let store = "out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);"
+        guard [rowStart, load, store].allSatisfy({ source.components(separatedBy: $0).count == 2 })
+        else { return nil }
+        let text =
+            source
+            .replacingOccurrences(
+                of: rowStart,
+                with: """
+                    long eid = long(ids[row]);
+                    if (eid < 0) eid += long(V);
+                    const device uint8_t* erow = (const device uint8_t*)codes + ulong(eid) * ulong(4 * WC);
+                    const device half* escale = scale_table + ulong(eid) * ulong(GC);
+                    const device half* ebias = bias_table + ulong(eid) * ulong(GC);
+                    \(rowStart)
+                    """)
+            .replacingOccurrences(
+                of: load, with: "float v = float(bonsai_affine_dequantize_2(erow, escale, ebias, col));")
+            .replacingOccurrences(
+                of: store,
+                with: "out[rowbase + bcol + uint(index + r)] = "
+                    + "OutT((buf[index + r] * 0.03125f) * signs[bcol + uint(index + r)]);")
+        guard !text.contains("inp[") else { return nil }
+        return MLXFast.metalKernel(
+            name: "bonsai_embedding_rows_hadamard_1024_inv",
+            inputNames: ["codes", "scale_table", "bias_table", "ids", "signs"],
+            outputNames: ["out"],
+            source: Qwen35IO32.narrow(text, count: 3, "bonsai_embedding_rows_hadamard_1024_inv"),
+            header: Qwen35FusedHadamard.header + dequantizeHeader,
+            ensureRowContiguous: true)
+    }()
+}
+
+
+// MARK: - One-row Q8 padding without zero-row transforms
+
+// Isolated pending producer increment, preserving the baseline row body.
+// A failed raw-word gate or unsupported form keeps concatenation and stock.
+extension Qwen35RotationQ8Blocks {
+    // Row is constant across the threadgroup. Padding exits before any
+    // input read or barrier; the real row retains the entire original body.
+    private static let paddedSource: String? = {
+        let anchor = "alignas(16) threadgroup float buf[N];"
+        guard source.components(separatedBy: anchor).count == 2 else { return nil }
+        let fill = """
+            if (row >= 1u) {
+              const uchar code = SIGNED ? uchar(0) : uchar(128);
+              for (uint word = tid; word < 256u; word += uint(TPB)) {
+                *(device uchar4*)(out + rowbase + bcol + 4u * word) = uchar4(code);
+              }
+              if (tid < 8u) {
+                const uint group = row * uint(W / 128) + bcol / 128u + tid;
+                qscale[group] = 1.0f;
+                qsum[group] = 0.0f;
+              }
+              return;
+            }
+
+            """
+        return source.replacingOccurrences(of: anchor, with: fill + anchor)
+    }()
+
+    private static let paddedKernel = paddedSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_signed_hadamard_1024_q8_blocks_padded",
+            inputNames: ["inp", "signs"], outputNames: ["out", "qscale", "qsum"],
+            source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let paddedWanted: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_Q8_ONE_ROW_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private static let paddedLock = NSLock()
+    private struct PaddedVerdict {
+        let signs: MLXArray
+        let passed: Bool
+    }
+    nonisolated(unsafe) private static var paddedVerdicts: [Form: PaddedVerdict] = [:]
+
+    static func installPadded() {
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, layout, groupSize in
+            guard paddedWanted, enabled, blockSize == 1024, groupSize == 128, layout == nil,
+                x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+                signs.dtype == .float32, signs.shape == [x.dim(1)],
+                Qwen35TensorPackedMatmul.signedCodes, let launch = paddedKernel
+            else { return nil }
+            let width = x.dim(1)
+            guard width > 0, width % 1024 == 0, width <= Int(Int32.max) / 16 else {
+                return nil
+            }
+            // Preserve the thread choice of the original sixteen-row launch.
+            let tpb = threads(blocks: 16 * (width / 1024))
+            let form = Form(
+                width: width, presigned: preSigned, gr: 1, gkh: 1, gd: 1,
+                perm: Qwen35TensorPackedMatmul.support == .staged8, mperm: false,
+                signed: true, dtype: "\(x.dtype)", tpb: tpb)
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", DType.float32), ("OutT", DType.int8), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", 1), ("PRESIGNED", preSigned ? 1 : 0),
+                ("GR", 1), ("GKH", 1), ("GD", 1), ("QSIM", 0),
+                ("PERM", form.perm ? 1 : 0), ("MPERM", 0), ("TPB", tpb),
+            ]
+            guard paddedVerified(form, signs: signs, template: template, launch: launch) else {
+                return nil
+            }
+            let outputs = launch(
+                [x, signs], template: template,
+                grid: (tpb * 16 * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
+                outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                outputDTypes: [.int8, .float32, .float32])
+            return SignedBlockHadamard.Int8Activation(
+                codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+    }
+
+    private static func paddedVerified(
+        _ form: Form, signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        launch: MLXFast.MLXFastKernel
+    ) -> Bool {
+        paddedLock.lock()
+        defer { paddedLock.unlock() }
+        if let verdict = paddedVerdicts[form], verdict.signs === signs { return verdict.passed }
+        var passed = false
+        do {
+            try withError { error in
+                guard let stock = SignedBlockHadamard.fusedTransformInt8 else { return }
+                let width = form.width
+                let random = MLXRandom.normal([1, width], key: MLXRandom.key(0x7168_7064))
+                let zero = MLXArray.zeros([1, width], dtype: .float32)
+                var checks: [MLXArray] = []
+                for row in [zero, random] {
+                    let input = concatenated(
+                        [row, MLXArray.zeros([15, width], dtype: .float32)], axis: 0)
+                    guard let reference = stock(input, signs, 1024, form.presigned, nil, 128),
+                        lock.withLock({ verdicts[form] == true })
+                    else { return }
+                    let candidate = launch(
+                        [row, signs], template: template,
+                        grid: (form.tpb * 16 * (width / 1024), 1, 1),
+                        threadGroup: (form.tpb, 1, 1),
+                        outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                        outputDTypes: [.int8, .float32, .float32])
+                    let truth = [reference.codes, reference.scales, reference.scaledSums]
+                    for (old, new) in zip(truth, candidate) {
+                        guard old.shape == new.shape, old.dtype == new.dtype else { return }
+                        let bits: DType = old.dtype.size == 1 ? .uint8 : .uint32
+                        checks.append((old.view(dtype: bits) .!= new.view(dtype: bits))
+                            .asType(.int32).sum())
+                    }
+                }
+                eval(checks)
+                try error.check()
+                passed = checks.count == 6 && checks.allSatisfy { $0.item(Int32.self) == 0 }
+            }
+        } catch {}
+        if paddedVerdicts.count >= 16 { paddedVerdicts.removeAll(keepingCapacity: true) }
+        paddedVerdicts[form] = PaddedVerdict(signs: signs, passed: passed)
+        FileHandle.standardError.write(
+            ("bonsai Q8 one-row padding (\(form.width), \(form.tpb)): "
+                + (passed ? "passed; padding filled in producer\n" : "failed; concat kept\n"))
+                .data(using: .utf8)!)
+        return passed
+    }
+}

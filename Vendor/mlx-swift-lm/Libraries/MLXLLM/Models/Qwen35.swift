@@ -7126,7 +7126,7 @@ enum Qwen35FusedHadamard {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
-    private static let header = """
+    static let header = """
         // MLX `Sigmoid` (unary_ops.h), verbatim.
         METAL_FUNC float bonsai_sigmoid(float x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -7158,7 +7158,7 @@ enum Qwen35FusedHadamard {
     // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
     // 1024-wide block. Template: InT, OutT, W (row width), BPR (blocks per
     // row), PRESIGNED, GR (GDN repeats, 1 = identity), GKH, GD.
-    private static let source = """
+    static let source = """
         constexpr short N = 1024;
         constexpr short NT = 64;
         const uint blk = threadgroup_position_in_grid.x;
@@ -7475,6 +7475,8 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
+        Qwen35EmbeddingRows.install()
+        Qwen35RotationQ8Blocks.installPadded()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
