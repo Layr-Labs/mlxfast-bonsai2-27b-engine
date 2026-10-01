@@ -438,3 +438,4 @@ enum AffineMetadataCoding {
 
 
 // Yukon reuse package v1; original inventory SHA-256: 5d6438013ddda29951e0f7788f3cb902b18d820ee9638c57a54101890e5c299f
+// Antigravity Crown-d038e70: 32-bit dflash2_qk_prework narrowing & fit32 gated RMSNorm Hadamard

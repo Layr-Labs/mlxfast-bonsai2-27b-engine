@@ -6406,7 +6406,7 @@ enum DFlash2QKPrework {
         name: "dflash2_qk_prework",
         inputNames: ["y", "qw", "kw", "p", "pos"],
         outputNames: ["q", "k"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework"),
         ensureRowContiguous: true)
 
     /// The kernel body, shared with `DFlash2SpeculativeFront`'s variant.
