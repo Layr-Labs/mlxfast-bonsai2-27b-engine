@@ -526,7 +526,14 @@ extension EngineLoopV2 {
             if let policyTopTwoValues = verify.policyTopTwoValues {
                 asyncEvalTargets.append(policyTopTwoValues)
             }
-            if let blockContext = verify.blockContext {
+            // TAPJOIN: a next block that reads the taps behind the block
+            // context leaves their join lazy (`defersVerifyContext`).
+            if let blockContext = verify.blockContext,
+                !(CBv2MTPDraftBeforeReadback.enabled && verify.rows.count == 1
+                    && mtp.config.fixedDraftTokens == verify.k
+                    && ((mtp.blockDrafter as? any CBv2MTPBlockSpeculation)?
+                        .defersVerifyContext(blockContext) ?? false))
+            {
                 asyncEvalTargets.append(blockContext)
             }
         }
@@ -845,8 +852,12 @@ extension EngineLoopV2 {
         let packetDrafts: MLXArray? =
             CBv2DW2.enabled && blockDraftIDs != nil && target.shortlist == nil
             ? packetParts[0] : nil
+        // ACCGLUE: where the parts are joined, one launch writes them
+        // (`CBv2AcceptGlue.packet`).
         let acceptancePacket =
-            packetDrafts != nil ? packetParts[1] : concatenated(packetParts, axis: 0)
+            packetDrafts != nil
+            ? packetParts[1]
+            : (CBv2AcceptGlue.packet(packetParts) ?? concatenated(packetParts, axis: 0))
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
