@@ -336,6 +336,12 @@ public final class DFlash2TapSlot {
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
+    /// `CBv2DW2`, capture verify only: the head whose quantized input the
+    /// trunk's last boundary forms (set around the trunk), and that boundary's
+    /// sum and activation. Kept here, off the module tree, for the tap's reason.
+    var head: HadamardQuantizedLinear?
+    var headInput: (h: MLXArray, activation: SignedBlockHadamard.Int8Activation)?
+
     public init() {}
 }
 
@@ -2371,8 +2377,11 @@ enum DFlash2TensorMatmul {
 
         /// The trial (see the type's notes), once; nothing unless `note` ran.
         static func run() {
-            guard !sequence.isEmpty, swappedActive else { return }
-            defer { (weights, sequence, inputs) = ([:], [], [:]) }
+            guard !sequence.isEmpty, swappedActive else { return DFlash2Pack11.finish(adopting: false) }
+            defer {
+                formTrial()
+                (weights, sequence, inputs) = ([:], [], [:])
+            }
             guard enabled else { return log("MLXFAST_DRAFT_TILING_TRIAL=0; the record's tiling, no trial") }
             guard forced == nil else { return }
             let start = DispatchTime.now().uptimeNanoseconds
@@ -2452,6 +2461,60 @@ enum DFlash2TensorMatmul {
                 + parts.joined(separator: " | ") + " -> " + verdict
                 + String(format: "; %.0f ms (checks and compiles %.0f)",
                     Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6, checking / 1e6))
+        }
+
+        /// The 11-bit form's stage (`DFlash2Pack11`), after the tiling's: the
+        /// form checked bit for bit at every adopted non-standard tiling, then
+        /// chains of every packed projection (the adopted tilings) on the
+        /// 12-bit and the 11-bit copies, alternating, `trialRounds` timed each;
+        /// the 11-bit form is adopted only past `DFlash2Pack11.adoptMargin`.
+        private static func formTrial() {
+            guard DFlash2Pack11.offered else { return }
+            let start = DispatchTime.now().uptimeNanoseconds
+            func on<T>(_ eleven: Bool, _ body: () -> T) -> T {
+                DFlash2Pack11.live = eleven
+                defer { DFlash2Pack11.live = false }
+                return body()
+            }
+            var checked = 0
+            let exact = packed && (try? withError { error -> Bool in
+                var differ: [MLXArray] = []
+                for (shape, t) in swapTilings where t.ahead != nil && t != shape.standard(packed: true) {
+                    for w in weights[shape] ?? [] {
+                        let x = input(shape)
+                        let (a, b) = (on(false) { launch(x, w, shape, t) }, on(true) { launch(x, w, shape, t) })
+                        differ.append((a.view(dtype: .uint16) .!= b.view(dtype: .uint16)).asType(.int32).sum())
+                        checked += 1
+                    }
+                }
+                let wrong = differ.isEmpty ? MLXArray(Int32(0)) : stacked(differ).sum()
+                eval(wrong)
+                try error.check()
+                return wrong.item(Int.self) == 0
+            }) == true
+            guard exact else {
+                DFlash2Pack11.finish(adopting: false)
+                return log("11-bit form FAILED its check at the adopted tilings; the 12-bit form kept, 11-bit copies freed")
+            }
+            let chain = sequence.map {
+                ($0.0, $0.1, swapTiling(k: $0.0.k, n: $0.0.n, rows32: $0.0.rows32, packed: true))
+            }
+            for _ in 0 ..< 3 { _ = on(false) { time(chain) }; _ = on(true) { time(chain) } }
+            var (base, mine) = ([Double](), [Double]())
+            for round in 0 ... DFlash2Pack11.trialRounds {
+                let first = round % 2 == 1
+                let (a, b) = (on(first) { time(chain) }, on(!first) { time(chain) })
+                if round > 0 { base.append(first ? b : a); mine.append(first ? a : b) }
+            }
+            let ratio = median(zip(mine, base).map { $0 / $1 })
+            let adopt = ratio <= 1 - DFlash2Pack11.adoptMargin
+            DFlash2Pack11.finish(adopting: adopt)
+            log("11-bit form: all \(sequence.count) projections (\(DFlash2Pack11.trialRounds) rounds"
+                + (checked > 0 ? ", \(checked) adopted-tiling weights bitwise" : "")
+                + String(format: ") 12-bit %.3f ms, 11-bit %.3f ms (%+.1f%%) -> ", median(base) / 1e6, median(mine) / 1e6, (ratio - 1) * 100)
+                + (adopt ? "11-bit adopted, 12-bit codes freed"
+                    : String(format: "12-bit kept (under %.1f%%), 11-bit copies freed", DFlash2Pack11.adoptMargin * 100))
+                + String(format: "; %.0f ms", Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6))
         }
     }
 
@@ -2917,11 +2980,27 @@ enum DFlash2PackedWeights {
         let escapes: MLXArray
         let escapeCount: Int
         let index32Safe: Bool
-        var arrays: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
+        /// The 12-bit kernel's operands.
+        var operands: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
+        /// What the block forward reads: the operands, or the 11-bit copy's once adopted.
+        var arrays: [MLXArray] { DFlash2Pack11.reads(self) ?? operands }
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+
+    /// Frees the 12-bit codes once the 11-bit copies replace them
+    /// (`DFlash2Pack11`; the 12-bit kernel never runs after).
+    static func dropCodes() {
+        let none = MLXArray.zeros([1], dtype: .uint32)
+        lock.withLock {
+            for (key, c) in copies {
+                copies[key] = Copy(
+                    source: c.source, mantissas: c.mantissas, codes: none, first: none, bases: none,
+                    offsets: none, escapes: none, escapeCount: c.escapeCount, index32Safe: c.index32Safe)
+            }
+        }
+    }
     /// Set once by `prepare`, when every packed weight passed.
     nonisolated(unsafe) static var active = false
 
@@ -3177,7 +3256,7 @@ enum DFlash2PackedWeights {
     // `sourceSwapped` with the operand rebuilt from the packed tile instead
     // of loaded: the same op, K partitions and reduction. grid: (N / 32 *
     // (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). x bfloat [16, K].
-    private static let source = """
+    fileprivate static let source = """
         using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
@@ -3254,7 +3333,7 @@ enum DFlash2PackedWeights {
 
     // `sourceSwapped32` the same way: one rebuilt operand per K step,
     // multiplied by rows 0-15 and 16-31. x bfloat [32, K].
-    private static let source32 = """
+    fileprivate static let source32 = """
         using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
@@ -3389,8 +3468,13 @@ enum DFlash2PackedWeights {
     ) -> MLXArray {
         let n = c.source.dim(0)
         let t = tiling ?? DFlash2TensorMatmul.swapTiling(k: c.source.dim(1), n: n, rows32: rows > 16, packed: true)
+        if DFlash2Pack11.live, let f = DFlash2Pack11.form(of: c.source),
+            let y = DFlash2Pack11.launch(a, f, rows: rows, outputDType: outputDType, tiling: t)
+        {
+            return y
+        }
         return (rows == 16 ? kernel : kernel32)(
-            [a] + c.arrays + [dims(c.source)],
+            [a] + c.operands + [dims(c.source)],
             template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)] + geometry + [("AHEAD", t.ahead ?? 1)],
             grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
@@ -3470,7 +3554,7 @@ enum DFlash2PackedWeights {
                     // Every weight rebuilt, against its stored bits.
                     let tiles = n / cols * (k / ks)
                     let unpacked = unpackKernel(
-                        c.arrays + [dims(w)], template: geometry,
+                        c.operands + [dims(w)], template: geometry,
                         grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
                         outputShapes: [[n, k]], outputDTypes: [.bfloat16])[0]
                     var differing = [
@@ -3497,7 +3581,7 @@ enum DFlash2PackedWeights {
                     packed.append(c)
                     escapes += c.escapeCount
                     bytes.stored += w.nbytes
-                    bytes.packed += c.arrays.reduce(0) { $0 + $1.nbytes }
+                    bytes.packed += c.operands.reduce(0) { $0 + $1.nbytes }
                 }
                 try error.check()
             }
@@ -3527,6 +3611,495 @@ enum DFlash2PackedWeights {
                     + String(format: "; %.0f ms\n", elapsed)).utf8))
     }
 }
+/// Lossless 11-bit resident copies of the weights `DFlash2PackedWeights`
+/// packs, and the 12-bit kernel over them, offered to the tiling trial.
+///
+/// The 12-bit form keeps a four-bit exponent code per weight; the drafter's
+/// exponents carry ~2.55 bits, so a three-bit code fits most of them. Each
+/// weight keeps its sign-and-mantissa byte (the 12-bit copy's own byte array,
+/// shared, not copied) plus a three-bit code: code c of 1-7 is exponent
+/// base + c, base the tile's (of the twelve windows ending zero to eleven
+/// below the tile's largest exponent, the one with the fewest escapes);
+/// code 0 is an escape, whose exponent byte sits in the tile's escape list.
+/// On the drafter's weights 2.49% of the weights escape, and the copy holds
+/// ~11.23 bits a weight with its side data (the 12-bit copy ~12.19).
+///
+/// Layout: the 12-bit tiles (`[16 columns, 64 K]`, the cooperative operand's
+/// element order, 32 elements a lane). A lane's codes are three words: the
+/// low two bits of elements 2g and 2g + 1 (pair g = 8j + q) at bits 2q and
+/// 16 + 2q of word j, and their high bits at bits 2q + j and 16 + 2q + j of
+/// word 2, each word contiguous across the simdgroup. A tile's escapes are
+/// exponent bytes, lane by lane, each lane's in that bit order of word 2;
+/// `heads[tile]` is the tile's base | its first escape's byte offset << 8
+/// (`heads[tiles]` closes the list). The kernel reads, with each tile's
+/// share, the 128 escape bytes from its first one's word (at most 125 escapes
+/// a tile: else not offered), a lane's rank comes from a prefix sum of the
+/// lanes' escape counts, and each escape's byte from the lane holding it
+/// (`simd_shuffle`), one escape a lane per round, its exponent delta added
+/// to its pair word (a select over the lane's 16). The decoded weights fill
+/// the same cooperative operand, and the op, the K partitions and their
+/// reduction are the 12-bit kernel's, so the outputs are its bits.
+///
+/// EXACT: `prepare` (load) rebuilds every packed weight from its copy and
+/// compares every element with the stored BF16 bits, and compares the
+/// products of random 16-row (and 32-row for the q|k|v stacks) inputs with
+/// the 12-bit kernel's, FP32 and BF16 out, bit for bit; any mismatch or MLX
+/// error drops the form. The tiling trial (`DFlash2TensorMatmul.SwapTrial`)
+/// checks it again at every non-standard tiling it adopted, then times
+/// chains of every packed projection on both forms, alternating; the 11-bit
+/// form is adopted only when its median chain is more than `adoptMargin`
+/// faster, and the losing form's code arrays are freed.
+/// `MLXFAST_P11=0`: the record's 12-bit form, nothing built;
+/// `MLXFAST_P11=force`: adopted once its self-test passes, no trial.
+enum DFlash2Pack11 {
+    /// 0 off, 1 offered to the trial (default), 2 forced on.
+    static let setting: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLXFAST_P11"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        return ["2", "force", "forced"].contains(raw) ? 2 : 1
+    }()
+
+    static let adoptMargin = 0.015
+    static let trialRounds = 12
+
+    struct Form {
+        let source: MLXArray
+        let mantissas: MLXArray
+        let codes: MLXArray
+        let heads: MLXArray
+        let escapes: MLXArray
+        let escapeCount: Int
+        /// The 12-bit copy's: the derived text keeps its bounded indices (`IO32`).
+        let index32Safe: Bool
+        var arrays: [MLXArray] { [mantissas, codes, heads, escapes] }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var forms: [ObjectIdentifier: Form] = [:]
+    /// Self-tested, waiting for the trial.
+    nonisolated(unsafe) static var offered = false
+    /// The packed launches read the 11-bit copies.
+    nonisolated(unsafe) static var live = false
+
+    static func form(of weight: MLXArray) -> Form? {
+        lock.withLock { forms[ObjectIdentifier(weight)] }.flatMap { $0.source === weight ? $0 : nil }
+    }
+
+    /// What the block forward reads for `c`'s weight once the form is live.
+    static func reads(_ c: DFlash2PackedWeights.Copy) -> [MLXArray]? {
+        live ? form(of: c.source)?.arrays : nil
+    }
+
+    private static let header = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        // One lane's share of an 11-bit tile: its 32 sign|mantissa bytes, its
+        // three code words, its word of the tile's escape window, the tile's
+        // head and the next tile's.
+        struct dflash2_pack11_share {
+          uint4 m[2];
+          uint c[3];
+          uint win;
+          uint head;
+          uint next;
+        };
+
+        // `head` is heads[tile], read with the previous tile's share.
+        inline void dflash2_pack11_read(
+            thread dflash2_pack11_share& t, const device uint4* mant, const device uint* code,
+            const device uint* esc, const device uint* heads, uint tile, uint lane, uint head) {
+          const device uint4* mp = mant + tile * 64u + lane;
+          const device uint* cp = code + tile * 96u + lane;
+          t.m[0] = mp[0];
+          t.m[1] = mp[32];
+          t.c[0] = cp[0];
+          t.c[1] = cp[32];
+          t.c[2] = cp[64];
+          t.head = head;
+          t.win = esc[(head >> 10) + lane];
+          t.next = heads[tile + 1u];
+        }
+
+        // The lane's 32 weights into the cooperative left operand `lw`. Each
+        // pair word is `sign | (base + code) << 7 | mantissa` per half
+        // (pack12's form); an escape (code 0) decodes with exponent `base`,
+        // then its exponent byte's delta is added at its half's exponent
+        // field, one escape a lane per round.
+        template <typename LW>
+        inline void dflash2_pack11_decode(thread LW& lw, thread const dflash2_pack11_share& t) {
+          const uint base = t.head & 0xffu;
+          const uint E2 = base | (base << 16);
+          const uint L0 = t.c[0];
+          const uint L1 = t.c[1];
+          const uint H = t.c[2];
+          uint w[16];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 2; j++) {
+            const uint4 m = t.m[j];
+            const uint L = j == 0 ? L0 : L1;
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 8; q++) {
+              uint a = (m[q >> 1] >> (16 * (q & 1))) & 0xffffu;
+              a = (a | (a << 8)) & 0x00ff00ffu;
+              const int s = 2 * q + j;
+              const uint hi = (s >= 2 ? (H >> (s - 2)) : (H << (2 - s))) & 0x00040004u;
+              const uint u = ((L >> (2 * q)) & 0x00030003u) | hi;
+              w[8 * j + q] = ((a & 0x00800080u) << 8) | (a & 0x007f007fu) | ((u + E2) << 7);
+            }
+          }
+          // Bit 16h + 2q + j: element 2(8j + q) + h has code 0.
+          const uint n0 = (L0 | (L0 >> 1)) & 0x55555555u;
+          const uint n1 = (L1 | (L1 >> 1)) & 0x55555555u;
+          const uint z = ~(n0 | (n1 << 1) | H);
+          const uint cnt = popcount(z);
+          const uint rounds = simd_max(cnt);
+          if (rounds != 0u) {
+            const uint r0 = ((t.head >> 8) & 3u) + simd_prefix_exclusive_sum(cnt);
+            uint zz = z;
+            for (uint i = 0u; i < rounds; i++) {
+              const uint bi = r0 + i;
+              const uint word = simd_shuffle(t.win, ushort((bi >> 2) & 31u));
+              if (zz != 0u) {
+                const uint b = ctz(zz);
+                zz &= zz - 1u;
+                const uint g = ((b & 1u) << 3) | ((b & 15u) >> 1);
+                const uint d = (((word >> ((bi & 3u) * 8u)) & 0xffu) - base) << (7u + (b & 16u));
+                #pragma clang loop unroll(full)
+                for (uint c = 0u; c < 16u; c++) { w[c] += c == g ? d : 0u; }
+              }
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (int g = 0; g < 16; g++) {
+            const bfloat2 p = as_type<bfloat2>(w[g]);
+            lw[2 * g] = p.x;
+            lw[2 * g + 1] = p.y;
+          }
+        }
+
+        // `bits`' code for base `base`: 1-7, or 0 (an escape).
+        inline uint dflash2_pack11_code(uint bits, uint base) {
+          const uint x = (bits >> 7) & 0xffu;
+          return (x > base && x <= base + 7u) ? x - base : 0u;
+        }
+
+        """
+
+    private static let prologue = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const uint lane = thread_index_in_simdgroup;
+        const int steps = K / KS;
+        const int tile = int(threadgroup_position_in_grid.x);
+        const int n0 = (tile / steps) * COLS;
+        const int k = (tile % steps) * KS;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            COLS, 16, KS, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+
+        """
+
+    // The encoder's first pass, one simdgroup per tile: the base, the code
+    // words, the escape count (all ones when the operand's capacity is not 32).
+    private static let encodeSource = prologue + """
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        if (lw.get_capacity() != KT) {
+          if (lane == 0) { count[tile] = 0xffffffffu; }
+          return;
+        }
+        lw.load(W.template slice<KS, COLS>(k, n0));
+        uint top = 0u;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < KT; i++) {
+          top = max(top, (uint(as_type<ushort>(bfloat(lw[i]))) >> 7) & 0xffu);
+        }
+        top = simd_max(top);
+        uint base = 0u;
+        uint fewest = 0xffffffffu;
+        for (uint s = 0u; s < 12u; s++) {
+          const uint b = top >= 7u + s ? top - 7u - s : 0u;
+          uint n = 0u;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < KT; i++) {
+            n += dflash2_pack11_code(uint(as_type<ushort>(bfloat(lw[i]))), b) == 0u ? 1u : 0u;
+          }
+          n = simd_sum(n);
+          if (n < fewest) {
+            fewest = n;
+            base = b;
+          }
+        }
+        uint L0 = 0u, L1 = 0u, H = 0u;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < KT; i++) {
+          const uint c = dflash2_pack11_code(uint(as_type<ushort>(bfloat(lw[i]))), base);
+          const int g = i >> 1, h = i & 1, j = g >> 3, q = g & 7;
+          if (j == 0) { L0 |= (c & 3u) << (2 * q + 16 * h); } else { L1 |= (c & 3u) << (2 * q + 16 * h); }
+          H |= (c >> 2) << (16 * h + 2 * q + j);
+        }
+        device uint* co = (device uint*)code + uint(tile) * 96u + lane;
+        co[0] = L0;
+        co[32] = L1;
+        co[64] = H;
+        if (lane == 0) {
+          count[tile] = fewest;
+          bases[tile] = base;
+        }
+        """
+
+    // The second pass: the tile's escape bytes from its offset, in order.
+    private static let escapeSource = prologue + """
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> W((device bfloat*)w, dextents<int, 2>(K, N));
+        lw.load(W.template slice<KS, COLS>(k, n0));
+        const uint base = heads[tile] & 0xffu;
+        uint z = 0u;
+        #pragma clang loop unroll(full)
+        for (int b = 0; b < 32; b++) {
+          const int i = 2 * (8 * (b & 1) + ((b & 15) >> 1)) + (b >> 4);
+          if (dflash2_pack11_code(uint(as_type<ushort>(bfloat(lw[i]))), base) == 0u) { z |= 1u << b; }
+        }
+        uint slot = (heads[tile] >> 8) + simd_prefix_exclusive_sum(popcount(z));
+        #pragma clang loop unroll(full)
+        for (int b = 0; b < 32; b++) {
+          const int i = 2 * (8 * (b & 1) + ((b & 15) >> 1)) + (b >> 4);
+          if (((z >> b) & 1u) != 0u) {
+            escapes[slot] = uint8_t((uint(as_type<ushort>(bfloat(lw[i]))) >> 7) & 0xffu);
+            slot += 1u;
+          }
+        }
+        """
+
+    // The self-test's rebuild: every tile decoded and stored into `[N, K]`.
+    private static let unpackSource = prologue + """
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> O((device bfloat*)out, dextents<int, 2>(K, N));
+        dflash2_pack11_share t;
+        dflash2_pack11_read(
+            t, (const device uint4*)mant, code, (const device uint*)esc, heads, uint(tile), lane, heads[tile]);
+        dflash2_pack11_decode(lw, t);
+        lw.store(O.template slice<KS, COLS>(k, n0));
+        """
+
+    // The 12-bit kernel's loop with the operand decoded from the 11-bit tile.
+    private static func loop(_ ops: String) -> String {
+        """
+        const device uint4* mp = (const device uint4*)mant;
+        const device uint* ep = (const device uint*)esc;
+        const uint t0 = uint(nb * steps + k0 / KS);
+        dflash2_pack11_share cur, nxt, far;
+        uint h0 = heads[t0];
+        if constexpr (AHEAD > 0) { dflash2_pack11_read(cur, mp, code, ep, heads, t0, lane, h0); }
+        if constexpr (AHEAD > 1) {
+          if (KS < kq) { dflash2_pack11_read(nxt, mp, code, ep, heads, t0 + 1u, lane, cur.next); }
+        }
+        for (int k = k0; k < k0 + kq; k += KS) {
+          const uint tile = uint(nb * steps + k / KS);
+          if constexpr (AHEAD == 0) {
+            dflash2_pack11_read(cur, mp, code, ep, heads, tile, lane, h0);
+            h0 = cur.next;
+          } else if constexpr (AHEAD == 1) {
+            if (k + KS < k0 + kq) { dflash2_pack11_read(nxt, mp, code, ep, heads, tile + 1u, lane, cur.next); }
+          } else {
+            if (k + 2 * KS < k0 + kq) { dflash2_pack11_read(far, mp, code, ep, heads, tile + 2u, lane, nxt.next); }
+          }
+          dflash2_pack11_decode(lw, cur);
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD > 1) { nxt = far; }
+        \(ops)
+        }
+        """
+    }
+
+    /// `DFlash2PackedWeights`' kernel text with its loop replaced (the same
+    /// op and reduction), or nil when the anchors moved.
+    private static func derived(_ text: String, ops: String) -> String? {
+        guard let begin = text.range(of: "// A tile's share is read AHEAD")
+            ?? text.range(of: "const device uint4* mp = (const device uint4*)mant;"),
+            let end = text.range(of: "threadgroup float red[", range: begin.upperBound ..< text.endIndex)
+        else { return nil }
+        return String(text[..<begin.lowerBound]) + loop(ops) + "\n" + String(text[end.lowerBound...])
+    }
+
+    private static let inputs = ["x", "mant", "code", "esc", "heads", "ksz"]
+
+    private static let kernels: (MLXFast.MLXFastKernel, MLXFast.MLXFastKernel)? = {
+        guard
+            let m16 = derived(
+                DFlash2PackedWeights.source,
+                ops: "  auto tX = X.template slice<KS, 16>(k, 0);\n          op.run(lw, tX, cT);"),
+            let m32 = derived(
+                DFlash2PackedWeights.source32,
+                ops: "  auto tXlo = X.template slice<KS, 16>(k, 0);\n          op.run(lw, tXlo, cT0);\n"
+                    + "          auto tXhi = X.template slice<KS, 16>(k, 16);\n          op.run(lw, tXhi, cT1);")
+        else { return nil }
+        return (
+            MLXFast.metalKernel(
+                name: "dflash2_pack11_matmul_m16", inputNames: inputs, outputNames: ["out"], source: m16,
+                header: header, ensureRowContiguous: true),
+            MLXFast.metalKernel(
+                name: "dflash2_pack11_matmul_m32", inputNames: inputs, outputNames: ["out"], source: m32,
+                header: header, ensureRowContiguous: true)
+        )
+    }()
+
+    private static let encodeKernel = MLXFast.metalKernel(
+        name: "dflash2_pack11_encode", inputNames: ["w", "ksz"], outputNames: ["code", "bases", "count"],
+        source: encodeSource, header: header, ensureRowContiguous: true)
+
+    private static let escapeKernel = MLXFast.metalKernel(
+        name: "dflash2_pack11_escapes", inputNames: ["w", "heads", "ksz"], outputNames: ["escapes"],
+        source: escapeSource, header: header, ensureRowContiguous: true)
+
+    private static let unpackKernel = MLXFast.metalKernel(
+        name: "dflash2_pack11_unpack", inputNames: ["mant", "code", "esc", "heads", "ksz"],
+        outputNames: ["out"], source: unpackSource, header: header, ensureRowContiguous: true)
+
+    private static var geometry: [(String, any KernelTemplateArg)] { [("KT", 32), ("KS", 64), ("COLS", 16)] }
+
+    private static func dims(_ w: MLXArray) -> MLXArray {
+        DFlash2TensorMatmul.dimsArray(k: w.dim(1), n: w.dim(0))
+    }
+
+    /// The 12-bit kernel's grid and tiling over the 11-bit copy.
+    static func launch(
+        _ a: MLXArray, _ f: Form, rows: Int, outputDType: DType, tiling t: DFlash2TensorMatmul.SwapTiling
+    ) -> MLXArray? {
+        guard let k = kernels else { return nil }
+        let n = f.source.dim(0)
+        return (rows == 16 ? k.0 : k.1)(
+            [a, f.mantissas, f.codes, f.escapes, f.heads, dims(f.source)],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", f.index32Safe ? 1 : 0)] + geometry
+                + [("AHEAD", t.ahead ?? 1)],
+            grid: (n / 16 * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
+    }
+
+    /// `c`'s weight in the 11-bit form, or nil (a tile past 125 escapes, or
+    /// offsets past 24 bits).
+    private static func encode(_ c: DFlash2PackedWeights.Copy) -> Form? {
+        let w = c.source
+        let tiles = w.dim(0) / 16 * (w.dim(1) / 64)
+        let first = encodeKernel(
+            [w, dims(w)], template: geometry, grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[tiles * 96], [tiles], [tiles]], outputDTypes: [.uint32, .uint32, .uint32])
+        let counts = first[2]
+        let largest = counts.max()
+        let offsets = concatenated(
+            [MLXArray.zeros([1], dtype: .uint32), cumsum(counts, axis: 0).asType(.uint32)], axis: 0)
+        let total = counts.asType(.int64).sum()
+        eval(first + [largest, total, offsets])
+        let escapeCount = total.item(Int.self)
+        guard largest.item(UInt32.self) <= 125, escapeCount < (1 << 24) - 256 else { return nil }
+        let heads = concatenated([first[1], MLXArray.zeros([1], dtype: .uint32)], axis: 0)
+            + offsets * MLXArray(UInt32(256))
+        let escapes = escapeKernel(
+            [w, heads, dims(w)], template: geometry, grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[(escapeCount + 132) / 4 * 4]], outputDTypes: [.uint8])[0]
+        eval(heads, escapes)
+        return Form(
+            source: w, mantissas: c.mantissas, codes: first[0], heads: heads, escapes: escapes,
+            escapeCount: escapeCount, index32Safe: c.index32Safe)
+    }
+
+    /// Builds and self-tests the 11-bit copy of every packed weight (after
+    /// `DFlash2PackedWeights.prepare`); offers the form to the tiling trial
+    /// (or, forced, adopts it) only when everything matched. One stderr line.
+    static func prepare(_ weights: [MLXArray], rows32 weights32: [MLXArray]) {
+        (offered, live) = (false, false)
+        lock.withLock { forms.removeAll() }
+        guard setting != 0, DFlash2PackedWeights.active, DFlash2PackedWeights.cols == 16, kernels != nil else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let cacheLimit = Memory.cacheLimit
+        Memory.cacheLimit = 0
+        defer { Memory.cacheLimit = cacheLimit }
+        let rows32 = Set(weights32.map { ObjectIdentifier($0) })
+        var seen = Set<ObjectIdentifier>()
+        let copies = (weights + weights32).compactMap { w in
+            seen.insert(ObjectIdentifier(w)).inserted ? DFlash2PackedWeights.copy(of: w) : nil
+        }
+        var made: [Form] = []
+        var (rebuilt, products, mismatches, escapes) = (0, 0, 0, 0)
+        var bytes = (twelve: 0, eleven: 0)
+        var passed = false
+        do {
+            try withError { error in
+                for (index, c) in copies.enumerated() {
+                    guard let f = encode(c) else {
+                        mismatches += 1
+                        break
+                    }
+                    let w = c.source
+                    let (n, k) = (w.dim(0), w.dim(1))
+                    let unpacked = unpackKernel(
+                        [f.mantissas, f.codes, f.escapes, f.heads, dims(w)], template: geometry,
+                        grid: (n / 16 * (k / 64) * 32, 1, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[n, k]], outputDTypes: [.bfloat16])[0]
+                    var differing = [(unpacked.view(dtype: .uint16) .!= w.view(dtype: .uint16)).asType(.int32).sum()]
+                    rebuilt += n * k
+                    for rows in rows32.contains(ObjectIdentifier(w)) ? [16, 32] : [16] {
+                        let a = MLXRandom.normal([rows, k], key: MLXRandom.key(UInt64(8817 + index))).asType(.bfloat16)
+                        let t = DFlash2TensorMatmul.swapTiling(k: k, n: n, rows32: rows > 16, packed: true)
+                        for (outputDType, bits) in [(DType.float32, DType.uint32), (.bfloat16, .uint16)] {
+                            let twelve = DFlash2PackedWeights.launch(a, c, rows: rows, outputDType: outputDType)
+                            guard let mine = launch(a, f, rows: rows, outputDType: outputDType, tiling: t) else { continue }
+                            differing.append((twelve.view(dtype: bits) .!= mine.view(dtype: bits)).asType(.int32).sum())
+                            products += rows * n
+                        }
+                    }
+                    let wrong = stacked(differing).sum()
+                    eval(wrong)
+                    mismatches += wrong.item(Int.self)
+                    made.append(f)
+                    escapes += f.escapeCount
+                    bytes.twelve += c.operands.reduce(0) { $0 + $1.nbytes }
+                    bytes.eleven += f.arrays.reduce(0) { $0 + $1.nbytes }
+                }
+                try error.check()
+            }
+            passed = mismatches == 0 && made.count == copies.count && !made.isEmpty
+        } catch {
+            passed = false
+        }
+        if passed {
+            lock.withLock { for f in made { forms[ObjectIdentifier(f.source)] = f } }
+            if setting == 2 { adopt() } else { offered = true }
+        }
+        made = []
+        Memory.clearCache()
+        let bits = { (b: Int) in Double(8 * b) / Double(max(rebuilt, 1)) }
+        FileHandle.standardError.write(
+            Data(
+                ("dflash2 packed 11-bit weights: self-test \(passed ? "passed" : "FAILED") "
+                    + "(\(copies.count) weights; \(rebuilt) values rebuilt bit for bit, \(escapes) escapes"
+                    + String(format: " (%.2f%%); ", 100 * Double(escapes) / Double(max(rebuilt, 1)))
+                    + "\(products) products bitwise against the 12-bit kernel, \(mismatches) mismatches); "
+                    + String(format: "%.3f bits a weight against %.3f; ", bits(bytes.eleven), bits(bytes.twelve))
+                    + (passed ? (setting == 2 ? "forced on (MLXFAST_P11), no trial" : "offered to the tiling trial")
+                        : "12-bit form kept")
+                    + String(format: "; %.0f ms\n", Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)).utf8))
+    }
+
+    /// The 11-bit copies replace the 12-bit codes (freed).
+    private static func adopt() {
+        (offered, live) = (false, true)
+        DFlash2PackedWeights.dropCodes()
+    }
+
+    /// The trial's verdict: adopt, or free the 11-bit copies.
+    static func finish(adopting: Bool) {
+        guard offered else { return }
+        if adopting {
+            adopt()
+        } else {
+            (offered, live) = (false, false)
+            lock.withLock { forms.removeAll() }
+        }
+        Memory.clearCache()
+    }
+}
+
 /// The drafter kernel's in-situ trial, in the load-time warm
 /// (`Qwen35DFlash2Assistant.runKernelTrial`), modelled on the verify int8
 /// kernels' `NarrowInSituTrial`: engine requests whose rounds rotate through
@@ -5206,6 +5779,21 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// block shape `[1, blockSize-1, hidden]`. Rebuilding that broadcast every
     /// propose round repeats an identical geometry graph.
     private var cachedMaskEmbeddingBlock: (cols: Int, array: MLXArray)?
+    /// `CBv2DW2`: the speculative block's zero for its unconfirmed rows, one
+    /// retained array per dtype (off the module tree), instead of a fill
+    /// launch every round.
+    private static let zerosLock = NSLock()
+    nonisolated(unsafe) private static var retainedZeros: [DType: MLXArray] = [:]
+
+    private func retainedZero(_ dtype: DType) -> MLXArray {
+        guard CBv2DW2.enabled else { return MLXArray.zeros([1, 1, 1], dtype: dtype) }
+        return Self.zerosLock.withLock {
+            if let zero = Self.retainedZeros[dtype] { return zero }
+            let zero = MLXArray.zeros([1, 1, 1], dtype: dtype)
+            Self.retainedZeros[dtype] = zero
+            return zero
+        }
+    }
 
     /// The drafter's own parameter dtype. The Bonsai trunk runs its norms in
     /// FP32 and hands out FP32 activations, so the two tensors that cross from
@@ -5296,6 +5884,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let qkvWeights = layers.compactMap { $0.selfAttn.stackedQKVWeight() }
         _ = DFlash2TensorMatmul.prepareSwapped(blockWeights, rows32: qkvWeights)
         DFlash2PackedWeights.prepare(blockWeights, rows32: qkvWeights)
+        DFlash2Pack11.prepare(blockWeights, rows32: qkvWeights)
         // The tiling trial's weights, on the kernel the two self-tests left on.
         DFlash2TensorMatmul.SwapTrial.note(blockWeights, rows32: qkvWeights)
         return DFlash2TensorMatmul.prepareTiled(layerWeights)
@@ -5629,14 +6218,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             maskUnconfirmed
                 ? which(
                     (MLXArray(Int32(0) ..< Int32(contextRows)) .< c).reshaped([1, contextRows, 1]),
-                    verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
+                    verifyRows, retainedZero(verifyRows.dtype))
                 : verifyRows)
         let base = concatenated(
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)
         let queryOffset = MLXArray(Int32(geometry.offset)) + c
         let keys = geometry.rows + n
-        let keyMask = (MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(Int32(geometry.rows + blockSize)) + c))
+        // `CBv2DW2`: `i < bound + c` as `i - bound < c`, the shift on the host
+        // (small integers, no wrap): the same mask without the device add.
+        let bound = Int32(geometry.rows + blockSize)
+        let keyMask = (CBv2DW2.enabled
+            ? MLXArray(-bound ..< Int32(keys) - bound) .< c
+            : MLXArray(Int32(0) ..< Int32(keys)) .< (MLXArray(bound) + c))
             .reshaped([1, keys])
         let leadAt = submitLead ? min(max(leadingLayers, 0), layers.count) : 0
         // The front's one-launch forms read `context` and `c` themselves;

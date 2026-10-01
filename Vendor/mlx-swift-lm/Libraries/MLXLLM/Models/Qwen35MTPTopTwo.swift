@@ -3377,6 +3377,94 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // 32-bit twins of the prompt int8 kernels (`MLXFastDW1`): the staged8,
+    // register-weight and plane texts with every `size_t` as `uint`, launched
+    // only where every offset they form is below 2^31 (`promptFits32`, the
+    // plane forms' `i32` bound: codes m k, output m n, words n k / 16; row
+    // constants and scales are smaller). The same loads, stores and arithmetic
+    // in the same order, so the output is the 64-bit text's bit for bit; each
+    // twin is compared with its text at load (both output types) and is used
+    // only if equal.
+    private static func io32Twin(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        guard MLXFastDW1.enabled, let source, source.contains("size_t") else { return nil }
+        return MLXFast.metalKernel(
+            name: name + "_io32",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"], source: source.replacingOccurrences(of: "size_t", with: "uint"),
+            header: header, ensureRowContiguous: true)
+    }
+    private static let kernelStaged8IO32 = io32Twin("bonsai_tensor_packed_matmul_q8_u8", sourceStaged8)
+    private static let kernelStaged8RegIO32 = io32Twin("bonsai_tensor_packed_matmul_q8_rb", sourceStaged8Reg)
+    private static let kernelStaged8RegPlaneIO32 = io32Twin(
+        "bonsai_tensor_packed_matmul_q8_rp", sourceStaged8RegPlane)
+
+    static func promptFits32(k: Int, m: Int, n: Int) -> Bool {
+        let limit = Int(Int32.max)
+        return k >= 128 && k % 128 == 0 && n > 0 && m > 0
+            && m <= limit / k && m <= limit / n && n <= limit / (k / 16)
+    }
+
+    /// The checked twin of `stock` for a `k, m, n` launch, else `stock`.
+    private static func io32(_ stock: MLXFast.MLXFastKernel, k: Int, m: Int, n: Int) -> MLXFast.MLXFastKernel {
+        guard MLXFastDW1.enabled, promptFits32(k: k, m: m, n: n) else { return stock }
+        return io32Checked.first { $0.stock === stock }?.twin ?? stock
+    }
+
+    nonisolated(unsafe) private static var io32Failed = false
+    private static let io32Checked: [(stock: MLXFast.MLXFastKernel, twin: MLXFast.MLXFastKernel)] = {
+        let (m, k, n) = (128, 1024, 192)
+        let kg = k / 128
+        let codes = MLXRandom.randInt(Int32(-127) ..< Int32(128), [m, k], key: MLXRandom.key(611)).asType(.int8)
+        let weight = MLXRandom.randInt(Int32(0) ..< Int32(65536), [n, k / 8], key: MLXRandom.key(612))
+            .asType(.uint16).view(dtype: .uint32)
+        let scalesT = MLXRandom.uniform(Float(-0.05) ..< Float(0.05), [kg, n], key: MLXRandom.key(613))
+            .asType(.float16)
+        let rest = [
+            scalesT, (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16),
+            MLXRandom.normal([kg, n], key: MLXRandom.key(614)),
+            MLXRandom.uniform(Float(0.0001) ..< Float(0.05), [m, kg], key: MLXRandom.key(615)),
+            MLXRandom.normal([m, kg], key: MLXRandom.key(616)) * Float(50), dimsArray(k: k, m: m, n: n),
+        ]
+        let tiled = tileNarrowWeight(weight, n: n, k: k)
+        let cases: [(String, MLXFast.MLXFastKernel?, MLXFast.MLXFastKernel?, MLXArray, Bool)] = [
+            ("staged8", kernelStaged8, kernelStaged8IO32, tiled, true),
+            ("register", kernelStaged8Reg, kernelStaged8RegIO32, tiled, false),
+            ("plane", kernelStaged8RegPlane, kernelStaged8RegPlaneIO32, planeWeight(tiled, n: n, k: k), false),
+        ]
+        var kept: [(stock: MLXFast.MLXFastKernel, twin: MLXFast.MLXFastKernel)] = []
+        var notes: [String] = []
+        for (name, stock, twin, words, staged) in cases {
+            guard let stock, let twin else { continue }
+            var same = true
+            io32Failed = false
+            withErrorHandler({ _ in Qwen35TensorPackedMatmul.io32Failed = true }) {
+                for outputDType in [DType.float32, .float16] {
+                    let template: [(String, any KernelTemplateArg)] = staged
+                        ? [("OutT", outputDType), ("MPERM", 1), ("SIGNED", 1), ("NEGATIVE_SCALE_BIAS", 1),
+                           ("FACTORED", 1), ("TILED", 1)]
+                        : [("OutT", outputDType)]
+                    let out = [stock, twin].map {
+                        $0([codes, words] + rest, template: template,
+                            grid: staged ? (n / 64 * 128, m / 64, 1) : (n / 64 * 64, m / 32, 1),
+                            threadGroup: (staged ? 128 : 64, 1, 1),
+                            outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
+                    }
+                    let bits: DType = outputDType == .float32 ? .uint32 : .uint16
+                    let equal = (out[0].view(dtype: bits) .== out[1].view(dtype: bits)).all()
+                    eval(equal)
+                    same = same && equal.item(Bool.self)
+                }
+            }
+            let ok = same && !io32Failed
+            if ok { kept.append((stock, twin)) }
+            notes.append("\(name) " + (ok ? "passed" : "FAILED (64-bit text kept)"))
+        }
+        FileHandle.standardError.write(
+            ("mlxfast dw1 prompt int8 32-bit twins: " + notes.joined(separator: ", ")
+                + " (\(m * n) values x 2 output types bitwise)\n").data(using: .utf8)!)
+        return kept
+    }()
+
     private static let dimsLock = NSLock()
     nonisolated(unsafe) private static var dims: [[Int]: MLXArray] = [:]
     private static func dimsArray(k: Int, m: Int, n: Int) -> MLXArray {
@@ -5483,7 +5571,7 @@ enum Qwen35TensorPackedMatmul {
             switch support {
             case .native2b: packedKernel = kernel
             case .staged8:
-                packedKernel = kernelStaged8
+                packedKernel = io32(kernelStaged8, k: k, m: m, n: n)
                 let negative = cache.biasesAreNegativeScales(scales, biases)
                 // The register-weight form of the same kernel (hot template,
                 // self-tested bitwise at load): same inputs, same grid.
@@ -5530,7 +5618,8 @@ enum Qwen35TensorPackedMatmul {
                             // The prefetched plane body ships when it built and
                             // the switch is on (bitwise, `promptPlaneSelfTest`).
                             return (planePrefetch
-                                    ? kernelStaged8RegPlanePrefetched ?? planeKernel : planeKernel)(
+                                    ? kernelStaged8RegPlanePrefetched ?? planeKernel
+                                    : io32(planeKernel, k: k, m: m, n: n))(
                                 [codes, plane, scalesT, biasesT, foldedSums,
                                  activation.scales, activation.scaledSums, dimsArray(k: k, m: m, n: n)],
                                 template: [("OutT", outputDType)],
@@ -5538,7 +5627,7 @@ enum Qwen35TensorPackedMatmul {
                                 outputShapes: [[m, n]], outputDTypes: [outputDType])[0]
                         }
                     }
-                    return kernelStaged8Reg(
+                    return io32(kernelStaged8Reg, k: k, m: m, n: n)(
                         [codes, words, scalesT, biasesT, foldedSums, activation.scales,
                          activation.scaledSums, dimsArray(k: k, m: m, n: n)],
                         template: [("OutT", outputDType)],
@@ -5744,7 +5833,7 @@ extension Qwen35TensorPackedMatmul {
     ) -> MLXArray? {
         guard let planeKernel = kernelStaged8RegPlane else { return nil }
         return (planePrefetch
-            ? kernelStaged8RegPlanePrefetched ?? planeKernel : planeKernel)(
+            ? kernelStaged8RegPlanePrefetched ?? planeKernel : io32(planeKernel, k: k, m: m, n: n))(
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [("OutT", outputDType)],
             grid: (n / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
