@@ -2040,6 +2040,44 @@ public enum HadamardStridedInputs {
           return strides[LEAD + 1] == 1
               && (shape[LEAD] == 1 || strides[LEAD] == int64_t(shape[LEAD + 1]));
         }
+        // Every element offset of an NDIM-dimensional view below 2^31: each
+        // dimension of extent above 1 has a stride in [0, 2^31) (an extent-1
+        // dimension's index is 0), and the largest offset, the sum of
+        // (extent - 1) * stride, is below 2^31. Then every row base, column
+        // offset and their sum (each a partial sum of that one) is below 2^31,
+        // and the 32-bit forms below equal the 64-bit ones.
+        template <int NDIM>
+        METAL_FUNC bool bonsai_offsets_fit32(constant const int* shape, constant const int64_t* strides) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (strides[d] < 0 || strides[d] >= (int64_t(1) << 31)) {
+                return false;
+              }
+              span += ulong(shape[d] - 1) * ulong(strides[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int LEAD>
+        METAL_FUNC uint bonsai_row_base32(
+            uint row, constant const int* shape, constant const int64_t* strides) {
+          if (LEAD == 1) {
+            return row * uint(strides[0]);
+          }
+          const uint n1 = uint(shape[1]);
+          return (row < n1) ? row * uint(strides[1])
+                            : (row / n1) * uint(strides[0]) + (row % n1) * uint(strides[1]);
+        }
+        template <int LEAD, int TRAIL>
+        METAL_FUNC uint bonsai_col_off32(
+            uint c, constant const int* shape, constant const int64_t* strides) {
+          if (TRAIL == 1) {
+            return c * uint(strides[LEAD]);
+          }
+          const uint n = uint(shape[LEAD + 1]);
+          return (c / n) * uint(strides[LEAD]) + (c % n) * uint(strides[LEAD + 1]);
+        }
 
         """
 }
@@ -2154,6 +2192,16 @@ enum FusedInputHadamardKernel {
               fill([&](uint p) { return static_cast<float>(ap[p]); },
                    [&](uint p) { return static_cast<float>(bp[p]); },
                    [&](uint p) { return signs[p]; });
+            } else if (bonsai_offsets_fit32<LEAD + TRAIL>(a_shape, a_strides)
+                && bonsai_offsets_fit32<LEAD + TRAIL>(b_shape, b_strides)
+                && bonsai_offsets_fit32<1>(signs_shape, signs_strides)) {
+              // The same elements through 32-bit offsets (every offset below 2^31).
+              const uint ra32 = bonsai_row_base32<LEAD>(row, a_shape, a_strides);
+              const uint rb32 = bonsai_row_base32<LEAD>(row, b_shape, b_strides);
+              const uint ss = uint(signs_strides[0]);
+              fill([&](uint p) { return static_cast<float>(a[ra32 + bonsai_col_off32<LEAD, TRAIL>(p, a_shape, a_strides)]); },
+                   [&](uint p) { return static_cast<float>(b[rb32 + bonsai_col_off32<LEAD, TRAIL>(p, b_shape, b_strides)]); },
+                   [&](uint p) { return signs[p * ss]; });
             } else {
               fill([&](uint p) { return static_cast<float>(a[ra + bonsai_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
                    [&](uint p) { return static_cast<float>(b[rb + bonsai_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },

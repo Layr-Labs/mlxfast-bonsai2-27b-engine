@@ -5850,6 +5850,13 @@ enum Qwen35PromptTapJoin {
             if (j >= width) return;
             const uint src = row * width + j;
             const uint dst = (row * 5 + tap) * width + j;
+            if ((width & 3u) == 0) {
+              auto input = tap == 0 ? x0 : tap == 1 ? x1 : tap == 2 ? x2 : tap == 3 ? x3 : x4;
+              *(device vec<bfloat16_t, 4>*)(out + dst) = vec<bfloat16_t, 4>(
+                  cast_to<bfloat16_t>(input[src]), cast_to<bfloat16_t>(input[src + 1]),
+                  cast_to<bfloat16_t>(input[src + 2]), cast_to<bfloat16_t>(input[src + 3]));
+              return;
+            }
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
               if (j + i < width) {
