@@ -882,6 +882,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ layoutCache: HadamardConstantLayoutCache
     ) -> MLXArray?
     nonisolated(unsafe) public static var tensorPackedMatmulNarrowInt8: TensorPackedMatmulNarrowInt8?
+    /// Two equal-width verify projections, with each product rounded to FP16
+    /// before FP32 SwiGLU and the down transform's signs. Nil declines.
+    public typealias TensorPackedSwiGLU = (
+        _ activation: SignedBlockHadamard.Int8Activation, _ weight: MLXArray,
+        _ scales: MLXArray, _ biases: MLXArray, _ signs: MLXArray,
+        _ layoutCache: HadamardConstantLayoutCache
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var tensorPackedSwiGLU: TensorPackedSwiGLU?
     static var narrowRouteInstalled: Bool {
         (tensorPackedMatmulNarrow != nil || tensorPackedMatmulNarrowInt8 != nil)
             && tensorPackedMatmulNarrowApplies != nil
@@ -1140,6 +1148,31 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return tensorRoutePromptMatmul(
             activation, siblings: siblings, n: n,
             outputDType: widenOutput ? .float32 : .float16, leading: leading)
+    }
+
+    fileprivate func tensorRouteSwiGLUQuantized(
+        _ activation: SignedBlockHadamard.Int8Activation, leading: [Int],
+        siblings: [HadamardQuantizedLinear], signs: MLXArray
+    ) -> MLXArray? {
+        // The existing all-producer policy already fuses SwiGLU into the
+        // following transform; leave that separately selected graph intact.
+        guard !Self.narrowProducerActive, let matmul = Self.tensorPackedSwiGLU,
+            siblings.count == 2, leading.reduce(1, *) == 16,
+            tensorRouteTakesNarrowInt8(rows: 16, siblings: siblings),
+            siblings[0].weight.dim(0) == siblings[1].weight.dim(0),
+            signs.dtype == .float32, signs.shape == [siblings[0].weight.dim(0)],
+            activation.codes.dtype == .int8, activation.codes.shape == [16, transform.width],
+            activation.scales.dtype == .float32,
+            activation.scales.shape == [16, transform.width / 128],
+            activation.scaledSums.dtype == .float32,
+            activation.scaledSums.shape == [16, transform.width / 128]
+        else { return nil }
+        let fused = matrixRoute.fusedSiblings(for: siblings)
+        guard let offsets = fused.biases,
+            let y = matmul(
+                activation, fused.weight, fused.scales, offsets, signs, fused.operands.layoutCache)
+        else { return nil }
+        return y.reshaped(leading + [siblings[0].weight.dim(0)])
     }
 
     /// `tensorRouteForwardQuantized`'s prompt branch over the stacked
@@ -1839,6 +1872,20 @@ public func sharedHadamardProjectionsQuantized(
     return first.tensorRouteForwardQuantized(
         activation, rows: leading.reduce(1, *), leading: leading, siblings: siblings,
         widenOutput: widenOutput)
+}
+
+/// The equal-width gate/up pair of a full verify window, with an exact
+/// FP16-product/FP32-SwiGLU epilogue installed by the model. Prompt and
+/// partial-window shapes decline without launching anything.
+public func sharedHadamardSwiGLUQuantized(
+    _ activation: SignedBlockHadamard.Int8Activation, leading: [Int],
+    _ siblings: [HadamardQuantizedLinear], signs: MLXArray
+) -> MLXArray? {
+    guard let first = siblings.first,
+        siblings.allSatisfy({ $0.sharesInputTransform(with: first) })
+    else { return nil }
+    return first.tensorRouteSwiGLUQuantized(
+        activation, leading: leading, siblings: siblings, signs: signs)
 }
 
 /// `sharedHadamardProjectionsQuantized` evaluated on rectangles of the

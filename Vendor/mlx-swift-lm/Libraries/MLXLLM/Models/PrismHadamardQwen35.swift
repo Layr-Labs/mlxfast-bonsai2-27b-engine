@@ -129,6 +129,139 @@ enum Qwen35SmallNMatmul {
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
 
+    // Eight columns and their four original K subranges share each SIMD group.
+    // Keep the original dot4 order and left-associated subrange reduction.
+    private static let simdSource = """
+        const int K = dims[0]; const int M = dims[1]; const int N = dims[2];
+        const int nb = int(threadgroup_position_in_grid.x) * 32;
+        const int kc = int(threadgroup_position_in_grid.y);
+        const int k0 = kc * 128;
+        const uint t = thread_position_in_threadgroup.x;
+        threadgroup float4 xs[16 * 32];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++) {
+          const uint i = t + 128 * j;
+          const int m = int(i >> 5); const int q = int(i & 31);
+          xs[i] = m < M ? *(const device float4*)(x + (uint)m * K + k0 + 4 * q) : float4(0.0f);
+        }
+        const int c = int(t % 8u + (t / 32u) * 8u);
+        const int s = int((t / 8u) % 4u);
+        const device float4* wp = (const device float4*)(w + (uint)(nb + c) * K + k0 + 32 * s);
+        float4 wv[8];
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 8; j++) { wv[j] = wp[j]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int m = 0; m < 16; m++) {
+          float acc = 0.0f;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 8; j++) { acc += dot(xs[m * 32 + 8 * s + j], wv[j]); }
+          const uint lane = thread_index_in_simdgroup;
+          const uint root = lane % 8u;
+          const float r0 = simd_shuffle(acc, root);
+          const float r1 = simd_shuffle(acc, root + 8u);
+          const float r2 = simd_shuffle(acc, root + 16u);
+          const float r3 = simd_shuffle(acc, root + 24u);
+          if (s == 0 && m < M) {
+            part[((uint)kc * M + m) * N + nb + c] = ((r0 + r1) + r2) + r3;
+          }
+        }
+        """
+
+    private static let simdEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_BA_SIMD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private static let simdKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_partial_simd", inputNames: ["x", "w", "dims", "dep"],
+        outputNames: ["part"], source: simdSource, ensureRowContiguous: true)
+    private static let simdLock = NSLock()
+    nonisolated(unsafe) private static var simdPrepared = false
+    nonisolated(unsafe) private static var simdAdopted = false
+    private enum SimdFailure: Error { case mismatch }
+
+    /// Called from target-layer construction, never from the timed forward.
+    static func prepareVerifySIMD(hidden: Int, valueHeads: Int) {
+        guard enabled, simdEnabled, hidden == 5120, valueHeads == 48 else { return }
+        guard simdLock.withLock({ () -> Bool in
+            if simdPrepared { return false }
+            simdPrepared = true
+            return true
+        }) else { return }
+        var report = "fallback"
+        var values = 0
+        do {
+            try withError { error in
+                let keys = MLXRandom.split(key: MLXRandom.key(0x6261_7367), into: 32)
+                let dims = MLXArray([Int32(5120), Int32(16), Int32(96)])
+                let base = MLXFast.metalKernel(
+                    name: "qwen35_splitk_partial_simd_trial_base",
+                    inputNames: ["x", "w", "dims", "dep"], outputNames: ["part"],
+                    source: Qwen35IO32.narrow(partialSource, count: 3, "qwen35_splitk_partial"),
+                    ensureRowContiguous: true)
+                func launch(_ inputs: [MLXArray], _ candidate: Bool) -> MLXArray {
+                    (candidate ? simdKernel : base)(
+                        inputs, grid: (384, 40, 1), threadGroup: (128, 1, 1),
+                        outputShapes: [[40, 16, 96]], outputDTypes: [.float32])[0]
+                }
+                for form in 0 ..< 3 {
+                    var x = MLXRandom.normal([16, 5120], key: keys[form * 4])
+                    var w = MLXRandom.normal([96, 5120], key: keys[form * 4 + 1]) * Float(0.2)
+                    if form == 1 {
+                        x = x * exp(MLXRandom.normal(x.shape, key: keys[6]))
+                        w = w * exp(MLXRandom.normal(w.shape, key: keys[7]))
+                    } else if form == 2 {
+                        let col = MLXArray(0 ..< 5120).reshaped([1, 5120])
+                        x = which((col % MLXArray(31)) .== MLXArray(0), MLXArray(Float(0)), x)
+                        w = which((col % MLXArray(31)) .== MLXArray(1), MLXArray(Float(1e-10)), w)
+                        x = which((col % MLXArray(31)) .== MLXArray(1), MLXArray(Float(1e10)), x)
+                    }
+                    let inputs = [x, w, dims, dims]
+                    let reference = launch(inputs, false)
+                    let candidate = launch(inputs, true)
+                    let count = (reference.view(dtype: .uint32) .!= candidate.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(count)
+                    try error.check()
+                    values += reference.size
+                    guard count.item(Int32.self) == 0 else { throw SimdFailure.mismatch }
+                }
+                // Distinct synthetic layer weights avoid selecting on one hot matrix.
+                let sets = (0 ..< 8).map { i in [
+                    MLXRandom.normal([16, 5120], key: keys[16 + i * 2]),
+                    MLXRandom.normal([96, 5120], key: keys[17 + i * 2]) * Float(0.2), dims,
+                ] }
+                eval(sets.flatMap { $0 })
+                var times = [[Double](), [Double]()]
+                for repetition in 0 ..< 13 {
+                    for step in 0 ..< 2 {
+                        let arm = (step + repetition) % 2
+                        var out = dims
+                        for inputs in sets { out = launch(inputs + [out], arm == 1) }
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(out)
+                        let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 8000
+                        try error.check()
+                        if repetition >= 2 { times[arm].append(us) }
+                    }
+                }
+                let old = times[0].sorted()[times[0].count / 2]
+                let new = times[1].sorted()[times[1].count / 2]
+                let adopt = new < old * 0.98
+                simdLock.withLock { simdAdopted = adopt }
+                report = "passed \(values) words; \(old) -> \(new) us; "
+                    + (adopt ? "adopted" : "speed rejected")
+            }
+        } catch {
+            simdLock.withLock { simdAdopted = false }
+            report = "fallback after \(values) words: \(error)"
+        }
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            ("qwen35 verify BA SIMD reduction: \(report)\n").data(using: .utf8)!)
+    }
+
     static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
         let k = x.dim(-1)
@@ -161,8 +294,11 @@ enum Qwen35SmallNMatmul {
         let rows = x.size / k
         guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
         let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
-        let part = partialKernel(
-            [x.reshaped(rows, k), w, dims],
+        let simd = rows == 16 && k == 5120 && n == 96
+            && simdLock.withLock { simdAdopted }
+        let inputs = [x.reshaped(rows, k), w, dims]
+        let part = (simd ? simdKernel : partialKernel)(
+            simd ? inputs + [dims] : inputs,
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
             outputShapes: [[k / chunk, rows, n]], outputDTypes: [.float32])[0]
         return Partials(

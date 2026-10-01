@@ -3077,6 +3077,215 @@ enum Qwen35PreworkSplit {
             source: $0, ensureRowContiguous: false)
     }
 
+    /// Two adjacent verify rows share their convolution window and weights.
+    /// Every row retains the stock four-FMA convolution and norm reduction.
+    /// The separate partial arrays let both rows use one, not two, barriers.
+    private static let temporalSource = """
+        constexpr int GRP = HV / HK;
+        constexpr int KEY = HK * DK;
+        constexpr int VOFF = 2 * KEY;
+        constexpr int NK = KS - 1;
+        static_assert(DK == 128 && DV == 128, "128-thread norm ownership");
+        const uint c = thread_position_in_threadgroup.x;
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t0 = threadgroup_position_in_grid.y * TT;
+        const uint bb = threadgroup_position_in_grid.z;
+        const int Sn = S;
+        const int64_t qb = int64_t(bb) * qkv_strides[0];
+        const int64_t qs1 = qkv_strides[1];
+        const int64_t qs2 = qkv_strides[2];
+        const int64_t cb = int64_t(bb) * cs_strides[0];
+        const int64_t cs1 = cs_strides[1];
+        const int64_t cs2 = cs_strides[2];
+        const bool wvec = (KS == 4) && (w_strides[1] == 1) && (w_strides[0] == 4);
+        if (blk >= uint(HK)) {
+          const uint hv0 = (blk - uint(HK)) * uint(GRP);
+          uint col[GRP];
+          float xt[GRP][KS + TT - 1];
+          float wt[GRP][KS];
+          #pragma clang loop unroll(full)
+          for (int n = 0; n < GRP; n++) {
+            col[n] = VOFF + (hv0 + uint(n)) * DV + c;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < KS + TT - 1; j++) {
+              const int r = int(t0) + j - NK;
+              xt[n][j] = (r < 0)
+                  ? cs[cb + int64_t(r + NK) * cs1 + int64_t(col[n]) * cs2]
+                  : float(qkv[qb + int64_t(r) * qs1 + int64_t(col[n]) * qs2]);
+            }
+            if (wvec) {
+              const float4 w4 = *(const device float4*)(w + int64_t(col[n]) * 4);
+              wt[n][0] = w4.x; wt[n][1] = w4.y; wt[n][2] = w4.z; wt[n][3] = w4.w;
+            } else {
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) {
+                wt[n][j] = w[int64_t(col[n]) * w_strides[0] + int64_t(j) * w_strides[1]];
+              }
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (int tt = 0; tt < TT; tt++) {
+            const uint t = t0 + uint(tt);
+            const size_t cirow = (size_t(bb) * size_t(Sn + NK) + size_t(NK) + size_t(t)) * size_t(CD);
+            #pragma clang loop unroll(full)
+            for (int n = 0; n < GRP; n++) {
+              float acc = 0.0f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < KS; j++) { acc = fma(xt[n][tt + j], wt[n][j], acc); }
+              const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+              const size_t vrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV)
+                  + size_t(hv0 + uint(n));
+              v[vrow * size_t(DV) + c] = acc * sig;
+              ci[cirow + col[n]] = xt[n][tt + NK];
+            }
+          }
+          if (t0 == 0) {
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NK; r++) {
+              const size_t cirow0 = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+              #pragma clang loop unroll(full)
+              for (int n = 0; n < GRP; n++) { ci[cirow0 + col[n]] = xt[n][r]; }
+            }
+          }
+          return;
+        }
+        const uint h = blk;
+        threadgroup float red[TT][8];
+        threadgroup float tgp[TT][2 * GRP * KSP];
+        uint col[2];
+        col[0] = h * DK + c;
+        col[1] = KEY + h * DK + c;
+        float xt[2][KS + TT - 1];
+        float wt[2][KS];
+        #pragma clang loop unroll(full)
+        for (int n = 0; n < 2; n++) {
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < KS + TT - 1; j++) {
+            const int r = int(t0) + j - NK;
+            xt[n][j] = (r < 0)
+                ? cs[cb + int64_t(r + NK) * cs1 + int64_t(col[n]) * cs2]
+                : float(qkv[qb + int64_t(r) * qs1 + int64_t(col[n]) * qs2]);
+          }
+          if (wvec) {
+            const float4 w4 = *(const device float4*)(w + int64_t(col[n]) * 4);
+            wt[n][0] = w4.x; wt[n][1] = w4.y; wt[n][2] = w4.z; wt[n][3] = w4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < KS; j++) {
+              wt[n][j] = w[int64_t(col[n]) * w_strides[0] + int64_t(j) * w_strides[1]];
+            }
+          }
+        }
+        const float wqc = wq[int64_t(c) * wq_strides[0]];
+        const float wkc = wk[int64_t(c) * wk_strides[0]];
+        const bool gate = c < uint(GRP);
+        const uint hv = h * GRP + (gate ? c : 0u);
+        float dtbv = 0.0f;
+        float dcy = 0.0f;
+        if (gate) {
+          dtbv = dtb[int64_t(hv) * dtb_strides[0]];
+          dcy = decay[int64_t(hv) * decay_strides[0]];
+        }
+        for (uint e = c; e < uint(TT * 2 * GRP * KSP); e += 128u) {
+          const uint tt = e / uint(2 * GRP * KSP);
+          const uint i = e % uint(2 * GRP * KSP);
+          const uint which = i / uint(KSP);
+          const uint s = i % uint(KSP);
+          const int colp = (which < uint(GRP) ? AOFF : BOFF) + int(h * GRP + which % uint(GRP));
+          const int64_t prow = (int64_t(bb) * int64_t(Sn) + int64_t(t0 + tt)) * abp_strides[1];
+          tgp[tt][i] = abp[int64_t(s) * abp_strides[0] + prow + int64_t(colp) * abp_strides[2]];
+        }
+        float xs[TT][2];
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        #pragma clang loop unroll(full)
+        for (int tt = 0; tt < TT; tt++) {
+          #pragma clang loop unroll(full)
+          for (int n = 0; n < 2; n++) {
+            float acc = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < KS; j++) { acc = fma(xt[n][tt + j], wt[n][j], acc); }
+            const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+            const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+            xs[tt][n] = acc * sig;
+          }
+          const float sq = simd_sum(xs[tt][0] * xs[tt][0]);
+          const float sk = simd_sum(xs[tt][1] * xs[tt][1]);
+          if (lane == 0) { red[tt][sg] = sq; red[tt][4 + sg] = sk; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int tt = 0; tt < TT; tt++) {
+          const uint t = t0 + uint(tt);
+          const float sq = (red[tt][0] + red[tt][1]) + (red[tt][2] + red[tt][3]);
+          const float sk = (red[tt][4] + red[tt][5]) + (red[tt][6] + red[tt][7]);
+          const float invq = metal::precise::rsqrt(sq / float(DK) + 1e-6f);
+          const float invk = metal::precise::rsqrt(sk / float(DK) + 1e-6f);
+          const size_t qkrow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HK) + size_t(h);
+          q[qkrow * size_t(DK) + c] = (xs[tt][0] * invq) * wqc;
+          k[qkrow * size_t(DK) + c] = (xs[tt][1] * invk) * wkc;
+          if (gate) {
+            float asum = 0.0f;
+            float bsum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int s = 0; s < KSP; s++) {
+              asum += tgp[tt][c * KSP + s];
+              bsum += tgp[tt][(GRP + c) * KSP + s];
+            }
+            const float av = asum + dtbv;
+            const float bv = bsum;
+            const float mx = metal::max(av, 0.0f);
+            const float mn = metal::min(av, 0.0f);
+            const float sp = mx + log1p(metal::exp(mn - mx));
+            const float gv = metal::precise::exp(dcy * sp);
+            const float by = 1.0f / (1.0f + metal::exp(metal::abs(bv)));
+            const float betav = (bv < 0.0f) ? by : 1.0f - by;
+            const size_t grow = (size_t(bb) * size_t(Sn) + size_t(t)) * size_t(HV) + size_t(hv);
+            g[grow] = gv; beta[grow] = betav; ao[grow] = asum; bo[grow] = bsum;
+          }
+          const size_t cirow = (size_t(bb) * size_t(Sn + NK) + size_t(NK) + size_t(t)) * size_t(CD);
+          #pragma clang loop unroll(full)
+          for (int n = 0; n < 2; n++) { ci[cirow + col[n]] = xt[n][tt + NK]; }
+        }
+        if (t0 == 0) {
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < NK; r++) {
+            const size_t cirow0 = (size_t(bb) * size_t(Sn + NK) + size_t(r)) * size_t(CD);
+            #pragma clang loop unroll(full)
+            for (int n = 0; n < 2; n++) { ci[cirow0 + col[n]] = xt[n][r]; }
+          }
+        }
+        """
+
+    private static let temporalEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_TIME2"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let temporalKernel: MLXFast.MLXFastKernel? = {
+        guard let fastSource,
+            let reads = try? NSRegularExpression(pattern: #"(\w+_strides\[\d\])(?! ==)"#)
+        else { return nil }
+        let pieces = fastSource.components(separatedBy: "if (fits32) {")
+        guard pieces.count == 2 else { return nil }
+        let narrow = reads.stringByReplacingMatches(
+            in: temporalSource, range: NSRange(temporalSource.startIndex..., in: temporalSource),
+            withTemplate: "uint($1)"
+        ).replacingOccurrences(of: "size_t", with: "uint")
+            .replacingOccurrences(of: "int64_t", with: "uint")
+        // Reuse precisely the existing stride bound; a negative stride runs
+        // the wide temporal body, with the same two-row launch geometry.
+        let source = pieces[0] + "if (fits32) {\n" + narrow + "\n} else {\n"
+            + temporalSource + "\n}"
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_prework_verify_time2",
+            inputNames: ["qkv", "cs", "w", "abp", "decay", "dtb", "wq", "wk", "S"],
+            outputNames: ["q", "k", "v", "g", "beta", "ci", "ao", "bo"],
+            source: source, ensureRowContiguous: false)
+    }()
+
     /// Fewer than 2^31 elements, checked by division.
     private static func fits32(_ shape: [Int]) -> Bool {
         var n = 1
@@ -3090,6 +3299,7 @@ enum Qwen35PreworkSplit {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
     nonisolated(unsafe) private static var fastVerdicts: [String: Bool] = [:]
+    nonisolated(unsafe) private static var temporalVerdicts: [String: Bool] = [:]
     /// Set while the twin's self-test runs the 64-bit text.
     nonisolated(unsafe) private static var forceWide = false
     nonisolated(unsafe) private static var prepared: Set<String> = []
@@ -3108,6 +3318,15 @@ enum Qwen35PreworkSplit {
         let fast =
             !forceWide && B * S <= 16 && lock.withLock({ fastVerdicts["\(dtype)"] ?? false })
             && outputShapes.allSatisfy(fits32)
+        if fast, temporalEnabled, B == 1, S == 16, keyHeads == 16, valueHeads == 48,
+            lock.withLock({ temporalVerdicts["\(dtype)"] ?? false }), let temporalKernel
+        {
+            return temporalKernel(
+                inputs, template: template + [("TT", 2)],
+                grid: (128 * 2 * keyHeads, S / 2, B), threadGroup: (128, 1, 1),
+                outputShapes: outputShapes,
+                outputDTypes: Array(repeating: DType.float32, count: outputShapes.count))
+        }
         return ((fast ? fastKernel : nil) ?? kernel)(
             inputs, template: template,
             grid: (128 * 2 * keyHeads, S, B), threadGroup: (128, 1, 1),
@@ -3232,6 +3451,7 @@ enum Qwen35PreworkSplit {
             ("qwen35 GDN verify prework, value threadgroups apart: self-test "
                 + report.joined(separator: "; ") + "\n").data(using: .utf8)!)
         fastSelfTest(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden)
+        temporalSelfTest(hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden)
     }
 
     /// The twin against the 64-bit text, every output bit, per dtype that
@@ -3277,11 +3497,10 @@ enum Qwen35PreworkSplit {
                 + "\n").data(using: .utf8)!)
     }
 
-    /// One `fastSelfTest` case: [mismatches, inf, NaN] (of the 64-bit
-    /// outputs) and the value count.
-    private static func fastCase(
+    /// Common synthetic operands for both address-width and temporal trials.
+    private static func testOperands(
         hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, hidden: Int, S: Int, form: Int, dtype: DType
-    ) throws -> (MLXArray, Int) {
+    ) throws -> ([MLXArray], [(String, any KernelTemplateArg)], [[Int]]) {
         let cd = 2 * hk * dk + hv * dv
         let width = cd + hv * dv
         let nab = 2 * hv
@@ -3325,6 +3544,16 @@ enum Qwen35PreworkSplit {
             [1, S, hk, dk], [1, S, hk, dk], [1, S, hv, dv], [1, S, hv], [1, S, hv], [1, ks - 1 + S, cd],
             [1, S, hv], [1, S, hv],
         ]
+        return (inputs, template, shapes)
+    }
+
+    /// One `fastSelfTest` case: [mismatches, inf, NaN] (of the 64-bit
+    /// outputs) and the value count.
+    private static func fastCase(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, hidden: Int, S: Int, form: Int, dtype: DType
+    ) throws -> (MLXArray, Int) {
+        let (inputs, template, shapes) = try testOperands(
+            hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden, S: S, form: form, dtype: dtype)
         func run(wide: Bool) -> [MLXArray]? {
             forceWide = wide
             defer { forceWide = false }
@@ -3340,6 +3569,78 @@ enum Qwen35PreworkSplit {
             ref.map { isInf($0).asType(.int32).sum() }, ref.map { isNaN($0).asType(.int32).sum() },
         ]
         return (stacked(counts.map { stacked($0).sum() }), ref.reduce(0) { $0 + $1.size })
+    }
+
+    private static func temporalSelfTest(
+        hk: Int, dk: Int, hv: Int, dv: Int, ks: Int, hidden: Int
+    ) {
+        guard temporalEnabled, hk == 16, hv == 48, dk == 128, dv == 128, ks == 4, hidden == 5120,
+            let temporalKernel, let fastKernel
+        else { return }
+        for dtype in [DType.float16, .float32] where lock.withLock({ fastVerdicts["\(dtype)"] ?? false }) {
+            var values = 0
+            var report = "fallback"
+            do {
+                try withError { error in
+                    var times = [[Double](), [Double]()]
+                    for form in 0 ..< 4 {
+                        let (inputs, template, shapes) = try testOperands(
+                            hk: hk, dk: dk, hv: hv, dv: dv, ks: ks, hidden: hidden,
+                            S: 16, form: form, dtype: dtype)
+                        func run(_ x: [MLXArray], _ temporal: Bool) -> [MLXArray] {
+                            (temporal ? temporalKernel : fastKernel)(
+                                x, template: template + [("TT", 2)],
+                                grid: (128 * 2 * hk, temporal ? 8 : 16, 1), threadGroup: (128, 1, 1),
+                                outputShapes: shapes, outputDTypes: Array(repeating: .float32, count: shapes.count))
+                        }
+                        let reference = run(inputs, false)
+                        let candidate = run(inputs, true)
+                        let count = stacked(zip(reference, candidate).map {
+                            ($0.view(dtype: .uint32) .!= $1.view(dtype: .uint32)).asType(.int32).sum()
+                        }).sum()
+                        eval(count)
+                        try error.check()
+                        values += reference.reduce(0) { $0 + $1.size }
+                        guard count.item(Int32.self) == 0 else {
+                            throw SelfTestFailure.message("temporal bitwise mismatch form \(form)")
+                        }
+                        // Time only the real contiguous-weight production layout.
+                        // Twelve dependent launches amortize submission overhead.
+                        if form == 0 {
+                            eval(inputs)
+                            for repetition in 0 ..< 13 {
+                                for step in 0 ..< 2 {
+                                    let arm = (step + repetition) % 2
+                                    var current = inputs
+                                    var out = [MLXArray]()
+                                    for _ in 0 ..< 12 {
+                                        out = run(current, arm == 1)
+                                        current[1] = out[5][0..., 16..., 0...]
+                                    }
+                                    let start = DispatchTime.now().uptimeNanoseconds
+                                    eval(out)
+                                    let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 12000
+                                    try error.check()
+                                    if repetition >= 2 { times[arm].append(us) }
+                                }
+                            }
+                        }
+                    }
+                    let base = times[0].sorted()[times[0].count / 2]
+                    let candidate = times[1].sorted()[times[1].count / 2]
+                    let adopt = candidate < base * 0.98
+                    lock.withLock { temporalVerdicts["\(dtype)"] = adopt }
+                    report = "passed \(values) values; \(base) -> \(candidate) us; "
+                        + (adopt ? "adopted" : "speed rejected")
+                }
+            } catch {
+                lock.withLock { temporalVerdicts["\(dtype)"] = false }
+                report = "fallback after \(values) values: \(error)"
+            }
+            Memory.clearCache()
+            FileHandle.standardError.write(
+                ("qwen35 GDN verify prework time2 \(dtype): \(report)\n").data(using: .utf8)!)
+        }
     }
 }
 

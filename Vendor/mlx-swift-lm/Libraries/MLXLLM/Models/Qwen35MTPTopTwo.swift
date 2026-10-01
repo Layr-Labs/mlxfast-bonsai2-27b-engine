@@ -2211,6 +2211,192 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // Paired gate/up tiles use the TN64 dot body. Only the second tile's
+    // column address changes (N/2, not 32). Dots, affine FMAs, quarter folds
+    // and FP16 rounding are unchanged. A complete load-time matrix check
+    // and a 1% median speed gate protect adoption on the target GPU.
+    private static let gateUpTail = """
+        // the reduction reuses the staging buffers, in simdgroup order
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)bs;
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < 2; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * 2 + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float4 gu[2];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < 2; h++) {
+              float v0 = acc[h][i];
+              float v1 = acc[h][i + 1];
+              float v2 = acc[h][i + 2];
+              float v3 = acc[h][i + 3];
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 3; q++) {
+                v0 += red[(q * 2 + h) * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[(q * 2 + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[(q * 2 + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[(q * 2 + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
+              gu[h] = float4(half4(half(v0), half(v1), half(v2), half(v3)));
+            }
+            const int col = n0 + fn + 16 * nq;
+            const size_t base = (size_t)(fm + 8 * mh) * (N / 2) + col;
+            float4 result;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const float g = gu[0][j];
+              const float sy = 1 / (1 + metal::exp(metal::abs(g)));
+              const float sig = g < 0 ? sy : 1 - sy;
+              result[j] = ((g * sig) * gu[1][j]) * signs[col + j];
+            }
+            *(device float4*)(out + base) = result;
+          }
+        }
+        """
+
+    private static let gateUpSource: String? = {
+        let anchor = "// the reduction reuses the staging buffers, in simdgroup order"
+        let parts = sourceNarrowInt8Zoo.components(separatedBy: anchor)
+        guard parts.count == 2 else { return nil }
+        var text = parts[0]
+        for (old, new) in [
+            ("int(threadgroup_position_in_grid.x) * TN", "int(threadgroup_position_in_grid.x) * 32"),
+            ("const size_t hstride = (size_t)Kg * 256;",
+             "const size_t hstride = (size_t)(N / 64) * (size_t)Kg * 256;"),
+            ("n0 + 32 * h + fn", "n0 + (N / 2) * h + fn"),
+        ] {
+            guard text.components(separatedBy: old).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        return text + gateUpTail
+    }()
+
+    private static let gateUpKernel: MLXFast.MLXFastKernel? = gateUpSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_verify_gate_up_epilogue",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz", "signs"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let gateUpEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATE_UP_EPILOGUE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private struct GateUpPick {
+        let reference: NarrowKernel
+        let pd: Int, kh: Int
+    }
+    nonisolated(unsafe) private static var gateUpPick: GateUpPick?
+
+    private static func launchGateUp(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, _ signs: MLXArray,
+        k: Int, n: Int, form: NarrowEpilogue, pd: Int, kh: Int
+    ) -> MLXArray? {
+        gateUpKernel?(
+            [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: 16, n: n), signs],
+            template: [
+                ("OutT", DType.float16), ("NEG", form == .base ? 0 : 1),
+                ("F32S", form == .negativeBiasF32Scales ? 1 : 0),
+                ("PD", pd), ("TN", 64), ("KH", kh), ("AM", 0),
+            ],
+            grid: (n / 64 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[16, n / 2]], outputDTypes: [.float32])[0]
+    }
+
+    /// Load-time only, synthetic stored weights. A changed in-situ kernel
+    /// pick declines rather than assuming the new baseline is slower.
+    private static func prepareGateUp() {
+        guard gateUpEnabled, narrowTiled, gateUpKernel != nil else { return }
+        let reference = narrowByShape[[5120, 34816]] ?? narrowDefault
+        var detail = "not adopted"
+        do {
+            try withError { error in
+                let ops = (0 ..< 2).map { NarrowOperands(k: 5120, n: 34816, seed: 9120 + UInt64($0)) }
+                let signs = which(
+                    MLXRandom.normal([17408], key: MLXRandom.key(9122)) .< 0,
+                    MLXArray(Float(-1)), MLXArray(Float(1)))
+                eval(signs)
+                func composed(_ o: NarrowOperands, _ choice: NarrowKernel, stored: Bool = false) -> MLXArray {
+                    let wide = o.run(choice, .float16, tiled: !stored)
+                    let pair = wide.split(parts: 2, axis: -1)
+                    return Qwen35FusedElementwise.swigluSigned(pair[0], pair[1], signs)
+                }
+                func fused(_ o: NarrowOperands, pd: Int, kh: Int) -> MLXArray? {
+                    let f = reference.form
+                    let s = f == .negativeBiasF32Scales ? o.scalesT32 : o.scalesT
+                    return launchGateUp(
+                        o.codes, o.tiledWeight, s, f == .base ? o.biasesT : s,
+                        o.ascale, o.rowsum, signs, k: o.k, n: o.n, form: f, pd: pd, kh: kh)
+                }
+                let refs = ops.map { composed($0, .original, stored: true) }
+                eval(refs)
+                var valid: [(Int, Int)] = []
+                for (pd, kh) in [(1, 32), (2, 32), (1, 64)] {
+                    let passed = try? withError { scoped -> Bool in
+                        for (o, ref) in zip(ops, refs) {
+                            guard let y = fused(o, pd: pd, kh: kh) else { return false }
+                            let bad = (y.view(dtype: .uint32) .!= ref.view(dtype: .uint32)).asType(.int32).sum()
+                            eval(bad)
+                            try scoped.check()
+                            if bad.item(Int32.self) != 0 { return false }
+                        }
+                        return true
+                    }
+                    if passed == true { valid.append((pd, kh)) }
+                }
+                guard !valid.isEmpty else {
+                    detail = "self-test failed or unsupported; composed path kept"
+                    return
+                }
+                for (o, ref) in zip(ops, refs) {
+                    let y = composed(o, reference)
+                    let bad = (y.view(dtype: .uint32) .!= ref.view(dtype: .uint32)).asType(.int32).sum()
+                    eval(bad)
+                    try error.check()
+                    guard bad.item(Int32.self) == 0 else { return }
+                }
+                var times = Array(repeating: [Double](), count: valid.count + 1)
+                for repetition in 0 ..< 11 {
+                    let order = repetition % 2 == 0 ? Array(times.indices) : Array(times.indices.reversed())
+                    for arm in order {
+                        let ys = arm == 0 ? ops.map { composed($0, reference) }
+                            : ops.compactMap { fused($0, pd: valid[arm - 1].0, kh: valid[arm - 1].1) }
+                        guard ys.count == ops.count else { return }
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(ys)
+                        let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 1000 / Double(ys.count)
+                        try error.check()
+                        if repetition >= 2 { times[arm].append(us) }
+                    }
+                }
+                let medians = times.map { $0.sorted()[$0.count / 2] }
+                let best = (1 ..< medians.count).min { medians[$0] < medians[$1] }!
+                if medians[best] <= medians[0] * 0.99 {
+                    gateUpPick = GateUpPick(reference: reference, pd: valid[best - 1].0, kh: valid[best - 1].1)
+                }
+                detail = String(
+                    format: "self-test passed (557056 values per body, uint32); composed %.2f us, paired %.2f us; %@",
+                    medians[0], medians[best], gateUpPick == nil ? "composed kept" : "paired adopted")
+            }
+        } catch {
+            gateUpPick = nil
+            detail = "error; composed path kept (\(error))"
+        }
+        Memory.clearCache()
+        FileHandle.standardError.write(Data(("bonsai verify gate/up epilogue: \(detail)\n").utf8))
+    }
+
     private static let kernelNarrowInt8Pair = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8x",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -5414,6 +5600,32 @@ enum Qwen35TensorPackedMatmul {
                     k: k, n: n, outputDType: outputDType, kernel: choice, tiled: narrowTiled)
             }
             installNarrowChoice()
+            prepareGateUp()
+            HadamardQuantizedLinear.tensorPackedSwiGLU = {
+                activation, weight, scales, biases, signs, cache in
+                guard let pick = gateUpPick, !HadamardQuantizedLinear.narrowProducerActive,
+                    activation.codes.dtype == .int8, activation.codes.shape == [16, 5120],
+                    activation.scales.dtype == .float32, activation.scales.shape == [16, 40],
+                    activation.scaledSums.dtype == .float32, activation.scaledSums.shape == [16, 40],
+                    weight.dtype == .uint32, weight.shape == [34816, 320],
+                    scales.dtype == .float16, scales.shape == [34816, 40],
+                    biases.dtype == .float16, biases.shape == [34816, 40],
+                    signs.dtype == .float32, signs.shape == [17408]
+                else { return nil }
+                let choice = narrowKernel(
+                    cache, scales, biases, k: 5120, n: 34816, outputDType: .float16, materialize: false)
+                guard choice == pick.reference else { return nil }
+                recordVerifySite(cache, weight, scales, biases, k: 5120, n: 34816, outputDType: .float16)
+                let s = choice.form == .negativeBiasF32Scales
+                    ? narrowScalesF32(cache, scales, materialize: false)
+                    : cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                let b = choice.form == .base
+                    ? cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() } : s
+                return launchGateUp(
+                    activation.codes, narrowTiledWeight(cache, weight, materialize: false), s, b,
+                    activation.scales, activation.scaledSums, signs, k: 5120, n: 34816,
+                    form: choice.form, pd: pick.pd, kh: pick.kh)
+            }
         } else if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in
@@ -6364,6 +6576,34 @@ extension Qwen35TensorPackedMatmul {
           return o;
         }
 
+        // GordoAR 26241e1c-6079-4baf-a5b6-814b6993d69d's full/disjoint-pair
+        // observation. The runner-up is the winner's second or loser's first.
+        inline void bonsai_head_top2_merge_full(
+            thread bonsai_head_top2 &a, bonsai_head_top2 b) {
+          const bool other_first = bonsai_head_top2_better(
+              b.first_value, b.first_id, a.first_value, a.first_id);
+          const float fv = other_first ? b.first_value : a.first_value;
+          const uint fi = other_first ? b.first_id : a.first_id;
+          const float sv = other_first ? b.second_value : a.second_value;
+          const uint si = other_first ? b.second_id : a.second_id;
+          const float cv = other_first ? a.first_value : b.first_value;
+          const uint ci = other_first ? a.first_id : b.first_id;
+          const bool cross_second = bonsai_head_top2_better(cv, ci, sv, si);
+          a.first_value = fv; a.first_id = fi;
+          a.second_value = cross_second ? cv : sv;
+          a.second_id = cross_second ? ci : si; a.count = 2;
+        }
+
+        inline bonsai_head_top2 bonsai_head_top2_shuffle_full(bonsai_head_top2 s, ushort mask) {
+          bonsai_head_top2 o;
+          o.first_value = simd_shuffle_xor(s.first_value, mask);
+          o.second_value = simd_shuffle_xor(s.second_value, mask);
+          o.first_id = simd_shuffle_xor(s.first_id, mask);
+          o.second_id = simd_shuffle_xor(s.second_id, mask);
+          o.count = 2;
+          return o;
+        }
+
         """
 
     /// The stock stores of the int8 verify kernels' reduction (simdgroup 0,
@@ -6395,8 +6635,15 @@ extension Qwen35TensorPackedMatmul {
         if (sg == 0) {
           #pragma clang loop unroll(full)
           for (int mh = 0; mh < 2; mh++) {
-            bonsai_head_top2_merge(ht2[mh], bonsai_head_top2_shuffle_xor(ht2[mh], 1));
-            bonsai_head_top2_merge(ht2[mh], bonsai_head_top2_shuffle_xor(ht2[mh], 8));
+            if (FULL_PAIR) {
+              // Each lane inserted at least four distinct columns; these
+              // two butterfly steps join disjoint sets of the same row.
+              bonsai_head_top2_merge_full(ht2[mh], bonsai_head_top2_shuffle_full(ht2[mh], 1));
+              bonsai_head_top2_merge_full(ht2[mh], bonsai_head_top2_shuffle_full(ht2[mh], 8));
+            } else {
+              bonsai_head_top2_merge(ht2[mh], bonsai_head_top2_shuffle_xor(ht2[mh], 1));
+              bonsai_head_top2_merge(ht2[mh], bonsai_head_top2_shuffle_xor(ht2[mh], 8));
+            }
           }
           if ((lane & 9u) == 0u) {
             const int ht2blocks = N / (HT2COLS);
@@ -6492,13 +6739,28 @@ extension Qwen35TensorPackedMatmul {
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
             bonsai_head_top2 st = bonsai_head_top2_empty();
-            for (uint b = lane; b < blocks; b += 32) {
+            uint start = lane;
+            if (FULL_PAIR) {
+              const size_t o = (size_t(row) * size_t(blocks) + size_t(lane)) * 2;
+              st = {pval[o], pval[o + 1], uint(pid[o]), uint(pid[o + 1]), 2};
+              start += 32;
+            }
+            for (uint b = start; b < blocks; b += 32) {
               const size_t o = (size_t(row) * size_t(blocks) + size_t(b)) * 2;
-              bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
-              bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+              if (FULL_PAIR) {
+                bonsai_head_top2 other = {pval[o], pval[o + 1], uint(pid[o]), uint(pid[o + 1]), 2};
+                bonsai_head_top2_merge_full(st, other);
+              } else {
+                bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
+                bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+              }
             }
             for (ushort m = 16; m > 0; m >>= 1) {
-              bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
+              if (FULL_PAIR) {
+                bonsai_head_top2_merge_full(st, bonsai_head_top2_shuffle_full(st, m));
+              } else {
+                bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
+              }
             }
             if (lane == 0) {
               top_ids[row * 2] = int(st.first_id);
@@ -6509,6 +6771,105 @@ extension Qwen35TensorPackedMatmul {
             """,
         header: headTop2Header,
         ensureRowContiguous: true)
+
+    private static func mergeHeadTop2(
+        _ partial: [MLXArray], fullPairs: Bool
+    ) -> (ids: MLXArray, values: MLXArray) {
+        let m = partial[0].dim(0)
+        let merged = headTop2MergeKernel(
+            partial, template: [("FULL_PAIR", fullPairs && partial[0].dim(1) >= 32)],
+            grid: (32, m, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
+        return (merged[0], merged[1])
+    }
+
+    /// Synthetic logits enter the matrix kernel's exact insertion and XOR
+    /// tail. The M5-only dot instructions are not required by this test.
+    private static let headPairTestSource = """
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int N = x_shape[1];
+        const int n0 = int(threadgroup_position_in_grid.x) * TN;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        bonsai_head_top2 ht2[2] = {bonsai_head_top2_empty(), bonsai_head_top2_empty()};
+        #pragma clang loop unroll(full)
+        for (int mh = 0; mh < 2; ++mh) {
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < TN / 16; ++j) {
+            const uint col = uint(n0 + fn + 16 * j);
+            const float4 v = *(const device float4*)(x + (fm + 8 * mh) * N + col);
+            bonsai_head_top2_insert(ht2[mh], v.x, col);
+            bonsai_head_top2_insert(ht2[mh], v.y, col + 1);
+            bonsai_head_top2_insert(ht2[mh], v.z, col + 2);
+            bonsai_head_top2_insert(ht2[mh], v.w, col + 3);
+          }
+        }
+        """ + headTop2Tail.replacingOccurrences(of: "HT2COLS", with: "TN")
+
+    private static let headPairTestKernel = MLXFast.metalKernel(
+        name: "bonsai_head_full_pair_selftest", inputNames: ["x"],
+        outputNames: ["top_ids", "top_values"], source: headPairTestSource,
+        header: headTop2Header, ensureRowContiguous: true)
+
+    /// First use is the existing load-time head warm. Payload words and IDs
+    /// must match the generic forms; failure retains those forms everywhere.
+    /// Normal CBv2, prompt, and drafter paths are not changed.
+    private static let headFullPairReady: Bool = {
+        let flag = ProcessInfo.processInfo.environment["BONSAI_HEAD_FULL_PAIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(flag ?? "") else { return false }
+        var checked = 0
+        do {
+            try withError { error in
+                func check(_ a: [MLXArray], _ b: [MLXArray]) throws {
+                    let count = (a[0].view(dtype: .uint32) .!= b[0].view(dtype: .uint32))
+                        .asType(.int32).sum()
+                        + (a[1].view(dtype: .uint32) .!= b[1].view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(count)
+                    try error.check()
+                    guard count.item(Int32.self) == 0 else {
+                        throw MLXFastHeadTop2Failure.message("full-pair bits differ")
+                    }
+                    checked += a[0].size + a[1].size
+                }
+                let edges: [UInt32] = [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000,
+                    0x7fc0_0001, 0x7fc0_1000, 0xffc0_0001, 0x3f80_0000]
+                for n in [512, 992, 1024, 1056, 4096, 248320] {
+                    for special in [false, true] {
+                        var word: UInt32 = 0x6675_6c6c
+                        let words: [UInt32] = (0 ..< 16 * n).map { i in
+                            word = word &* 1_664_525 &+ 1_013_904_223
+                            return special ? edges[i % edges.count] : word
+                        }
+                        let x = MLXArray(words, [16, n]).view(dtype: .float32)
+                        for tn in [32, 64, 128] where n % tn == 0 {
+                            func partial(_ full: Bool) -> [MLXArray] {
+                                headPairTestKernel(
+                                    [x], template: [("TN", tn), ("FULL_PAIR", full)],
+                                    grid: (n / tn * 32, 1, 1), threadGroup: (32, 1, 1),
+                                    outputShapes: [[16, n / tn, 2], [16, n / tn, 2]],
+                                    outputDTypes: [.int32, .float32])
+                            }
+                            let reference = partial(false), candidate = partial(true)
+                            try check(reference, candidate)
+                            let baseline = mergeHeadTop2(reference, fullPairs: false)
+                            let fused = mergeHeadTop2(candidate, fullPairs: true)
+                            try check([baseline.ids, baseline.values], [fused.ids, fused.values])
+                        }
+                    }
+                }
+            }
+            FileHandle.standardError.write(
+                "bonsai head full-pair: self-test passed (\(checked) uint32 words)\n".data(using: .utf8)!)
+            return true
+        } catch {
+            FileHandle.standardError.write(
+                "bonsai head full-pair: generic fallback (\(error))\n".data(using: .utf8)!)
+            return false
+        }
+    }()
 
     /// The fused form of `launchNarrowInt8` with FP32 output: the same
     /// kernel body, template and grid, returning each of the 16 rows' top
@@ -6523,6 +6884,7 @@ extension Qwen35TensorPackedMatmul {
     ) -> (ids: MLXArray, values: MLXArray)? {
         let m = 16
         let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
+        let fullPairTemplate: [(String, any KernelTemplateArg)] = [("FULL_PAIR", headFullPairReady)]
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", DType.float32), ("NEG", kernel.form == .base ? 0 : 1),
             ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0), ("TILED", tiled ? 1 : 0),
@@ -6538,7 +6900,7 @@ extension Qwen35TensorPackedMatmul {
             // A zoo body's fused form: the same body text, template and grid
             // as its stock launch (`launchNarrowInt8`), on the tiled copy only.
             guard tiled else { return nil }
-            let zooTemplate = Array(template.prefix(3))
+            let zooTemplate = Array(template.prefix(3)) + fullPairTemplate
             let launch: MLXFast.MLXFastKernel?
             let t: [(String, any KernelTemplateArg)]
             var grid = (n / v.tn * 128, 1, 1)
@@ -6573,21 +6935,18 @@ extension Qwen35TensorPackedMatmul {
             case .v0:
                 guard let launch = kernelNarrowInt8Top2 else { return nil }
                 partial = launch(
-                    inputs, template: template,
+                    inputs, template: template + fullPairTemplate,
                     grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
                     outputShapes: shapes, outputDTypes: dtypes)
             default:
                 guard let launch = kernelNarrowInt8PipelinedTop2 else { return nil }
                 partial = launch(
-                    inputs, template: template + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
+                    inputs, template: template + fullPairTemplate + [("PD", v.pd), ("TN", v.tn), ("KH", v.kh)],
                     grid: (n / v.tn * 128, 1, 1), threadGroup: (128, 1, 1),
                     outputShapes: shapes, outputDTypes: dtypes)
             }
         }
-        let merged = headTop2MergeKernel(
-            partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
-        return (merged[0], merged[1])
+        return mergeHeadTop2(partial, fullPairs: headFullPairReady)
     }
 
     /// The capture verify's head launch: `(k, n)` and the kernel the route
