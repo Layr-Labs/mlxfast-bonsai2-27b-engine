@@ -418,6 +418,17 @@ enum Qwen35IO32 {
     }
 }
 
+/// Exact dead-work removals in the timed prompt forwards (default on;
+/// `MLXFAST_DW1=0` restores the record's launches): the prompt int8 kernels'
+/// guarded 32-bit twins and the final layer's last-row gate.
+enum MLXFastDW1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DW1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
 /// same order as the ops it replaces; fusion changes the dispatch count, not
@@ -4442,7 +4453,11 @@ final class Qwen35Attention: Module {
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
                 .reshaped(B, 1, -1)
-            attendedGate = gate[0..., (qL - 1)..., 0...]
+            // `MLXFastDW1`: the last row's gate half reshaped alone (the same
+            // elements), not every row's reshaped into a copy and sliced.
+            attendedGate = MLXFastDW1.enabled
+                ? qSplit[1][0..., (qL - 1)..., 0..., 0...].reshaped(B, 1, -1)
+                : gate[0..., (qL - 1)..., 0...]
         } else {
             // Prompt width on the tensor route: the o_proj rotation reads the
             // attention's query blocks in place (`rowBlockActivation`), so they
@@ -6702,6 +6717,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6739,7 +6756,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
