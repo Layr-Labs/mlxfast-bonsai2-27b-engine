@@ -2239,11 +2239,16 @@ enum FusedInputHadamardKernel {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // Same values as the scalar loop: index = j*4*NT + i*4 is a
+            // multiple of 4; col0 is a multiple of 1024; WIDTH multiples keep
+            // row_base 4-element aligned. One vec<OutT,4> store per quartet.
             BONSAI_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
-              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-                out[row_base + col0 + index + r] = static_cast<OutT>(buf[index + r] * 0.03125f);
-              }
+              *(device vec<OutT, 4>*)(out + row_base + col0 + index) = vec<OutT, 4>(
+                  OutT(buf[index] * 0.03125f),
+                  OutT(buf[index + 1] * 0.03125f),
+                  OutT(buf[index + 2] * 0.03125f),
+                  OutT(buf[index + 3] * 0.03125f));
             }
             """,
         header: """
@@ -2403,11 +2408,16 @@ extension FusedInputHadamardKernel {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // Same values as the scalar loop: index = j*4*NT + i*4 is a
+            // multiple of 4; col0 is a multiple of 1024; WIDTH multiples keep
+            // row_base 4-element aligned. One vec<OutT,4> store per quartet.
             BONSAI_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
-              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-                out[row_base + col0 + index + r] = static_cast<OutT>(buf[index + r] * 0.03125f);
-              }
+              *(device vec<OutT, 4>*)(out + row_base + col0 + index) = vec<OutT, 4>(
+                  OutT(buf[index] * 0.03125f),
+                  OutT(buf[index + 1] * 0.03125f),
+                  OutT(buf[index + 2] * 0.03125f),
+                  OutT(buf[index + 3] * 0.03125f));
             }
             """,
         header: """

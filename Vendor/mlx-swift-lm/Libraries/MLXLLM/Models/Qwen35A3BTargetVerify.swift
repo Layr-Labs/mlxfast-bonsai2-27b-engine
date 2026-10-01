@@ -4795,6 +4795,9 @@ enum Qwen35ExactFormTrial {
 
     static let rowsMargin = 0.02
 
+    /// Whether the prompt prework race also offers 16 rows per threadgroup.
+    static let promptRows16Wanted = on("BONSAI_TRIAL_PROMPT_ROWS16")
+
     /// The prompt prework's rows per threadgroup: 8 and 2 are checked bit for
     /// bit (`checkRowTile`), then raced against 4 at the real prompt shape
     /// (512 rows, the model's geometry and prompt qkv dtype;
@@ -4809,7 +4812,9 @@ enum Qwen35ExactFormTrial {
         let start = DispatchTime.now().uptimeNanoseconds
         var tiles = [Qwen35GDNPrework.rowTile]
         var notes: [String] = []
-        for rows in [8, 2] {
+        // 16 is the tile `BONSAI_GDN_PREWORK_ROW_TILE` already accepts and
+        // checks, never raced; `BONSAI_TRIAL_PROMPT_ROWS16=0` keeps 8 and 2 only.
+        for rows in [8, 2] + (Self.promptRows16Wanted ? [16] : []) {
             let passed = Qwen35GDNPrework.checkRowTile(rows)
             notes.append("\(rows) rows " + (passed ? "passed" : "FAILED"))
             if passed { tiles.append(rows) }
