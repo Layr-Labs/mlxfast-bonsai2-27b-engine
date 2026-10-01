@@ -406,6 +406,18 @@ extension DFlash2TapTarget {
 /// mask = context | block
 /// ```
 public enum DFlash2SlidingMask {
+    // All operands are integers/booleans. Fusion preserves the exact window
+    // and causal predicates but emits one comparison kernel instead of an
+    // elementwise graph per block. Shapeless handles a changing context length.
+    private static let predicates: @Sendable ([MLXArray]) -> [MLXArray] =
+        compile(shapeless: true) { inputs in
+            let query = inputs[0], key = inputs[1]
+            let contextLength = inputs[2], slidingWindow = inputs[3], isCausal = inputs[4]
+            let context = (key .< contextLength) .&& ((query - key) .< slidingWindow)
+            let block = (key .>= contextLength) .&& ((isCausal .== MLXArray(false)) .|| (key .<= query))
+            return [context .|| block]
+        }
+
     /// `true` where attention is allowed. Shape `[blockLength, contextLength + blockLength]`.
     public static func make(
         contextLength: Int,
@@ -417,12 +429,9 @@ public enum DFlash2SlidingMask {
             .reshaped(blockLength, 1)
         let key = MLXArray(Int32(0) ..< Int32(contextLength + blockLength))
             .reshaped(1, contextLength + blockLength)
-        let context = (key .< Int32(contextLength)) .&& ((query - key) .< Int32(slidingWindow))
-        var block = key .>= Int32(contextLength)
-        if isCausal {
-            block = block .&& (key .<= query)
-        }
-        return context .|| block
+        return predicates([
+            query, key, MLXArray(Int32(contextLength)), MLXArray(Int32(slidingWindow)),
+            MLXArray(isCausal)])[0]
     }
 
     /// How many leading context rows the layer drops before it projects them,
