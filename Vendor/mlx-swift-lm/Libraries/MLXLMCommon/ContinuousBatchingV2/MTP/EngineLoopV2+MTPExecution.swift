@@ -518,6 +518,7 @@ extension EngineLoopV2 {
         }
         if let verify {
             asyncEvalTargets.append(verify.acceptancePacket)
+            if let drafts = verify.packetDrafts { asyncEvalTargets.append(drafts) }
             asyncEvalTargets.append(verify.lastHidden)
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
@@ -838,9 +839,14 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        // ACCGLUE: one launch writes both parts (`CBv2AcceptGlue.packet`).
+        // The block's draft ids are evaluated already; the finalize reads
+        // them and the target ids as they are (`CBv2DW2`), so the verify's
+        // tail has no join (two copy launches) before the readback.
+        let packetDrafts: MLXArray? =
+            CBv2DW2.enabled && blockDraftIDs != nil && target.shortlist == nil
+            ? packetParts[0] : nil
         let acceptancePacket =
-            CBv2AcceptGlue.packet(packetParts) ?? concatenated(packetParts, axis: 0)
+            packetDrafts != nil ? packetParts[1] : concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
@@ -858,6 +864,7 @@ extension EngineLoopV2 {
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.packetDrafts = packetDrafts
         return result
     }
 
