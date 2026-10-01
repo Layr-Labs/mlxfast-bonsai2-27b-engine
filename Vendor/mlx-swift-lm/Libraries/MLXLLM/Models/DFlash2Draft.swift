@@ -5058,8 +5058,26 @@ public enum DFlash2ResidencyPrefetch {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// The prompt layers after which one group each is due.
-    static let dueAfterLayers = [8, 16, 32, 48]
+    /// The prompt layers after which one group each is due: [16, 32, 48, 48]
+    /// (four groups of about equal bytes, the last two together), the
+    /// forward's early submissions with the most prompt work queued ahead of
+    /// the host. A group's bind blocks the stream thread that commits it for
+    /// as long as the system takes to wire its arrays (~10-20 ms per GB after
+    /// the gates' idle), and the stream encodes nothing else meanwhile. At
+    /// layer 8 only the layers 4-7 submission is queued, and a cold or warm
+    /// seed's Metal trace shows the GPU idle ~3.5 ms right after the first
+    /// group's touch while the wiring finishes; at 16, 32 and 48 the queue
+    /// holds 8, 16 and 16 layers (~35-70 ms) and the binds hide behind them.
+    /// Each group is still bound before the forward ends, so nothing the first
+    /// round reads changes. `DARKBLOOM_DFLASH2_RESIDENCY_DUE` sets the layers
+    /// (comma-separated, non-decreasing; `8,16,32,48` is the previous schedule).
+    static let dueAfterLayers: [Int] = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_DUE"] {
+            let layers = raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if !layers.isEmpty, layers.allSatisfy({ $0 > 0 }), layers == layers.sorted() { return layers }
+        }
+        return [16, 32, 48, 48]
+    }()
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var groups: [[MLXArray]] = []
