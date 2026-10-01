@@ -418,6 +418,16 @@ enum Qwen35IO32 {
     }
 }
 
+/// Reshape only the final gate row when prompt attention consumes that row.
+/// `MLXFAST_DW1=0` keeps the original full gate reshape and slice.
+enum MLXFastDW1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DW1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
 /// same order as the ops it replaces; fusion changes the dispatch count, not
@@ -645,7 +655,7 @@ enum Qwen35GatedDeltaV3 {
     }()
     nonisolated(unsafe) static var rowsPerLane: Int = rowsPerLaneForced ?? 2
 
-    fileprivate static let source = """
+    fileprivate static let scalarSource = """
         constexpr int R = 16;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
@@ -767,6 +777,46 @@ enum Qwen35GatedDeltaV3 {
         }
         """
 
+    /// Quartet entry reads are limited to this family's row-contiguous
+    /// kernels. Batch replay and A3B replay retain the original scalar text.
+    static let stateLoadVectorEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_STATE_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let vectorStateLoad =
+        "const packed_float4 s4 = *((const device packed_float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));"
+
+    fileprivate static let source: String = {
+        guard stateLoadVectorEnabled else { return scalarSource }
+        let scalar = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < R; ++i) {
+                state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+              }
+            }
+            """
+        let vector = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < R; i += 4) {
+                const packed_float4 s4 = *((const device packed_float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));
+                state[d][i] = s4.x;
+                state[d][i + 1] = s4.y;
+                state[d][i + 2] = s4.z;
+                state[d][i + 3] = s4.w;
+              }
+            }
+            """
+        guard scalarSource.components(separatedBy: scalar).count == 2
+        else { return scalarSource }
+        return scalarSource.replacingOccurrences(of: scalar, with: vector)
+    }()
+
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gated_delta_v3",
         inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
@@ -812,8 +862,10 @@ enum Qwen35GatedDeltaV3 {
     /// state load), the step loop itself, and the trailing state store; nil
     /// when the stock text no longer ends in exactly that store after one
     /// step loop. The derived kernels below reassemble these pieces.
-    static let sourceParts: (head: String, loop: String, store: String)? = {
-        let text = source
+    static let sourceParts = splitSource(source)
+    static let scalarSourceParts = splitSource(scalarSource)
+
+    private static func splitSource(_ text: String) -> (head: String, loop: String, store: String)? {
         let loopHead = "for (int t = 0; t < T; ++t) {"
         guard text.components(separatedBy: loopHead).count == 2,
             let start = text.range(of: loopHead)
@@ -849,7 +901,7 @@ enum Qwen35GatedDeltaV3 {
         guard store.filter({ !$0.isWhitespace }) == expectedStore.filter({ !$0.isWhitespace })
         else { return nil }
         return (String(text[..<start.lowerBound]), String(text[start.lowerBound ..< end]), store)
-    }()
+    }
 
     /// `source` without the trailing state store: the same step loop, whose
     /// state lives in registers only. For a verify window whose final state
@@ -900,12 +952,23 @@ enum Qwen35GatedDeltaV3 {
     /// then never materialized. The same values (+0.0f) enter the same
     /// arithmetic. Derived from `source` so the stock kernel stays as it is.
     private static let freshSource: String = {
-        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        let quartet = source.contains(vectorStateLoad)
+        let load = quartet ? vectorStateLoad
+            : "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
         precondition(
             source.components(separatedBy: load).count == 2,
             "Qwen35 GDN v3: the fresh-state source no longer matches the stock kernel")
-        let text = source.replacingOccurrences(of: load, with: "state[d][i] = 0.0f;")
-        precondition(!text.contains("state_in"))
+        let zero = quartet
+            ? "state[d][i] = 0.0f; state[d][i + 1] = 0.0f; state[d][i + 2] = 0.0f; state[d][i + 3] = 0.0f;"
+            : "state[d][i] = 0.0f;"
+        var text = source.replacingOccurrences(of: load, with: zero)
+        if quartet {
+            text = text.replacingOccurrences(of: "state[d][i] = s4.x;", with: "")
+            text = text.replacingOccurrences(of: "state[d][i + 1] = s4.y;", with: "")
+            text = text.replacingOccurrences(of: "state[d][i + 2] = s4.z;", with: "")
+            text = text.replacingOccurrences(of: "state[d][i + 3] = s4.w;", with: "")
+        }
+        precondition(!text.contains("state_in") && !text.contains("s4"))
         return text
     }()
 
@@ -1074,7 +1137,7 @@ enum Qwen35GDNReplayBatch {
                 }
 
         """
-        var text = Qwen35GatedDeltaV3.source
+        var text = Qwen35GatedDeltaV3.scalarSource
         // Single-line anchors, each unique in the stock text.
         let replacements: [(String, String)] = [
             ("const device float* q_ = q;", prelude),
@@ -4446,7 +4509,10 @@ final class Qwen35Attention: Module {
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
                 .reshaped(B, 1, -1)
-            attendedGate = gate[0..., (qL - 1)..., 0...]
+            // The selected gate elements retain head-major element order.
+            attendedGate = MLXFastDW1.enabled
+                ? qSplit[1][0..., (qL - 1)..., 0..., 0...].reshaped(B, 1, -1)
+                : gate[0..., (qL - 1)..., 0...]
         } else {
             // Prompt width on the tensor route: the o_proj rotation reads the
             // attention's query blocks in place (`rowBlockActivation`), so they
@@ -6478,6 +6544,33 @@ enum Qwen35GDNPrework {
 /// (a disagreeing device keeps the op chain). `BONSAI_FUSED_ATTN_PREWORK=0`
 /// keeps the op chain.
 enum Qwen35AttentionPrework {
+    private struct ScalarKey: Equatable {
+        let epsQ: UInt32
+        let epsK: UInt32
+        let dimension: UInt32
+        let log2Base: UInt32
+    }
+
+    private static let scalarLock = NSLock()
+    nonisolated(unsafe) private static var lastScalars:
+        (ScalarKey, (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray))?
+
+    static func scalarInputs(epsQ: Float, epsK: Float, D: Int, ropeBase: Float)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)
+    {
+        let dimension = UInt32(D)
+        let log2Base = log2(ropeBase)
+        let key = ScalarKey(epsQ: epsQ.bitPattern, epsK: epsK.bitPattern,
+            dimension: dimension, log2Base: log2Base.bitPattern)
+        scalarLock.lock()
+        defer { scalarLock.unlock() }
+        if let (previous, inputs) = lastScalars, previous == key { return inputs }
+        let inputs = (MLXArray(epsQ), MLXArray(epsK), MLXArray(dimension),
+            MLXArray(log2Base), MLXArray(Float(1)))
+        lastScalars = (key, inputs)
+        return inputs
+    }
+
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_FUSED_ATTN_PREWORK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -6502,7 +6595,7 @@ enum Qwen35AttentionPrework {
         const bool isq = hh < uint(HQ);
         const uint h = isq ? hh : hh - uint(HQ);
 
-        threadgroup float local_sums[32];
+        threadgroup float local_sums[D / 128];
         threadgroup float local_inv[1];
         threadgroup float rot[RD];
 
@@ -6519,16 +6612,12 @@ enum Qwen35AttentionPrework {
           acc += thread_x[i] * thread_x[i];
         }
         acc = simd_sum(acc);
-        if (sg == 0) {
-          local_sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
           local_sums[sg] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-          acc = simd_sum(local_sums[lane]);
+          acc = simd_sum(lane < uint(D / 128) ? local_sums[lane] : 0.0f);
           if (lane == 0) {
             const float eps = isq ? epsq : epsk;
             local_inv[0] = metal::precise::rsqrt(acc / axis + eps);
@@ -6611,9 +6700,9 @@ enum Qwen35AttentionPrework {
             L > 0, L < 65536
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -6722,6 +6811,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6759,7 +6850,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
@@ -6803,9 +6894,9 @@ extension Qwen35AttentionPrework {
             offsets.dtype == .int32, offsets.ndim <= 1, offsets.size == 1 || offsets.size == B
         else { return nil }
         let offs = offsets.ndim == 1 ? offsets : offsets.reshaped([1])
+        let scalars = scalarInputs(epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         let outputs = kernel(
-            [q, k, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-             MLXArray(log2(ropeBase)), MLXArray(Float(1))],
+            [q, k, wq, wk, offs, scalars.0, scalars.1, scalars.2, scalars.3, scalars.4],
             template: [
                 ("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK),
                 ("OB", offs.size == 1 ? 1 : 0),
@@ -7508,6 +7599,7 @@ enum Qwen35FusedHadamard {
         installed = true
         installInverse()
         Qwen35EmbeddingRows.install()
+        Qwen35RotationQ8Blocks.installPadded()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7667,7 +7759,7 @@ enum Qwen35FusedHadamard {
                 guard x.shape == gate.shape, weight.dtype == .float32, weight.ndim == 1,
                     weight.dim(0) == 128
                 else { return nil }
-                a = x; b = gate; w = weight; eps = MLXArray([epsilon]); prod = 3
+                a = x; b = gate; w = weight; eps = Qwen35GatedNormTail.epsilonInput(epsilon); prod = 3
             case .sigmoidGateRowBlocks(let blocks, let gate):
                 return rowBlockActivation(
                     blocks: blocks, gate: gate, signs: signs, gdnLayout: gdnLayout)
@@ -9446,6 +9538,21 @@ extension Qwen35FusedBoundaryQ8 {
 /// any MLX error keeps the composed path. `BONSAI_VERIFY_GATEDNORM=0` keeps it
 /// too.
 enum Qwen35GatedNormTail {
+    nonisolated(unsafe) private static let defaultEpsilonInput = MLXArray([Float(1e-6)])
+    private static let epsilonLock = NSLock()
+    nonisolated(unsafe) private static var lastEpsilon: (UInt32, MLXArray)?
+
+    static func epsilonInput(_ epsilon: Float) -> MLXArray {
+        let bits = epsilon.bitPattern
+        if bits == Float(1e-6).bitPattern { return defaultEpsilonInput }
+        return epsilonLock.withLock {
+            if let (previous, input) = lastEpsilon, previous == bits { return input }
+            let input = MLXArray([epsilon])
+            lastEpsilon = (bits, input)
+            return input
+        }
+    }
+
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATEDNORM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -9530,7 +9637,7 @@ enum Qwen35GatedNormTail {
         let rows = x.dim(0) * x.dim(1)
         let heads = x.dim(2)
         return kernel(
-            [x, z, weight, MLXArray([eps]), signs.reshaped(-1)],
+            [x, z, weight, epsilonInput(eps), signs.reshaped(-1)],
             template: [("H", heads), ("InZ", z.dtype)],
             grid: (32 * rows * heads, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, heads * 128]], outputDTypes: [.float32])[0]

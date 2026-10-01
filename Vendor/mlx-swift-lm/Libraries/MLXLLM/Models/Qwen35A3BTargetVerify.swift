@@ -529,7 +529,7 @@ enum Qwen35GDNReplayFused {
     /// tape's `KP` rows with the batched replay's replacements and
     /// `OUTPUT_NEEDED` false, then the stock state store.
     static let source: String? = {
-        guard let parts = Qwen35GatedDeltaV3.sourceParts else { return nil }
+        guard let parts = Qwen35GatedDeltaV3.scalarSourceParts else { return nil }
         let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
         guard parts.head.components(separatedBy: load).count == 2 else { return nil }
         let head = parts.head.replacingOccurrences(
@@ -645,7 +645,7 @@ enum Qwen35GDNReplayFused {
         let useStaged =
             (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
             && P <= stagedRows
-        var inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
+        var inputs = [q, k, v, g, beta, rowCountInput(T)] + previous
             + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
         // Reuse this tape's verify gates when their layout fits the staged read.
         var storedGates = false
@@ -656,7 +656,7 @@ enum Qwen35GDNReplayFused {
         {
             inputs[9] = pg
             inputs[10] = pb
-            inputs[13] = MLXArray([Int32(Hv), Int32(Hv)])
+            inputs[13] = storedGateRowsInput(Hv)
             storedGates = true
         }
         let template: [(String, any KernelTemplateArg)] = [
@@ -691,6 +691,21 @@ enum Qwen35GDNReplayFused {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    nonisolated(unsafe) private static let noReplayKeep = MLXArray(Int32(0))
+
+    nonisolated(unsafe) private static let verifyRows16 = MLXArray(Int32(16))
+    nonisolated(unsafe) private static let storedGateRows48 = MLXArray([Int32(48), Int32(48)])
+
+    @inline(__always)
+    private static func rowCountInput(_ rows: Int) -> MLXArray {
+        rows == 16 ? verifyRows16 : MLXArray(Int32(rows))
+    }
+
+    @inline(__always)
+    private static func storedGateRowsInput(_ heads: Int) -> MLXArray {
+        heads == 48 ? storedGateRows48 : MLXArray([Int32(heads), Int32(heads)])
+    }
+
     /// This verify's rows from a committed (not deferred) `state` (and, with
     /// `storeFinal`, the window's final state): the staged kernel without the
     /// replay (`KP` 0) and without the committed-state store. The same step
@@ -722,8 +737,8 @@ enum Qwen35GDNReplayFused {
         else { return nil }
         // KP = 0: the replay inputs are never read; any float arrays bind.
         let out = stagedKernel(
-            [q, k, v, g, beta, MLXArray(Int32(T)), state, k, v, g, beta, aLog, dtBias,
-             MLXArray([Int32(Hv), Int32(Hv)]), MLXArray(Int32(0))],
+            [q, k, v, g, beta, rowCountInput(T), state, k, v, g, beta, aLog, dtBias,
+             storedGateRowsInput(Hv), noReplayKeep],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
@@ -1018,8 +1033,13 @@ extension Qwen35GDNReplayFused {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+            const float4 x = *(const device float4*)(ps + base);
+            state[d][i] = x.x;
+            state[d][i + 1] = x.y;
+            state[d][i + 2] = x.z;
+            state[d][i + 3] = x.w;
           }
         }
 
@@ -6003,6 +6023,150 @@ enum Qwen35EmbeddingRows {
             header: Qwen35FusedHadamard.header + dequantizeHeader,
             ensureRowContiguous: true)
     }()
+
+// MARK: - One-row Q8 padding without zero-row transforms
+
+// Isolated GordoAR producer increment; whole donor 8a passed the <=0.1% rule.
+// That whole score is not an isolated padding measurement; combination awaits official.
+// A failed raw-word gate or unsupported form keeps concatenation and stock.
+extension Qwen35RotationQ8Blocks {
+    // Row is constant across the threadgroup. Padding exits before any
+    // input read or barrier; the real row retains the entire original body.
+    private static let paddedSource: String? = {
+        let anchor = "alignas(16) threadgroup float buf[N];"
+        guard source.components(separatedBy: anchor).count == 2 else { return nil }
+        let fill = """
+            if (row >= 1u) {
+              const uchar code = SIGNED ? uchar(0) : uchar(128);
+              for (uint word = tid; word < 256u; word += uint(TPB)) {
+                *(device uchar4*)(out + rowbase + bcol + 4u * word) = uchar4(code);
+              }
+              if (tid < 8u) {
+                const uint group = row * uint(W / 128) + bcol / 128u + tid;
+                qscale[group] = 1.0f;
+                qsum[group] = 0.0f;
+              }
+              return;
+            }
+
+            """
+        return source.replacingOccurrences(of: anchor, with: fill + anchor)
+    }()
+
+    private static let paddedKernel = paddedSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_signed_hadamard_1024_q8_blocks_padded",
+            inputNames: ["inp", "signs"], outputNames: ["out", "qscale", "qsum"],
+            source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let paddedWanted: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_Q8_ONE_ROW_PAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private static let paddedLock = NSLock()
+    private struct PaddedKey: Hashable {
+        let form: Form
+        let signs: ObjectIdentifier
+    }
+    private struct PaddedVerdict {
+        let signs: Qwen35TensorPackedMatmul.WeakArray
+        let passed: Bool
+    }
+    nonisolated(unsafe) private static var paddedVerdicts: [PaddedKey: PaddedVerdict] = [:]
+
+    static func installPadded() {
+        SignedBlockHadamard.fusedTransformInt8OneRowPadded = {
+            x, signs, blockSize, preSigned, layout, groupSize in
+            guard paddedWanted, enabled, blockSize == 1024, groupSize == 128, layout == nil,
+                x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+                signs.dtype == .float32, signs.shape == [x.dim(1)],
+                Qwen35TensorPackedMatmul.signedCodes, let launch = paddedKernel
+            else { return nil }
+            let width = x.dim(1)
+            guard width > 0, width % 1024 == 0, width <= Int(Int32.max) / 16 else {
+                return nil
+            }
+            // Preserve the thread choice of the original sixteen-row launch.
+            let tpb = threads(blocks: 16 * (width / 1024))
+            let form = Form(
+                width: width, presigned: preSigned, gr: 1, gkh: 1, gd: 1,
+                perm: Qwen35TensorPackedMatmul.support == .staged8, mperm: false,
+                signed: true, dtype: "\(x.dtype)", tpb: tpb)
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", DType.float32), ("OutT", DType.int8), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", 1), ("PRESIGNED", preSigned ? 1 : 0),
+                ("GR", 1), ("GKH", 1), ("GD", 1), ("QSIM", 0),
+                ("PERM", form.perm ? 1 : 0), ("MPERM", 0), ("TPB", tpb),
+            ]
+            guard paddedVerified(form, signs: signs, template: template, launch: launch) else {
+                return nil
+            }
+            let outputs = launch(
+                [x, signs], template: template,
+                grid: (tpb * 16 * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
+                outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                outputDTypes: [.int8, .float32, .float32])
+            return SignedBlockHadamard.Int8Activation(
+                codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+    }
+
+    private static func paddedVerified(
+        _ form: Form, signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        launch: MLXFast.MLXFastKernel
+    ) -> Bool {
+        paddedLock.lock()
+        defer { paddedLock.unlock() }
+        let key = PaddedKey(form: form, signs: ObjectIdentifier(signs))
+        if let verdict = paddedVerdicts[key], verdict.signs.array === signs {
+            return verdict.passed
+        }
+        var passed = false
+        do {
+            try withError { error in
+                guard let stock = SignedBlockHadamard.fusedTransformInt8 else { return }
+                let width = form.width
+                let random = MLXRandom.normal([1, width], key: MLXRandom.key(0x7168_7064))
+                let zero = MLXArray.zeros([1, width], dtype: .float32)
+                var checks: [MLXArray] = []
+                for row in [zero, random] {
+                    let input = concatenated(
+                        [row, MLXArray.zeros([15, width], dtype: .float32)], axis: 0)
+                    guard let reference = stock(input, signs, 1024, form.presigned, nil, 128),
+                        lock.withLock({ verdicts[form] == true })
+                    else { return }
+                    let candidate = launch(
+                        [row, signs], template: template,
+                        grid: (form.tpb * 16 * (width / 1024), 1, 1),
+                        threadGroup: (form.tpb, 1, 1),
+                        outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                        outputDTypes: [.int8, .float32, .float32])
+                    let truth = [reference.codes, reference.scales, reference.scaledSums]
+                    for (old, new) in zip(truth, candidate) {
+                        guard old.shape == new.shape, old.dtype == new.dtype else { return }
+                        let bits: DType = old.dtype.size == 1 ? .uint8 : .uint32
+                        checks.append((old.view(dtype: bits) .!= new.view(dtype: bits))
+                            .asType(.int32).sum())
+                    }
+                }
+                eval(checks)
+                try error.check()
+                passed = checks.count == 6 && checks.allSatisfy { $0.item(Int32.self) == 0 }
+            }
+        } catch {}
+        if paddedVerdicts.count >= 4096 {
+            paddedVerdicts = paddedVerdicts.filter { $0.value.signs.array != nil }
+            if paddedVerdicts.count >= 4096 { paddedVerdicts.removeAll(keepingCapacity: true) }
+        }
+        paddedVerdicts[key] = PaddedVerdict(signs: Qwen35TensorPackedMatmul.WeakArray(signs), passed: passed)
+        FileHandle.standardError.write(
+            ("bonsai Q8 one-row padding (\(form.width), \(form.tpb)): "
+                + (passed ? "passed; padding filled in producer\n" : "failed; concat kept\n"))
+                .data(using: .utf8)!)
+        return passed
+    }
 }
 
 // MARK: - The GDN output's gated norm in the out_proj rotation's read

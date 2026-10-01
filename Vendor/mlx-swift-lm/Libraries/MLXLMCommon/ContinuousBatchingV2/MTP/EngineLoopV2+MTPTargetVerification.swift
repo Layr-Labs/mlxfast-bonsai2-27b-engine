@@ -35,7 +35,8 @@ enum CBv2VerifyTokenStack {
 
     /// `[seed | block]`, or nil (the caller concatenates `columns`).
     static func tokens(seed: MLXArray, block: MLXArray?, columns: [MLXArray]) -> MLXArray? {
-        guard enabled, let block, block.ndim == 2, seed.ndim == 2, seed.dim(1) == 1,
+        guard enabled, let block, block.ndim == 2, seed.ndim == 2,
+            seed.dim(0) == 1, seed.dim(1) == 1, block.dim(1) == 15, seed.dtype == .int32,
             block.dim(0) == seed.dim(0), columns.count == block.dim(1) + 1,
             block.dtype == seed.dtype, verified
         else { return nil }
