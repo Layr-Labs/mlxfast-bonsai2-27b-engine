@@ -114,7 +114,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
-        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -172,11 +171,25 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 DFlash2TensorMatmul.SwapTrial.run()
                 Stream().synchronize()
                 Memory.clearCache()
+                if self.speculationPlan != nil, self.drafter.prepareQueryWindows() {
+                    // Existing whole-block proposals/cache/cursor parity guard;
+                    // failure disables all windows without changing the plan.
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableQueryWindows()
+                        FileHandle.standardError.write(
+                            ("dflash2 query window: whole-block check failed (\(failure)); stock kept\n")
+                                .data(using: .utf8)!)
+                    }
+                }
+                Stream().synchronize()
+                Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
+                Qwen35DFlash2PacketFront.prepare()
             }
         }
         Stream().synchronize()
@@ -981,15 +994,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        // WALK1: the walk in one launch when on; ACCGLUE: the chain scans the
-        // bool comparison when on (no cast launch).
-        let (anchor, confirmed) =
-            CBv2AcceptGlue.walk(packet, depth: k) ?? CBv2AcceptGlue.chainWalk(packet, depth: k)
+        let front = Qwen35DFlash2PacketFront.apply(packet, depth: k)
+            ?? Qwen35DFlash2PacketFront.stock(packet, depth: k)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: anchor, confirmed: confirmed, verifyContext: verifyContext,
+                anchor: front.anchor,
+                confirmed: front.confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
@@ -1123,5 +1135,110 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             failure = "\(error)"
         }
         return (failure, compared)
+    }
+}
+
+/// The device packet front's exact integer prefix count and anchor in one
+/// launch. The same composition remains the unsupported/unadmitted fallback.
+private enum Qwen35DFlash2PacketFront {
+    private static let enabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_DFLASH_PACKET_FRONT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var checked = false
+    nonisolated(unsafe) private static var active = false
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_packet_prefix_front", inputNames: ["packet"], outputNames: ["pair"],
+        source: """
+            static_assert(K >= 1 && K <= 16, "bounded draft depth");
+            int accepted = 0;
+            for (int i = 0; i < K; i++) {
+              if (packet[i] != packet[K + i]) break;
+              accepted++;
+            }
+            pair[0] = packet[K + accepted];
+            pair[1] = accepted + 1;
+            """, ensureRowContiguous: true)
+
+    static func stock(_ packet: MLXArray, depth k: Int) -> (anchor: MLXArray, confirmed: MLXArray) {
+        let targets = packet[k ..< (2 * k + 1)]
+        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+            .sum().asType(.int32)
+        return (targets.take(accepted.reshaped([1]), axis: 0), accepted + MLXArray(Int32(1)))
+    }
+
+    private static func launch(_ packet: MLXArray, depth k: Int) -> (anchor: MLXArray, confirmed: MLXArray) {
+        let pair = kernel(
+            [packet], template: [("K", k)], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[2]], outputDTypes: [.int32])[0]
+        return (pair[0 ..< 1], pair[1 ..< 2].reshaped([]))
+    }
+
+    static func apply(_ packet: MLXArray, depth k: Int) -> (anchor: MLXArray, confirmed: MLXArray)? {
+        guard enabled, (1 ... CBv2MTPConfig.testedMaxBlockDraftTokens).contains(k), k <= 16,
+            packet.dtype == .int32, packet.ndim == 1, packet.dim(0) >= 2 * k + 1,
+            lock.withLock({ active })
+        else { return nil }
+        return launch(packet, depth: k)
+    }
+
+    /// Written for remote startup only, after the existing form trials. Every
+    /// supported depth and prefix length, with late matches and mismatches,
+    /// signed extremes, noncontiguous packets and extra ignored tail entries.
+    /// Any MLX error, shape/dtype error or raw mismatch leaves stock enabled.
+    static func prepare() {
+        guard enabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !checked else { return }
+        checked = true
+        var same = true
+        let values: [Int32] = [0, 1, -1, Int32.min, Int32.max, 17, 4242, 247_319]
+        do {
+            try withError { error in
+                for k in 1 ... min(16, CBv2MTPConfig.testedMaxBlockDraftTokens) {
+                    for count in 0 ... k {
+                        for pattern in 0 ..< 3 {
+                            let targets = (0 ... k).map { values[($0 + k + pattern) % values.count] }
+                            var drafts = Array(targets[..<k])
+                            if count < k {
+                                drafts[count] ^= Int32(1)
+                                if pattern > 0, count + 1 < k {
+                                    for i in (count + 1) ..< k where pattern == 1 || i % 2 == 0 {
+                                        drafts[i] ^= Int32(1)
+                                    }
+                                }
+                            }
+                            let packet = MLXArray(drafts + targets + [Int32.min, Int32.max])
+                            // Row-strided slice, copied only by kernel input
+                            // contiguity handling; the original reference reads it as a view.
+                            let input = pattern == 2
+                                ? stacked([packet, packet], axis: 1)[0..., 0] : packet
+                            let expected = stock(input, depth: k)
+                            let actual = launch(input, depth: k)
+                            eval([expected.anchor, expected.confirmed, actual.anchor, actual.confirmed])
+                            same = expected.anchor.shape == actual.anchor.shape
+                                && expected.confirmed.shape == actual.confirmed.shape
+                                && expected.anchor.dtype == .int32 && actual.anchor.dtype == .int32
+                                && expected.confirmed.dtype == .int32 && actual.confirmed.dtype == .int32
+                                && all(expected.anchor.view(dtype: .uint32)
+                                    .== actual.anchor.view(dtype: .uint32)).item(Bool.self)
+                                && all(expected.confirmed.view(dtype: .uint32)
+                                    .== actual.confirmed.view(dtype: .uint32)).item(Bool.self)
+                            if !same { return }
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        active = same
+        FileHandle.standardError.write(
+            ("dflash2 packet front: " + (same
+                ? "all depths/counts raw bits and ranks matched; one launch on\n"
+                : "admission failed; original composition kept\n")).data(using: .utf8)!)
     }
 }
