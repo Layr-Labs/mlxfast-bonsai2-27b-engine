@@ -171,6 +171,19 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 DFlash2TensorMatmul.SwapTrial.run()
                 Stream().synchronize()
                 Memory.clearCache()
+                if self.speculationPlan != nil, self.drafter.prepareQueryWindows() {
+                    // Reuse the existing whole-block parity guard without
+                    // changing its row classes, front choice or active plan.
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableQueryWindows()
+                        FileHandle.standardError.write(
+                            ("dflash2 query window: whole-block check failed (\(failure)); stock kept\n")
+                                .data(using: .utf8)!)
+                    }
+                }
+                Stream().synchronize()
+                Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
