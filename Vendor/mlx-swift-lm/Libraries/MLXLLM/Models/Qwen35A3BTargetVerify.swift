@@ -617,7 +617,12 @@ enum Qwen35GDNReplayFused {
         let Hv = v.dim(2)
         let Dv = v.dim(3)
         let P = tape.rowCount
-        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let useStaged =
+            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
+            && P <= stagedRows
+        let dvpl =
+            useStaged ? stagedRowsPerLane ?? Qwen35GatedDeltaV3.rowsPerLane
+            : Qwen35GatedDeltaV3.rowsPerLane
         let previous = [ps, tape.k, tape.v, tape.a, tape.b, aLog, dtBias]
         // The replay's own routing: from `minRows` kept rows it is chunked.
         guard ([q, k, v, g, beta] + previous).allSatisfy({ $0.dtype == .float32 }),
@@ -640,11 +645,6 @@ enum Qwen35GDNReplayFused {
             let aRows = Qwen35GDNReplayBatch.gateRowStride(tape.a),
             let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
         else { return nil }
-        // Both windows fit the staging buffers (and the verify window is a
-        // full one, where staging pays): the staged form (same values).
-        let useStaged =
-            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
-            && P <= stagedRows
         var inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
             + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
         // Reuse this tape's verify gates when their layout fits the staged read.
@@ -668,7 +668,7 @@ enum Qwen35GDNReplayFused {
             let out = stagedKernel(
                 inputs, template: template + [
                     ("SC", true), ("SF", storeFinal), ("GATES_STORED", storedGates),
-                    ("REPLAY_NEEDED", keep > 0),
+                    ("REPLAY_NEEDED", keep > 0), ("SLOAD4", stagedWideLoads),
                 ],
                 grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
                 outputShapes: [[1, T, Hv, Dv], ps.shape, storeFinal ? ps.shape : [1]],
@@ -710,7 +710,7 @@ enum Qwen35GDNReplayFused {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let dvpl = stagedRowsPerLane ?? Qwen35GatedDeltaV3.rowsPerLane
         guard [q, k, v, g, beta, state, aLog, dtBias].allSatisfy({ $0.dtype == .float32 }),
             Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0,
             T >= stagedRows / 2, T <= stagedRows,
@@ -728,6 +728,7 @@ enum Qwen35GDNReplayFused {
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
                 ("GATES_STORED", false), ("REPLAY_NEEDED", false),
+                ("SLOAD4", stagedWideLoads),
             ],
             grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1, T, Hv, Dv], [1], storeFinal ? state.shape : [1]],
@@ -809,7 +810,7 @@ enum Qwen35GDNReplayFused {
     /// The batch self-test's tapes (a/b column slices of one product, one row
     /// of saturating and infinite gate inputs) and a following window whose
     /// gates `Qwen35FusedElementwise.gatedDeltaGates` forms from such inputs.
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+    fileprivate static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
         let G = Qwen35GDNReplayBatch.layersPerLaunch
         let S = Qwen35GDNReplayBatch.selfTestRows
         let Hk = layer.numKHeads
@@ -979,6 +980,10 @@ extension Qwen35GDNReplayFused {
 
     /// Rows per staged window (the threadgroup buffers' size).
     static let stagedRows = 16
+    // The exact device trial may choose one state row per lane for staged
+    // kernels only. Nil follows the existing two/four-row selection.
+    nonisolated(unsafe) static var stagedRowsPerLane: Int?
+    nonisolated(unsafe) static var stagedWideLoads = false
 
     private static let stagedHeader = Qwen35GDNReplayBatch.header + """
         // float4 j of the 16-float k (or q) slice c of a staged row; the
@@ -1017,9 +1022,20 @@ extension Qwen35GDNReplayFused {
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          if (SLOAD4) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; i += 4) {
+              const float4 first = *(const device float4*)(ps + (n * Dv + dvbase + d) * Dk + dk0 + i);
+              state[d][i] = first.x;
+              state[d][i + 1] = first.y;
+              state[d][i + 2] = first.z;
+              state[d][i + 3] = first.w;
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; ++i) {
+              state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+            }
           }
         }
 
@@ -1327,7 +1343,7 @@ enum Qwen35GDNFullAcceptStore {
                     : "; the state skip stays on\n")).data(using: .utf8)!)
     }
 
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+    fileprivate static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
         let G = 4
         let S = Qwen35GDNVerifyStateSkip.selfTestRows
         let Hk = layer.numKHeads
@@ -2274,7 +2290,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -4462,6 +4478,10 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 ///   the same operands (1, 3 and 16 rows) bit for bit, then the derived
 ///   kernels' own self-tests (state skip, fused replay, full-accept store)
 ///   at 4 rows per lane, which must reach the verdicts they reached at 2.
+/// - `staged1`: one state row per lane in staged GDN kernels only. Both
+///   replay and final-state self-tests must match the existing kernels.
+/// - `staged1load4`, `staged2load4`, `staged4load4`: four-wide initial state
+///   loads with one, two or four staged rows per lane, with both self-tests.
 /// - `tpb128`, `wide128`: the per-block quantizing rotations
 ///   (`Qwen35RotationQ8Blocks`, plain and SwiGLU / attention-gate producer)
 ///   with 128 threads per 1024-block instead of 256, at most 128 blocks
@@ -4500,6 +4520,7 @@ enum Qwen35ExactFormTrial {
     static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
     static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
     static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
+    static let unfoldWanted = enabled && on("BONSAI_TRIAL_VERIFY_UNFOLD")
     static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
 
     /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
@@ -4556,6 +4577,42 @@ enum Qwen35ExactFormTrial {
                 })
             }
         }
+        if dvplWanted, Qwen35GDNReplayFused.stagedActive,
+            Qwen35GatedDeltaV3.rowsPerLaneForced == nil,
+            Qwen35GDNReplayFused.stagedRowsPerLane == nil, let layer = gdnLayer
+        {
+            Qwen35GDNReplayFused.stagedRowsPerLane = 1
+            let replay = Qwen35GDNReplayFused.selfTest(layer: layer)
+            let final = Qwen35GDNFullAcceptStore.selfTest(layer: layer)
+            Qwen35GDNReplayFused.stagedRowsPerLane = nil
+            let passed = replay.0 && final.0
+            checks.append(
+                "staged1 " + (passed ? "passed" : "FAILED")
+                    + " (replay: \(replay.1); final: \(final.1))")
+            if passed {
+                list.append(Arm(name: "staged1", knob: "dvpl") {
+                    Qwen35GDNReplayFused.stagedRowsPerLane = $0 ? 1 : nil
+                })
+            }
+            for rows in [1, 2, 4] {
+                Qwen35GDNReplayFused.stagedRowsPerLane = rows
+                Qwen35GDNReplayFused.stagedWideLoads = true
+                let replay = Qwen35GDNReplayFused.selfTest(layer: layer)
+                let final = Qwen35GDNFullAcceptStore.selfTest(layer: layer)
+                Qwen35GDNReplayFused.stagedRowsPerLane = nil
+                Qwen35GDNReplayFused.stagedWideLoads = false
+                let passed = replay.0 && final.0
+                checks.append(
+                    "staged\(rows)load4 " + (passed ? "passed" : "FAILED")
+                        + " (replay: \(replay.1); final: \(final.1))")
+                if passed {
+                    list.append(Arm(name: "staged\(rows)load4", knob: "dvpl") {
+                        Qwen35GDNReplayFused.stagedRowsPerLane = $0 ? rows : nil
+                        Qwen35GDNReplayFused.stagedWideLoads = $0
+                    })
+                }
+            }
+        }
         if rotationWanted, Qwen35RotationQ8Blocks.enabled {
             if Qwen35RotationQ8Blocks.smallThreadsForced == nil {
                 list.append(Arm(name: "tpb128", knob: "small") {
@@ -4577,6 +4634,22 @@ enum Qwen35ExactFormTrial {
                     Qwen35BoundaryBlocks.stock = $0
                 })
             }
+        }
+        if unfoldWanted, CBv2PromptCausalAttention.verifyFoldRepeats,
+            !CBv2PromptCausalAttention.verifyFoldRepeatsForced
+        {
+            if let check = CBv2PromptCausalAttention.checkVerifyUnfold() {
+                checks.append(
+                    "unfold " + (check.passed ? "passed" : "FAILED") + " (\(check.detail))")
+                if check.passed {
+                    list.append(Arm(name: "unfold", knob: "fold") {
+                        CBv2PromptCausalAttention.verifyFoldRepeats = !$0
+                    })
+                }
+            } else {
+                checks.append("unfold not offered (no verify block warm)")
+            }
+            Memory.clearCache()
         }
         guard list.count > 1 else {
             if !checks.isEmpty || enabled {
