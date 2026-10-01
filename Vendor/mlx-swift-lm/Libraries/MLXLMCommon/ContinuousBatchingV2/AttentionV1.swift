@@ -1056,11 +1056,27 @@ package enum CBv2PromptCausalAttention {
     /// row between tiles and batches does not change its value; the scores
     /// keep the `[..., repeats, L, kL]` row order the softmax indexes by.
     /// `BONSAI_VERIFY_FOLD_REPEATS=0` restores the broadcast batches.
-    static let verifyFoldRepeats: Bool = {
+    ///
+    /// The fold was timed on the M4 Max only; the load-time trial
+    /// (`Qwen35ExactFormTrial`, arm `unfold`) may turn it off on this device
+    /// after `checkVerifyUnfold` found both forms equal bit for bit. Setting
+    /// `BONSAI_VERIFY_FOLD_REPEATS` either way forces the form (no arm).
+    package nonisolated(unsafe) static var verifyFoldRepeats =
+        !["0", "false", "no", "off"].contains(verifyFoldRepeatsSetting ?? "")
+
+    package static var verifyFoldRepeatsForced: Bool { verifyFoldRepeatsSetting != nil }
+
+    private static let verifyFoldRepeatsSetting: String? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_FOLD_REPEATS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return value?.isEmpty == false ? value : nil
     }()
+
+    /// The geometry and key counts `warmVerifyBlock` last warmed, for
+    /// `checkVerifyUnfold` (which must build the unfolded form's pipelines at
+    /// the same alignment classes).
+    nonisolated(unsafe) private static var warmedVerify:
+        (heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int])?
 
     /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
     /// per thread (kL % 4 == 0, so they share a row).
@@ -1095,7 +1111,7 @@ package enum CBv2PromptCausalAttention {
         name: "bonsai_prompt_causal_scale_select_softmax",
         inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
         outputNames: ["out"],
-        source: """
+        source: narrow("""
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -1172,8 +1188,25 @@ package enum CBv2PromptCausalAttention {
                 }
               }
             }
-            """,
+            """, count: 2),
         ensureRowContiguous: true)
+
+    /// `text` with its `count` `size_t` as `uint`: MLXLLM's `Qwen35IO32.narrow`
+    /// rule and switch (`MLXFAST_IO32_GDN=0` keeps the stock text). `attend`
+    /// launches only when `B * H * L * kL < Int32.max`, so every softmax
+    /// offset (row x kL + column) is an element index below 2^31.
+    private static func narrow(_ text: String, count: Int) -> String {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_IO32_GDN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? "") else { return text }
+        guard text.components(separatedBy: "size_t").count - 1 == count else {
+            FileHandle.standardError.write(
+                "cbv2 32-bit offsets: causal softmax holds a moved size_t count; 64-bit text kept\n"
+                    .data(using: .utf8)!)
+            return text
+        }
+        return text.replacingOccurrences(of: "size_t", with: "uint")
+    }
 
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
     private static let softmaxSingleRowLimit = 4096
@@ -1189,6 +1222,7 @@ package enum CBv2PromptCausalAttention {
         heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int]
     ) -> [MLXArray] {
         guard verifyEnabled, heads > 0, kvHeads > 0, headDim > 0, rows > 0 else { return [] }
+        warmedVerify = (heads, kvHeads, headDim, rows, scale, keyLengths)
         var outputs: [MLXArray] = []
         for keyLength in keyLengths where keyLength >= rows {
             let queries = MLXArray.zeros([1, heads, rows, headDim], dtype: .float32)
@@ -1201,13 +1235,85 @@ package enum CBv2PromptCausalAttention {
                 outputs.append(output)
             }
         }
+        CBv2VerifyPV16.prepare(
+            heads: heads, kvHeads: kvHeads, rows: rows, headDim: headDim, keyLengths: keyLengths)
         return outputs
+    }
+
+    /// The folded verify block against the unfolded one (`verifyFoldRepeats`
+    /// on and off), bit for bit: the probabilities and the output, on seeded
+    /// random operands (keys and values as views into a longer buffer, as a
+    /// cache hands them), at the geometry and every key count
+    /// `warmVerifyBlock` warmed, so it also builds the unfolded GEMM
+    /// pipelines of every alignment class the warm covered. Any mismatch or
+    /// declined launch fails it. Nil when there is nothing to check (no warm,
+    /// one query head per KV head).
+    package static func checkVerifyUnfold() -> (passed: Bool, detail: String)? {
+        guard verifyEnabled, let g = warmedVerify, g.kvHeads > 0, g.heads % g.kvHeads == 0,
+            g.heads / g.kvHeads > 1
+        else { return nil }
+        let lengths = g.keyLengths.filter { $0 >= g.rows }
+        guard !lengths.isEmpty else { return nil }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5546_4c44), into: 3 * lengths.count)
+        var values = 0
+        var mismatches = 0
+        var declined = 0
+        do {
+            try withError { error in
+                for (i, kL) in lengths.enumerated() {
+                    let q = MLXRandom.normal([1, g.heads, g.rows, g.headDim], key: keys[3 * i])
+                    let stored = [1, g.kvHeads, kL + 64, g.headDim]
+                    let k = MLXRandom.normal(stored, key: keys[3 * i + 1])[0..., 0..., ..<kL, 0...]
+                    let v = MLXRandom.normal(stored, key: keys[3 * i + 2])[0..., 0..., ..<kL, 0...]
+                    eval(q, k, v)
+                    guard
+                        let folded = compose(
+                            queries: q, keys: k, values: v, scale: g.scale, promptRows: g.rows,
+                            verify: true, fold: true),
+                        let unfolded = compose(
+                            queries: q, keys: k, values: v, scale: g.scale, promptRows: g.rows,
+                            verify: true, fold: false)
+                    else {
+                        declined += 1
+                        continue
+                    }
+                    let differ =
+                        (folded.probabilities.flattened().view(dtype: .uint32)
+                            .!= unfolded.probabilities.flattened().view(dtype: .uint32))
+                        .asType(.int32).sum()
+                        + (folded.out.flattened().view(dtype: .uint32)
+                            .!= unfolded.out.flattened().view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    values += folded.probabilities.size + folded.out.size
+                    mismatches += Int(differ.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let detail =
+            "\(lengths.count) key counts, \(values) values bitwise, \(mismatches) mismatches"
+            + (declined > 0 ? ", \(declined) declined" : "")
+        return (mismatches == 0 && declined == 0 && values > 0, detail)
     }
 
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
         verify: Bool = false
     ) -> MLXArray? {
+        compose(
+            queries: queries, keys: keys, values: values, scale: scale, promptRows: promptRows,
+            verify: verify, fold: verifyFoldRepeats)?.out
+    }
+
+    /// `attend`'s composition with the verify fold chosen by `fold`; also
+    /// returns the probabilities (for `checkVerifyUnfold`).
+    private static func compose(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
+        verify: Bool, fold: Bool
+    ) -> (probabilities: MLXArray, out: MLXArray)? {
         guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
@@ -1229,7 +1335,7 @@ package enum CBv2PromptCausalAttention {
         var q = queries
         var k = keys
         var v = values
-        if repeats > 1, verify, verifyFoldRepeats {
+        if repeats > 1, verify, fold {
             // One kvHeads-batched GEMM over repeats * L rows per KV head (see
             // `verifyFoldRepeats`): the same buffer in the same row order, so
             // the scores, the softmax rows and the output keep their layout.
@@ -1262,10 +1368,311 @@ package enum CBv2PromptCausalAttention {
                 outputDTypes: [.float32])[0]
             probabilities = softmax(masked, axis: -1, precise: true)
         }
-        var out = matmul(probabilities, v)
+        var out = (verify ? CBv2VerifyPV16.output(probabilities, v) : nil)
+            ?? matmul(probabilities, v)
         if repeats > 1 {
             out = out.reshaped([B, H, L, out.dim(-1)])
         }
-        return out
+        return (probabilities, out)
+    }
+}
+
+
+/// The NAX probability-value product with one 16-row SIMD group per tile.
+/// Startup tests the actual device and both verify layouts. Nothing from a
+/// request is retained, and the stock matmul is the initial choice.
+private enum CBv2VerifyPV16 {
+    private static let forms = [(32, 0), (32, 1), (64, 0), (64, 1)]
+    private static let header = """
+        #include <metal_stdlib>
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace metal;
+
+        inline int2 pv_a_coord(int i) {
+          constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(
+              16,32,16,false,false,true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroup> op;
+          auto a=op.template get_left_input_cooperative_tensor<float,float,float>();
+          auto xy=a.get_multidimensional_index(i);
+          return int2(xy[0],xy[1]);
+        }
+
+        inline int2 pv_b_coord(int i) {
+          constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(
+              16,32,16,false,false,true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroup> op;
+          auto b=op.template get_right_input_cooperative_tensor<float,float,float>();
+          auto xy=b.get_multidimensional_index(i);
+          return int2(xy[0],xy[1]);
+        }
+
+        inline int2 pv_c_coord(int i) {
+          constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(
+              16,32,16,false,false,true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroup> op;
+          auto a=op.template get_left_input_cooperative_tensor<float,float,float>();
+          auto b=op.template get_right_input_cooperative_tensor<float,float,float>();
+          auto c=op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(a)>,metal::remove_addrspace_t<decltype(b)>,float>();
+          auto xy=c.get_multidimensional_index(i);
+          return int2(xy[0],xy[1]);
+        }
+
+        template<int TN>
+        inline void pv_load(const device float* p, const device float* v,
+                            int K, int M, int N, int REPS, uint3 group, uint lane, int k0,
+                            size_t ps0, size_t ps1, size_t ps2,
+                            size_t vs0, size_t vs1, size_t vs2,
+                            thread float (&a)[8], thread float (&b)[TN/32][16]) {
+          const int row0=int(group.y)*16;
+          const int col0=int(group.x)*TN;
+          const size_t po=size_t(group.z)*ps0;
+          const size_t vo=size_t(group.z/uint(REPS))*vs0;
+          #pragma clang loop unroll(full)
+          for (int i=0;i<8;++i) {
+            const int2 xy=pv_a_coord(i);
+            const int row=row0+xy.y, kk=k0+xy.x;
+            a[i]=(row<M && kk<K)?p[po+size_t(row)*ps1+size_t(kk)*ps2]:0.0f;
+          }
+          #pragma clang loop unroll(full)
+          for (int tile=0;tile<TN/32;++tile) {
+            #pragma clang loop unroll(full)
+            for (int i=0;i<16;++i) {
+              const int2 xy=pv_b_coord(i);
+              const int kk=k0+xy.y;
+              const int col=col0+tile*32+xy.x;
+              b[tile][i]=(kk<K && col<N)?v[vo+size_t(kk)*vs1+size_t(col)*vs2]:0.0f;
+            }
+          }
+        }
+
+        template<int TN>
+        inline void pv_mma(const thread float (&a)[8], const thread float (&b)[TN/32][16],
+                           thread float (&c)[TN/32][16]) {
+          constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(
+              16,32,16,false,false,true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroup> op;
+          auto ct_a=op.template get_left_input_cooperative_tensor<float,float,float>();
+          auto ct_b=op.template get_right_input_cooperative_tensor<float,float,float>();
+          auto ct_c=op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(ct_a)>,
+              metal::remove_addrspace_t<decltype(ct_b)>,float>();
+          #pragma clang loop unroll(full)
+          for(int i=0;i<8;++i) ct_a[i]=a[i];
+          #pragma clang loop unroll(full)
+          for(int tile=0;tile<TN/32;++tile) {
+            #pragma clang loop unroll(full)
+            for(int i=0;i<16;++i) { ct_b[i]=b[tile][i]; ct_c[i]=c[tile][i]; }
+            op.run(ct_a,ct_b,ct_c);
+            #pragma clang loop unroll(full)
+            for(int i=0;i<16;++i) c[tile][i]=ct_c[i];
+          }
+        }
+        """
+    private static let body = """
+        const uint3 group=threadgroup_position_in_grid;
+        const uint lane=thread_index_in_simdgroup;
+
+          const int K=dims[0], M=dims[1], N=dims[2];
+          const int paddedK=((K+31)/32)*32;
+          const size_t ps0=size_t(p_strides[0]),ps1=size_t(p_strides[1]),ps2=size_t(p_strides[2]);
+          const size_t vs0=size_t(v_strides[0]),vs1=size_t(v_strides[1]),vs2=size_t(v_strides[2]);
+          float a[8], b[TN/32][16], c[TN/32][16]={};
+          if constexpr(PF==1) {
+            pv_load<TN>(p,v,K,M,N,dims[3],group,lane,0,ps0,ps1,ps2,vs0,vs1,vs2,a,b);
+            for(int k0=0;k0<paddedK;k0+=16) {
+              float nextA[8], nextB[TN/32][16];
+              if(k0+16<paddedK) pv_load<TN>(p,v,K,M,N,dims[3],group,lane,k0+16,ps0,ps1,ps2,vs0,vs1,vs2,nextA,nextB);
+              pv_mma<TN>(a,b,c);
+              if(k0+16<paddedK) {
+                #pragma clang loop unroll(full)
+                for(int i=0;i<8;++i) a[i]=nextA[i];
+                #pragma clang loop unroll(full)
+                for(int tile=0;tile<TN/32;++tile) {
+                  #pragma clang loop unroll(full)
+                  for(int i=0;i<16;++i) b[tile][i]=nextB[tile][i];
+                }
+              }
+            }
+          } else {
+            for(int k0=0;k0<paddedK;k0+=16) {
+              pv_load<TN>(p,v,K,M,N,dims[3],group,lane,k0,ps0,ps1,ps2,vs0,vs1,vs2,a,b);
+              pv_mma<TN>(a,b,c);
+            }
+          }
+          const int row0=int(group.y)*16, col0=int(group.x)*TN;
+          const size_t oo=size_t(group.z)*size_t(M)*size_t(N);
+          #pragma clang loop unroll(full)
+          for(int tile=0;tile<TN/32;++tile) {
+            #pragma clang loop unroll(full)
+            for(int i=0;i<16;++i) {
+              const int2 xy=pv_c_coord(i);
+              const int row=row0+xy.y;
+              const int col=col0+tile*32+xy.x;
+              if(row<M && col<N) out[oo+size_t(row)*size_t(N)+size_t(col)]=c[tile][i];
+            }
+          }
+        """
+    private static let kernels = forms.map { tn, pf in
+        MLXFast.metalKernel(
+            name: "bonsai_verify_pv16_\(tn)_\(pf)",
+            inputNames: ["p", "v", "dims"], outputNames: ["out"],
+            source: "constexpr int TN=\(tn),PF=\(pf);\n" + body,
+            header: header, ensureRowContiguous: false)
+    }
+    nonisolated(unsafe) private static var prepared = false
+    nonisolated(unsafe) private static var choices: [Int: (groups: Int, form: Int)] = [:]
+    private static let available: Bool = {
+        // This reads the existing NAX capability without arming counters.
+        guard GPU.gemma4ExpertQMMDiagnostics().naxAvailable else { return false }
+        guard let tf32 = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] else { return true }
+        return tf32.withCString { atoi($0) != 0 }
+    }()
+
+    private static func launch(_ p: MLXArray, _ v: MLXArray, form: Int) -> MLXArray {
+        let M = p.dim(-2), K = p.dim(-1), N = v.dim(-1)
+        let G = p.size / (M * K)
+        let kvHeads = v.size / (K * N)
+        let dims = MLXArray([Int32(K), Int32(M), Int32(N), Int32(G / kvHeads)])
+        let tn = forms[form].0
+        let out = kernels[form](
+            [p.reshaped([G, M, K]), v.reshaped([kvHeads, K, N]), dims],
+            grid: ((N / tn) * 32, (M + 15) / 16, G), threadGroup: (32, 1, 1),
+            outputShapes: [[G, M, N]], outputDTypes: [.float32])[0]
+        return out.reshaped(Array(p.shape.dropLast()) + [N])
+    }
+
+    static func output(_ p: MLXArray, _ v: MLXArray) -> MLXArray? {
+        guard !choices.isEmpty else { return nil }
+        guard p.dtype == .float32, v.dtype == .float32, p.dim(-1) > 0,
+            p.dim(-1) <= Int(Int32.max) - 31, v.dim(-1) == 256,
+            let choice = choices[p.dim(-2)],
+            p.size / (p.dim(-2) * p.dim(-1)) == choice.groups
+        else { return nil }
+        return launch(p, v, form: choice.form)
+    }
+
+    private static func median(_ samples: [Double]) -> Double {
+        let sorted = samples.sorted(), mid = sorted.count / 2
+        return sorted.count % 2 == 1 ? sorted[mid] : (sorted[mid-1] + sorted[mid]) / 2
+    }
+
+    static func prepare(heads: Int, kvHeads: Int, rows: Int, headDim: Int, keyLengths: [Int]) {
+        guard !prepared, kvHeads > 1, heads > kvHeads, heads % kvHeads == 0,
+            rows > 0, rows % 16 == 0, headDim == 256
+        else { return }
+        prepared = true
+        let lengths = Array(Set(keyLengths.filter {
+            $0 >= rows && $0 <= Int(Int32.max) - 31
+        })).sorted()
+        guard !lengths.isEmpty else { return }
+        var detail: [String] = []
+        do {
+            try withError { error in
+                // This small exact check also compiles the MLX stride metadata
+                // on a non-NAX local device. It does not enable the live path.
+                let pData: [Float] = (0..<2112).map { Float($0 % 31 - 15) * 0.0625 }
+                let vData: [Float] = (0..<16640).map { Float($0 % 37 - 18) * 0.0625 }
+                let p = MLXArray(pData, [4,16,33])
+                let stored = MLXArray(vData, [4,65,64])
+                let v = stored[0..., ..<33, 0...]
+                let reference = matmul(p, v)
+                eval(reference)
+                for form in forms.indices {
+                    let out = launch(p, v, form: form)
+                    let differ = (out.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    guard differ.item(Int32.self) == 0 else {
+                        detail.append("metadata check FAILED form \(form)")
+                        return
+                    }
+                }
+                detail.append("metadata check passed (16384 values)")
+                let trial = ProcessInfo.processInfo.environment["BONSAI_EXACT_TRIALS"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard available, !["0", "false", "no", "off"].contains(trial ?? "") else {
+                    detail.append("stock retained (NAX, TF32 or trials unavailable)")
+                    return
+                }
+                let keys = MLXRandom.split(key: MLXRandom.key(0x5056_3136), into: lengths.count * 4)
+                for fold in [true, false] {
+                    let repeats = heads / kvHeads
+                    var inputs: [(MLXArray, MLXArray)] = []
+                    var valid = [Bool](repeating: true, count: forms.count)
+                    var values = 0
+                    for (i, K) in lengths.enumerated() {
+                        let shape = fold ? [1,kvHeads,repeats*rows,K] : [1,kvHeads,repeats,rows,K]
+                        let p = MLXRandom.uniform(0 ..< 1, shape, key: keys[4*i]) / Float(K)
+                        let stored = MLXRandom.normal(
+                            [1,kvHeads,K+64,headDim], key: keys[4*i+1])
+                        var v = stored[0..., 0..., ..<K, 0...]
+                        if !fold { v = v.expandedDimensions(axis: 2) }
+                        let reference = matmul(p, v)
+                        eval(p, v, reference)
+                        for form in forms.indices {
+                            let out = launch(p, v, form: form)
+                            let differ = (out.view(dtype: .uint32) .!= reference.view(dtype: .uint32))
+                                .asType(.int32).sum()
+                            eval(differ)
+                            try error.check()
+                            valid[form] = valid[form] && differ.item(Int32.self) == 0
+                            values += out.size
+                        }
+                        inputs.append((p, v))
+                    }
+                    let arms = [-1] + forms.indices.filter { valid[$0] }
+                    var times = [[Double]](repeating: [], count: arms.count)
+                    for round in 0..<9 {
+                        for offset in arms.indices {
+                            let arm = (round + offset) % arms.count, form = arms[arm]
+                            let start = DispatchTime.now().uptimeNanoseconds
+                            let outputs = inputs.map { p, v in
+                                form < 0 ? matmul(p, v) : launch(p, v, form: form)
+                            }
+                            eval(outputs)
+                            try error.check()
+                            if round > 0 {
+                                times[arm].append(Double(DispatchTime.now().uptimeNanoseconds - start))
+                            }
+                        }
+                    }
+                    let stats = times.map { samples -> (Double, Int) in
+                        let first = median(samples)
+                        let kept = samples.filter { $0 <= first * 1.5 }
+                        return (median(kept), kept.count)
+                    }
+                    var chosen = 0
+                    if stats[0].1 >= 5 {
+                        for i in arms.indices.dropFirst() where stats[i].1 >= 5 {
+                            if stats[i].0 < stats[0].0 * 0.98 && stats[i].0 < stats[chosen].0 {
+                                chosen = i
+                            }
+                        }
+                    }
+                    if chosen > 0 {
+                        choices[fold ? repeats*rows : rows] =
+                            (fold ? kvHeads : heads, arms[chosen])
+                    }
+                    let samples = arms.indices.map { i in
+                        let name = arms[i] < 0 ? "stock" : "tn\(forms[arms[i]].0)pf\(forms[arms[i]].1)"
+                        return name + String(format: " %.1f us (%d)", stats[i].0 / 1000, stats[i].1)
+                    }.joined(separator: ", ")
+                    detail.append("\(fold ? "folded" : "unfolded"): \(values) bits checked, forms \(valid); \(samples); adopted \(arms[chosen])")
+                }
+            }
+        } catch {
+            choices.removeAll()
+            detail.append("stock retained: \(error)")
+        }
+        FileHandle.standardError.write(
+            ("bonsai verify PV16: " + detail.joined(separator: "; ") + "\n").data(using: .utf8)!)
+        Memory.clearCache()
     }
 }
