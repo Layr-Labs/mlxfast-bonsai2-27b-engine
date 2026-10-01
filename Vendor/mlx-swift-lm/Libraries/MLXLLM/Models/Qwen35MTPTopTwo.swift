@@ -6377,7 +6377,7 @@ extension Qwen35TensorPackedMatmul {
     private static let headTop2Insert = """
         {
                       // TOP2: the four columns enter this lane's top two of the row.
-                      const uint ht2col = uint(base - (size_t)(fm + 8 * mh) * (size_t)N);
+                      const uint ht2col = uint(base - (uint)(fm + 8 * mh) * (uint)N);
                       bonsai_head_top2_insert(ht2[mh], v0, ht2col);
                       bonsai_head_top2_insert(ht2[mh], v1, ht2col + 1u);
                       bonsai_head_top2_insert(ht2[mh], v2, ht2col + 2u);
@@ -6403,11 +6403,9 @@ extension Qwen35TensorPackedMatmul {
             const int ht2block = n0 / (HT2COLS);
             #pragma clang loop unroll(full)
             for (int mh = 0; mh < 2; mh++) {
-              const size_t o = ((size_t)(fm + 8 * mh) * (size_t)ht2blocks + (size_t)ht2block) * 2;
-              top_ids[o] = int(ht2[mh].first_id);
-              top_ids[o + 1] = int(ht2[mh].second_id);
-              top_values[o] = ht2[mh].first_value;
-              top_values[o + 1] = ht2[mh].second_value;
+              const uint o = (uint(fm + 8 * mh) * uint(ht2blocks) + uint(ht2block)) * 2u;
+              *(device int2*)(top_ids + o) = int2(int(ht2[mh].first_id), int(ht2[mh].second_id));
+              *(device float2*)(top_values + o) = float2(ht2[mh].first_value, ht2[mh].second_value);
             }
           }
         }
@@ -6483,32 +6481,77 @@ extension Qwen35TensorPackedMatmul {
     /// One simdgroup per row merges the blocks' pairs (`DFlash2TopK`'s merge
     /// pattern): each lane takes every 32nd block, then five butterfly steps.
     /// grid (32, rows, 1), threadgroup (32, 1, 1).
-    private static let headTop2MergeKernel = MLXFast.metalKernel(
-        name: "bonsai_head_top2_merge",
-        inputNames: ["pid", "pval"],
-        outputNames: ["top_ids", "top_values"],
-        source: """
+    private static let headTop2MergeSource = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
             bonsai_head_top2 st = bonsai_head_top2_empty();
-            for (uint b = lane; b < blocks; b += 32) {
-              const size_t o = (size_t(row) * size_t(blocks) + size_t(b)) * 2;
-              bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
-              bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+            const uint row_base = (row * blocks) * 2u;
+            for (uint b = lane; b < blocks; b += 32u) {
+              const uint o = row_base + b * 2u;
+              const float2 pv = *(const device float2*)(pval + o);
+              const uint2 pi = *(const device uint2*)(pid + o);
+              bonsai_head_top2_insert(st, pv.x, pi.x);
+              bonsai_head_top2_insert(st, pv.y, pi.y);
             }
             for (ushort m = 16; m > 0; m >>= 1) {
               bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
             }
             if (lane == 0) {
-              top_ids[row * 2] = int(st.first_id);
-              top_ids[row * 2 + 1] = int(st.second_id);
-              top_values[row * 2] = st.first_value;
-              top_values[row * 2 + 1] = st.second_value;
+              *(device int2*)(top_ids + row * 2) = int2(int(st.first_id), int(st.second_id));
+              *(device float2*)(top_values + row * 2) = float2(st.first_value, st.second_value);
             }
-            """,
+            """
+
+    private static let headTop2MergeKernel = MLXFast.metalKernel(
+        name: "bonsai_head_top2_merge",
+        inputNames: ["pid", "pval"],
+        outputNames: ["top_ids", "top_values"],
+        source: headTop2MergeSource,
         header: headTop2Header,
         ensureRowContiguous: true)
+
+    private static let headTop2PartitionedMergeSource = headTop2MergeSource
+        .replacingOccurrences(
+            of: "const uint row = threadgroup_position_in_grid.y;",
+            with: "const uint output_row = threadgroup_position_in_grid.y;\n"
+                + "const uint row = output_row / PARTS;\nconst uint part = output_row % PARTS;")
+        .replacingOccurrences(
+            of: "uint b = lane; b < blocks; b += 32u",
+            with: "uint b = lane + part * 32u; b < blocks; b += 32u * PARTS")
+        .replacingOccurrences(of: "top_ids + row * 2", with: "top_ids + output_row * 2")
+        .replacingOccurrences(of: "top_values + row * 2", with: "top_values + output_row * 2")
+
+    private static let headTop2PartitionedMergeKernel = MLXFast.metalKernel(
+        name: "bonsai_head_top2_partitioned_merge",
+        inputNames: ["pid", "pval"],
+        outputNames: ["top_ids", "top_values"],
+        source: headTop2PartitionedMergeSource,
+        header: headTop2Header,
+        ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static var headTop2MergeParts = 1
+
+    private static func mergeHeadTop2(
+        _ partial: [MLXArray], parts: Int
+    ) -> (ids: MLXArray, values: MLXArray) {
+        let m = partial[0].dim(0)
+        let pairs: [MLXArray]
+        if parts > 1 && partial[0].dim(1) >= parts * 32 {
+            // Every partition has a nonempty pair in every lane.
+            pairs = headTop2PartitionedMergeKernel(
+                partial, template: [("PARTS", parts)],
+                grid: (32, m * parts, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[m, parts, 2], [m, parts, 2]],
+                outputDTypes: [.int32, .float32])
+        } else {
+            pairs = partial
+        }
+        let merged = headTop2MergeKernel(
+            pairs, grid: (32, m, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
+        return (merged[0], merged[1])
+    }
 
     /// The fused form of `launchNarrowInt8` with FP32 output: the same
     /// kernel body, template and grid, returning each of the 16 rows' top
@@ -6521,7 +6564,20 @@ extension Qwen35TensorPackedMatmul {
         _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel,
         tiled: Bool
     ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let partial = launchNarrowInt8Top2Partial(
+            codes, weight, scalesT, biasesT, ascale, rowsum, k: k, n: n,
+            kernel: kernel, tiled: tiled)
+        else { return nil }
+        return mergeHeadTop2(partial, parts: headTop2MergeParts)
+    }
+
+    private static func launchNarrowInt8Top2Partial(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel,
+        tiled: Bool
+    ) -> [MLXArray]? {
         let m = 16
+        guard n > 0, n <= Int(UInt32.max) / m else { return nil }
         let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
         let template: [(String, any KernelTemplateArg)] = [
             ("OutT", DType.float32), ("NEG", kernel.form == .base ? 0 : 1),
@@ -6584,10 +6640,7 @@ extension Qwen35TensorPackedMatmul {
                     outputShapes: shapes, outputDTypes: dtypes)
             }
         }
-        let merged = headTop2MergeKernel(
-            partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
-        return (merged[0], merged[1])
+        return partial
     }
 
     /// The capture verify's head launch: `(k, n)` and the kernel the route
@@ -6623,6 +6676,7 @@ extension Qwen35TensorPackedMatmul {
         let (k, n) = (site.k, site.n)
         let start = DispatchTime.now().uptimeNanoseconds
         let kernels = [site.kernel()]
+        headTop2MergeParts = 1
         var log = "bonsai head top-2: "
         let base = NarrowOperands(k: k, n: n, seed: 0x7432_6865)
         func repeated(_ period: Int, specials: Bool) -> NarrowOperands {
@@ -6652,6 +6706,9 @@ extension Qwen35TensorPackedMatmul {
         }
         var mismatchesByKernel = [NarrowKernel: Int]()
         var failed = [NarrowKernel: String]()
+        var partitionMismatches = [Int: Int]()
+        var failedPartitions = Set<Int>()
+        var trialPartial: [MLXArray]?
         var values = 0
         let cases: [() -> NarrowOperands] = [
             { base }, { repeated(24, specials: false) }, { repeated(4099, specials: true) },
@@ -6663,9 +6720,12 @@ extension Qwen35TensorPackedMatmul {
                     try withError { error in
                         let stock = qwen35MTPTopTwoRows(
                             operands.run(kernel, .float32).reshaped([1, 16, n]))
-                        guard let fused = operands.runTop2(kernel) else {
+                        guard let partial = operands.runTop2Partial(kernel) else {
                             throw MLXFastHeadTop2Failure.message("no fused body")
                         }
+                        eval(partial)
+                        if trialPartial == nil { trialPartial = partial }
+                        let fused = mergeHeadTop2(partial, parts: 1)
                         guard fused.ids.shape == stock.ids.shape,
                             fused.values.shape == stock.values.shape,
                             fused.ids.dtype == stock.ids.dtype,
@@ -6680,6 +6740,25 @@ extension Qwen35TensorPackedMatmul {
                         try error.check()
                         mismatchesByKernel[kernel, default: 0] += Int(count.item(Int32.self))
                         values += 2 * stock.ids.size
+                        for parts in [2, 4, 8, 16]
+                            where partial[0].dim(1) >= parts * 32 && !failedPartitions.contains(parts)
+                        {
+                            do {
+                                try withError { partError in
+                                    let split = mergeHeadTop2(partial, parts: parts)
+                                    let count =
+                                        (split.ids.view(dtype: .uint32)
+                                            .!= stock.ids.view(dtype: .uint32)).asType(.int32).sum()
+                                        + (split.values.view(dtype: .uint32)
+                                            .!= stock.values.view(dtype: .uint32)).asType(.int32).sum()
+                                    eval(count)
+                                    try partError.check()
+                                    partitionMismatches[parts, default: 0] += Int(count.item(Int32.self))
+                                }
+                            } catch {
+                                failedPartitions.insert(parts)
+                            }
+                        }
                     }
                 } catch {
                     failed[kernel] = "\(error)"
@@ -6689,6 +6768,48 @@ extension Qwen35TensorPackedMatmul {
         let passed = kernels.filter { failed[$0] == nil && mismatchesByKernel[$0] == 0 }
         headTop2Shape = [k, n]
         headTop2Verified = Set(passed)
+        if !passed.isEmpty, let partial = trialPartial {
+            let choices = [1] + [2, 4, 8, 16].filter {
+                partial[0].dim(1) >= $0 * 32 && !failedPartitions.contains($0)
+                    && partitionMismatches[$0] == 0
+            }
+            var samples = [Int: [UInt64]]()
+            for parts in choices {
+                let result = mergeHeadTop2(partial, parts: parts)
+                eval(result.ids, result.values)
+            }
+            for round in 0 ..< 8 {
+                for offset in choices.indices {
+                    let parts = choices[(round + offset) % choices.count]
+                    let before = DispatchTime.now().uptimeNanoseconds
+                    let result = mergeHeadTop2(partial, parts: parts)
+                    eval(result.ids, result.values)
+                    samples[parts, default: []].append(DispatchTime.now().uptimeNanoseconds - before)
+                }
+            }
+            func median(_ a: [UInt64]) -> Double {
+                let a = a.sorted(), middle = a.count / 2
+                return a.count % 2 == 1 ? Double(a[middle])
+                    : (Double(a[middle - 1]) + Double(a[middle])) / 2
+            }
+            var times = [Int: Double]()
+            for parts in choices {
+                let a = samples[parts]!, first = median(a)
+                let kept = a.filter { Double($0) <= first * 1.5 }
+                if kept.count >= 5 { times[parts] = median(kept) }
+            }
+            if let record = times[1], let best = times.min(by: { $0.value < $1.value }),
+                best.value < record * 0.98
+            {
+                headTop2MergeParts = best.key
+            }
+            let readings = choices.map {
+                "\($0):" + (times[$0].map { String(format: "%.1f us", $0 / 1e3) } ?? "-")
+            }.joined(separator: " ")
+            FileHandle.standardError.write(
+                ("bonsai head top-2 merge partitions: \(readings); adopted \(headTop2MergeParts); "
+                    + "checks \(choices), 3 cases, 0 mismatches\n").data(using: .utf8)!)
+        }
         Memory.clearCache()
         let total = mismatchesByKernel.values.reduce(0, +)
         log += (passed.count == kernels.count ? "self-test passed" : "self-test FAILED")
@@ -6732,9 +6853,9 @@ extension Qwen35TensorPackedMatmul.NarrowOperands {
 
     /// `run` in its fused head form (FP32 values), on the words the route
     /// reads (the tiled copy where `narrowTiled`).
-    func runTop2(
+    func runTop2Partial(
         _ kernel: Qwen35TensorPackedMatmul.NarrowKernel
-    ) -> (ids: MLXArray, values: MLXArray)? {
+    ) -> [MLXArray]? {
         let tiled = Qwen35TensorPackedMatmul.narrowTiled
         let (s, b): (MLXArray, MLXArray)
         switch kernel.form {
@@ -6742,7 +6863,7 @@ extension Qwen35TensorPackedMatmul.NarrowOperands {
         case .negativeBias: (s, b) = (scalesT, scalesT)
         case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
         }
-        return Qwen35TensorPackedMatmul.launchNarrowInt8Top2(
+        return Qwen35TensorPackedMatmul.launchNarrowInt8Top2Partial(
             codes, tiled ? tiledWeight : weight, s, b, ascale, rowsum, k: k, n: n,
             kernel: kernel, tiled: tiled)
     }
