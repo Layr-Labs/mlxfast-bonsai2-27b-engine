@@ -335,7 +335,24 @@ enum CBv2PromptLookupDraft {
     private static let splicePick = MLXFast.metalKernel(
         name: "cbv2_prompt_splice_pick",
         inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out"],
-        source: """
+        source: splicePickSource, ensureRowContiguous: true)
+
+    /// ROUNDFUSE: `splicePick` that also writes the splice flag. Its
+    /// threadgroup reduction already holds the best score: `scores[0]` is the
+    /// maximum of 0 and every ranked score, and `spliceScore` writes only 0 or
+    /// positive scores, so `scores[0] >= minimum` is
+    /// `ranked.max() .>= minimum`, the flag a two-pass `all_reduce_max` and a
+    /// scalar compare computed (three launches per round). The pick's own
+    /// text and output are unchanged. Self-tested against that chain before
+    /// first use (`prepareSpliceFlag`); `MLXFAST_ROUND_FUSE=0` keeps it.
+    private static let splicePickFlag = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_pick_flag",
+        inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out", "found"],
+        source: splicePickSource + """
+        if (tid == 0) found[0] = scores[0] >= minimum;
+        """, ensureRowContiguous: true)
+
+    private static let splicePickSource = """
 
         uint tid = thread_position_in_threadgroup.x;
         int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
@@ -362,7 +379,89 @@ enum CBv2PromptLookupDraft {
          int j=indices[0]/n, c=indices[0]%n;
          out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
-        """, ensureRowContiguous: true)
+        """
+
+    static let roundFuseEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_FUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let spliceFlagLock = NSLock()
+    nonisolated(unsafe) private static var spliceFlagVerdict: Bool?
+
+    /// Runs the flag's self-test now (bind time); the verdict is kept.
+    static func prepareSpliceFlag() { _ = spliceFlagFused() }
+
+    private static func spliceFlagFused() -> Bool {
+        guard roundFuseEnabled else { return false }
+        return spliceFlagLock.withLock {
+            if let verdict = spliceFlagVerdict { return verdict }
+            let (passed, summary) = spliceFlagSelfTest()
+            spliceFlagVerdict = passed
+            FileHandle.standardError.write(
+                Data(("dflash2 prompt splice flag: " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).utf8))
+            return passed
+        }
+    }
+
+    /// The pick and its flag against `splicePick` and `ranked.max() .>=
+    /// minimum` on random ranked scores (0, below the bar, at it, above it;
+    /// all zero; anchored bars below the minimum), every id and flag compared.
+    private static func spliceFlagSelfTest() -> (Bool, String) {
+        var cases = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                for seed in 0 ..< 48 {
+                    let n = [1, 3, 17, 255, 497, 1201][seed % 6]
+                    let d = [1, 2, 15, 16][(seed / 6) % 4]
+                    let minimum = [5, 1, 3, 6][seed % 4]
+                    let anchored = seed % 3 == 1 && minimum > 2 ? minimum - 2 : 0
+                    func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x51ce + seed * 8 + salt)) }
+                    var ranked = MLXRandom.randInt(
+                        Int32(0) ..< Int32(minimum + 4), [n * d], key: key(0))
+                    ranked = which(
+                        MLXRandom.randInt(Int32(0) ..< Int32(4), [n * d], key: key(1)) .== 0,
+                        ranked, MLXArray(Int32(0)))
+                    if seed % 8 == 3 { ranked = MLX.minimum(ranked, MLXArray(Int32(minimum - 1))) }
+                    if seed % 8 == 5 { ranked = MLX.zeros(like: ranked) }
+                    let block = MLXRandom.randInt(Int32(0) ..< Int32(50), [d], key: key(2))
+                    let prompt = MLXRandom.randInt(Int32(0) ..< Int32(50), [n + d], key: key(3))
+                    let dims = MLXArray([Int32(n), Int32(d), Int32(minimum), Int32(anchored)])
+                    let inputs = [ranked, block, prompt, dims]
+                    let chain = splicePick(
+                        inputs, grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, d]], outputDTypes: [.int32])[0]
+                    let chainFlag = ranked.max() .>= MLXArray(Int32(minimum))
+                    let fused = splicePickFlag(
+                        inputs, grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, d], [1]], outputDTypes: [.int32, .bool])
+                    let flag = fused[1].reshaped([])
+                    guard flag.dtype == chainFlag.dtype, flag.shape == chainFlag.shape else {
+                        failure = "flag \(flag.dtype) \(flag.shape) vs \(chainFlag.dtype) \(chainFlag.shape)"
+                        return
+                    }
+                    let differ = (chain .!= fused[0]).asType(.int32).sum()
+                        + (chainFlag .!= flag).asType(.int32)
+                    eval(differ)
+                    try error.check()
+                    mismatches += Int(differ.item(Int32.self))
+                    cases += 1
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && cases > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(cases) picks and flags compared with "
+                + "the pick and ranked.max() >= minimum, \(mismatches) mismatches")
+    }
 
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
@@ -420,6 +519,14 @@ enum CBv2PromptLookupDraft {
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
+            if spliceFlagFused() {
+                let picked = splicePickFlag(
+                    [ranked, block, promptIDs, dims],
+                    grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, depth], [1]], outputDTypes: [.int32, .bool])
+                lastSpliceFound = picked[1].reshaped([])
+                return picked[0].asType(drafted.dtype)
+            }
             // `splicePick` fires on the best score; a score is 0 or at least
             // `minimum`.
             lastSpliceFound = ranked.max() .>= MLXArray(Int32(minimum))
