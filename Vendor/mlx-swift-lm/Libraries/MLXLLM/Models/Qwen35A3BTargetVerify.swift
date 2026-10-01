@@ -2274,7 +2274,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {

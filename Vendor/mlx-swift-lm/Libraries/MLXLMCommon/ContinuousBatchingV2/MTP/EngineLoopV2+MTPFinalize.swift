@@ -193,7 +193,8 @@ extension EngineLoopV2 {
             let rec = scheduler.record(for: metadata.id),
             rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1,
             let block = speculative.speculateBlock(
-                acceptancePacket: verify.acceptancePacket, depth: k, verifyContext: context,
+                acceptancePacket: verify.acceptancePacket, drafts: verify.packetDrafts,
+                depth: k, verifyContext: context,
                 requestState: state,
                 leadingLayersBeforeReadback: CBv2MTPDraftBeforeReadback.leadingLayers)
         {
@@ -220,7 +221,10 @@ extension EngineLoopV2 {
                 if CFAbsoluteTimeGetCurrent() > pollDeadline { break }
             }
         }
-        let host = verify.acceptancePacket.asArray(Int32.self)
+        var host = verify.acceptancePacket.asArray(Int32.self)
+        // The draft ids ahead of the target ids, as the packet's join laid
+        // them out; evaluated before the verify that read them.
+        if let drafts = verify.packetDrafts { host = drafts.asArray(Int32.self) + host }
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
