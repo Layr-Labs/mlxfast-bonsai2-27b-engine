@@ -7244,10 +7244,11 @@ enum Qwen35FusedHadamard {
               out[rowbase + bcol + uint(index + r)] = OutT(q * qs);
             }
           } else {
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 4; r++) {
-              out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);
-            }
+            *(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(
+                OutT(buf[index] * 0.03125f),
+                OutT(buf[index + 1] * 0.03125f),
+                OutT(buf[index + 2] * 0.03125f),
+                OutT(buf[index + 3] * 0.03125f));
           }
         }
         """
@@ -7718,7 +7719,11 @@ extension Qwen35FusedHadamard {
     }()
 
     private static let inverseKernel: MLXFast.MLXFastKernel? = {
-        let store = "out[rowbase + bcol + uint(index + r)] = OutT(buf[index + r] * 0.03125f);"
+        let store = "*(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(\n"
+            + "                OutT(buf[index] * 0.03125f),\n"
+            + "                OutT(buf[index + 1] * 0.03125f),\n"
+            + "                OutT(buf[index + 2] * 0.03125f),\n"
+            + "                OutT(buf[index + 3] * 0.03125f));"
         guard source.components(separatedBy: store).count == 2 else { return nil }
         return MLXFast.metalKernel(
             name: "bonsai_signed_hadamard_1024_inv",
@@ -7727,8 +7732,11 @@ extension Qwen35FusedHadamard {
             source: Qwen35IO32.narrow(
                 source.replacingOccurrences(
                     of: store,
-                    with: "out[rowbase + bcol + uint(index + r)] = "
-                        + "OutT((buf[index + r] * 0.03125f) * signs[bcol + uint(index + r)]);"),
+                    with: "*(device vec<OutT, 4>*)(out + rowbase + bcol + uint(index)) = vec<OutT, 4>(\n"
+                        + "                OutT((buf[index] * 0.03125f) * signs[bcol + uint(index)]),\n"
+                        + "                OutT((buf[index + 1] * 0.03125f) * signs[bcol + uint(index + 1)]),\n"
+                        + "                OutT((buf[index + 2] * 0.03125f) * signs[bcol + uint(index + 2)]),\n"
+                        + "                OutT((buf[index + 3] * 0.03125f) * signs[bcol + uint(index + 3)]));"),
                 count: 3, "bonsai_signed_hadamard_1024_inv"),
             header: header,
             ensureRowContiguous: true)
