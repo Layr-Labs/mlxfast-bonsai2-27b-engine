@@ -5049,20 +5049,14 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
-                // Layer 0 norms the FP16 embedding in one launch
-                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
-                        ?? inputLayerNorm(x),
-                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
+                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
-                // Layer 0 norms the FP16 embedding in one launch
-                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
-                        ?? inputLayerNorm(x),
-                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5189,12 +5183,8 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it). Layer 0 norms the FP16
-        // embedding in one launch (`Qwen35HalfInputNorm`).
-        let layerInput =
-            boundary?.normed ?? verifyBoundary?.normed
-            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
-            ?? inputLayerNorm(input)
+        // unless a projection falls back to it).
+        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -5635,8 +5625,7 @@ public class Qwen35TextModelInner: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        lastRowOnly: Bool = false,
-        finalAdd: ((MLXArray, MLXArray) -> MLXArray?)? = nil
+        lastRowOnly: Bool = false
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -5815,8 +5804,7 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            // A verify window's last add may also form its final norm (`finalAdd`).
-            hiddenStates = (verifyPending ? finalAdd?(hiddenStates, p) : nil) ?? (hiddenStates + p)
+            hiddenStates = hiddenStates + p
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -7138,7 +7126,7 @@ enum Qwen35FusedHadamard {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
-    static let header = """
+    private static let header = """
         // MLX `Sigmoid` (unary_ops.h), verbatim.
         METAL_FUNC float bonsai_sigmoid(float x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -7170,7 +7158,7 @@ enum Qwen35FusedHadamard {
     // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
     // 1024-wide block. Template: InT, OutT, W (row width), BPR (blocks per
     // row), PRESIGNED, GR (GDN repeats, 1 = identity), GKH, GD.
-    static let source = """
+    private static let source = """
         constexpr short N = 1024;
         constexpr short NT = 64;
         const uint blk = threadgroup_position_in_grid.x;
@@ -7487,7 +7475,6 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
-        Qwen35EmbeddingRows.install()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7571,28 +7558,6 @@ enum Qwen35FusedHadamard {
                 outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
-        }
-        // The drafter head's BF16 rows, padded to `paddedRows` in the read
-        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
-        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
-        // the zero-row concatenation.
-        SignedBlockHadamard.fusedTransformInt8Padded = {
-            x, signs, blockSize, preSigned, groupSize, paddedRows in
-            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
-                signs.dtype == .float32
-            else { return nil }
-            let width = x.dim(1)
-            guard width % 1024 == 0, signs.size == width else { return nil }
-            let template: [(String, any KernelTemplateArg)] = [
-                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
-                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
-                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
-                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
-                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
-            ]
-            return Qwen35RotationQ8Blocks.launchPadded(
-                x, signs, template: template, paddedRows: paddedRows, width: width,
-                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
         }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
@@ -10184,31 +10149,11 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
-        // The last residual add, its FP32 promotion and the final norm in one
-        // launch (`Qwen35FinalNormGlue`), or the add and the head's quantized
-        // input (`Qwen35HeadInputGlue`); the forward returns the kernel's sum.
-        var glued: MLXArray? = nil
-        var headInput: Qwen35HeadInputGlue.Input? = nil
-        let norm = model.norm
-        let head = model.exactTargetVerify ? nil : lmHead
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true,
-            finalAdd: Qwen35FinalNormGlue.enabled || Qwen35HeadInputGlue.enabled
-                ? { h, p in
-                    if let input = Qwen35HeadInputGlue.apply(h, p, norm, head) {
-                        headInput = input
-                        return input.sum
-                    }
-                    guard let out = Qwen35FinalNormGlue.apply(h, p, norm) else { return nil }
-                    glued = out.normed
-                    return out.sum
-                } : nil)
-        if let headInput {
-            return (Qwen35HeadTopTwo.capture { headInput.logits { model.norm(hidden) } }, hidden)
-        }
-        let normalized = glued ?? model.norm(hidden)
+            captureRecurrentWindow: true)
+        let normalized = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             // The head's fused top two rides beside the lazy logits where the

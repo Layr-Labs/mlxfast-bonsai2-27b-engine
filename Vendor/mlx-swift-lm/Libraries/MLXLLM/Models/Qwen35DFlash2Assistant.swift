@@ -114,7 +114,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
-        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -981,15 +980,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        // WALK1: the walk in one launch when on; ACCGLUE: the chain scans the
-        // bool comparison when on (no cast launch).
-        let (anchor, confirmed) =
-            CBv2AcceptGlue.walk(packet, depth: k) ?? CBv2AcceptGlue.chainWalk(packet, depth: k)
+        let targets = packet[k ..< (2 * k + 1)]
+        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+            .sum().asType(.int32)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: anchor, confirmed: confirmed, verifyContext: verifyContext,
+                anchor: targets.take(accepted.reshaped([1]), axis: 0),
+                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)

@@ -838,9 +838,7 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        // ACCGLUE: one launch writes both parts (`CBv2AcceptGlue.packet`).
-        let acceptancePacket =
-            CBv2AcceptGlue.packet(packetParts) ?? concatenated(packetParts, axis: 0)
+        let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
