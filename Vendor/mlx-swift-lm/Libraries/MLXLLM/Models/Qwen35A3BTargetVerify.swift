@@ -617,7 +617,12 @@ enum Qwen35GDNReplayFused {
         let Hv = v.dim(2)
         let Dv = v.dim(3)
         let P = tape.rowCount
-        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let useStaged =
+            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
+            && P <= stagedRows
+        let dvpl =
+            useStaged ? stagedRowsPerLane ?? Qwen35GatedDeltaV3.rowsPerLane
+            : Qwen35GatedDeltaV3.rowsPerLane
         let previous = [ps, tape.k, tape.v, tape.a, tape.b, aLog, dtBias]
         // The replay's own routing: from `minRows` kept rows it is chunked.
         guard ([q, k, v, g, beta] + previous).allSatisfy({ $0.dtype == .float32 }),
@@ -640,11 +645,6 @@ enum Qwen35GDNReplayFused {
             let aRows = Qwen35GDNReplayBatch.gateRowStride(tape.a),
             let bRows = Qwen35GDNReplayBatch.gateRowStride(tape.b)
         else { return nil }
-        // Both windows fit the staging buffers (and the verify window is a
-        // full one, where staging pays): the staged form (same values).
-        let useStaged =
-            (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
-            && P <= stagedRows
         var inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
             + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
         // Reuse this tape's verify gates when their layout fits the staged read.
@@ -668,7 +668,7 @@ enum Qwen35GDNReplayFused {
             let out = stagedKernel(
                 inputs, template: template + [
                     ("SC", true), ("SF", storeFinal), ("GATES_STORED", storedGates),
-                    ("REPLAY_NEEDED", keep > 0),
+                    ("REPLAY_NEEDED", keep > 0), ("SLOAD4", stagedWideLoads),
                 ],
                 grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
                 outputShapes: [[1, T, Hv, Dv], ps.shape, storeFinal ? ps.shape : [1]],
@@ -691,6 +691,8 @@ enum Qwen35GDNReplayFused {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    nonisolated(unsafe) private static let noReplayKeep = MLXArray(Int32(0))
+
     /// This verify's rows from a committed (not deferred) `state` (and, with
     /// `storeFinal`, the window's final state): the staged kernel without the
     /// replay (`KP` 0) and without the committed-state store. The same step
@@ -710,7 +712,7 @@ enum Qwen35GDNReplayFused {
         let Dk = k.dim(3)
         let Hv = v.dim(2)
         let Dv = v.dim(3)
-        let dvpl = Qwen35GatedDeltaV3.rowsPerLane
+        let dvpl = stagedRowsPerLane ?? Qwen35GatedDeltaV3.rowsPerLane
         guard [q, k, v, g, beta, state, aLog, dtBias].allSatisfy({ $0.dtype == .float32 }),
             Dk == 128, Dv % (16 * dvpl) == 0, Hv % Hk == 0,
             T >= stagedRows / 2, T <= stagedRows,
@@ -723,11 +725,12 @@ enum Qwen35GDNReplayFused {
         // KP = 0: the replay inputs are never read; any float arrays bind.
         let out = stagedKernel(
             [q, k, v, g, beta, MLXArray(Int32(T)), state, k, v, g, beta, aLog, dtBias,
-             MLXArray([Int32(Hv), Int32(Hv)]), MLXArray(Int32(0))],
+             MLXArray([Int32(Hv), Int32(Hv)]), noReplayKeep],
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
                 ("GATES_STORED", false), ("REPLAY_NEEDED", false),
+                ("SLOAD4", stagedWideLoads),
             ],
             grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1, T, Hv, Dv], [1], storeFinal ? state.shape : [1]],
@@ -809,7 +812,7 @@ enum Qwen35GDNReplayFused {
     /// The batch self-test's tapes (a/b column slices of one product, one row
     /// of saturating and infinite gate inputs) and a following window whose
     /// gates `Qwen35FusedElementwise.gatedDeltaGates` forms from such inputs.
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+    fileprivate static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
         let G = Qwen35GDNReplayBatch.layersPerLaunch
         let S = Qwen35GDNReplayBatch.selfTestRows
         let Hk = layer.numKHeads
@@ -979,6 +982,10 @@ extension Qwen35GDNReplayFused {
 
     /// Rows per staged window (the threadgroup buffers' size).
     static let stagedRows = 16
+    // The exact device trial may choose one state row per lane for staged
+    // kernels only. Nil follows the existing two/four-row selection.
+    nonisolated(unsafe) static var stagedRowsPerLane: Int?
+    nonisolated(unsafe) static var stagedWideLoads = false
 
     private static let stagedHeader = Qwen35GDNReplayBatch.header + """
         // float4 j of the 16-float k (or q) slice c of a staged row; the
@@ -1017,9 +1024,20 @@ extension Qwen35GDNReplayFused {
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          if (SLOAD4) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; i += 4) {
+              const float4 first = *(const device float4*)(ps + (n * Dv + dvbase + d) * Dk + dk0 + i);
+              state[d][i] = first.x;
+              state[d][i + 1] = first.y;
+              state[d][i + 2] = first.z;
+              state[d][i + 3] = first.w;
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < R; ++i) {
+              state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+            }
           }
         }
 
@@ -1327,7 +1345,7 @@ enum Qwen35GDNFullAcceptStore {
                     : "; the state skip stays on\n")).data(using: .utf8)!)
     }
 
-    private static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
+    fileprivate static func selfTest(layer: Qwen35GatedDeltaNet) -> (Bool, String) {
         let G = 4
         let S = Qwen35GDNVerifyStateSkip.selfTestRows
         let Hk = layer.numKHeads
@@ -2274,7 +2292,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -2710,6 +2728,125 @@ enum Qwen35RotationQ8Blocks {
             grid: (tpb * rows * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
             outputShapes: [x.shape, groupShape, groupShape],
             outputDTypes: [codesDType, .float32, .float32])
+    }
+
+    // Row is constant across the threadgroup. Padding exits before any
+    // input read or barrier; the real row retains the entire original body.
+    private static let paddedSource: String? = {
+        let anchor = "alignas(16) threadgroup float buf[N];"
+        guard source.components(separatedBy: anchor).count == 2 else { return nil }
+        let fill = """
+            if (row >= 1u) {
+              const uchar code = SIGNED ? uchar(0) : uchar(128);
+              for (uint word = tid; word < 256u; word += uint(TPB)) {
+                *(device uchar4*)(out + rowbase + bcol + 4u * word) = uchar4(code);
+              }
+              if (tid < 8u) {
+                const uint group = row * uint(W / 128) + bcol / 128u + tid;
+                qscale[group] = 1.0f;
+                qsum[group] = 0.0f;
+              }
+              return;
+            }
+
+            """
+        return source.replacingOccurrences(of: anchor, with: fill + anchor)
+    }()
+
+    private static let paddedKernel = paddedSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_signed_hadamard_1024_q8_blocks_padded",
+            inputNames: ["inp", "signs"], outputNames: ["out", "qscale", "qsum"],
+            source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let paddedLock = NSLock()
+    nonisolated(unsafe) private static var paddedVerdicts: [Form: Bool] = [:]
+
+    static func installPadded() {
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, layout, groupSize in
+            guard enabled, blockSize == 1024, groupSize == 128, layout == nil,
+                x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+                signs.dtype == .float32, signs.shape == [x.dim(1)],
+                Qwen35TensorPackedMatmul.signedCodes, let launch = paddedKernel
+            else { return nil }
+            let width = x.dim(1)
+            guard width > 0, width % 1024 == 0, width <= Int(Int32.max) / 16 else {
+                return nil
+            }
+            // Preserve the thread choice of the original sixteen-row launch.
+            let tpb = threads(blocks: 16 * (width / 1024))
+            let form = Form(
+                width: width, presigned: preSigned, gr: 1, gkh: 1, gd: 1,
+                perm: Qwen35TensorPackedMatmul.support == .staged8, mperm: false,
+                signed: true, dtype: "\(x.dtype)", tpb: tpb)
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", DType.float32), ("OutT", DType.int8), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", 1), ("PRESIGNED", preSigned ? 1 : 0),
+                ("GR", 1), ("GKH", 1), ("GD", 1), ("QSIM", 0),
+                ("PERM", form.perm ? 1 : 0), ("MPERM", 0), ("TPB", tpb),
+            ]
+            guard paddedVerified(form, signs: signs, template: template, launch: launch) else {
+                return nil
+            }
+            let outputs = launch(
+                [x, signs], template: template,
+                grid: (tpb * 16 * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
+                outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                outputDTypes: [.int8, .float32, .float32])
+            return SignedBlockHadamard.Int8Activation(
+                codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+    }
+
+    private static func paddedVerified(
+        _ form: Form, signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        launch: MLXFast.MLXFastKernel
+    ) -> Bool {
+        paddedLock.lock()
+        defer { paddedLock.unlock() }
+        if let verdict = paddedVerdicts[form] { return verdict }
+        var passed = false
+        do {
+            try withError { error in
+                guard let stock = SignedBlockHadamard.fusedTransformInt8 else { return }
+                let width = form.width
+                let random = MLXRandom.normal([1, width], key: MLXRandom.key(0x7168_7064))
+                let zero = MLXArray.zeros([1, width], dtype: .float32)
+                var checks: [MLXArray] = []
+                for row in [zero, random] {
+                    let input = concatenated(
+                        [row, MLXArray.zeros([15, width], dtype: .float32)], axis: 0)
+                    guard let reference = stock(input, signs, 1024, form.presigned, nil, 128),
+                        lock.withLock({ verdicts[form] == true })
+                    else { return }
+                    let candidate = launch(
+                        [row, signs], template: template,
+                        grid: (form.tpb * 16 * (width / 1024), 1, 1),
+                        threadGroup: (form.tpb, 1, 1),
+                        outputShapes: [[16, width], [16, width / 128], [16, width / 128]],
+                        outputDTypes: [.int8, .float32, .float32])
+                    let truth = [reference.codes, reference.scales, reference.scaledSums]
+                    for (old, new) in zip(truth, candidate) {
+                        guard old.shape == new.shape, old.dtype == new.dtype else { return }
+                        let bits: DType = old.dtype.size == 1 ? .uint8 : .uint32
+                        checks.append((old.view(dtype: bits) .!= new.view(dtype: bits))
+                            .asType(.int32).sum())
+                    }
+                }
+                eval(checks)
+                try error.check()
+                passed = checks.count == 6 && checks.allSatisfy { $0.item(Int32.self) == 0 }
+            }
+        } catch {}
+        if paddedVerdicts.count >= 16 { paddedVerdicts.removeAll(keepingCapacity: true) }
+        paddedVerdicts[form] = passed
+        FileHandle.standardError.write(
+            ("bonsai Q8 one-row padding (\(form.width), \(form.tpb)): "
+                + (passed ? "passed; padding filled in producer\n" : "failed; concat kept\n"))
+                .data(using: .utf8)!)
+        return passed
     }
 
     private enum SelfTestFailure: Error {
@@ -4462,6 +4599,10 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 ///   the same operands (1, 3 and 16 rows) bit for bit, then the derived
 ///   kernels' own self-tests (state skip, fused replay, full-accept store)
 ///   at 4 rows per lane, which must reach the verdicts they reached at 2.
+/// - `staged1`: one state row per lane in staged GDN kernels only. Both
+///   replay and final-state self-tests must match the existing kernels.
+/// - `staged1load4`, `staged2load4`, `staged4load4`: four-wide initial state
+///   loads with one, two or four staged rows per lane, with both self-tests.
 /// - `tpb128`, `wide128`: the per-block quantizing rotations
 ///   (`Qwen35RotationQ8Blocks`, plain and SwiGLU / attention-gate producer)
 ///   with 128 threads per 1024-block instead of 256, at most 128 blocks
@@ -4500,6 +4641,7 @@ enum Qwen35ExactFormTrial {
     static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
     static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
     static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
+    static let unfoldWanted = enabled && on("BONSAI_TRIAL_VERIFY_UNFOLD")
     static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
 
     /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
@@ -4556,6 +4698,42 @@ enum Qwen35ExactFormTrial {
                 })
             }
         }
+        if dvplWanted, Qwen35GDNReplayFused.stagedActive,
+            Qwen35GatedDeltaV3.rowsPerLaneForced == nil,
+            Qwen35GDNReplayFused.stagedRowsPerLane == nil, let layer = gdnLayer
+        {
+            Qwen35GDNReplayFused.stagedRowsPerLane = 1
+            let replay = Qwen35GDNReplayFused.selfTest(layer: layer)
+            let final = Qwen35GDNFullAcceptStore.selfTest(layer: layer)
+            Qwen35GDNReplayFused.stagedRowsPerLane = nil
+            let passed = replay.0 && final.0
+            checks.append(
+                "staged1 " + (passed ? "passed" : "FAILED")
+                    + " (replay: \(replay.1); final: \(final.1))")
+            if passed {
+                list.append(Arm(name: "staged1", knob: "dvpl") {
+                    Qwen35GDNReplayFused.stagedRowsPerLane = $0 ? 1 : nil
+                })
+            }
+            for rows in [1, 2, 4] {
+                Qwen35GDNReplayFused.stagedRowsPerLane = rows
+                Qwen35GDNReplayFused.stagedWideLoads = true
+                let replay = Qwen35GDNReplayFused.selfTest(layer: layer)
+                let final = Qwen35GDNFullAcceptStore.selfTest(layer: layer)
+                Qwen35GDNReplayFused.stagedRowsPerLane = nil
+                Qwen35GDNReplayFused.stagedWideLoads = false
+                let passed = replay.0 && final.0
+                checks.append(
+                    "staged\(rows)load4 " + (passed ? "passed" : "FAILED")
+                        + " (replay: \(replay.1); final: \(final.1))")
+                if passed {
+                    list.append(Arm(name: "staged\(rows)load4", knob: "dvpl") {
+                        Qwen35GDNReplayFused.stagedRowsPerLane = $0 ? rows : nil
+                        Qwen35GDNReplayFused.stagedWideLoads = $0
+                    })
+                }
+            }
+        }
         if rotationWanted, Qwen35RotationQ8Blocks.enabled {
             if Qwen35RotationQ8Blocks.smallThreadsForced == nil {
                 list.append(Arm(name: "tpb128", knob: "small") {
@@ -4577,6 +4755,22 @@ enum Qwen35ExactFormTrial {
                     Qwen35BoundaryBlocks.stock = $0
                 })
             }
+        }
+        if unfoldWanted, CBv2PromptCausalAttention.verifyFoldRepeats,
+            !CBv2PromptCausalAttention.verifyFoldRepeatsForced
+        {
+            if let check = CBv2PromptCausalAttention.checkVerifyUnfold() {
+                checks.append(
+                    "unfold " + (check.passed ? "passed" : "FAILED") + " (\(check.detail))")
+                if check.passed {
+                    list.append(Arm(name: "unfold", knob: "fold") {
+                        CBv2PromptCausalAttention.verifyFoldRepeats = !$0
+                    })
+                }
+            } else {
+                checks.append("unfold not offered (no verify block warm)")
+            }
+            Memory.clearCache()
         }
         guard list.count > 1 else {
             if !checks.isEmpty || enabled {

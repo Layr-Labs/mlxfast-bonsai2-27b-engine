@@ -39,6 +39,11 @@ public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
     func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
 }
 
+/// Exact first IDs for a captured greedy verify; nil keeps the top-two route.
+public protocol CBv2MTPPolicyFirstProviding: AnyObject {
+    func cbv2MTPFirst(_ logits: MLXArray) -> MLXArray?
+}
+
 /// Runtime availability for type-erased model adapters whose static wrapper
 /// type cannot express whether the wrapped target implements top-two.
 public protocol CBv2MTPPolicyTopTwoCapabilityProviding: AnyObject {
