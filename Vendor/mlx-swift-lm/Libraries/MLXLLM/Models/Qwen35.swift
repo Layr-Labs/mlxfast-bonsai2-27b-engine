@@ -418,6 +418,17 @@ enum Qwen35IO32 {
     }
 }
 
+/// Exact dead-work removals in the timed prompt forwards (default on;
+/// `MLXFAST_DW1=0` restores the record's launches): the prompt int8 kernels'
+/// guarded 32-bit twins and the final layer's last-row gate.
+enum MLXFastDW1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DW1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
 /// same order as the ops it replaces; fusion changes the dispatch count, not
@@ -2896,9 +2907,6 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
-            // A full verify window: the gated norm formed in out_proj's
-            // quantizing rotation (`Qwen35GDNNormFold`), the same values.
-            if let y = Qwen35GDNNormFold.apply(self, packed, out, gate: gate) { return y }
             // At verify width on the int8 route: the norm and the gated tail
             // in one launch (`Qwen35GatedNormTail`), the same values.
             if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
@@ -2978,7 +2986,6 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
         Qwen35GDNFullAcceptStore.prepare(layer: self)
-        Qwen35GDNNormFold.register(self)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
@@ -4446,7 +4453,11 @@ final class Qwen35Attention: Module {
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
                 .reshaped(B, 1, -1)
-            attendedGate = gate[0..., (qL - 1)..., 0...]
+            // `MLXFastDW1`: the last row's gate half reshaped alone (the same
+            // elements), not every row's reshaped into a copy and sliced.
+            attendedGate = MLXFastDW1.enabled
+                ? qSplit[1][0..., (qL - 1)..., 0..., 0...].reshaped(B, 1, -1)
+                : gate[0..., (qL - 1)..., 0...]
         } else {
             // Prompt width on the tensor route: the o_proj rotation reads the
             // attention's query blocks in place (`rowBlockActivation`), so they
@@ -4487,13 +4498,6 @@ final class Qwen35Attention: Module {
             if !exactTargetVerify, let packed = oProj as? HadamardQuantizedLinear,
                 let y = packed.applyAfterSigmoidGateHeads(
                     attended, gate: qSplit[1], widenOutput: false)
-            {
-                return y
-            }
-            // A full verify window on the int8 route: the gate formed in
-            // o_proj's quantizing rotation (`Qwen35ProducerFold`), the same values.
-            if !exactTargetVerify,
-                let y = Qwen35ProducerFold.sigmoidGate(oProj, attended, qSplit[1])
             {
                 return y
             }
@@ -4811,7 +4815,6 @@ extension Qwen3NextMLP {
             {
                 return y
             }
-            if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return y }
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
@@ -4845,7 +4848,6 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return y
         }
-        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return y }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
@@ -4886,7 +4888,6 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return (boundary.h, y)
         }
-        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return (boundary.h, y) }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
@@ -4929,7 +4930,6 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return (boundary.h, y)
         }
-        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return (boundary.h, y) }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
@@ -4999,7 +4999,6 @@ final class Qwen35DecoderLayer: Module {
         )
 
         super.init()
-        Qwen35ProducerFold.register(self)
     }
 
     func callAsFunction(
@@ -5200,10 +5199,6 @@ final class Qwen35DecoderLayer: Module {
                 boundary = fusedInputBoundary(x, pending)
                 input = boundary?.h ?? (x + pending)
             }
-        } else if captureRecurrentWindow, modelLayerIndex == 0, isLinear {
-            // Layer 0's norm of the FP16 embedding and its quantized rotation
-            // in one launch (`Qwen35Layer0InputGlue`).
-            boundary = Qwen35Layer0InputGlue.apply(x, inputLayerNorm, inputRotationSiblings)
         }
         let quantized = boundary?.activation
         let rotated = verifyBoundary?.rotated
@@ -6722,6 +6717,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6759,7 +6756,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 

@@ -178,6 +178,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
             }
+        } else {
+            // No deferred warm, no tiling trial: the 11-bit copies are not kept.
+            DFlash2Pack11.finish(adopting: false)
         }
         Stream().synchronize()
         Memory.clearCache()
