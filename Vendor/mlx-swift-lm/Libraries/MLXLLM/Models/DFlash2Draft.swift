@@ -3391,8 +3391,7 @@ enum DFlash2PackedWeights {
         let t = tiling ?? DFlash2TensorMatmul.swapTiling(k: c.source.dim(1), n: n, rows32: rows > 16, packed: true)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)] + geometry
-                + [("AHEAD", t.ahead ?? 1)],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)] + geometry + [("AHEAD", t.ahead ?? 1)],
             grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
