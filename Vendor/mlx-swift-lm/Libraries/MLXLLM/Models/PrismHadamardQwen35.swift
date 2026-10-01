@@ -107,7 +107,8 @@ enum Qwen35SmallNMatmul {
         """
 
     // One thread per output: the KS chunk partials loaded together (unrolled),
-    // then added in chunk order.
+    // then added in chunk order. Offsets below part.size ((K / 128) x 16 x N):
+    // 32-bit through `Qwen35IO32`, as the partial that writes them.
     private static let reduceSource = """
         const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
@@ -127,6 +128,12 @@ enum Qwen35SmallNMatmul {
         ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
+        source: Qwen35IO32.narrow(reduceSource, count: 1, "qwen35_splitk_reduce"),
+        ensureRowContiguous: false)
+    // Keep the original index width for an oversized partial buffer. The
+    // pinned 16 x 96 x 40 product fits; this checks metadata without eval.
+    private static let reduceWideKernel = MLXFast.metalKernel(
+        name: "qwen35_splitk_reduce_wide", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
 
     static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
@@ -174,7 +181,8 @@ enum Qwen35SmallNMatmul {
     /// `after` is the record's unread `dep` input (`overlap`): the reduce is
     /// encoded after the qkv|z product, so the partial runs beside it.
     static func reduce(_ p: Partials, after: MLXArray? = nil) -> MLXArray {
-        let y = reduceKernel(
+        let kernel = p.part.size <= Int(Int32.max) ? reduceKernel : reduceWideKernel
+        let y = kernel(
             [p.part, p.dims, (overlap ? after : nil) ?? p.dims], template: [("KS", p.chunks)],
             grid: ((p.rows * p.n + 31) / 32 * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[p.rows, p.n]], outputDTypes: [.float32])[0]

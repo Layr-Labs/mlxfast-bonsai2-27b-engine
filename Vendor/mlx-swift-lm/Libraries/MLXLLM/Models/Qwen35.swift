@@ -6687,6 +6687,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit output offsets (`Qwen35IO32`): q.size and k.size bound the
+/// head-major outputs at launch. Strided input address arithmetic stays wide.
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6724,7 +6726,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
@@ -6763,6 +6765,7 @@ extension Qwen35AttentionPrework {
         let HK = k.dim(2)
         let D = q.dim(3)
         guard let kernel = lastRowsKernel, k.dim(0) == B, k.dim(3) == D, Lq > 0, Lq <= Lk,
+            q.size > 0, k.size > 0, q.size <= Int(Int32.max), k.size <= Int(Int32.max),
             Lk < 65536, q.dtype == k.dtype, [DType.float32, .float16, .bfloat16].contains(q.dtype),
             wq.dtype == .float32, wk.dtype == .float32, wq.shape == [D], wk.shape == [D],
             offsets.dtype == .int32, offsets.ndim <= 1, offsets.size == 1 || offsets.size == B
