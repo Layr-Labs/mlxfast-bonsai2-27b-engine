@@ -3381,6 +3381,182 @@ enum DFlash2PackedWeights {
         return launch(a, c, rows: 32, outputDType: outputDType)
     }
 
+    // One device-count branch for the padded context FC. Keep the original
+    // sixteen-row body byte-for-byte in the >8 arm; the <=8 arm uses an
+    // eight-row right operand, with the same packed left operand and K order.
+    // Changing tensor geometry may change its operand mapping or numerics:
+    // actual-weight product checks below must pass before this can be used.
+    private static let contextHalfSource: String = {
+        let small = source
+            .replacingOccurrences(of: "COLS, 16, KS", with: "COLS, 8, KS")
+            .replacingOccurrences(of: "slice<KS, 16>", with: "slice<KS, 8>")
+            .replacingOccurrences(of: "red[SPLITS - 1][16 * COLS]", with: "red[SPLITS - 1][8 * COLS]")
+            .replacingOccurrences(
+                of: "const uint16_t cap = cT.get_capacity();",
+                with: """
+                // Decode only when the eight-row left operand has exactly
+                // the baseline packed encoder's per-lane coordinate mapping.
+                // Capacity equality alone cannot establish that property.
+                constexpr auto packedDesc = mpp::tensor_ops::matmul2d_descriptor(
+                    COLS, 16, KS, false, true, false,
+                    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+                mpp::tensor_ops::matmul2d<packedDesc, metal::execution_simdgroup> packedOp;
+                auto packedLeft = packedOp.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+                bool layoutSame = lw.get_capacity() == KT && packedLeft.get_capacity() == KT
+                    && cT.get_capacity() * 32 <= 8 * COLS;
+                if (layoutSame) {
+                  #pragma clang loop unroll(full)
+                  for (uint16_t j = 0; j < KT; j++) {
+                    auto oldIndex = packedLeft.get_multidimensional_index(j);
+                    auto newIndex = lw.get_multidimensional_index(j);
+                    layoutSame = layoutSame && oldIndex[0] == newIndex[0] && oldIndex[1] == newIndex[1];
+                  }
+                }
+                // Metadata depends on lane and static geometry, never sg or
+                // data. simd_all gives the same verdict to all lanes and all
+                // simdgroups before the shared-reduction barrier can be reached.
+                layoutSame = simd_all(layoutSame);
+                if (!layoutSame) {
+                  for (int j = int(sg * 32 + lane); j < 16 * COLS; j += SPLITS * 32) {
+                    out[(IndexT)(j / COLS) * N + n0 + j % COLS] = OutT(0.0f);
+                  }
+                  return;
+                }
+                const uint16_t cap = cT.get_capacity();
+                """)
+            .replacingOccurrences(
+                of: "out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v);",
+                with: """
+                out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v);
+                out[(IndexT)(idx[0] + 8) * N + n0 + idx[1]] = OutT(0.0f);
+                """)
+        // confirmed is a single immutable device word: every lane and group
+        // follows the same branch, including every threadgroup barrier.
+        return "if (confirmed[0] >= 1 && confirmed[0] <= 8) {\n" + small
+            + "\n} else {\n" + source + "\n}\n"
+    }()
+
+    private static let contextHalfKernel = MLXFast.metalKernel(
+        name: "dflash2_pack12_context_half_m16",
+        inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "confirmed"],
+        outputNames: ["out"], source: contextHalfSource, header: header, ensureRowContiguous: true)
+
+    static let contextHalfEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_DFLASH_CONTEXT_HALF"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    struct ContextHalfChoice {
+        let source: MLXArray
+        let tiling: DFlash2TensorMatmul.SwapTiling
+    }
+
+    private static func contextHalfLaunch(
+        _ a: MLXArray, _ c: Copy, confirmed: MLXArray,
+        outputDType: DType, tiling t: DFlash2TensorMatmul.SwapTiling
+    ) -> MLXArray {
+        contextHalfKernel(
+            [a] + c.arrays + [dims(c.source), confirmed.reshaped([1])],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)]
+                + geometry + [("AHEAD", t.ahead ?? 1)],
+            grid: (c.source.dim(0) / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
+            outputShapes: [[16, c.source.dim(0)]], outputDTypes: [outputDType])[0]
+    }
+
+    static func applyContextHalf(
+        _ x: MLXArray, weight: MLXArray, confirmed: MLXArray, choice: ContextHalfChoice
+    ) -> MLXArray? {
+        guard contextHalfEnabled, choice.source === weight,
+            x.dtype == .bfloat16, x.shape == [1, 16, 25600], weight.shape == [5120, 25600],
+            confirmed.dtype == .int32, confirmed.size == 1, let c = copy(of: weight), c.arrays.count == 6,
+            DFlash2TensorMatmul.swapTiling(k: 25600, n: 5120, rows32: false, packed: true) == choice.tiling
+        else { return nil }
+        return contextHalfLaunch(x.reshaped(16, 25600), c, confirmed: confirmed,
+            outputDType: .bfloat16, tiling: choice.tiling).reshaped(1, 16, 5120)
+    }
+
+    /// Production startup only. Use this exact FC's real lossless copy and
+    /// adopted tiling. Check every output row (including zero padding), both
+    /// output dtypes, then the real hiddenNorm for all 16 confirmed counts.
+    /// Single chained graphs, not many independent launches, time adoption.
+    static func prepareContextHalf(weight: MLXArray, norm: RMSNorm) -> ContextHalfChoice? {
+        guard contextHalfEnabled, weight.dtype == .bfloat16, weight.shape == [5120, 25600],
+            norm.weight.dtype == .bfloat16, norm.weight.shape == [5120],
+            let c = copy(of: weight), c.arrays.count == 6
+        else { return nil }
+        let t = DFlash2TensorMatmul.swapTiling(k: 25600, n: 5120, rows32: false, packed: true)
+        guard [2, 4, 8].contains(t.splits), t.fits(k: 25600), (0 ... 2).contains(t.ahead ?? 1)
+        else { return nil }
+        var same = true
+        let warm = MLXRandom.normal([16, 25600], key: MLXRandom.key(0xc081eed)).asType(.bfloat16)
+        let indices = MLXArray(Int32(0) ..< Int32(16)).reshaped(16, 1)
+        do {
+            try withError { error in
+                for pattern in 0 ..< 3 {
+                    let input: MLXArray
+                    if pattern == 0 { input = warm }
+                    else if pattern == 1 {
+                        input = (MLXRandom.normal([16, 25600], key: MLXRandom.key(0xc082eed)) * 8)
+                            .asType(.bfloat16)
+                    } else {
+                        input = broadcast(MLX.where(indices % 2 .== 0,
+                            MLXArray(Float(-0.0)), MLXArray(Float(0.0))), to: [16, 25600]).asType(.bfloat16)
+                    }
+                    for count in 1 ... 16 {
+                        let cdev = MLXArray([Int32(count)])
+                        let masked = which(indices .< cdev.reshaped([]), input,
+                            MLXArray.zeros([1, 1], dtype: .bfloat16))
+                        for dt in [DType.float32, DType.bfloat16] {
+                            let stock = launch(masked, c, rows: 16, outputDType: dt, tiling: t)
+                            let fast = contextHalfLaunch(masked, c, confirmed: cdev, outputDType: dt, tiling: t)
+                            let bits: DType = dt == .float32 ? .uint32 : .uint16
+                            same = same && all(stock.view(dtype: bits) .== fast.view(dtype: bits)).item(Bool.self)
+                            if dt == .bfloat16 {
+                                same = same && all(norm(stock.reshaped(1, 16, 5120)).view(dtype: .uint16)
+                                    .== norm(fast.reshaped(1, 16, 5120)).view(dtype: .uint16)).item(Bool.self)
+                            }
+                            if !same { return }
+                        }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        guard same else {
+            FileHandle.standardError.write(Data("dflash2 context half: actual-weight bits failed; stock kept\n".utf8))
+            return nil
+        }
+        // Next projection depends on the preceding actual normalized result.
+        // Repeating its five target-tap-width groups models K without any
+        // request/token cache. Both arms construct the identical chain.
+        let builders = [false, true].map { half in
+            { () -> [MLXArray] in
+                var a = warm
+                var last = warm
+                for count in [1, 8, 16, 9, 4, 16, 8, 1] {
+                    let cdev = MLXArray([Int32(count)])
+                    let masked = which(indices .< cdev.reshaped([]), a,
+                        MLXArray.zeros([1, 1], dtype: .bfloat16))
+                    let y = half
+                        ? contextHalfLaunch(masked, c, confirmed: cdev, outputDType: .bfloat16, tiling: t)
+                        : launch(masked, c, rows: 16, outputDType: .bfloat16, tiling: t)
+                    last = norm(y.reshaped(1, 16, 5120)).reshaped(16, 5120)
+                    a = concatenated([last, last, last, last, last], axis: 1)
+                }
+                return [last]
+            }
+        }
+        let first = DFlash2LaunchTrial.race(builders, copies: 1, samples: 11)
+        guard first.count == 2, first.allSatisfy({ $0.isFinite && $0 > 0 }), first[1] < first[0] * 0.98
+        else { return nil }
+        let reverse = DFlash2LaunchTrial.race(Array(builders.reversed()), copies: 1, samples: 11)
+        guard reverse.count == 2, reverse.allSatisfy({ $0.isFinite && $0 > 0 }), reverse[0] < reverse[1] * 0.98
+        else { return nil }
+        FileHandle.standardError.write(Data(
+            "dflash2 context half: all-count raw/norm bits and two chained 2% races passed; pending block guard\n".utf8))
+        return ContextHalfChoice(source: weight, tiling: t)
+    }
+
     /// The swapped kernel's grid (`launch`, `launch32`) over the copy, with
     /// `tiling` or the shape's (`DFlash2TensorMatmul.swapTiling`: the stock
     /// split and one tile ahead unless a forced choice or its trial set another).
@@ -5058,8 +5234,18 @@ public enum DFlash2ResidencyPrefetch {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// The prompt layers after which one group each is due.
-    static let dueAfterLayers = [8, 16, 32, 48]
+    /// Pending Subflatus3 residency schedule experiment: bind behind deeper
+    /// prompt queues, with two groups at layer 48. All groups remain inside
+    /// the request and submitRemaining still drains them before the forward
+    /// ends. No timing gain has been measured here. The previous schedule is
+    /// restored with DARKBLOOM_DFLASH2_RESIDENCY_DUE=8,16,32,48.
+    static let dueAfterLayers: [Int] = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_RESIDENCY_DUE"] {
+            let layers = raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if !layers.isEmpty, layers.allSatisfy({ $0 > 0 }), layers == layers.sorted() { return layers }
+        }
+        return [16, 32, 48, 48]
+    }()
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var groups: [[MLXArray]] = []
@@ -5194,6 +5380,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "layers") private var layers: [DFlash2DecoderLayer]
     @ModuleInfo public var norm: RMSNorm
     @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
+
+    private var contextHalfChoice: DFlash2PackedWeights.ContextHalfChoice?
 
     private let rope: RoPELayer
     // Sliding masks depend only on block geometry. Keep the memo with the
@@ -5488,8 +5676,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// `hiddenNorm(fc(rows))`. `BONSAI_DRAFT_CONTEXT_PAD16=1` (validation aid)
     /// pads to 16 rows, as the tensor kernel does, so MLX's matmul (kernel by
     /// row count) gets the tensor route's row independence.
-    func contextProjection(_ targetHidden: MLXArray) -> MLXArray {
+    func prepareContextHalf() -> Bool {
+        contextHalfChoice = nil
+        guard fc.bias == nil, contextProjectionPadsRows else { return false }
+        contextHalfChoice = DFlash2PackedWeights.prepareContextHalf(weight: fc.weight, norm: hiddenNorm)
+        return contextHalfChoice != nil
+    }
+
+    func disableContextHalf() { contextHalfChoice = nil }
+
+    func contextProjection(_ targetHidden: MLXArray, confirmed: MLXArray? = nil) -> MLXArray {
         let rows = targetHidden.asType(dtype)
+        if let confirmed, let choice = contextHalfChoice, fc.bias == nil,
+            let product = DFlash2PackedWeights.applyContextHalf(rows, weight: fc.weight,
+                confirmed: confirmed, choice: choice)
+        {
+            return hiddenNorm(product)
+        }
         if DFlash2ContextPadding.enabled, rows.ndim == 3, rows.dim(1) < 16 {
             let padded = concatenated(
                 [rows, MLXArray.zeros([rows.dim(0), 16 - rows.dim(1), rows.dim(2)], dtype: rows.dtype)],
@@ -5630,7 +5833,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 ? which(
                     (MLXArray(Int32(0) ..< Int32(contextRows)) .< c).reshaped([1, contextRows, 1]),
                     verifyRows, MLXArray.zeros([1, 1, 1], dtype: verifyRows.dtype))
-                : verifyRows)
+                : verifyRows, confirmed: maskUnconfirmed ? c : nil)
         let base = concatenated(
             [context, MLXArray.zeros([1, n - contextRows, config.hiddenSize], dtype: context.dtype)],
             axis: 1)

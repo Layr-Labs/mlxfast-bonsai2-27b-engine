@@ -176,6 +176,21 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
+                // Context FC count pruning follows every existing tiling
+                // trial and can only live with the original speculation plan.
+                if self.speculationPlan != nil, self.drafter.prepareContextHalf() {
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableContextHalf()
+                        FileHandle.standardError.write(Data(
+                            "dflash2 context half: whole-block check failed (\(failure)); stock kept\n".utf8))
+                    } else {
+                        FileHandle.standardError.write(Data(
+                            "dflash2 context half: whole-block/cache/cursor bits passed; adopted\n".utf8))
+                    }
+                }
+                Stream().synchronize()
+                Memory.clearCache()
             }
         }
         Stream().synchronize()

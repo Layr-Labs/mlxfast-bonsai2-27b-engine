@@ -1011,7 +1011,7 @@ extension Qwen35GDNReplayFused {
         const uint dvbase = row0 + rbase;
         threadgroup float4 tk[16 * 32];
         threadgroup float4 tq[16 * 32];
-        threadgroup float tv[16 * DVPT];
+        alignas(16) threadgroup float tv[16 * DVPT];
         threadgroup float tgate[32];
 
         float state[DVPL][R];
@@ -1035,9 +1035,9 @@ extension Qwen35GDNReplayFused {
             const uint t = e >> 5, f = e & 31u;
             tk[t * 32u + qwen35_staged_slot(f >> 2, f & 3u)] = k4src[t * uint(Hk * Dk / 4) + f];
           }
-          for (uint e = tid; e < uint(KP) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
+          for (uint e = tid; e < uint(KP) * uint(DVPT / 4); e += NT) {
+            const uint t = e / uint(DVPT / 4), r = e % uint(DVPT / 4);
+            ((threadgroup float4*)tv)[e] = ((const device float4*)(pv + (t * Hv + hv_idx) * Dv + row0))[r];
           }
           if (tid < uint(KP)) {
             if (GATES_STORED) {
@@ -1115,9 +1115,9 @@ extension Qwen35GDNReplayFused {
             tk[slot] = k4src[t * uint(Hk * Dk / 4) + f];
             tq[slot] = q4src[t * uint(Hk * Dk / 4) + f];
           }
-          for (uint e = tid; e < uint(T) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = v[((b_idx * T + t) * Hv + hv_idx) * Dv + row0 + r];
+          for (uint e = tid; e < uint(T) * uint(DVPT / 4); e += NT) {
+            const uint t = e / uint(DVPT / 4), r = e % uint(DVPT / 4);
+            ((threadgroup float4*)tv)[e] = ((const device float4*)(v + ((b_idx * T + t) * Hv + hv_idx) * Dv + row0))[r];
           }
           if (tid < uint(T)) {
             tgate[tid] = g[(b_idx * T + tid) * Hv + hv_idx];
