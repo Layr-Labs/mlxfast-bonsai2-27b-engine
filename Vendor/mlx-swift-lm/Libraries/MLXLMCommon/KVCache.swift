@@ -823,12 +823,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         return MLXArray(result)
     }
 
-    static let firstAppend: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH2_KV_FIRST_APPEND"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
     /// Context rows held in the buffer (`offset` is absolute and may start
     /// past zero when the prompt was longer than the window).
     private var rows = 0
@@ -856,23 +850,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
             return nil
         }
         let end = rows + total
-        // The first write (the prompt's context rows) allocates both buffers
-        // and writes its rows in one launch (`CBv2KVFirstAppend`) instead of
-        // two zero-filled buffers and two slice updates: every view this cache
-        // hands out, and every read of the speculative block, stops at rows
-        // it has written, so the unwritten tail is never observed.
-        // `MLXFAST_DFLASH2_KV_FIRST_APPEND=0` keeps the zero-filled buffers.
-        if self.keys == nil, rows == 0, Self.firstAppend,
-            let (firstK, firstV) = CBv2KVFirstAppend.apply(
-                keys, values, capacity: Swift.max(end, maxCacheSize + blockRows))
-        {
-            self.keys = firstK
-            self.values = firstV
-            rows += contextRows
-            idx = rows
-            offset += contextRows
-            return (firstK[.ellipsis, ..<end, 0...], firstV[.ellipsis, ..<end, 0...])
-        }
         if self.keys == nil || self.keys!.dim(2) < end {
             let capacity = Swift.max(end, maxCacheSize + blockRows)
             let kShape = [keys.dim(0), keys.dim(1), capacity, keys.dim(3)]
@@ -1424,9 +1401,6 @@ open class ArraysCache: BaseKVCache {
         public let mask: MLXArray?
         public let rowCount: Int
         public let convStateRows: Int
-        /// Gates already formed by this verify's prework; nil for other tapes.
-        public let g: MLXArray?
-        public let beta: MLXArray?
 
         public init(
             convInput: MLXArray,
@@ -1438,9 +1412,7 @@ open class ArraysCache: BaseKVCache {
             ssmPre: MLXArray?,
             mask: MLXArray?,
             rowCount: Int,
-            convStateRows: Int,
-            g: MLXArray? = nil,
-            beta: MLXArray? = nil
+            convStateRows: Int
         ) {
             self.convInput = convInput
             self.q = q
@@ -1452,8 +1424,6 @@ open class ArraysCache: BaseKVCache {
             self.mask = mask
             self.rowCount = rowCount
             self.convStateRows = convStateRows
-            self.g = g
-            self.beta = beta
         }
     }
 

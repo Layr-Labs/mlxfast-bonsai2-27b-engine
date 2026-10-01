@@ -72,7 +72,7 @@ enum Qwen35SmallNMatmul {
         const int k0 = kc * 128;
         const uint t = thread_position_in_threadgroup.x;
         threadgroup float4 xs[16 * 32];
-        threadgroup float red[4 * 16 * 32];
+        threadgroup float red[4 * 16 * 33];
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 4; j++) {
           const uint i = t + 128 * j;
@@ -91,7 +91,7 @@ enum Qwen35SmallNMatmul {
           float acc = 0.0f;
           #pragma clang loop unroll(full)
           for (int j = 0; j < 8; j++) { acc += dot(xs[m * 32 + 8 * s + j], wv[j]); }
-          red[(s * 16 + m) * 32 + c] = acc;
+          red[(s * 16 + m) * 33 + c] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
@@ -99,8 +99,8 @@ enum Qwen35SmallNMatmul {
           const uint o = t + 128 * j;
           const int m = int(o >> 5); const int cc = int(o & 31);
           if (m < M) {
-            const float v = ((red[(0 * 16 + m) * 32 + cc] + red[(1 * 16 + m) * 32 + cc])
-                + red[(2 * 16 + m) * 32 + cc]) + red[(3 * 16 + m) * 32 + cc];
+            const float v = ((red[(0 * 16 + m) * 33 + cc] + red[(1 * 16 + m) * 33 + cc])
+                + red[(2 * 16 + m) * 33 + cc]) + red[(3 * 16 + m) * 33 + cc];
             part[((size_t)kc * M + m) * N + nb + cc] = v;
           }
         }
@@ -123,8 +123,7 @@ enum Qwen35SmallNMatmul {
 
     private static let partialKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_partial", inputNames: ["x", "w", "dims"], outputNames: ["part"],
-        source: Qwen35IO32.narrow(partialSource, count: 3, "qwen35_splitk_partial"),
-        ensureRowContiguous: true)
+        source: partialSource, ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
         source: reduceSource, ensureRowContiguous: false)
@@ -755,21 +754,15 @@ extension Qwen35GDNPrework {
         if loadsFirst {
             // q, k, v, g, beta, ci, ao, bo: the tail is the conv input's last
             // NK rows, as the reads-first launch returns it.
-            let lfShapes: [[Int]] = [
-                [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
-                [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
-                [B, KS - 1 + S, CD], [B, S, valueHeads], [B, S, valueHeads],
-            ]
-            // The value columns in their own threadgroups (same outputs).
-            let outputs =
-                Qwen35PreworkSplit.launch(
-                    inputs, template: template, keyHeads: keyHeads, valueHeads: valueHeads,
-                    S: S, B: B, outputShapes: lfShapes, dtype: qkv.dtype)
-                ?? launch(
-                    inputs, template: template,
-                    grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
-                    outputShapes: lfShapes,
-                    outputDTypes: Array(repeating: DType.float32, count: 8))
+            let outputs = launch(
+                inputs, template: template,
+                grid: (128 * keyHeads, S, B), threadGroup: (128, 1, 1),
+                outputShapes: [
+                    [B, S, keyHeads, headKDim], [B, S, keyHeads, headKDim],
+                    [B, S, valueHeads, headVDim], [B, S, valueHeads], [B, S, valueHeads],
+                    [B, KS - 1 + S, CD], [B, S, valueHeads], [B, S, valueHeads],
+                ],
+                outputDTypes: Array(repeating: DType.float32, count: 8))
             return Outputs(
                 q: outputs[0], k: outputs[1], v: outputs[2], g: outputs[3], beta: outputs[4],
                 tail: outputs[5][0..., S..., 0...], convInput: outputs[5],

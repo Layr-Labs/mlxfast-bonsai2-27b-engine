@@ -2,51 +2,10 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
-import Cmlx
 import Foundation
 import MLX
 
-/// A next block built before the readback that the round does not adopt is a
-/// whole drafter forward left unevaluated. Its graph used to be torn down when
-/// `finalizeMTPRound` returned, between the drafter's submission and the next
-/// verify build, on the host path the GPU waits on (about 0.1 ms of array
-/// releases on an M4 Max). It is held here instead and released at the end of
-/// the engine step, after the next round's graph is submitted. Nothing reads
-/// it: the same graphs are built and submitted in the same order, only the
-/// release moves. `MLXFAST_DEFER_BLOCK_RELEASE=0` releases it in place.
-enum CBv2MTPDeferredRelease {
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_DEFER_BLOCK_RELEASE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Engine-thread confined.
-    nonisolated(unsafe) private static var held: [AnyObject] = []
-
-    static func hold(_ object: AnyObject) { held.append(object) }
-
-    static func drain() {
-        if !held.isEmpty { held.removeAll(keepingCapacity: true) }
-    }
-}
-
 extension EngineLoopV2 {
-
-    /// `BONSAI_POLL_PACKET=0` sleeps on the acceptance packet's completion
-    /// event instead of polling it. Ported from ercumentyildirim's `cc0895d`
-    /// (run on the ranked box inside that submission): the step thread polls
-    /// an already-submitted packet so it wakes the instant the verify
-    /// finishes and stays on a clocked-up core for the finalize and the next
-    /// graph build, which sit on the GPU's critical path; the blocking read
-    /// below then returns at once. The spin is DEADLINE-BOUNDED: on a path
-    /// where the packet's graph was never submitted for evaluation, polling
-    /// could never become ready, so after a quarter of a second the poll
-    /// falls through to the blocking read, which forces the evaluation
-    /// exactly as the base does. No GPU work is added and no ordering
-    /// changes; outputs are bit-identical.
-    static let pollsAcceptancePacket: Bool =
-        ProcessInfo.processInfo.environment["BONSAI_POLL_PACKET"] != "0"
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -188,7 +147,7 @@ extension EngineLoopV2 {
             mtp.config.fixedDraftTokens == k, let metadata = verify.rows.first,
             // A row quoting the prompt looks its next ids up after the
             // readback instead (`CBv2PromptLookupDraft.skipEnabled`).
-            !CBv2PromptLookupDraft.holdsSpeculation(metadata.id),
+            !CBv2PromptLookupDraft.expectsPromptProposal(metadata.id),
             let state = metadata.assistantState, !step.discard.contains(metadata.id),
             let rec = scheduler.record(for: metadata.id),
             rec.request.maxTokens - rec.generatedTokenCount > 2 * k + 1,
@@ -207,19 +166,6 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
-        if Self.pollsAcceptancePacket {
-            // Deadline-bounded poll (see `pollsAcceptancePacket`). The
-            // common path's packet is already submitted with the round
-            // graph, so this returns the moment its kernels complete; the
-            // bound only guards the never-submitted corner.
-            let pollDeadline = CFAbsoluteTimeGetCurrent() + 0.25
-            var available = false
-            while _mlx_array_is_available(&available, verify.acceptancePacket.ctx) == 0,
-                !available
-            {
-                if CFAbsoluteTimeGetCurrent() > pollDeadline { break }
-            }
-        }
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
@@ -367,11 +313,7 @@ extension EngineLoopV2 {
             if let speculation, speculation.id == id, finishReason == nil,
                 confirmed == accepted + 1, mtp.config.fixedDraftTokens == k,
                 rec.request.maxTokens - rec.generatedTokenCount > k,
-                let state = metadata.assistantState,
-                // The lookup below runs first and hits: dropped, as if unbuilt.
-                !CBv2PromptLookupDraft.lookupPreempts(
-                    id, history: rec.tokens, promptLength: rec.request.promptTokens.count,
-                    depth: k)
+                let state = metadata.assistantState
             {
                 adoptedProposal = speculation.drafter.adoptSpeculativeBlock(
                     speculation.block, confirmed: confirmed, requestState: state)
@@ -531,7 +473,7 @@ extension EngineLoopV2 {
                         anchor: anchor, depth: k, requestState: state)
                 }
                 if let tokens = promptProposal {
-                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true, host: true)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: true)
                     CBv2VerifyQueueHint.markNothingAhead()
                     earlyBlock = CBv2MTPEarlyBlockProposal(
                         tokens: tokens, depth: k, anchor: anchor, kvOffset: kvOffset)
@@ -541,16 +483,9 @@ extension EngineLoopV2 {
                     let tokens = CBv2PromptLookupDraft.override(
                         drafted, history: rec.tokens,
                         promptLength: rec.request.promptTokens.count, depth: k)
-                    // The splice's flag is evaluated with the block, so the
-                    // next finalize reads it without waiting for the verify.
-                    let span = CBv2PromptLookupDraft.lastSpliceFound
-                    CBv2PromptLookupDraft.noteProposal(
-                        id, fromPrompt: tokens !== drafted,
-                        host: CBv2PromptLookupDraft.lastOverrideWasHostLookup, span: span)
+                    CBv2PromptLookupDraft.noteProposal(id, fromPrompt: tokens !== drafted)
                     block.trimBlockState(state, toCommittedLength: kvOffset)
-                    let targets =
-                        [tokens, drafted] + (span.map { [$0] } ?? [])
-                        + block.evaluationTargets(for: state)
+                    let targets = [tokens, drafted] + block.evaluationTargets(for: state)
                     if leading != nil {
                         deferredDraftTargets = targets
                     } else {
@@ -682,13 +617,6 @@ extension EngineLoopV2 {
                     kvOffset: rec.numComputedTokens,
                     earlyBlock: earlyBlock)
             }
-        }
-
-        // An unadopted next block is released after the next submission
-        // (`CBv2MTPDeferredRelease`); an adopted one is referenced anyway.
-        if CBv2MTPDeferredRelease.enabled, let block = speculation?.block {
-            CBv2MTPDeferredRelease.hold(block)
-            speculation = nil
         }
 
         // Verify rows emitted tokens without passing through the sampler;
