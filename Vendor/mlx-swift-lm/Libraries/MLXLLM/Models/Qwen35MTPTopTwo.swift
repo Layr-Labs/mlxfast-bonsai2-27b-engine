@@ -2211,6 +2211,192 @@ enum Qwen35TensorPackedMatmul {
         header: header,
         ensureRowContiguous: true)
 
+    // Paired gate/up tiles use the TN64 dot body. Only the second tile's
+    // column address changes (N/2, not 32). Dots, affine FMAs, quarter folds
+    // and FP16 rounding are unchanged. A complete load-time matrix check
+    // and a 1% median speed gate protect adoption on the target GPU.
+    private static let gateUpTail = """
+        // the reduction reuses the staging buffers, in simdgroup order
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* red = (threadgroup float*)bs;
+        if (sg > 0) {
+          #pragma clang loop unroll(full)
+          for (int h = 0; h < 2; h++) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < CAP; i++) { red[((int(sg) - 1) * 2 + h) * (CAP * 32) + i * 32 + int(lane)] = acc[h][i]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i += 4) {
+            const int mh = (i >> 2) & 1;
+            const int nq = i >> 3;
+            float4 gu[2];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < 2; h++) {
+              float v0 = acc[h][i];
+              float v1 = acc[h][i + 1];
+              float v2 = acc[h][i + 2];
+              float v3 = acc[h][i + 3];
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 3; q++) {
+                v0 += red[(q * 2 + h) * (CAP * 32) + i * 32 + int(lane)];
+                v1 += red[(q * 2 + h) * (CAP * 32) + (i + 1) * 32 + int(lane)];
+                v2 += red[(q * 2 + h) * (CAP * 32) + (i + 2) * 32 + int(lane)];
+                v3 += red[(q * 2 + h) * (CAP * 32) + (i + 3) * 32 + int(lane)];
+              }
+              gu[h] = float4(half4(half(v0), half(v1), half(v2), half(v3)));
+            }
+            const int col = n0 + fn + 16 * nq;
+            const size_t base = (size_t)(fm + 8 * mh) * (N / 2) + col;
+            float4 result;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; j++) {
+              const float g = gu[0][j];
+              const float sy = 1 / (1 + metal::exp(metal::abs(g)));
+              const float sig = g < 0 ? sy : 1 - sy;
+              result[j] = ((g * sig) * gu[1][j]) * signs[col + j];
+            }
+            *(device float4*)(out + base) = result;
+          }
+        }
+        """
+
+    private static let gateUpSource: String? = {
+        let anchor = "// the reduction reuses the staging buffers, in simdgroup order"
+        let parts = sourceNarrowInt8Zoo.components(separatedBy: anchor)
+        guard parts.count == 2 else { return nil }
+        var text = parts[0]
+        for (old, new) in [
+            ("int(threadgroup_position_in_grid.x) * TN", "int(threadgroup_position_in_grid.x) * 32"),
+            ("const size_t hstride = (size_t)Kg * 256;",
+             "const size_t hstride = (size_t)(N / 64) * (size_t)Kg * 256;"),
+            ("n0 + 32 * h + fn", "n0 + (N / 2) * h + fn"),
+        ] {
+            guard text.components(separatedBy: old).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        return text + gateUpTail
+    }()
+
+    private static let gateUpKernel: MLXFast.MLXFastKernel? = gateUpSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_verify_gate_up_epilogue",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz", "signs"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let gateUpEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_GATE_UP_EPILOGUE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private struct GateUpPick {
+        let reference: NarrowKernel
+        let pd: Int, kh: Int
+    }
+    nonisolated(unsafe) private static var gateUpPick: GateUpPick?
+
+    private static func launchGateUp(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, _ signs: MLXArray,
+        k: Int, n: Int, form: NarrowEpilogue, pd: Int, kh: Int
+    ) -> MLXArray? {
+        gateUpKernel?(
+            [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: 16, n: n), signs],
+            template: [
+                ("OutT", DType.float16), ("NEG", form == .base ? 0 : 1),
+                ("F32S", form == .negativeBiasF32Scales ? 1 : 0),
+                ("PD", pd), ("TN", 64), ("KH", kh), ("AM", 0),
+            ],
+            grid: (n / 64 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[16, n / 2]], outputDTypes: [.float32])[0]
+    }
+
+    /// Load-time only, synthetic stored weights. A changed in-situ kernel
+    /// pick declines rather than assuming the new baseline is slower.
+    private static func prepareGateUp() {
+        guard gateUpEnabled, narrowTiled, gateUpKernel != nil else { return }
+        let reference = narrowByShape[[5120, 34816]] ?? narrowDefault
+        var detail = "not adopted"
+        do {
+            try withError { error in
+                let ops = (0 ..< 2).map { NarrowOperands(k: 5120, n: 34816, seed: 9120 + UInt64($0)) }
+                let signs = which(
+                    MLXRandom.normal([17408], key: MLXRandom.key(9122)) .< 0,
+                    MLXArray(Float(-1)), MLXArray(Float(1)))
+                eval(signs)
+                func composed(_ o: NarrowOperands, _ choice: NarrowKernel, stored: Bool = false) -> MLXArray {
+                    let wide = o.run(choice, .float16, tiled: !stored)
+                    let pair = wide.split(parts: 2, axis: -1)
+                    return Qwen35FusedElementwise.swigluSigned(pair[0], pair[1], signs)
+                }
+                func fused(_ o: NarrowOperands, pd: Int, kh: Int) -> MLXArray? {
+                    let f = reference.form
+                    let s = f == .negativeBiasF32Scales ? o.scalesT32 : o.scalesT
+                    return launchGateUp(
+                        o.codes, o.tiledWeight, s, f == .base ? o.biasesT : s,
+                        o.ascale, o.rowsum, signs, k: o.k, n: o.n, form: f, pd: pd, kh: kh)
+                }
+                let refs = ops.map { composed($0, .original, stored: true) }
+                eval(refs)
+                var valid: [(Int, Int)] = []
+                for (pd, kh) in [(1, 32), (2, 32), (1, 64)] {
+                    let passed = try? withError { scoped -> Bool in
+                        for (o, ref) in zip(ops, refs) {
+                            guard let y = fused(o, pd: pd, kh: kh) else { return false }
+                            let bad = (y.view(dtype: .uint32) .!= ref.view(dtype: .uint32)).asType(.int32).sum()
+                            eval(bad)
+                            try scoped.check()
+                            if bad.item(Int32.self) != 0 { return false }
+                        }
+                        return true
+                    }
+                    if passed == true { valid.append((pd, kh)) }
+                }
+                guard !valid.isEmpty else {
+                    detail = "self-test failed or unsupported; composed path kept"
+                    return
+                }
+                for (o, ref) in zip(ops, refs) {
+                    let y = composed(o, reference)
+                    let bad = (y.view(dtype: .uint32) .!= ref.view(dtype: .uint32)).asType(.int32).sum()
+                    eval(bad)
+                    try error.check()
+                    guard bad.item(Int32.self) == 0 else { return }
+                }
+                var times = Array(repeating: [Double](), count: valid.count + 1)
+                for repetition in 0 ..< 11 {
+                    let order = repetition % 2 == 0 ? Array(times.indices) : Array(times.indices.reversed())
+                    for arm in order {
+                        let ys = arm == 0 ? ops.map { composed($0, reference) }
+                            : ops.compactMap { fused($0, pd: valid[arm - 1].0, kh: valid[arm - 1].1) }
+                        guard ys.count == ops.count else { return }
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(ys)
+                        let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 1000 / Double(ys.count)
+                        try error.check()
+                        if repetition >= 2 { times[arm].append(us) }
+                    }
+                }
+                let medians = times.map { $0.sorted()[$0.count / 2] }
+                let best = (1 ..< medians.count).min { medians[$0] < medians[$1] }!
+                if medians[best] <= medians[0] * 0.99 {
+                    gateUpPick = GateUpPick(reference: reference, pd: valid[best - 1].0, kh: valid[best - 1].1)
+                }
+                detail = String(
+                    format: "self-test passed (557056 values per body, uint32); composed %.2f us, paired %.2f us; %@",
+                    medians[0], medians[best], gateUpPick == nil ? "composed kept" : "paired adopted")
+            }
+        } catch {
+            gateUpPick = nil
+            detail = "error; composed path kept (\(error))"
+        }
+        Memory.clearCache()
+        FileHandle.standardError.write(Data(("bonsai verify gate/up epilogue: \(detail)\n").utf8))
+    }
+
     private static let kernelNarrowInt8Pair = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_m16_i8x",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
@@ -5414,6 +5600,32 @@ enum Qwen35TensorPackedMatmul {
                     k: k, n: n, outputDType: outputDType, kernel: choice, tiled: narrowTiled)
             }
             installNarrowChoice()
+            prepareGateUp()
+            HadamardQuantizedLinear.tensorPackedSwiGLU = {
+                activation, weight, scales, biases, signs, cache in
+                guard let pick = gateUpPick, !HadamardQuantizedLinear.narrowProducerActive,
+                    activation.codes.dtype == .int8, activation.codes.shape == [16, 5120],
+                    activation.scales.dtype == .float32, activation.scales.shape == [16, 40],
+                    activation.scaledSums.dtype == .float32, activation.scaledSums.shape == [16, 40],
+                    weight.dtype == .uint32, weight.shape == [34816, 320],
+                    scales.dtype == .float16, scales.shape == [34816, 40],
+                    biases.dtype == .float16, biases.shape == [34816, 40],
+                    signs.dtype == .float32, signs.shape == [17408]
+                else { return nil }
+                let choice = narrowKernel(
+                    cache, scales, biases, k: 5120, n: 34816, outputDType: .float16, materialize: false)
+                guard choice == pick.reference else { return nil }
+                recordVerifySite(cache, weight, scales, biases, k: 5120, n: 34816, outputDType: .float16)
+                let s = choice.form == .negativeBiasF32Scales
+                    ? narrowScalesF32(cache, scales, materialize: false)
+                    : cache.derived(scales, tag: 1) { $0.transposed(1, 0).contiguous() }
+                let b = choice.form == .base
+                    ? cache.derived(biases, tag: 2) { $0.transposed(1, 0).contiguous() } : s
+                return launchGateUp(
+                    activation.codes, narrowTiledWeight(cache, weight, materialize: false), s, b,
+                    activation.scales, activation.scaledSums, signs, k: 5120, n: 34816,
+                    form: choice.form, pd: pick.pd, kh: pick.kh)
+            }
         } else if verifyEnabled, verifyForm != .none {
             HadamardQuantizedLinear.tensorPackedMatmulNarrow = {
                 rotated, sums, weight, scales, biases, groupSize, outputDType, cache in

@@ -4865,8 +4865,15 @@ extension Qwen3NextMLP {
         guard
             let boundary = Qwen35FusedBoundaryQ8.apply(
                 x, r, gain: weight, unsignedGain: norm.weight, eps: norm.eps,
-                transform: transform, gainSigned: folds, writeNormed: false),
-            let shared = sharedHadamardProjectionsQuantized(
+                transform: transform, gainSigned: folds, writeNormed: false)
+        else { return nil }
+        if let signed = sharedHadamardSwiGLUQuantized(
+            boundary.activation, leading: Array(x.shape.dropLast()), siblings,
+            signs: down.transform.signVector)
+        {
+            return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
+        }
+        guard let shared = sharedHadamardProjectionsQuantized(
                 boundary.activation, leading: Array(x.shape.dropLast()), siblings,
                 widenOutput: false)
         else { return nil }
