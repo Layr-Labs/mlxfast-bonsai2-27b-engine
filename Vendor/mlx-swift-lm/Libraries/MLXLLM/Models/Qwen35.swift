@@ -5049,14 +5049,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5183,8 +5189,12 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -7558,6 +7568,28 @@ enum Qwen35FusedHadamard {
                 outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+        // The drafter head's BF16 rows, padded to `paddedRows` in the read
+        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
+        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
+        // the zero-row concatenation.
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, groupSize, paddedRows in
+            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
+                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
+            ]
+            return Qwen35RotationQ8Blocks.launchPadded(
+                x, signs, template: template, paddedRows: paddedRows, width: width,
+                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
         }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
