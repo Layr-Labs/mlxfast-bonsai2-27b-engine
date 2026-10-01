@@ -513,28 +513,14 @@ public enum CBv2MTPDraftBeforeReadback {
     public static let dumpsDrafts = ProcessInfo.processInfo.environment["BONSAI_DRAFT_DUMP"] == "1"
 }
 
-/// The decode window's exact dead-work removals (default on): the target ids
-/// and draft ids read back as they are instead of joined into one packet,
-/// the speculative block's accept walk in one launch, the splice's found
-/// flag from its pick launch, the block's constant zero and key bound, and
-/// FP16 rows joined straight into their BF16 consumer. Same values, fewer
-/// launches per round. `MLXFAST_DW2=0` restores the record's launches.
-public enum CBv2DW2 {
-    public static let enabled = !["0", "false", "no", "off"].contains(
-        ProcessInfo.processInfo.environment["MLXFAST_DW2"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
-}
-
 public protocol CBv2MTPSpeculativeBlock: AnyObject {}
 
 /// Builds the next round's block before the readback from device values; a
 /// round confirming `accepted + 1` columns on the early block path adopts it
 /// (that path's proposal and state, bit for bit), any other drops it.
 public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
-    /// `drafts` non-nil: the packet holds the target ids alone, the draft ids
-    /// are `drafts` (`CBv2DW2`).
     func speculateBlock(
-        acceptancePacket: MLXArray, drafts: MLXArray?, depth: Int, verifyContext: MLXArray,
+        acceptancePacket: MLXArray, depth: Int, verifyContext: MLXArray,
         requestState: any CBv2MTPRequestState,
         leadingLayersBeforeReadback: Int
     ) -> (any CBv2MTPSpeculativeBlock)?
@@ -545,6 +531,16 @@ public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
         _ block: any CBv2MTPSpeculativeBlock, confirmed: Int,
         requestState: any CBv2MTPRequestState
     ) -> MLXArray?
+
+    /// Whether the next block built from `verifyContext` reads the target's
+    /// taps behind it instead of the join itself (TAPJOIN). The verify then
+    /// leaves the join lazy: the taps are its own layer outputs, and a later
+    /// reader (the absorb of a block that is not adopted) evaluates the join.
+    func defersVerifyContext(_ verifyContext: MLXArray) -> Bool
+}
+
+extension CBv2MTPBlockSpeculation {
+    public func defersVerifyContext(_ verifyContext: MLXArray) -> Bool { false }
 }
 
 // MARK: - Config

@@ -267,7 +267,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     /// `positionOffsets + n`: on the host (the same int32 values, no
     /// launch; one array shared by every layer that holds them), or the
-    /// on-device add when `CBv2HostPositionOffsets` is off.
+    /// on-device add when `CBv2HostPositionOffsets` is off, made once for
+    /// the layers that hand in the same array (`CBv2SharedPositionAdvance`).
     private func advancePositionOffsets(by n: Int) {
         let advanced = hostPositionOffsets.map { $0 &+ Int32(n) }
         if CBv2HostPositionOffsets.enabled,
@@ -276,13 +277,84 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         {
             cachedPositionOffsets = CBv2HostPositionOffsets.array(advanced)
         } else {
-            cachedPositionOffsets = cachedPositionOffsets + Int32(n)
+            cachedPositionOffsets = CBv2SharedPositionAdvance.advance(cachedPositionOffsets, by: n)
         }
         hostPositionOffsets = advanced
     }
 
     private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
-        MLXArray(rows.map { Int32($0.absoluteOffset) })
+        CBv2SharedPositionAdvance.built(rows.map { Int32($0.absoluteOffset) })
+    }
+}
+
+/// The on-device `positionOffsets + L` of a step, made once for the layers
+/// that hand in the same array instead of once per layer (16 one-element
+/// launches in every verify window of the 27B, on the command buffer the
+/// acceptance readback waits on). Every layer of a step holds the same
+/// values, so a host rebuild hands them one array (`built`: the array built
+/// last, while the host values are the same) and an advance takes the add
+/// made last of that same array by the same `L` (`advance`). The memo holds
+/// its input, so no other array can take that identity, and arrays are
+/// never written in place, so what it returns is that input's add, values
+/// and dtype, whichever layer asks; a rebuild or rollback hands in another
+/// array and misses. The first reuse also runs the layer's own add and
+/// compares it bit for bit; a mismatch keeps one array and one add per
+/// layer for the process. `MLXFAST_SHARED_POSITION_ADVANCE=0` keeps them.
+enum CBv2SharedPositionAdvance {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_SHARED_POSITION_ADVANCE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var lastBuilt: (values: [Int32], array: MLXArray)?
+    nonisolated(unsafe) private static var lastAdvance:
+        (input: MLXArray, n: Int, output: MLXArray)?
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// `MLXArray(values)`: the array built last while the values are the same.
+    static func built(_ values: [Int32]) -> MLXArray {
+        guard enabled else { return MLXArray(values) }
+        return lock.withLock {
+            guard verdict != false else { return MLXArray(values) }
+            if let lastBuilt, lastBuilt.values == values { return lastBuilt.array }
+            let array = MLXArray(values)
+            lastBuilt = (values, array)
+            return array
+        }
+    }
+
+    /// `input + n`: the add made last when it was made of this array by `n`.
+    static func advance(_ input: MLXArray, by n: Int) -> MLXArray {
+        guard enabled, input.size > 0 else { return input + Int32(n) }
+        return lock.withLock {
+            guard verdict != false else { return input + Int32(n) }
+            if let last = lastAdvance, last.input === input, last.n == n {
+                if verdict == nil {
+                    let own = input + Int32(n)
+                    let same =
+                        own.shape == last.output.shape && own.dtype == last.output.dtype
+                        && (own .== last.output).all().item(Bool.self)
+                    let line =
+                        same
+                        ? "equals the layer's own add (\(own.size) \(own.dtype) bitwise); one add per step"
+                        : "differs from the layer's own add; one add per layer kept"
+                    FileHandle.standardError.write(
+                        Data("mlxfast shared position advance: first reuse \(line)\n".utf8))
+                    verdict = same
+                    if !same {
+                        lastBuilt = nil
+                        lastAdvance = nil
+                        return own
+                    }
+                }
+                return last.output
+            }
+            let output = input + Int32(n)
+            lastAdvance = (input, n, output)
+            return output
+        }
     }
 }
 
