@@ -910,33 +910,6 @@ public final class DFlash2BlockKVCache: RotatingKVCache {
         !rotating && contextRows >= 1 && rows + contextRows <= maxCacheSize
     }
 
-    /// The capacity `updateBlock`'s one-launch first append gives
-    /// `contextRows` context rows and no block, or nil when that write would
-    /// not take it (buffers already allocated, the rotating path owns the
-    /// state, the rows do not fit, or the first append is switched off).
-    public func firstAppendCapacity(contextRows: Int) -> Int? {
-        guard !rotating, self.keys == nil, rows == 0, contextRows >= 1,
-            contextRows <= maxCacheSize, Self.firstAppend, CBv2KVFirstAppend.ready
-        else { return nil }
-        return Swift.max(contextRows, maxCacheSize)
-    }
-
-    /// Takes `keys`/`values` (`[B, H, capacity, D]`, the first `contextRows`
-    /// rows written, as the first append leaves its buffers) as the buffers
-    /// and advances as that write does. Returns false, having changed
-    /// nothing, when the first append would not have been taken.
-    public func installFirst(keys: MLXArray, values: MLXArray, contextRows: Int) -> Bool {
-        guard let capacity = firstAppendCapacity(contextRows: contextRows),
-            keys.dim(2) == capacity, values.dim(2) == capacity
-        else { return false }
-        self.keys = keys
-        self.values = values
-        rows += contextRows
-        idx = rows
-        offset += contextRows
-        return true
-    }
-
     // Speculative block writes (`DFlash2DraftModel.proposeSpeculative`).
 
     /// Held context rows; nil once the rotating path owns the state.

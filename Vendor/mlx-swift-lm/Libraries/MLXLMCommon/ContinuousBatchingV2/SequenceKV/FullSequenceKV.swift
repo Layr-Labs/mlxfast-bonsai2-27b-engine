@@ -348,9 +348,6 @@ enum CBv2KVFirstAppend {
         return (outputs[0], outputs[1])
     }
 
-    /// Whether `apply` takes its launch (switched on and self-tested).
-    static var ready: Bool { enabled && verified }
-
     static func apply(_ k: MLXArray, _ v: MLXArray, capacity: Int) -> (MLXArray, MLXArray)? {
         guard enabled, k.ndim == 4, v.ndim == 4, k.shape == v.shape, k.dtype == v.dtype,
             k.dim(0) == 1, k.dim(3) <= 1024, capacity >= k.dim(2), k.dim(2) > 0,
