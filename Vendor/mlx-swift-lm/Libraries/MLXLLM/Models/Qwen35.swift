@@ -7335,6 +7335,37 @@ enum Qwen35FusedHadamard {
           }
           return int64_t(c / uint(HD)) * st[2] + int64_t(c % uint(HD)) * st[3];
         }
+        // The 32-bit twins: every element offset below 2^31 (a negative
+        // stride or a span at or above it picks the 64-bit path), so the
+        // 32-bit forms address the same elements.
+        template <int NDIM>
+        inline bool bonsai_q8p_fits32(
+            const constant int* shape, const constant int64_t* st) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (st[d] < 0 || st[d] >= (int64_t(1) << 31)) { return false; }
+              span += ulong(shape[d] - 1) * ulong(st[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_row32(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return row * uint(st[0]);
+          }
+          const uint L = uint(shape[1]);
+          return (row / L) * uint(st[0]) + (row % L) * uint(st[1]);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_col32(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return c * uint(st[1]);
+          }
+          return (c / uint(HD)) * uint(st[2]) + (c % uint(HD)) * uint(st[3]);
+        }
 
         """
 
@@ -7358,8 +7389,12 @@ enum Qwen35FusedHadamard {
         // of each q|gate head, and the GDN z is a slice of qkv|z. None is
         // copied into a row-contiguous array first.
         const size_t rowbase = size_t(row) * size_t(W);
-        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
-        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)
+            && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);
+        const int64_t arow64 = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
+        const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const uint arow = uint(arow64);
+        const uint brow = uint(brow64);
         threadgroup float buf[N];
         threadgroup float inv_rms[8];
         if (PROD == 3) {
@@ -7377,7 +7412,7 @@ enum Qwen35FusedHadamard {
             float acc = 0.0f;
             #pragma clang loop unroll(full)
             for (int r = 0; r < 4; r++) {
-              const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
+              const float tx = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, c0 + uint(r))) : arow64 + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r)))]);
               acc += tx * tx;
             }
             acc = simd_sum(acc);
@@ -7401,8 +7436,8 @@ enum Qwen35FusedHadamard {
               const uint rr = hr % uint(GR);
               src = (rr * uint(GKH) + h) * uint(GD) + d;
             }
-            const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
-            const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
+            const float av = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, src)) : arow64 + bonsai_q8p_col<AHD>(a_strides, src))]);
+            const float bv = float(b[(p32 ? int64_t(brow + bonsai_q8p_col32<BHD>(b_strides, src)) : brow64 + bonsai_q8p_col<BHD>(b_strides, src))]);
             float v;
             if (PROD == 1) {
               v = (av * bonsai_sigmoid(av)) * bv;
@@ -7899,6 +7934,21 @@ extension Qwen35FusedHadamard {
           }
           return v;
         }
+        // The 32-bit twin (`p32` proven at the kernel's head): the same
+        // elements, addressed through 32-bit offsets.
+        template <int HD, typename T>
+        inline float4 bonsai_q8p_ld4_32(
+            const device T* p, uint rowoff, const constant int64_t* st, uint c, bool vec) {
+          if (vec) {
+            return bonsai_ld4(p + int64_t(rowoff + bonsai_q8p_col32<HD>(st, c)));
+          }
+          float4 v;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            v[r] = float(p[int64_t(rowoff + bonsai_q8p_col32<HD>(st, c + uint(r)))]);
+          }
+          return v;
+        }
 
         """
 
@@ -7910,7 +7960,7 @@ extension Qwen35FusedHadamard {
             return text.replacingOccurrences(of: target, with: replacement)
         }
         var text = sourceInt8Producer
-        let brow = "const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+        let brow = "const uint brow = uint(brow64);\n"
         text = replacing(
             text, brow,
             brow + """
@@ -7937,7 +7987,7 @@ extension Qwen35FusedHadamard {
                 float acc = 0.0f;
                 #pragma clang loop unroll(full)
                 for (int r = 0; r < 4; r++) {
-                  const float tx = float(a[arow + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r))]);
+                  const float tx = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, c0 + uint(r))) : arow64 + bonsai_q8p_col<AHD>(a_strides, c0 + uint(r)))]);
                   acc += tx * tx;
                 }
                 acc = simd_sum(acc);
@@ -7967,8 +8017,8 @@ extension Qwen35FusedHadamard {
                   const uint rr = hr % uint(GR);
                   src = (rr * uint(GKH) + h) * uint(GD) + d;
                 }
-                const float av = float(a[arow + bonsai_q8p_col<AHD>(a_strides, src)]);
-                const float bv = float(b[brow + bonsai_q8p_col<BHD>(b_strides, src)]);
+                const float av = float(a[(p32 ? int64_t(arow + bonsai_q8p_col32<AHD>(a_strides, src)) : arow64 + bonsai_q8p_col<AHD>(a_strides, src))]);
+                const float bv = float(b[(p32 ? int64_t(brow + bonsai_q8p_col32<BHD>(b_strides, src)) : brow64 + bonsai_q8p_col<BHD>(b_strides, src))]);
                 float v;
                 if (PROD == 1) {
                   v = (av * bonsai_sigmoid(av)) * bv;
@@ -8003,8 +8053,12 @@ extension Qwen35FusedHadamard {
                 const uint rr = hr % uint(GR);
                 src = (rr * uint(GKH) + h) * uint(GD) + d;
               }
-              const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
-              const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
+              const float4 a4 = p32
+                  ? bonsai_q8p_ld4_32<AHD>(a, arow, a_strides, src, AV)
+                  : bonsai_q8p_ld4<AHD>(a, arow64, a_strides, src, AV);
+              const float4 b4 = p32
+                  ? bonsai_q8p_ld4_32<BHD>(b, brow, b_strides, src, BV)
+                  : bonsai_q8p_ld4<BHD>(b, brow64, b_strides, src, BV);
               const float4 s4 = bonsai_ld4(signs + col);
               float inv = 0.0f;
               if (PROD == 3) {
@@ -8448,23 +8502,32 @@ extension Qwen35FusedHadamard {
     /// inputs `a0 ..`, at local row `row % BLR`; nil when the q8pv text no
     /// longer matches.
     private static func rowBlocksSource(_ count: Int) -> String? {
-        let arow = "const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);\n"
+        let arow = "const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)\n"
+            + "            && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);\n"
+            + "        const int64_t arow64 = bonsai_q8p_row<AHD>(a_shape, a_strides, row);\n"
+            + "        const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+            + "        const uint arow = uint(arow64);\n"
         let text = producerVecSource
         guard count >= 1, text.components(separatedBy: arow).count == 2,
-            text.components(separatedBy: "bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV)").count == 2
+            text.components(separatedBy: "bonsai_q8p_ld4<AHD>(a, arow64, a_strides, src, AV)").count == 2
         else { return nil }
         var select = """
             // The attention output as `count` row blocks of BLR rows, one shape
             // and one set of strides: row r is local row r % BLR of block r / BLR.
             const uint ablk = row / uint(BLR);
             const constant int64_t* a_strides = a0_strides;
+            const constant int* a_shape = a0_shape;
             auto a = a0;
 
             """
         for i in 1 ..< count {
             select += "if (ablk == \(i)u) { a = a\(i); }\n"
         }
-        select += "const int64_t arow = bonsai_q8p_row<AHD>(a0_shape, a_strides, row % uint(BLR));\n"
+        select += "const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)\n"
+            + "            && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);\n"
+            + "        const int64_t arow64 = bonsai_q8p_row<AHD>(a0_shape, a_strides, row % uint(BLR));\n"
+            + "        const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);\n"
+            + "        const uint arow = uint(arow64);\n"
         return text.replacingOccurrences(of: arow, with: select)
     }
 
