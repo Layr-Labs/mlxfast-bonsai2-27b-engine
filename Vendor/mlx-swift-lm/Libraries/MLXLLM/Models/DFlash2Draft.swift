@@ -1641,7 +1641,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_bf16_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1792,7 +1792,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m32s",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(sourceSwapped32, count: 2, "dflash2_bf16_matmul_m32s"),
+        source: Qwen35IO32.narrow(sourceSwapped32, count: 1, "dflash2_bf16_matmul_m32s"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1927,7 +1927,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: Qwen35IO32.narrow(variantSource, count: 4, "dflash2_bf16_matmul_m16_kvar"),
         header: header,
         ensureRowContiguous: true)
 
@@ -4508,6 +4508,23 @@ enum DFlash2GreedyWalk {
         let k = candidates.dim(2)
         let rank = projected.dim(-1)
         guard length >= 2, k >= 1, k <= 32, rank > 0 else { return nil }
+        // Only the measured singleton 15 x 16 x 256 BF16 selector uses the
+        // narrow parallel edges. Any other shape/dtype keeps its old path.
+        if narrowParallelSetting, parallelActive, length == 15, k == 16, rank == 256,
+            unary.ndim == 3, unary.dim(0) == 1, unary.dim(1) == length,
+            unary.dim(2) == k, unary.dtype == .float32,
+            projected.ndim == 3, projected.dim(0) == 1, projected.dim(1) == length,
+            projected.dtype == .bfloat16,
+            predecessorCodebook.ndim == 2, predecessorCodebook.dim(1) == rank,
+            predecessorCodebook.dtype == .bfloat16,
+            successorCodebook.ndim == 2, successorCodebook.dim(1) == rank,
+            successorCodebook.dtype == .bfloat16,
+            narrowParallelActive
+        {
+            return selectNarrowParallel(
+                candidates: candidates, unary: unary, projected: projected, anchor: anchor,
+                predecessorCodebook: predecessorCodebook, successorCodebook: successorCodebook)
+        }
         if narrowOperands, unary.ndim == 3, unary.dim(0) == 1, projected.ndim == 3,
             projected.dim(0) == 1, predecessorCodebook.dtype == successorCodebook.dtype,
             [DType.bfloat16, .float16, .float32].contains(predecessorCodebook.dtype),
@@ -4603,6 +4620,36 @@ enum DFlash2GreedyWalk {
             outputShapes: [[length]],
             outputDTypes: [.int32])[0]
     }
+
+    /// Keep the wide path's exact edge layout and FP32 table walk. Only the
+    /// first four operands differ: gathered BF16 rows instead of FP32 copies.
+    private static func walkNarrowParallel(
+        _ operands: [MLXArray], length: Int, k: Int, rank: Int
+    ) -> MLXArray {
+        let edges = k + (length - 1) * k * k
+        let table = narrowEdgeKernel(
+            operands,
+            template: [("L", length), ("K", k), ("R", rank)],
+            grid: (edges, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[edges]],
+            outputDTypes: [.float32])[0]
+        return tableKernel(
+            [table, operands[4], operands[5]],
+            template: [("L", length), ("K", k)],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[length]],
+            outputDTypes: [.int32])[0]
+    }
+
+    /// `MLXFAST_DFLASH_WALK_NARROW_PARALLEL=0` keeps the stock widened
+    /// parallel edges, independently of the older serial-narrow opt-in.
+    static let narrowParallelSetting: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_NARROW_PARALLEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     static let parallelSetting: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_WALK_PARALLEL"]?
@@ -4711,6 +4758,34 @@ enum DFlash2GreedyWalk {
             edges[gid] = edge;
             """)
 
+    private static let narrowEdgeKernel = MLXFast.metalKernel(
+        name: "mlxfast_dflash_walk_edges_bf16",
+        inputNames: [
+            "anchor_predecessor", "previous", "next", "projected", "unary", "cand",
+        ],
+        outputNames: ["edges"],
+        source: """
+            // Match edgeKernel's gid layout and left-to-right FP32 sum. Only
+            // the four gathered BF16 operands change; unary stays FP32 in
+            // the unchanged tableKernel, which owns weighting and tie breaks.
+            const uint gid = thread_position_in_grid.x;
+            if (gid >= uint(K + (L - 1) * K * K)) return;
+            uint i, p, c;
+            if (gid < uint(K)) { i = 0; p = 0; c = gid; }
+            else { const uint e = gid - K; i = 1 + e / (K * K); p = (e / K) % K; c = e % K; }
+            const uint pred_base = i == 0 ? 0 : ((i - 1) * K + p) * R;
+            const uint succ_base = (i * K + c) * R;
+            auto pred_ptr = (i == 0) ? anchor_predecessor : (previous + pred_base);
+            auto proj_ptr = projected + i * R;
+            auto succ_ptr = next + succ_base;
+            float edge = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint d = 0; d < R; d++) {
+                edge += (float(pred_ptr[d]) * float(proj_ptr[d])) * float(succ_ptr[d]);
+            }
+            edges[gid] = edge;
+            """)
+
     private static let tableKernel = MLXFast.metalKernel(
         name: "mlxfast_dflash_walk_table" + weightSuffix,
         inputNames: ["edges", "unary", "cand"],
@@ -4746,6 +4821,86 @@ enum DFlash2GreedyWalk {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
+    /// The parallel narrow path removes all four BF16-to-FP32 copies made by
+    /// selectWide. It keeps selectWide's FP32 unary and unchanged tableKernel.
+    private static func selectNarrowParallel(
+        candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
+        predecessorCodebook: MLXArray, successorCodebook: MLXArray
+    ) -> MLXArray {
+        let length = candidates.dim(1)
+        let k = candidates.dim(2)
+        let rank = projected.dim(2)
+        let c = candidates.squeezed(axis: 0)
+        let operands = [
+            take(predecessorCodebook, anchor, axis: 0).reshaped([-1]),
+            take(predecessorCodebook, c[0 ..< (length - 1)], axis: 0).reshaped([-1]),
+            take(successorCodebook, c, axis: 0).reshaped([-1]),
+            projected.squeezed(axis: 0).reshaped([-1]),
+            unary.squeezed(axis: 0).asType(.float32).reshaped([-1]),
+            c.asType(.uint32).reshaped([-1]),
+        ]
+        return walkNarrowParallel(operands, length: length, k: k, rank: rank)
+            .reshaped([1, length])
+    }
+
+    nonisolated(unsafe) private static var narrowParallelChecked = false
+    nonisolated(unsafe) private static var narrowParallelActive = false
+
+    /// Check complete Int32 paths bitwise against the stock widened parallel
+    /// path. Failure or a GPU error keeps the prior dispatch; never accept a
+    /// merely close FP score or a subset of matched positions.
+    private static func narrowParallelVerified() -> Bool {
+        narrowLock.withLock {
+            if narrowParallelChecked { return narrowParallelActive }
+            narrowParallelChecked = true
+            guard enabled, parallelActive, narrowParallelSetting else { return false }
+            var same = true
+            var walks = 0
+            do {
+                try withError { error in
+                    let (vocab, length, k, rank) = (4096, 15, 16, 256)
+                    for seed in 0 ..< 32 {
+                        func key(_ salt: Int) -> MLXArray {
+                            MLXRandom.key(UInt64(0x74a1 + seed * 8 + salt))
+                        }
+                        let pred = MLXRandom.normal([vocab, rank], key: key(0)).asType(.bfloat16)
+                        let succ = MLXRandom.normal([vocab, rank], key: key(1)).asType(.bfloat16)
+                        var proj = MLXRandom.normal([1, length, rank], key: key(2))
+                        if seed % 3 == 1 { proj = proj * 0.001 }
+                        let projected = proj.asType(.bfloat16)
+                        var una = MLXRandom.normal([1, length, k], key: key(3)) * 4
+                        if seed % 3 == 2 { una = MLX.floor(una) }
+                        let cand = MLXRandom.randInt(
+                            Int32(0) ..< Int32(vocab), [1, length, k], key: key(4))
+                            .asType(.uint32)
+                        let anchor = MLXArray([Int32(seed * 97 % vocab)])
+                        guard let wide = selectWide(
+                            candidates: cand, unary: una, projected: projected, anchor: anchor,
+                            predecessorCodebook: pred, successorCodebook: succ)
+                        else { same = false; return }
+                        let narrow = selectNarrowParallel(
+                            candidates: cand, unary: una, projected: projected, anchor: anchor,
+                            predecessorCodebook: pred, successorCodebook: succ)
+                        same = same && all(
+                            wide.view(dtype: .uint32) .== narrow.view(dtype: .uint32)).item(Bool.self)
+                        walks += 1
+                        if !same { break }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            narrowParallelActive = same
+            FileHandle.standardError.write(
+                ("dflash2 greedy walk BF16 parallel edges: "
+                    + (same
+                        ? "self-test passed: \(walks) walks of 15 ids bitwise identical; on\n"
+                        : "self-test failed; prior walk kept\n")).data(using: .utf8)!)
+            return same
+        }
+    }
+
     private static func selectNarrow(
         candidates: MLXArray, unary: MLXArray, projected: MLXArray, anchor: MLXArray,
         predecessorCodebook: MLXArray, successorCodebook: MLXArray
@@ -4773,6 +4928,11 @@ enum DFlash2GreedyWalk {
     /// Runs the narrow walk's self-test for these dtypes now (load time).
     static func prepare(codebook: DType, projected: DType, unary: DType) {
         _ = parallelVerified()
+        if codebook == .bfloat16, projected == .bfloat16, unary == .float32,
+            parallelActive, narrowParallelSetting
+        {
+            _ = narrowParallelVerified()
+        }
         guard enabled, narrowOperands else { return }
         _ = narrowVerified(codebook: codebook, projected: projected, unary: unary)
     }
