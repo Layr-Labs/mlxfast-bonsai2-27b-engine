@@ -177,6 +177,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
             }
+        } else {
+            // No deferred warm, no tiling trial: the 11-bit copies are not kept.
+            DFlash2Pack11.finish(adopting: false)
         }
         Stream().synchronize()
         Memory.clearCache()
@@ -971,24 +974,29 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// at `accepted`. Nothing may be pending: the confirmed columns are then
     /// exactly today's early block context.
     public func speculateBlock(
-        acceptancePacket packet: MLXArray, depth k: Int, verifyContext: MLXArray,
+        acceptancePacket packet: MLXArray, drafts: MLXArray?, depth k: Int, verifyContext: MLXArray,
         requestState: any CBv2MTPRequestState,
         leadingLayersBeforeReadback: Int
     ) -> (any CBv2MTPSpeculativeBlock)? {
         let state = self.state(requestState)
         guard let plan = speculationPlan, k + 2 == plan.classes.count, !state.isReleased,
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
-            packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
+            packet.ndim == 1, packet.dim(0) >= (drafts == nil ? 2 * k + 1 : k + 1),
+            packet.dtype == .int32
         else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
+        let targets = drafts == nil ? packet[k ..< (2 * k + 1)] : packet
+        let draftIDs = drafts ?? packet[0 ..< k]
+        let walk = CBv2DW2.enabled ? DFlash2AcceptWalk.launch(drafts: draftIDs, targets: targets, k: k) : nil
+        let accepted = walk != nil ? nil
+            : cumprod((draftIDs[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
+                .sum().asType(.int32)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                anchor: walk?.anchor ?? targets.take(accepted!.reshaped([1]), axis: 0),
+                confirmed: walk?.confirmed ?? (accepted! + MLXArray(Int32(1))),
+                verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
@@ -1094,7 +1102,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 b.lastConfirmed = c  // build this count's class
                 guard
                     let pending = speculateBlock(
-                        acceptancePacket: MLXArray(drafts + targets), depth: block - 1,
+                        acceptancePacket: MLXArray(CBv2DW2.enabled ? targets : drafts + targets),
+                        drafts: CBv2DW2.enabled ? MLXArray(drafts) : nil, depth: block - 1,
                         verifyContext: window, requestState: b,
                         leadingLayersBeforeReadback: CBv2MTPDraftBeforeReadback.leadingLayers),
                     let actual = adoptSpeculativeBlock(pending, confirmed: c, requestState: b)
@@ -1124,3 +1133,85 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         return (failure, compared)
     }
 }
+
+/// The block-before-readback's accept walk as one launch (`CBv2DW2`): the
+/// number `a` of leading draft ids equal to their target ids, then `a + 1`
+/// and the target id at `a`: the integers the record's compare, cast,
+/// cumulative product, sum, add and gather (six launches) produce.
+enum DFlash2AcceptWalk {
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_accept_walk", inputNames: ["drafts", "targets"],
+        outputNames: ["confirmed", "anchor"],
+        // (A thread attribute in the text: MLX's signature writer needs one when
+        // an input's strides are bound.)
+        source: """
+            if (thread_position_in_grid.x != 0) { return; }
+            const int ds = int(drafts_strides[0]), ts = int(targets_strides[0]);
+            int a = 0;
+            while (a < K && drafts[a * ds] == targets[a * ts]) { ++a; }
+            confirmed[0] = a + 1;
+            anchor[0] = targets[a * ts];
+            """,
+        ensureRowContiguous: false)
+
+    /// `(anchor [1], confirmed [])` for `k` drafts and `k + 1` targets (int32, 1-D), or nil.
+    static func launch(drafts: MLXArray, targets: MLXArray, k: Int)
+        -> (anchor: MLXArray, confirmed: MLXArray)?
+    {
+        guard k >= 1, drafts.ndim == 1, targets.ndim == 1, drafts.dim(0) >= k,
+            targets.dim(0) >= k + 1, drafts.dtype == .int32, targets.dtype == .int32, verified(k)
+        else { return nil }
+        return run(drafts, targets, k)
+    }
+
+    private static func run(_ drafts: MLXArray, _ targets: MLXArray, _ k: Int)
+        -> (anchor: MLXArray, confirmed: MLXArray)
+    {
+        let out = kernel(
+            [drafts, targets], template: [("K", k)], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[], [1]], outputDTypes: [.int32, .int32])
+        return (out[1], out[0])
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [Int: Bool] = [:]
+
+    /// Once per depth, on first use (the load-time speculation self-test):
+    /// every accepted count 0...k (confirmed 1...k + 1), the targets read
+    /// through a stride-2 view as the verify's top-two ids are, against the
+    /// record's six launches, bitwise. A failure keeps the six launches.
+    private static func verified(_ k: Int) -> Bool {
+        lock.withLock {
+            if let verdict = verdicts[k] { return verdict }
+            var same = true
+            do {
+                try withError { error in
+                    for a in 0 ... k {
+                        let t = (0 ... k).map { Int32(1000 + 7 * $0) }
+                        var d = Array(t[..<k])
+                        if a < k { d[a] &+= 1 }
+                        let targets = MLXArray(t.flatMap { [$0, -1] }, [k + 1, 2])[0..., 0]
+                        let drafts = MLXArray(d)
+                        let out = run(drafts, targets, k)
+                        let accepted = cumprod((drafts .== targets[0 ..< k]).asType(.int32), axis: 0)
+                            .sum().asType(.int32)
+                        let ok = all(out.confirmed .== accepted + MLXArray(Int32(1)))
+                            .&& all(out.anchor .== targets.take(accepted.reshaped([1]), axis: 0))
+                            .&& all(out.confirmed .== MLXArray(Int32(a + 1)))
+                        same = same && ok.item(Bool.self)
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            verdicts[k] = same
+            FileHandle.standardError.write(
+                Data(("dflash2 one-launch accept walk (k=\(k)): "
+                    + (same ? "self-test passed (accepted 0-\(k), bitwise)\n"
+                        : "self-test failed; the six launches kept\n")).utf8))
+            return same
+        }
+    }
+}
+// A further box reading of i34-9's f2cb82e5 tree on the 4dfa2b97 record.
