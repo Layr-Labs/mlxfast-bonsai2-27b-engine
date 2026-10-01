@@ -5669,12 +5669,17 @@ private enum DFlash2ResidencyTouch {
     /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
     static let inputs = 24
 
+    static let name = "dflash2_residency_touch"
+    static let source: String = {
+        let reads = (0 ..< inputs).map { "acc += static_cast<float>(w\($0)[0]);" }.joined(separator: "\n")
+        return "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n"
+    }()
+
     private static let kernel: MLXFast.MLXFastKernel = {
         let names = (0 ..< inputs).map { "w\($0)" }
-        let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }.joined(separator: "\n")
         return MLXFast.metalKernel(
-            name: "dflash2_residency_touch", inputNames: names, outputNames: ["out"],
-            source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
+            name: name, inputNames: names, outputNames: ["out"],
+            source: source,
             ensureRowContiguous: false)
     }()
 
@@ -5684,22 +5689,36 @@ private enum DFlash2ResidencyTouch {
             outputShapes: [[1]], outputDTypes: [.float32])[0]
     }
 
-    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+    /// The launches' operands for `arrays`: per dtype (first-seen order),
+    /// `inputs` at a time, the last chunk padded with its own last array.
+    static func chunks(_ arrays: [MLXArray]) -> [[MLXArray]] {
         var order: [DType] = []
         var byType: [DType: [MLXArray]] = [:]
         for array in arrays {
             if byType[array.dtype] == nil { order.append(array.dtype) }
             byType[array.dtype, default: []].append(array)
         }
-        return order.flatMap { dtype -> [MLXArray] in
+        return order.flatMap { dtype -> [[MLXArray]] in
             let same = byType[dtype]!
             return stride(from: 0, to: same.count, by: inputs).map { start in
                 var chunk = Array(same[start ..< min(start + inputs, same.count)])
                 chunk += Array(repeating: chunk[chunk.count - 1], count: inputs - chunk.count)
-                return launch(chunk)
+                return chunk
             }
         }
+    }
+
+    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
+    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+        chunks(arrays).map { launch($0) }
+    }
+
+    /// Submits the touches of `groups` (each group's chunks, in order) on the
+    /// side queue (`CBv2SideQueue`, `MLXFAST_SEEDGAP`): the same launches the
+    /// default queue would take, committed on their own queue.
+    static func submitOnSideQueue(_ groups: [[MLXArray]]) {
+        CBv2SideQueue.submitTouches(
+            groups.flatMap { chunks($0) }, name: name, inputs: inputs, source: source)
     }
 
     private static let lock = NSLock()
@@ -5713,6 +5732,15 @@ private enum DFlash2ResidencyTouch {
         }) else { return }
         let types: [DType] = [.bfloat16, .float16, .float32, .uint32, .uint16, .uint8, .int8, .int32]
         eval(types.map { launch(Array(repeating: MLXArray.zeros([1], dtype: $0), count: inputs)) })
+        // The side queue is made here, at load, with its own first touches.
+        if CBv2SideQueue.enabled {
+            CBv2SideQueue.prepare()
+            let zeros = types.map { MLXArray.zeros([1], dtype: $0) }
+            eval(zeros)
+            CBv2SideQueue.submitTouches(
+                zeros.map { Array(repeating: $0, count: inputs) }, name: name, inputs: inputs,
+                source: source)
+        }
     }
 }
 
@@ -5933,6 +5961,10 @@ public enum DFlash2ResidencyPrefetch {
             return due
         }
         guard !due.isEmpty else { return }
+        if CBv2SideQueue.enabled {
+            DFlash2ResidencyTouch.submitOnSideQueue(due)
+            return
+        }
         asyncEval(due.flatMap { DFlash2ResidencyTouch.touch($0) })
     }
 
