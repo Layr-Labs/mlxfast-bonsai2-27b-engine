@@ -2098,6 +2098,38 @@ enum Qwen35TensorPackedMatmul {
             outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
     }
 
+    private static func fixedKNNarrowSource(_ source: String?) -> String? {
+        let old = "const int K = ksz[0]; const int M = 16; const int N = ksz[2];"
+        guard let source, source.components(separatedBy: old).count == 2 else { return nil }
+        return source.replacingOccurrences(
+            of: old, with: "constexpr int K = 5120; const int M = 16; constexpr int N = 16384;")
+    }
+
+    private static let kernelNarrowC1FixedKN = fixedKNNarrowSource(sourceNarrowInt8ZooC1IO32).map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1io32_fixedkn",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let kernelNarrowC1U2FixedKN = fixedKNNarrowSource(sourceNarrowInt8ZooC1U2IO32).map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1u2io32_fixedkn",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static func fixedKNNarrowKernel(
+        _ kernel: NarrowKernel
+    ) -> MLXFast.MLXFastKernel? {
+        guard kernel.fixedKN, kernel.form != .base else { return nil }
+        switch kernel.variant {
+        case .k32pd1C1IO32: return kernelNarrowC1FixedKN
+        case .k32pd1C1U2IO32: return kernelNarrowC1U2FixedKN
+        default: return nil
+        }
+    }
+
     private static func narrowZooIO32Fits(k: Int, n: Int, m: Int) -> Bool {
         guard m == 16, k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
         let limit = Int(Int32.max)
@@ -3663,8 +3695,9 @@ enum Qwen35TensorPackedMatmul {
     struct NarrowKernel: Hashable, CustomStringConvertible {
         var variant: NarrowVariant
         var form: NarrowEpilogue
+        var fixedKN = false
         static let original = NarrowKernel(variant: .v0, form: .base)
-        var description: String { "\(variant)/\(form)" }
+        var description: String { "\(variant)/\(form)" + (fixedKN ? "/fixedKN" : "") }
     }
 
     /// The load-time choice (see `chooseNarrowKernels`): per production shape
@@ -3920,7 +3953,7 @@ enum Qwen35TensorPackedMatmul {
 
         /// A kernel's name in the logs.
         static func name(_ kernel: NarrowKernel) -> String {
-            kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
+            kernel.fixedKN || kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
         }
 
         /// A set's kernel on each per-shape factor and the head.
@@ -4204,7 +4237,10 @@ enum Qwen35TensorPackedMatmul {
         _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
         k: Int, n: Int, outputDType: DType
     ) -> NarrowKernel {
-        let choice = narrowByShape[[k, n]] ?? narrowDefault
+        var choice = narrowByShape[[k, n]] ?? narrowDefault
+        if choice.fixedKN, k != 5120 || n != 16384 || outputDType != .float32 {
+            choice.fixedKN = false
+        }
         if n % choice.variant.tn != 0 { return .original }
         // zoo 3a: only on the production shapes its self-test ran (not the head)
         if choice.variant.xtg != nil, !narrowXTGShapes.contains([k, n]) { return .original }
@@ -4589,7 +4625,11 @@ enum Qwen35TensorPackedMatmul {
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
             let zooKernel: MLXFast.MLXFastKernel
-            if v == .k32pd1C1IO32, narrowZooIO32Fits(k: k, n: n, m: m),
+            if kernel.fixedKN, k == 5120, n == 16384, outputDType == .float32,
+                narrowZooIO32Fits(k: k, n: n, m: m),
+                let body = fixedKNNarrowKernel(kernel) {
+                zooKernel = body
+            } else if v == .k32pd1C1IO32, narrowZooIO32Fits(k: k, n: n, m: m),
                 let body = kernelNarrowInt8ZooC1IO32 {
                 zooKernel = body
             } else if v == .k32pd1C1U2IO32, narrowZooIO32Fits(k: k, n: n, m: m),
@@ -5307,11 +5347,65 @@ enum Qwen35TensorPackedMatmul {
         return choices
     }
 
+    // A fixed shape option in the existing whole-forward trial; no new timing rule.
+    private static func fixedKNTrials(_ choice: NarrowChoice) -> [(NarrowChoice, String, Int)] {
+        guard narrowTiled, NarrowInSituTrial.enabled else { return [] }
+        let stocks = zooExact32.filter {
+            !$0.fixedKN && $0.form != .base && zooExact16.contains($0)
+                && [.k32pd1C1IO32, .k32pd1C1U2IO32].contains($0.variant)
+        }.sorted { $0.description < $1.description }
+        guard !stocks.isEmpty else { return [] }
+        let ops = NarrowOperands(k: 5120, n: 16384, seed: 0x6669_7865)
+        let zeroCodes = MLXArray.zeros([16, ops.k], dtype: .int8)
+        let zeroScales = MLXArray.ones([16, ops.k / 128], dtype: .float32)
+        let zeroSums = MLXArray.zeros([16, ops.k / 128], dtype: .float32)
+        eval(zeroCodes, zeroScales, zeroSums)
+        var trial: [(NarrowChoice, String, Int)] = []
+        var passed: [String] = [], failed: [String] = []
+        for stock in stocks {
+            var fixed = stock
+            fixed.fixedKN = true
+            guard fixedKNNarrowKernel(fixed) != nil else { continue }
+            let scales = stock.form == .negativeBiasF32Scales ? ops.scalesT32 : ops.scalesT
+            let checked = try? withError { scoped -> Bool in
+                for zero in [false, true] {
+                    let codes = zero ? zeroCodes : ops.codes
+                    let ascale = zero ? zeroScales : ops.ascale
+                    let rowsum = zero ? zeroSums : ops.rowsum
+                    func run(_ kernel: NarrowKernel) -> MLXArray {
+                        launchNarrowInt8(
+                            codes, ops.tiledWeight, scales, scales, ascale, rowsum,
+                            k: ops.k, n: ops.n, outputDType: .float32, kernel: kernel, tiled: true)
+                    }
+                    let differ = (run(stock).view(dtype: .uint32) .!= run(fixed).view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try scoped.check()
+                    if differ.item(Int32.self) != 0 { return false }
+                }
+                return true
+            }
+            if checked == true {
+                zooExact32.insert(fixed)
+                var map = choice.1
+                map[[5120, 16384]] = fixed
+                trial.append(((choice.0, map), "fixedKN \(fixed)", 2))
+                passed.append("\(fixed)")
+            } else {
+                failed.append("\(fixed)")
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "bonsai tensor fixed KN: self-test passed [\(passed.joined(separator: " "))] failed [\(failed.joined(separator: " "))]\n".utf8))
+        return trial
+    }
+
     /// Installs the record's pick and sets up the in-situ trial. The operands
     /// every candidate reads (the per-projection proof, the FP32 scales) are
     /// prepared at the load-time prompt forward, before any trial round.
     private static func installNarrowChoice() {
-        let (choice, trial) = chooseNarrowKernels()
+        let (choice, stockTrial) = chooseNarrowKernels()
+        let trial = stockTrial.isEmpty ? [] : stockTrial + fixedKNTrials(choice)
         narrowDefault = choice.0
         narrowByShape = choice.1
         NarrowInSituTrial.sets = trial.map(\.0)
