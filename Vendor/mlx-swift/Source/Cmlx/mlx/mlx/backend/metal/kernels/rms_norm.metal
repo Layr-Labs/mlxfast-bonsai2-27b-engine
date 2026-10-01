@@ -31,9 +31,22 @@ template <typename T, int N_READS = RMS_N_READS>
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      thread_x[i] = x[i];
-      acc += thread_x[i] * thread_x[i];
+    // Contiguous N_READS==4: one vec load instead of four scalar loads.
+    if constexpr (N_READS == 4) {
+      vec<T, 4> xv = *(const device vec<T, 4>*)(x);
+      thread_x[0] = float(xv[0]);
+      thread_x[1] = float(xv[1]);
+      thread_x[2] = float(xv[2]);
+      thread_x[3] = float(xv[3]);
+#pragma clang loop unroll(full)
+      for (int i = 0; i < N_READS; i++) {
+        acc += thread_x[i] * thread_x[i];
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        thread_x[i] = x[i];
+        acc += thread_x[i] * thread_x[i];
+      }
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
@@ -66,9 +79,29 @@ template <typename T, int N_READS = RMS_N_READS>
   // Write the outputs using cached x values
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      out[i] =
-          w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+    // Contiguous quartet store; vec-load weight only when w_stride==1
+    // (w_stride==0 means broadcast w[0], must stay scalar).
+    if constexpr (N_READS == 4) {
+      const float inv = local_inv_mean[0];
+      vec<T, 4> ov;
+      if (w_stride == 1) {
+        vec<T, 4> wv = *(const device vec<T, 4>*)(w);
+        ov[0] = wv[0] * static_cast<T>(thread_x[0] * inv);
+        ov[1] = wv[1] * static_cast<T>(thread_x[1] * inv);
+        ov[2] = wv[2] * static_cast<T>(thread_x[2] * inv);
+        ov[3] = wv[3] * static_cast<T>(thread_x[3] * inv);
+      } else {
+        ov[0] = w[w_stride * 0] * static_cast<T>(thread_x[0] * inv);
+        ov[1] = w[w_stride * 1] * static_cast<T>(thread_x[1] * inv);
+        ov[2] = w[w_stride * 2] * static_cast<T>(thread_x[2] * inv);
+        ov[3] = w[w_stride * 3] * static_cast<T>(thread_x[3] * inv);
+      }
+      *(device vec<T, 4>*)(out) = ov;
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        out[i] =
+            w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+      }
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
@@ -102,9 +135,15 @@ template <typename T, int N_READS = RMS_N_READS>
   w += w_stride * lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
-      for (int i = 0; i < N_READS; i++) {
-        float xi = x[i + r];
-        acc += xi * xi;
+      if constexpr (N_READS == 4) {
+        vec<T, 4> xv = *(const device vec<T, 4>*)(x + r);
+        float xi0 = float(xv[0]), xi1 = float(xv[1]), xi2 = float(xv[2]), xi3 = float(xv[3]);
+        acc += xi0 * xi0 + xi1 * xi1 + xi2 * xi2 + xi3 * xi3;
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          float xi = x[i + r];
+          acc += xi * xi;
+        }
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
@@ -141,9 +180,28 @@ template <typename T, int N_READS = RMS_N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
-      for (int i = 0; i < N_READS; i++) {
-        out[r + i] = w[w_stride * (i + r)] *
-            static_cast<T>(x[r + i] * local_inv_mean[0]);
+      if constexpr (N_READS == 4) {
+        const float inv = local_inv_mean[0];
+        vec<T, 4> xv = *(const device vec<T, 4>*)(x + r);
+        vec<T, 4> ov;
+        if (w_stride == 1) {
+          vec<T, 4> wv = *(const device vec<T, 4>*)(w + r);
+          ov[0] = wv[0] * static_cast<T>(float(xv[0]) * inv);
+          ov[1] = wv[1] * static_cast<T>(float(xv[1]) * inv);
+          ov[2] = wv[2] * static_cast<T>(float(xv[2]) * inv);
+          ov[3] = wv[3] * static_cast<T>(float(xv[3]) * inv);
+        } else {
+          ov[0] = w[w_stride * (0 + r)] * static_cast<T>(float(xv[0]) * inv);
+          ov[1] = w[w_stride * (1 + r)] * static_cast<T>(float(xv[1]) * inv);
+          ov[2] = w[w_stride * (2 + r)] * static_cast<T>(float(xv[2]) * inv);
+          ov[3] = w[w_stride * (3 + r)] * static_cast<T>(float(xv[3]) * inv);
+        }
+        *(device vec<T, 4>*)(out + r) = ov;
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          out[r + i] = w[w_stride * (i + r)] *
+              static_cast<T>(x[r + i] * local_inv_mean[0]);
+        }
       }
     } else {
       for (int i = 0; i < N_READS; i++) {

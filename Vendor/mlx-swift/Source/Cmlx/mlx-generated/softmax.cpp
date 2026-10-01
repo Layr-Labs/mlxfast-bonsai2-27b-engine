@@ -40,8 +40,17 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
 
   in += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      ld[i] = AccT(in[i]);
+    // Contiguous N_READS==4: one vec load of T, widen to AccT.
+    if constexpr (N_READS == 4) {
+      vec<T, 4> iv = *(const device vec<T, 4>*)(in);
+      ld[0] = AccT(iv[0]);
+      ld[1] = AccT(iv[1]);
+      ld[2] = AccT(iv[2]);
+      ld[3] = AccT(iv[3]);
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        ld[i] = AccT(in[i]);
+      }
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
@@ -98,8 +107,17 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
   // Normalize and write to the output
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      out[i] = T(ld[i] * normalizer);
+    if constexpr (N_READS == 4) {
+      vec<T, 4> ov;
+      ov[0] = T(ld[0] * normalizer);
+      ov[1] = T(ld[1] * normalizer);
+      ov[2] = T(ld[2] * normalizer);
+      ov[3] = T(ld[3] * normalizer);
+      *(device vec<T, 4>*)(out) = ov;
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        out[i] = T(ld[i] * normalizer);
+      }
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
@@ -136,8 +154,16 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
     int offset = r * lsize * N_READS + lid * N_READS;
     AccT vals[N_READS];
     if (offset + N_READS <= axis_size) {
-      for (int i = 0; i < N_READS; i++) {
-        vals[i] = AccT(in[offset + i]);
+      if constexpr (N_READS == 4) {
+        vec<T, 4> iv = *(const device vec<T, 4>*)(in + offset);
+        vals[0] = AccT(iv[0]);
+        vals[1] = AccT(iv[1]);
+        vals[2] = AccT(iv[2]);
+        vals[3] = AccT(iv[3]);
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          vals[i] = AccT(in[offset + i]);
+        }
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
@@ -188,8 +214,18 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
        r++) {
     int offset = r * lsize * N_READS + lid * N_READS;
     if (offset + N_READS <= axis_size) {
-      for (int i = 0; i < N_READS; i++) {
-        out[offset + i] = T(softmax_exp(in[offset + i] - maxval) * normalizer);
+      if constexpr (N_READS == 4) {
+        vec<T, 4> iv = *(const device vec<T, 4>*)(in + offset);
+        vec<T, 4> ov;
+        ov[0] = T(softmax_exp(AccT(iv[0]) - maxval) * normalizer);
+        ov[1] = T(softmax_exp(AccT(iv[1]) - maxval) * normalizer);
+        ov[2] = T(softmax_exp(AccT(iv[2]) - maxval) * normalizer);
+        ov[3] = T(softmax_exp(AccT(iv[3]) - maxval) * normalizer);
+        *(device vec<T, 4>*)(out + offset) = ov;
+      } else {
+        for (int i = 0; i < N_READS; i++) {
+          out[offset + i] = T(softmax_exp(in[offset + i] - maxval) * normalizer);
+        }
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
@@ -202,7 +238,6 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
 
