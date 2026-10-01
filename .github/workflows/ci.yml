@@ -495,13 +495,29 @@ jobs:
           restore-keys: |
             swiftpm-engine-v1-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build (library, both executables, and the test bundle)
+      - name: Build (library, executables, and the test bundle)
         run: |
           set -euo pipefail
           # --force-resolved-versions on every invocation: the dependency graph
           # is frozen and a bare build can silently rewrite Package.resolved.
           # The tee is what the warning gate reads; keep the pipefail.
           swift build --build-tests --force-resolved-versions 2>&1 | tee swift-build.log
+
+      - name: OpenAI server route smoke test (no weights)
+        run: |
+          set -euo pipefail
+          swift build --force-resolved-versions --product mlxfast-server
+          .build/debug/mlxfast-server --list-routes | python3 -c '
+          import json, sys
+          routes = {(route["method"], route["path"]) for route in json.load(sys.stdin)}
+          required = {("GET", "/v1/models"), ("POST", "/v1/chat/completions")}
+          assert required <= routes, f"missing routes: {required - routes}"
+          '
+          if .build/debug/mlxfast-server --model /nonexistent-bonsai2-checkpoint-for-ci 2>server-error.log; then
+            echo 'server accepted a missing local checkpoint' >&2
+            exit 1
+          fi
+          python3 -c 'from pathlib import Path; assert "Local model directory" in Path("server-error.log").read_text()'
 
       - name: First-party warnings are errors
         run: tools/ci-swift-warning-gate.sh swift-build.log
