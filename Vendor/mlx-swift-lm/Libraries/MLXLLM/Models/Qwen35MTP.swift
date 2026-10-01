@@ -1430,10 +1430,12 @@ enum Qwen35AttentionPreworkKV {
         row: Int, prev: MLXArray, kc: MLXArray, vc: MLXArray
     ) -> [MLXArray] {
         let (L, HQ, HK, D) = (q.dim(1), q.dim(2), k.dim(2), q.dim(3))
+        let scalars = Qwen35AttentionPrework.scalarInputs(
+            epsQ: epsQ, epsK: epsK, D: D, ropeBase: ropeBase)
         return kern(
             [
-                q, k, v, wq, wk, offs, MLXArray(epsQ), MLXArray(epsK), MLXArray(UInt32(D)),
-                MLXArray(log2(ropeBase)), MLXArray(Float(1)), MLXArray(Int32(row)), prev, kc, vc,
+                q, k, v, wq, wk, offs, scalars.0, scalars.1, scalars.2,
+                scalars.3, scalars.4, MLXArray(Int32(row)), prev, kc, vc,
             ],
             template: [("D", D), ("RD", ropeDims), ("HQ", HQ), ("HK", HK)],
             grid: ((D / 4) * (HQ + 2 * HK), L, 1), threadGroup: (D / 4, 1, 1),

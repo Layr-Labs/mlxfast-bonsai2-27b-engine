@@ -513,6 +513,17 @@ public enum CBv2MTPDraftBeforeReadback {
     public static let dumpsDrafts = ProcessInfo.processInfo.environment["BONSAI_DRAFT_DUMP"] == "1"
 }
 
+/// The decode window's exact dead-work removal kept in this tree (default
+/// on): the capture verify's last residual add, final norm and the head's
+/// quantizing rotation as one fused boundary launch, self-tested bitwise
+/// (`Qwen35HeadBoundary`). Same values, fewer launches per round.
+/// `MLXFAST_DW2=0` restores the record's launches.
+public enum CBv2DW2 {
+    public static let enabled = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["MLXFAST_DW2"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+}
+
 public protocol CBv2MTPSpeculativeBlock: AnyObject {}
 
 /// Builds the next round's block before the readback from device values; a
