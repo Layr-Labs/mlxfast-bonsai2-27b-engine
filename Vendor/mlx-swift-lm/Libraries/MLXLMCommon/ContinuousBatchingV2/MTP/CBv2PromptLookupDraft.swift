@@ -335,19 +335,7 @@ enum CBv2PromptLookupDraft {
     private static let splicePick = MLXFast.metalKernel(
         name: "cbv2_prompt_splice_pick",
         inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out"],
-        source: splicePickSource, ensureRowContiguous: true)
-
-    /// `splicePick` that also stores the splice's found flag (`CBv2DW2`): its
-    /// reduction ends with the best score in `scores[0]`, so `ranked.max() >=
-    /// minimum` (a two-pass reduction and a compare, three launches) is
-    /// `scores[0] >= minimum` here.
-    private static let splicePickFlag = MLXFast.metalKernel(
-        name: "cbv2_prompt_splice_pick_flag",
-        inputNames: ["ranked", "block", "prompt", "dims"], outputNames: ["out", "found"],
-        source: splicePickSource + "if (tid == 0) { found[0] = scores[0] >= minimum; }\n",
-        ensureRowContiguous: true)
-
-    private static let splicePickSource = """
+        source: """
 
         uint tid = thread_position_in_threadgroup.x;
         int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
@@ -374,7 +362,7 @@ enum CBv2PromptLookupDraft {
          int j=indices[0]/n, c=indices[0]%n;
          out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
         }
-        """
+        """, ensureRowContiguous: true)
 
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
@@ -432,14 +420,6 @@ enum CBv2PromptLookupDraft {
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
-            if CBv2DW2.enabled {
-                let picked = splicePickFlag(
-                    [ranked, block, promptIDs, dims],
-                    grid: (256, 1, 1), threadGroup: (256, 1, 1),
-                    outputShapes: [[1, depth], []], outputDTypes: [.int32, .bool])
-                lastSpliceFound = picked[1]
-                return picked[0].asType(drafted.dtype)
-            }
             // `splicePick` fires on the best score; a score is 0 or at least
             // `minimum`.
             lastSpliceFound = ranked.max() .>= MLXArray(Int32(minimum))
