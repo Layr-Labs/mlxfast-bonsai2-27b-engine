@@ -1095,7 +1095,7 @@ package enum CBv2PromptCausalAttention {
         name: "bonsai_prompt_causal_scale_select_softmax",
         inputNames: ["scores", "c_off", "c_ql", "c_kl", "c_scale", "c_fill"],
         outputNames: ["out"],
-        source: """
+        source: narrow("""
             constexpr int N_READS = 4;
             constexpr int SIMD_SIZE = 32;
             const uint gid = threadgroup_position_in_grid.x;
@@ -1110,8 +1110,8 @@ package enum CBv2PromptCausalAttention {
             threadgroup float local_normalizer[SIMD_SIZE];
 
             float ld[N_READS];
-
-            const device float* in = scores + gid * size_t(axis_size) + lid * N_READS;
+            const uint row_off = gid * uint(axis_size) + uint(lid * N_READS);
+            const device float* in = scores + row_off;
             if (lid * N_READS + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
                 ld[i] = (lid * N_READS + i <= last) ? in[i] * c_scale : c_fill;
@@ -1160,7 +1160,7 @@ package enum CBv2PromptCausalAttention {
             normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
 
             // Normalize and write to the output
-            device float* o = out + gid * size_t(axis_size) + lid * N_READS;
+            device float* o = out + row_off;
             if (lid * N_READS + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
                 o[i] = float(ld[i] * normalizer);
@@ -1172,8 +1172,25 @@ package enum CBv2PromptCausalAttention {
                 }
               }
             }
-            """,
+            """, count: 2),
         ensureRowContiguous: true)
+
+    /// `text` with its `count` `size_t` as `uint`: MLXLLM's `Qwen35IO32.narrow`
+    /// rule and switch (`MLXFAST_IO32_GDN=0` keeps the stock text). `attend`
+    /// launches only when `B * H * L * kL < Int32.max`, so every softmax
+    /// offset (row x kL + column) is an element index below 2^31.
+    private static func narrow(_ text: String, count: Int) -> String {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_IO32_GDN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["0", "false", "no", "off"].contains(value ?? "") else { return text }
+        guard text.components(separatedBy: "size_t").count - 1 == count else {
+            FileHandle.standardError.write(
+                "cbv2 32-bit offsets: causal softmax holds a moved size_t count; 64-bit text kept\n"
+                    .data(using: .utf8)!)
+            return text
+        }
+        return text.replacingOccurrences(of: "size_t", with: "uint")
+    }
 
     /// `Softmax::eval_gpu`'s single-row limit (`SOFTMAX_LOOPED_LIMIT`).
     private static let softmaxSingleRowLimit = 4096
