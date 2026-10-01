@@ -3085,8 +3085,8 @@ enum DFlash2PackedWeights {
           }
         }
         constexpr int WORDS = KT / 16;
-        device uint4* mo = (device uint4*)mant + (size_t)tile * WORDS * 32 + lane;
-        device uint2* co = (device uint2*)code + (size_t)tile * WORDS * 32 + lane;
+        device uint4* mo = (device uint4*)mant + uint(tile) * uint(WORDS * 32) + lane;
+        device uint2* co = (device uint2*)code + uint(tile) * uint(WORDS * 32) + lane;
         uint own = 0u;
         #pragma clang loop unroll(full)
         for (int j = 0; j < WORDS; j++) {
@@ -3141,13 +3141,13 @@ enum DFlash2PackedWeights {
           if (dflash2_pack12_code(bits, base) == 0u) {
             const uint v = ((lane * uint(KT) + uint(i)) << 16) | bits;
             escapes[start + slot] = v;
-            if (slot < 4u) { first4[(size_t)tile * 4 + slot] = v; }
+            if (slot < 4u) { first4[uint(tile) * 4u + slot] = v; }
             slot += 1u;
           }
         }
         // Unused first words: all ones (no position matches).
         if (lane >= offsets[tile + 1] - start && lane < 4u) {
-          first4[(size_t)tile * 4 + lane] = 0xffffffffu;
+          first4[uint(tile) * 4u + lane] = 0xffffffffu;
         }
         """
 
