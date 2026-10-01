@@ -3768,6 +3768,49 @@ extension Qwen35RotationQ8Blocks {
         inline float4 bonsai_ld4(const device T* p) {
           return float4(float(p[0]), float(p[1]), float(p[2]), float(p[3]));
         }
+        // Same row and column formulas, in 32-bit. The host sets FIT32 only
+        // when every stride and every corner offset fits in int, so the casts
+        // do not truncate. Pointer + int is the 32-bit offset add; the loaded
+        // elements are the 64-bit path's elements. Prompt width keeps int64.
+        template <int HD>
+        inline int bonsai_q8p_row32(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return int(row) * int(st[0]);
+          }
+          const uint L = uint(shape[1]);
+          return int(row / L) * int(st[0]) + int(row % L) * int(st[1]);
+        }
+        template <int HD>
+        inline int bonsai_q8p_col32(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return int(c) * int(st[1]);
+          }
+          return int(c / uint(HD)) * int(st[2]) + int(c % uint(HD)) * int(st[3]);
+        }
+        template <int HD, typename T>
+        inline float4 bonsai_q8p_ld4_32(
+            const device T* p, int rowoff, const constant int64_t* st, uint c, bool vec) {
+          if (vec) {
+            return bonsai_ld4(p + (rowoff + bonsai_q8p_col32<HD>(st, c)));
+          }
+          float4 v;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            v[r] = float(p[rowoff + bonsai_q8p_col32<HD>(st, c + uint(r))]);
+          }
+          return v;
+        }
+        template <int FIT, int HD, typename T>
+        inline float4 bonsai_q8p_load(
+            const device T* p, const constant int* shape, const constant int64_t* st,
+            uint row, uint c, bool vec) {
+          if (FIT) {
+            return bonsai_q8p_ld4_32<HD>(p, bonsai_q8p_row32<HD>(shape, st, row), st, c, vec);
+          }
+          return bonsai_q8p_ld4<HD>(p, bonsai_q8p_row<HD>(shape, st, row), st, c, vec);
+        }
+
         template <int HD, typename T>
         inline float4 bonsai_q8p_ld4(
             const device T* p, int64_t rowoff, const constant int64_t* st, uint c, bool vec) {
@@ -3799,8 +3842,6 @@ extension Qwen35RotationQ8Blocks {
         const uint row = blk / uint(BPR);
         const uint bcol = (blk % uint(BPR)) * uint(N);
         const uint rowbase = uint(row) * uint(W);
-        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
-        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
         const bool AV = (AHD == 0 ? a_strides[1] : a_strides[3]) == 1;
         const bool BV = (BHD == 0 ? b_strides[1] : b_strides[3]) == 1;
         alignas(16) threadgroup float buf[N];
@@ -3817,8 +3858,8 @@ extension Qwen35RotationQ8Blocks {
             const uint rr = hr % uint(GR);
             src = (rr * uint(GKH) + h) * uint(GD) + d;
           }
-          const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
-          const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
+          const float4 a4 = bonsai_q8p_load<FIT32, AHD>(a, a_shape, a_strides, row, src, AV);
+          const float4 b4 = bonsai_q8p_load<FIT32, BHD>(b, b_shape, b_strides, row, src, BV);
           const float4 s4 = bonsai_ld4(signs + col);
           float inv = 0.0f;
           if (PROD == 3) {
@@ -3952,6 +3993,7 @@ extension Qwen35RotationQ8Blocks {
     private struct ProducerForm: Hashable {
         let width: Int, prod: Int, gr: Int, gkh: Int, gd: Int, ahd: Int, bhd: Int
         let perm: Int, mperm: Int, signed: Int, adtype: String, bdtype: String, tpb: Int
+        let fit32: Int
     }
 
     private static let producerLock = NSLock()
@@ -3961,6 +4003,50 @@ extension Qwen35RotationQ8Blocks {
     /// kernel, or nil (off, not a verify-width launch, or a form that failed
     /// or cannot take its self-test). `stock` launches the stock producer
     /// kernel with the same template on given operands.
+
+    /// True when every stride and every corner offset of this launch fits in
+    /// a signed 32-bit int. Negative strides are included. A false answer
+    /// keeps the int64 address path.
+    private static func producerOffsetsFit32(
+        _ x: MLXArray, rows: Int, width: Int, head: Int
+    ) -> Bool {
+        let st = x.strides
+        func fits(_ v: Int) -> Bool { v >= Int(Int32.min) && v <= Int(Int32.max) }
+        guard rows > 0, width > 0, st.allSatisfy(fits) else { return false }
+        func corner(_ parts: [(Int, Int)]) -> Bool {
+            var acc = 0
+            for (n, s) in parts {
+                let p = n.multipliedReportingOverflow(by: s)
+                if p.overflow { return false }
+                let q = acc.addingReportingOverflow(p.partialValue)
+                if q.overflow { return false }
+                acc = q.partialValue
+            }
+            return fits(acc)
+        }
+        if head == 0 {
+            guard st.count >= 2 else { return false }
+            for row in [0, rows - 1] {
+                for col in [0, width - 1] {
+                    if !corner([(row, st[0]), (col, st[1])]) { return false }
+                }
+            }
+            return true
+        }
+        guard x.ndim == 4, st.count >= 4, head > 0 else { return false }
+        let L = x.dim(1)
+        guard L > 0 else { return false }
+        for row in [0, rows - 1] {
+            for col in [0, width - 1] {
+                if !corner([
+                    (row / L, st[0]), (row % L, st[1]),
+                    (col / head, st[2]), (col % head, st[3]),
+                ]) { return false }
+            }
+        }
+        return true
+    }
+
     static func launchProducer(
         a: MLXArray, b: MLXArray, w: MLXArray, eps: MLXArray, signs: MLXArray,
         template: [(String, any KernelTemplateArg)], rows: Int, width: Int,
@@ -3988,10 +4074,16 @@ extension Qwen35RotationQ8Blocks {
         guard (1 ... 3).contains(prod), gr == 1 || gd % 4 == 0,
             prod != 3 || (gd == 128 && tpb == 256)
         else { return nil }
+        // Verify width only. Prompt-width 32-bit offsets have regressed the
+        // scoring box on another kernel; this producer stays int64 there.
+        let fit32 = rows < BonsaiPromptWidth.minimumRows
+            && producerOffsetsFit32(a, rows: rows, width: width, head: ahd)
+            && producerOffsetsFit32(b, rows: rows, width: width, head: bhd) ? 1 : 0
         let form = ProducerForm(
             width: width, prod: prod, gr: gr, gkh: gkh, gd: gd, ahd: ahd, bhd: bhd, perm: perm,
-            mperm: mperm, signed: signed, adtype: "\(a.dtype)", bdtype: "\(b.dtype)", tpb: tpb)
-        let tmpl = template + [("TPB", tpb)]
+            mperm: mperm, signed: signed, adtype: "\(a.dtype)", bdtype: "\(b.dtype)", tpb: tpb,
+            fit32: fit32)
+        let tmpl = template + [("TPB", tpb), ("FIT32", fit32)]
         func run(_ inputs: [MLXArray]) -> [MLXArray] {
             producerKernel(
                 inputs, template: tmpl,
@@ -4076,7 +4168,7 @@ extension Qwen35RotationQ8Blocks {
         producerVerdicts[form] = passed
         FileHandle.standardError.write(
             ("bonsai producer rotation q8 per block (prod \(form.prod), width \(form.width), "
-                + "\(form.tpb) threads, a \(form.adtype)/\(form.ahd), b \(form.bdtype)/\(form.bhd)): "
+                + "\(form.tpb) threads, fit32 \(form.fit32), a \(form.adtype)/\(form.ahd), b \(form.bdtype)/\(form.bhd)): "
                 + "self-test " + (passed ? "passed" : "FAILED") + ": \(values) values, "
                 + "\(mismatches) mismatches" + detail + (passed ? "\n" : "; stock kernel kept\n"))
                 .data(using: .utf8)!)
