@@ -1414,14 +1414,18 @@ private let dflash2GroupedConvJoinSource = """
 /// threshold and merge passes, and the four-wide concat. Every narrowed offset
 /// is a non-negative element / word index below 2^31: at most (262144 context
 /// + 64) rows x 6144 columns, 32 rows x the 248320-entry vocabulary, a
-/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The headers keep
-/// their `size_t`.
+/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The grouped
+/// conv header's eight (block row, h / dyn / base offsets) stay below each
+/// operand's element count: (262144 + 64) rows x 5120 at most.
+private let dflash2GroupedConvHeaderIO32 = Qwen35IO32.narrow(
+    dflash2GroupedConvHeader, count: 8, "dflash2_grouped_conv_header")
+
 private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv_join",
     inputNames: ["h", "dyn", "base", "ctx"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvJoinSource, count: 4, "dflash2_grouped_conv_join"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvKernel = MLXFast.metalKernel(
@@ -1429,7 +1433,7 @@ private let dflash2GroupedConvKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvSource, count: 2, "dflash2_grouped_conv"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
@@ -1437,7 +1441,7 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base", "res"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvResidualSource, count: 2, "dflash2_grouped_conv_residual"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 // MARK: - The decoder layer
@@ -1641,7 +1645,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_bf16_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1927,7 +1931,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: Qwen35IO32.narrow(variantSource, count: 4, "dflash2_bf16_matmul_m16_kvar"),
         header: header,
         ensureRowContiguous: true)
 
@@ -6836,7 +6840,7 @@ enum DFlash2SpeculativeFront {
               out[(size_t(b) * R + r) * H + c] = v;
             }
             """, count: 4, "dflash2_grouped_conv_join_at"),
-        header: dflash2GroupedConvHeader,
+        header: dflash2GroupedConvHeaderIO32,
         ensureRowContiguous: true)
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its
