@@ -39,12 +39,12 @@ public enum CBv2AcceptGlue {
         name: "cbv2_accept_packet",
         inputNames: ["drafts", "targets"], outputNames: ["packet"],
         source: """
-            int i = int(thread_position_in_grid.x);
-            int k = drafts_shape[0];
+            const uint i = thread_position_in_grid.x;
+            const uint k = uint(drafts_shape[0]);
             if (i < k) {
-                packet[i] = drafts[int64_t(i) * drafts_strides[0]];
-            } else if (i < k + targets_shape[0]) {
-                packet[i] = targets[int64_t(i - k) * targets_strides[0]];
+                packet[i] = drafts[i * uint(drafts_strides[0])];
+            } else if (i < k + uint(targets_shape[0])) {
+                packet[i] = targets[(i - k) * uint(targets_strides[0])];
             }
             """,
         ensureRowContiguous: false)
@@ -78,12 +78,12 @@ public enum CBv2AcceptGlue {
                 return;
             }
             const int k = (int(packet_shape[0]) - 1) / 2;
-            const int64_t s = int64_t(packet_strides[0]);
+            const int s = int(packet_strides[0]);
             int m = 0;
-            while (m < k && packet[int64_t(m) * s] == packet[int64_t(k + m) * s]) {
+            while (m < k && packet[m * s] == packet[(k + m) * s]) {
                 ++m;
             }
-            anchor[0] = packet[int64_t(k + m) * s];
+            anchor[0] = packet[(k + m) * s];
             confirmed[0] = m + 1;
             """,
         ensureRowContiguous: false)

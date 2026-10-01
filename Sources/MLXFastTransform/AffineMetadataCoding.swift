@@ -441,3 +441,4 @@ enum AffineMetadataCoding {
 
 
 // Yukon reuse package v1; original inventory SHA-256: 4acdbf96b3d7a0cf191d7babf598cb8d733e2dd131cac5fa9edc53240f4592be
+// Antigravity Crown-3d73948: ps4 vector state, headTop2 int2/float2, 32-bit CBv2AcceptGlue & fit32 Hadamard

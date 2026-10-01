@@ -2597,6 +2597,18 @@ extension FusedInputHadamardKernel {
               const auto zp = z + rz;
               fill([&](uint c) { return float(xp[c]); }, [&](uint c) { return float(zp[c]); },
                    [&](uint c) { return w[c]; }, [&](uint c) { return signs[c]; });
+            } else if (bonsai_offsets_fit32<4>(x_shape, x_strides)
+                && bonsai_offsets_fit32<4>(z_shape, z_strides)
+                && bonsai_offsets_fit32<1>(w_shape, w_strides)
+                && bonsai_offsets_fit32<1>(signs_shape, signs_strides)) {
+              const uint rx32 = bonsai_row_base32<2>(row, x_shape, x_strides);
+              const uint rz32 = bonsai_row_base32<2>(row, z_shape, z_strides);
+              const uint ws = uint(w_strides[0]);
+              const uint ss = uint(signs_strides[0]);
+              fill([&](uint c) { return float(x[rx32 + bonsai_col_off32<2, 2>(c, x_shape, x_strides)]); },
+                   [&](uint c) { return float(z[rz32 + bonsai_col_off32<2, 2>(c, z_shape, z_strides)]); },
+                   [&](uint c) { return w[c * ws]; },
+                   [&](uint c) { return signs[c * ss]; });
             } else {
               fill([&](uint c) { return float(x[rx + bonsai_col_off<2, 2>(c, x_shape, x_strides)]); },
                    [&](uint c) { return float(z[rz + bonsai_col_off<2, 2>(c, z_shape, z_strides)]); },
