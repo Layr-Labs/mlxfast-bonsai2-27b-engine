@@ -1414,14 +1414,18 @@ private let dflash2GroupedConvJoinSource = """
 /// threshold and merge passes, and the four-wide concat. Every narrowed offset
 /// is a non-negative element / word index below 2^31: at most (262144 context
 /// + 64) rows x 6144 columns, 32 rows x the 248320-entry vocabulary, a
-/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The headers keep
-/// their `size_t`.
+/// 34816 x 5120 weight, or a concat of at most 2^20 elements. The grouped
+/// conv header's eight (block row, h / dyn / base offsets) stay below each
+/// operand's element count: (262144 + 64) rows x 5120 at most.
+private let dflash2GroupedConvHeaderIO32 = Qwen35IO32.narrow(
+    dflash2GroupedConvHeader, count: 8, "dflash2_grouped_conv_header")
+
 private let dflash2GroupedConvJoinKernel = MLXFast.metalKernel(
     name: "dflash2_grouped_conv_join",
     inputNames: ["h", "dyn", "base", "ctx"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvJoinSource, count: 4, "dflash2_grouped_conv_join"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvKernel = MLXFast.metalKernel(
@@ -1429,7 +1433,7 @@ private let dflash2GroupedConvKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvSource, count: 2, "dflash2_grouped_conv"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
@@ -1437,7 +1441,7 @@ private let dflash2GroupedConvResidualKernel = MLXFast.metalKernel(
     inputNames: ["h", "dyn", "base", "res"],
     outputNames: ["out"],
     source: Qwen35IO32.narrow(dflash2GroupedConvResidualSource, count: 2, "dflash2_grouped_conv_residual"),
-    header: dflash2GroupedConvHeader,
+    header: dflash2GroupedConvHeaderIO32,
     ensureRowContiguous: true)
 
 // MARK: - The decoder layer
@@ -1641,7 +1645,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_bf16_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1927,7 +1931,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: Qwen35IO32.narrow(variantSource, count: 4, "dflash2_bf16_matmul_m16_kvar"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2916,6 +2920,7 @@ enum DFlash2PackedWeights {
         let offsets: MLXArray
         let escapes: MLXArray
         let escapeCount: Int
+        let index32Safe: Bool
         var arrays: [MLXArray] { [mantissas, codes, first, bases, offsets, escapes] }
     }
 
@@ -2946,13 +2951,13 @@ enum DFlash2PackedWeights {
           uint base;
         };
 
-        template <int KT>
+        template <int KT, typename IndexT = size_t>
         inline void dflash2_pack12_read(
             thread dflash2_pack12_share<KT>& t, const device uint4* mant, const device uint2* code,
             const device uint4* first4, const device uint* bases, int tile, uint lane) {
           constexpr int WORDS = KT / 16;
-          const device uint4* mp = mant + (size_t)tile * WORDS * 32 + lane;
-          const device uint2* cp = code + (size_t)tile * WORDS * 32 + lane;
+          const device uint4* mp = mant + (IndexT)tile * WORDS * 32 + lane;
+          const device uint2* cp = code + (IndexT)tile * WORDS * 32 + lane;
           #pragma clang loop unroll(full)
           for (int j = 0; j < WORDS; j++) {
             t.m[j] = mp[j * 32];
@@ -3177,6 +3182,7 @@ enum DFlash2PackedWeights {
     // of loaded: the same op, K partitions and reduction. grid: (N / 32 *
     // (32 * SPLITS), 1, 1), threadgroup (32 * SPLITS, 1, 1). x bfloat [16, K].
     private static let source = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * COLS;
@@ -3207,19 +3213,19 @@ enum DFlash2PackedWeights {
         const device uint4* fp = (const device uint4*)first4;
         dflash2_pack12_share<KT> cur, nxt, far;
         if constexpr (AHEAD > 0) {
-          dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+          dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
         }
         if constexpr (AHEAD > 1) {
-          if (KS < kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+          if (KS < kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
         }
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
           if constexpr (AHEAD == 0) {
-            dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, tile, lane);
+            dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, tile, lane);
           } else if constexpr (AHEAD == 1) {
-            if (k + KS < k0 + kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
           } else {
-            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT>(far, mp, cp, fp, bases, tile + 2, lane); }
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(far, mp, cp, fp, bases, tile + 2, lane); }
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
           auto tX = X.template slice<KS, 16>(k, 0);
@@ -3245,7 +3251,7 @@ enum DFlash2PackedWeights {
               for (int j = 0; j < SPLITS - 1; j++) { v += red[j][i * 32 + lane]; }
             }
             auto idx = cT.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v);
+            out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v);
           }
         }
         """
@@ -3253,6 +3259,7 @@ enum DFlash2PackedWeights {
     // `sourceSwapped32` the same way: one rebuilt operand per K step,
     // multiplied by rows 0-15 and 16-31. x bfloat [32, K].
     private static let source32 = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
         const int K = ksz[0]; const int N = ksz[2];
         const int nb = int(threadgroup_position_in_grid.x);
         const int n0 = nb * COLS;
@@ -3282,19 +3289,19 @@ enum DFlash2PackedWeights {
         const device uint4* fp = (const device uint4*)first4;
         dflash2_pack12_share<KT> cur, nxt, far;
         if constexpr (AHEAD > 0) {
-          dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+          dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
         }
         if constexpr (AHEAD > 1) {
-          if (KS < kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+          if (KS < kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
         }
         for (int k = k0; k < k0 + kq; k += KS) {
           const int tile = nb * steps + k / KS;
           if constexpr (AHEAD == 0) {
-            dflash2_pack12_read<KT>(cur, mp, cp, fp, bases, tile, lane);
+            dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, tile, lane);
           } else if constexpr (AHEAD == 1) {
-            if (k + KS < k0 + kq) { dflash2_pack12_read<KT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
           } else {
-            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT>(far, mp, cp, fp, bases, tile + 2, lane); }
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(far, mp, cp, fp, bases, tile + 2, lane); }
           }
           dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
           if constexpr (AHEAD > 0) { cur = nxt; }
@@ -3330,8 +3337,8 @@ enum DFlash2PackedWeights {
               }
             }
             auto idx = cT0.get_multidimensional_index(i);
-            out[(size_t)idx[0] * N + n0 + idx[1]] = OutT(v0);
-            out[(size_t)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
+            out[(IndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
           }
         }
         """
@@ -3388,7 +3395,8 @@ enum DFlash2PackedWeights {
         let t = tiling ?? DFlash2TensorMatmul.swapTiling(k: c.source.dim(1), n: n, rows32: rows > 16, packed: true)
         return (rows == 16 ? kernel : kernel32)(
             [a] + c.arrays + [dims(c.source)],
-            template: [("OutT", outputDType), ("SPLITS", t.splits)] + geometry + [("AHEAD", t.ahead ?? 1)],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)] + geometry
+                + [("AHEAD", t.ahead ?? 1)],
             grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
             outputShapes: [[rows, n]], outputDTypes: [outputDType])[0]
     }
@@ -3415,9 +3423,14 @@ enum DFlash2PackedWeights {
             grid: (tiles * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[max(escapeCount, 1)], [tiles * 4]], outputDTypes: [.uint32, .uint32])
         eval(written)
+        let limit = Int(Int32.max)
+        let arrays = [first[0], first[1], written[1], first[2], offsets, written[0]]
+        let index32Safe = w.size > 0 && w.size <= limit
+            && w.dim(0) <= limit / 32 && w.dim(1) <= limit / 32
+            && arrays.allSatisfy { $0.size > 0 && $0.size <= limit }
         return Copy(
             source: w, mantissas: first[0], codes: first[1], first: written[1], bases: first[2],
-            offsets: offsets, escapes: written[0], escapeCount: escapeCount)
+            offsets: offsets, escapes: written[0], escapeCount: escapeCount, index32Safe: index32Safe)
     }
 
     /// Packs every eligible one of `weights` (16-row products) and
@@ -6828,7 +6841,7 @@ enum DFlash2SpeculativeFront {
               out[(size_t(b) * R + r) * H + c] = v;
             }
             """, count: 4, "dflash2_grouped_conv_join_at"),
-        header: dflash2GroupedConvHeader,
+        header: dflash2GroupedConvHeaderIO32,
         ensureRowContiguous: true)
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its

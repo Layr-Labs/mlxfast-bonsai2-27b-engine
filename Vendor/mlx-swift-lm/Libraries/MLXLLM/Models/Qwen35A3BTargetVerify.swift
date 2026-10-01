@@ -2574,17 +2574,21 @@ enum Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = uint(index + r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
@@ -3513,17 +3517,21 @@ enum Qwen35BoundaryBlocks {
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = lane * 4 + uint(r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { codes[base + uint(g) * 128 + kp] = int8_t(q); } else { codes[base + uint(g) * 128 + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint ml = row & 63u;
@@ -3851,17 +3859,21 @@ extension Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = uint(index + r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
@@ -4115,7 +4127,9 @@ extension Qwen35GatedDeltaChunked {
             guard text.components(separatedBy: target).count == 2 else { return nil }
             text = text.replacingOccurrences(of: target, with: replacement)
         }
-        return text
+        guard text.components(separatedBy: "size_t").count == 9 else { return nil }
+        return "using ScanIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;\n"
+            + text.replacingOccurrences(of: "size_t", with: "ScanIndexT")
     }
 
     private static let ktKernel: MLXFast.MLXFastKernel? = {
@@ -4142,6 +4156,14 @@ extension Qwen35GatedDeltaChunked {
         let simdgroups: Int
     }
 
+    static func scanOffsetsFitIO32(batch: Int, rows: Int, hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let limit = Int(Int32.max)
+        let rowWidth = max(hk * dk, hv * dv, hv * chunk)
+        return Qwen35IO32.enabled && batch > 0 && rows > 0
+            && rows <= limit / rowWidth && batch <= limit / (rows * rowWidth)
+            && batch <= limit / (hv * dv * dk)
+    }
+
     private static func scanFormLaunch(
         _ form: ScanForm, q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray],
         stateShape: [Int]
@@ -4152,6 +4174,7 @@ extension Qwen35GatedDeltaChunked {
             template: [
                 ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", form.simdgroups),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, form.simdgroups, 1),
@@ -4432,6 +4455,13 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// - `rowkernel`: the verify boundary on the per-row kernel instead of
 ///   `Qwen35BoundaryBlocks` (80 threadgroups of 256); offered only when the
 ///   16-row self-test passed through both.
+/// - `unfold`: the verify block's attention GEMMs as `kvHeads * repeats`
+///   broadcast batches of 16 rows instead of `kvHeads` folded batches
+///   (`CBv2PromptCausalAttention.verifyFoldRepeats`, fixed from the M4 Max):
+///   three times the threadgroups at 64-row tiles. Offered only when
+///   `checkVerifyUnfold` found the probabilities and the output of both forms
+///   equal bit for bit at every key count the verify warm covered, which also
+///   builds the unfolded pipelines before any timed round.
 /// Round 0 and each arm's first round warm up; then the arms rotate for
 /// `roundsPerArm` rounds each, rounds above 1.5x their arm's median dropped,
 /// and an alternative is kept only when its median round beats the record's
@@ -4446,10 +4476,10 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// `BONSAI_EXACT_TRIALS=0` keeps every record form (no trial, no extra
 /// self-test). Per item (default on): `BONSAI_TRIAL_GDN_DVPL`,
 /// `BONSAI_TRIAL_ROTATION_TPB`, `BONSAI_TRIAL_BOUNDARY`,
-/// `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced form skips its item:
-/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
+/// `BONSAI_TRIAL_VERIFY_UNFOLD`, `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced
+/// form skips its item: `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
 /// `BONSAI_ROTATION_Q8_TPB_SMALL=128`, `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
-/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
+/// `BONSAI_VERIFY_FOLD_REPEATS` (either way), `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
 enum Qwen35ExactFormTrial {
     private static func on(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
@@ -4461,6 +4491,7 @@ enum Qwen35ExactFormTrial {
     static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
     static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
     static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
+    static let unfoldWanted = enabled && on("BONSAI_TRIAL_VERIFY_UNFOLD")
     static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
 
     /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
@@ -4538,6 +4569,22 @@ enum Qwen35ExactFormTrial {
                     Qwen35BoundaryBlocks.stock = $0
                 })
             }
+        }
+        if unfoldWanted, CBv2PromptCausalAttention.verifyFoldRepeats,
+            !CBv2PromptCausalAttention.verifyFoldRepeatsForced
+        {
+            if let check = CBv2PromptCausalAttention.checkVerifyUnfold() {
+                checks.append(
+                    "unfold " + (check.passed ? "passed" : "FAILED") + " (\(check.detail))")
+                if check.passed {
+                    list.append(Arm(name: "unfold", knob: "fold") {
+                        CBv2PromptCausalAttention.verifyFoldRepeats = !$0
+                    })
+                }
+            } else {
+                checks.append("unfold not offered (no verify block warm)")
+            }
+            Memory.clearCache()
         }
         guard list.count > 1 else {
             if !checks.isEmpty || enabled {

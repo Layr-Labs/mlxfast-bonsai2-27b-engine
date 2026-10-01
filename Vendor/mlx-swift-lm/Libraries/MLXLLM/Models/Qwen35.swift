@@ -2421,6 +2421,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),
@@ -6687,6 +6688,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6724,7 +6727,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
