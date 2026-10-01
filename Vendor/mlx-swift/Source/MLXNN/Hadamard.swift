@@ -96,6 +96,27 @@ public struct SignedBlockHadamard {
         return fused(x, signs, blockSize, preSigned, gdnLayout, groupSize)
     }
 
+    /// `FusedTransformInt8` of a `[rows, width]` activation (`rows <=
+    /// paddedRows`) padded with zero rows to `paddedRows` rows, the padding
+    /// formed in the read: the outputs are those of `fusedTransformInt8` over
+    /// the activation widened to FP32 and concatenated with FP32 zero rows.
+    /// Installed by the model file (BF16 rows); nil declines.
+    public typealias FusedTransformInt8Padded = (
+        _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int, _ preSigned: Bool,
+        _ groupSize: Int, _ paddedRows: Int
+    ) -> Int8Activation?
+    nonisolated(unsafe) public static var fusedTransformInt8Padded: FusedTransformInt8Padded?
+
+    /// `forwardInt8` of `x` padded with zero rows to `paddedRows` rows in the
+    /// read; nil when no fused implementation provides it.
+    public func forwardInt8(
+        _ x: MLXArray, paddedRows: Int, preSigned: Bool, groupSize: Int
+    ) -> Int8Activation? {
+        validate(x)
+        guard let fused = Self.fusedTransformInt8Padded else { return nil }
+        return fused(x, signs, blockSize, preSigned, groupSize, paddedRows)
+    }
+
     /// The forward transform stored in `outputDType` together with the FP32
     /// sums of every `groupSize` consecutive rounded outputs (`[..., width /
     /// groupSize]`), for the verify-width tensor route. Installed by the
@@ -291,6 +312,25 @@ public struct SignedBlockHadamard {
         _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
     ) -> MLXArray?
     nonisolated(unsafe) public static var fusedInverse: FusedInverse?
+
+    /// A packed embedding lookup, `inverse(dequantized(gathered rows))`, as
+    /// one kernel: the tables, the flat ids, the signs, the block size, the
+    /// group size and bits, and `chain`, the lookup's own path (the same
+    /// function of the ids, for a self-test). It must return exactly what
+    /// `chain` returns. Installed by the model file; nil declines.
+    public typealias FusedLookup = (
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ signs: MLXArray, _ blockSize: Int, _ groupSize: Int, _ bits: Int,
+        _ chain: (MLXArray) -> MLXArray
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedLookup: FusedLookup?
+
+    func lookupRows(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        groupSize: Int, bits: Int, chain: (MLXArray) -> MLXArray
+    ) -> MLXArray? {
+        Self.fusedLookup?(codes, scales, biases, ids, signs, blockSize, groupSize, bits, chain)
+    }
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -921,16 +961,26 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// The tensor route for `siblings` (self first) over one FP32 activation:
     /// one fused rotation with group sums, one packed matmul over the stacked
     /// codes, split per sibling. Nil when the route does not apply.
+    ///
+    /// `bf16Rows` (the drafter head's read only) also takes BF16 rows at
+    /// verify width for the int8 form, which pads them in the rotation's read
+    /// (`tensorRouteForwardNarrowInt8`); anything else declines.
     fileprivate func tensorRouteForward(
-        _ x: MLXArray, siblings: [HadamardQuantizedLinear], preSigned: Bool, widenOutput: Bool
+        _ x: MLXArray, siblings: [HadamardQuantizedLinear], preSigned: Bool, widenOutput: Bool,
+        bf16Rows: Bool = false
     ) -> [MLXArray]? {
-        guard Self.tensorRouteEnabled, x.dtype == .float32, x.ndim >= 2,
-            !siblings.isEmpty, siblings[0] === self
+        guard Self.tensorRouteEnabled, x.dtype == .float32 || (bf16Rows && x.dtype == .bfloat16),
+            x.ndim >= 2, !siblings.isEmpty, siblings[0] === self
         else { return nil }
         let k = x.dim(-1)
         let rows = x.size / k
         let promptWidth = rows >= Self.tensorRouteMinimumRows && rows % 64 == 0
         let verifyWidth = rows <= Self.tensorRouteMaximumNarrowRows
+        if x.dtype == .bfloat16 {
+            guard verifyWidth, !promptWidth, gdnLayout == nil,
+                Self.tensorPackedMatmulNarrowInt8 != nil
+            else { return nil }
+        }
         guard k % 128 == 0,
             (promptWidth && Self.tensorPackedMatmul != nil && Self.tensorPackedMatmulApplies != nil)
                 || (verifyWidth && Self.narrowRouteInstalled)
@@ -1318,15 +1368,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
         else { return nil }
         let padded = Self.tensorRouteMaximumNarrowRows
-        let input =
-            rows < padded
-            ? concatenated(
-                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
-            : x
-        guard
-            let activation = transform.forwardInt8(
+        let quantized: SignedBlockHadamard.Int8Activation?
+        if x.dtype == .bfloat16 {
+            // The drafter head's BF16 rows: the rotation reads them as they
+            // are and forms the zero rows in its read (no cast, no concat).
+            quantized = transform.forwardInt8(
+                x, paddedRows: padded, preSigned: preSigned, groupSize: 128)
+        } else {
+            let input =
+                rows < padded
+                ? concatenated(
+                    [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)],
+                    axis: 0)
+                : x
+            quantized = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
-        else { return nil }
+        }
+        guard let activation = quantized else { return nil }
         if siblings.count == 1 {
             guard let y = matmul(
                 activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
@@ -1356,13 +1414,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         }
         // The drafter's shared-head read (`drafterHeadInt8`): its BF16
         // activation widens to FP32 exactly and takes the verify route's
-        // int8 head, FP16 logits out.
+        // int8 head, FP16 logits out. With `headRotationReadsBF16` the
+        // rotation reads the BF16 rows itself (the same values, no cast or
+        // pad copies); where that declines, the FP32 chain runs.
         if Self.drafterHeadInt8, x.dtype == .bfloat16, bias == nil,
-            weight.dim(0) >= Self.vocabularyHeadMinimumRows,
-            let routed = tensorRouteForward(
-                x.asType(.float32), siblings: [self], preSigned: false, widenOutput: false)
+            weight.dim(0) >= Self.vocabularyHeadMinimumRows
         {
-            return routed[0]
+            if Self.headRotationReadsBF16,
+                let routed = tensorRouteForward(
+                    x, siblings: [self], preSigned: false, widenOutput: false, bf16Rows: true)
+            {
+                return routed[0]
+            }
+            if let routed = tensorRouteForward(
+                x.asType(.float32), siblings: [self], preSigned: false, widenOutput: false)
+            {
+                return routed[0]
+            }
         }
         let rotated = rotate(x)
         return matrixRegimeForward(rotated, widenOutput: false) ?? applyRotated(rotated)
@@ -1380,6 +1448,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// read (`drafterHeadFloat16`).
     public static let drafterHeadInt8: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH2_HEAD_INT8"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// On unless explicitly disabled: the int8 head's quantizing rotation
+    /// reads the drafter's BF16 rows directly and forms the zero pad rows in
+    /// its read, instead of reading an FP32 copy padded by `concatenated`
+    /// (three copy launches per round: the cast, the rows, the zero row).
+    /// BF16 to FP32 is exact, so every code, scale and sum is the chain's;
+    /// the model file self-tests the launch against that chain at first use
+    /// and declines on a mismatch. `BONSAI_HEAD_ROT_BF16=0` keeps the chain.
+    public static let headRotationReadsBF16: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_HEAD_ROT_BF16"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
@@ -1962,10 +2043,28 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let indices = x.flattened()
-        let rows = dequantized(
-            weight[indices], scales: scales[indices],
-            biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
-        return transform.inverse(rows).reshaped(x.shape + [transform.width])
+        let chain: (MLXArray) -> MLXArray = { [self] indices in
+            let rows: MLXArray
+            if let biases,
+                let gathered = HadamardEmbeddingGather.apply(
+                    weight, scales, biases, indices, groupSize: groupSize, bits: bits)
+            {
+                rows = dequantized(
+                    gathered[0], scales: gathered[1], biases: gathered[2],
+                    groupSize: groupSize, bits: bits)
+            } else {
+                rows = dequantized(
+                    weight[indices], scales: scales[indices],
+                    biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
+            }
+            return transform.inverse(rows)
+        }
+        let rows =
+            biases.flatMap {
+                transform.lookupRows(
+                    weight, scales, $0, indices, groupSize: groupSize, bits: bits, chain: chain)
+            } ?? chain(indices)
+        return rows.reshaped(x.shape + [transform.width])
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {
@@ -1973,6 +2072,139 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             transform(x), weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
     }
+}
+
+/// ROUNDFUSE: a packed embedding lookup's three row gathers (codes, scales,
+/// biases: one `gather_front` launch each, twice per speculative round: the
+/// drafter's anchor row and the verify window's rows) as one launch. Pure
+/// copies: each output word is the word MLX's gather reads, at the same row
+/// (a negative signed id counts from the end, as `offset_neg_idx` does), so
+/// `dequantized` reads the takes' bits. Self-tested before first use on the
+/// production tables against the three takes (and the dequantized rows),
+/// every bit compared; a mismatch or an MLX error keeps the takes.
+/// `MLXFAST_ROUND_FUSE=0` keeps them.
+enum HadamardEmbeddingGather {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_FUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+
+    /// `[codes[ids], scales[ids], biases[ids]]` in one launch, or nil.
+    static func apply(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        groupSize: Int, bits: Int
+    ) -> [MLXArray]? {
+        guard enabled, ids.ndim == 1, ids.size > 0, ids.dtype == .int32 || ids.dtype == .uint32,
+            codes.ndim == 2, scales.ndim == 2, biases.shape == scales.shape,
+            codes.dim(0) == scales.dim(0), codes.dim(0) <= Int(Int32.max),
+            verified(codes, scales, biases, ids.dtype, groupSize: groupSize, bits: bits)
+        else { return nil }
+        return launch(codes, scales, biases, ids)
+    }
+
+    private static func launch(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray
+    ) -> [MLXArray] {
+        let (n, wc, gc) = (ids.dim(0), codes.dim(1), scales.dim(1))
+        return kernel(
+            [codes, scales, biases, ids],
+            template: [("WC", wc), ("GC", gc), ("V", codes.dim(0))],
+            grid: (max(wc, gc), n, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[n, wc], [n, gc], [n, gc]],
+            outputDTypes: [codes.dtype, scales.dtype, biases.dtype])
+    }
+
+    private static func verified(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ idType: DType,
+        groupSize: Int, bits: Int
+    ) -> Bool {
+        lock.withLock {
+            let key = "\(codes.dtype) \(scales.dtype) \(idType) \(codes.shape) \(scales.shape) \(groupSize) \(bits)"
+            if let verdict = verdicts[key] { return verdict }
+            let (passed, summary) = selfTest(codes, scales, biases, idType, groupSize, bits)
+            verdicts[key] = passed
+            FileHandle.standardError.write(
+                ("bonsai embedding row gather: " + summary
+                    + (passed ? "; one launch\n" : "; takes kept\n")).data(using: .utf8)!)
+            return passed
+        }
+    }
+
+    private static func selfTest(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ idType: DType,
+        _ groupSize: Int, _ bits: Int
+    ) -> (Bool, String) {
+        let vocab = codes.dim(0)
+        var values = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                for (count, seed) in [(1, 71), (16, 72), (17, 73), (512, 74)] {
+                    var ids = MLXRandom.randInt(
+                        Int32(0) ..< Int32(vocab), [count], key: MLXRandom.key(UInt64(seed)))
+                    let edges = [Int32(0), Int32(vocab - 1), Int32(vocab / 2), Int32(vocab - 1)]
+                    if count >= 16 {
+                        ids = concatenated([MLXArray(edges), ids[4 ..< count]], axis: 0)
+                    }
+                    if idType == .int32, count >= 16 {
+                        ids = concatenated(
+                            [ids[0 ..< (count - 2)], MLXArray([Int32(-1), Int32(-vocab)])], axis: 0)
+                    }
+                    ids = ids.asType(idType)
+                    let fused = launch(codes, scales, biases, ids)
+                    let chain = [codes[ids], scales[ids], biases[ids]]
+                    let rows = [chain, fused].map {
+                        dequantized($0[0], scales: $0[1], biases: $0[2], groupSize: groupSize, bits: bits)
+                    }
+                    var differ = MLXArray(Int32(0))
+                    for (a, b) in zip(chain + [rows[0]], fused + [rows[1]]) {
+                        guard a.dtype == b.dtype, a.shape == b.shape else {
+                            failure = "output \(b.dtype) \(b.shape) vs \(a.dtype) \(a.shape)"
+                            return
+                        }
+                        differ = differ
+                            + (a.view(dtype: .uint8) .!= b.view(dtype: .uint8)).asType(.int32).sum()
+                        values += a.size
+                    }
+                    eval(differ)
+                    try error.check()
+                    mismatches += Int(differ.item(Int32.self))
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && values > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(values) values compared bitwise, "
+                + "\(mismatches) mismatches")
+    }
+
+    // grid (max(WC, GC), rows, 1): thread (x, r) copies word x of row r's codes
+    // and, for x < GC, its scale and bias; the row is MLX gather's.
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_embedding_row_gather",
+        inputNames: ["codes", "scale_table", "bias_table", "ids"],
+        outputNames: ["code_rows", "scale_rows", "bias_rows"],
+        source: """
+            const uint x = thread_position_in_grid.x;
+            const uint r = thread_position_in_grid.y;
+            long i = long(ids[r]);
+            if (i < 0) i += long(V);
+            const ulong src = ulong(i);
+            if (x < uint(WC)) code_rows[ulong(r) * WC + x] = codes[src * WC + x];
+            if (x < uint(GC)) {
+                scale_rows[ulong(r) * GC + x] = scale_table[src * GC + x];
+                bias_rows[ulong(r) * GC + x] = bias_table[src * GC + x];
+            }
+            """)
 }
 
 /// The row count from which a forward counts as prompt width: the timed
@@ -2039,6 +2271,44 @@ public enum HadamardStridedInputs {
           }
           return strides[LEAD + 1] == 1
               && (shape[LEAD] == 1 || strides[LEAD] == int64_t(shape[LEAD + 1]));
+        }
+        // Every element offset of an NDIM-dimensional view below 2^31: each
+        // dimension of extent above 1 has a stride in [0, 2^31) (an extent-1
+        // dimension's index is 0), and the largest offset, the sum of
+        // (extent - 1) * stride, is below 2^31. Then every row base, column
+        // offset and their sum (each a partial sum of that one) is below 2^31,
+        // and the 32-bit forms below equal the 64-bit ones.
+        template <int NDIM>
+        METAL_FUNC bool bonsai_offsets_fit32(constant const int* shape, constant const int64_t* strides) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (strides[d] < 0 || strides[d] >= (int64_t(1) << 31)) {
+                return false;
+              }
+              span += ulong(shape[d] - 1) * ulong(strides[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int LEAD>
+        METAL_FUNC uint bonsai_row_base32(
+            uint row, constant const int* shape, constant const int64_t* strides) {
+          if (LEAD == 1) {
+            return row * uint(strides[0]);
+          }
+          const uint n1 = uint(shape[1]);
+          return (row < n1) ? row * uint(strides[1])
+                            : (row / n1) * uint(strides[0]) + (row % n1) * uint(strides[1]);
+        }
+        template <int LEAD, int TRAIL>
+        METAL_FUNC uint bonsai_col_off32(
+            uint c, constant const int* shape, constant const int64_t* strides) {
+          if (TRAIL == 1) {
+            return c * uint(strides[LEAD]);
+          }
+          const uint n = uint(shape[LEAD + 1]);
+          return (c / n) * uint(strides[LEAD]) + (c % n) * uint(strides[LEAD + 1]);
         }
 
         """
@@ -2154,6 +2424,16 @@ enum FusedInputHadamardKernel {
               fill([&](uint p) { return static_cast<float>(ap[p]); },
                    [&](uint p) { return static_cast<float>(bp[p]); },
                    [&](uint p) { return signs[p]; });
+            } else if (bonsai_offsets_fit32<LEAD + TRAIL>(a_shape, a_strides)
+                && bonsai_offsets_fit32<LEAD + TRAIL>(b_shape, b_strides)
+                && bonsai_offsets_fit32<1>(signs_shape, signs_strides)) {
+              // The same elements through 32-bit offsets (every offset below 2^31).
+              const uint ra32 = bonsai_row_base32<LEAD>(row, a_shape, a_strides);
+              const uint rb32 = bonsai_row_base32<LEAD>(row, b_shape, b_strides);
+              const uint ss = uint(signs_strides[0]);
+              fill([&](uint p) { return static_cast<float>(a[ra32 + bonsai_col_off32<LEAD, TRAIL>(p, a_shape, a_strides)]); },
+                   [&](uint p) { return static_cast<float>(b[rb32 + bonsai_col_off32<LEAD, TRAIL>(p, b_shape, b_strides)]); },
+                   [&](uint p) { return signs[p * ss]; });
             } else {
               fill([&](uint p) { return static_cast<float>(a[ra + bonsai_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
                    [&](uint p) { return static_cast<float>(b[rb + bonsai_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },
