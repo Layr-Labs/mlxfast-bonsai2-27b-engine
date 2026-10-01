@@ -1018,8 +1018,13 @@ extension Qwen35GDNReplayFused {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+            const float4 x = *(const device float4*)(ps + base);
+            state[d][i] = x.x;
+            state[d][i + 1] = x.y;
+            state[d][i + 2] = x.z;
+            state[d][i + 3] = x.w;
           }
         }
 
@@ -2274,7 +2279,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -4154,7 +4159,9 @@ extension Qwen35GatedDeltaChunked {
             guard text.components(separatedBy: target).count == 2 else { return nil }
             text = text.replacingOccurrences(of: target, with: replacement)
         }
-        return text
+        guard text.components(separatedBy: "size_t").count == 9 else { return nil }
+        return "using ScanIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;\n"
+            + text.replacingOccurrences(of: "size_t", with: "ScanIndexT")
     }
 
     private static let ktKernel: MLXFast.MLXFastKernel? = {
@@ -4181,6 +4188,14 @@ extension Qwen35GatedDeltaChunked {
         let simdgroups: Int
     }
 
+    static func scanOffsetsFitIO32(batch: Int, rows: Int, hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let limit = Int(Int32.max)
+        let rowWidth = max(hk * dk, hv * dv, hv * chunk)
+        return Qwen35IO32.enabled && batch > 0 && rows > 0
+            && rows <= limit / rowWidth && batch <= limit / (rows * rowWidth)
+            && batch <= limit / (hv * dv * dk)
+    }
+
     private static func scanFormLaunch(
         _ form: ScanForm, q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray],
         stateShape: [Int]
@@ -4191,6 +4206,7 @@ extension Qwen35GatedDeltaChunked {
             template: [
                 ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", form.simdgroups),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, form.simdgroups, 1),
