@@ -418,6 +418,16 @@ enum Qwen35IO32 {
     }
 }
 
+/// Slice the consumed seed gate row before reshaping. The original full
+/// gate copy remains available with `MLXFAST_DW1=0`.
+enum MLXFastDW1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DW1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
 /// same order as the ops it replaces; fusion changes the dispatch count, not
@@ -641,7 +651,7 @@ enum Qwen35GatedDeltaV3 {
     static let rowsPerLaneForced: Int? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_V3_DVPL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value == "4" ? 4 : value == "2" ? 2 : nil
+        return value == "4" ? 4 : value == "2" ? 2 : value == "1" ? 1 : nil
     }()
     nonisolated(unsafe) static var rowsPerLane: Int = rowsPerLaneForced ?? 2
 
@@ -4442,7 +4452,11 @@ final class Qwen35Attention: Module {
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
                 .reshaped(B, 1, -1)
-            attendedGate = gate[0..., (qL - 1)..., 0...]
+            // Slice the consumed gate row before reshaping the noncontiguous
+            // q|gate view; preserve its values, dtype and row order.
+            attendedGate = MLXFastDW1.enabled
+                ? qSplit[1][0..., (qL - 1)..., 0..., 0...].reshaped(B, 1, -1)
+                : gate[0..., (qL - 1)..., 0...]
         } else {
             // Prompt width on the tensor route: the o_proj rotation reads the
             // attention's query blocks in place (`rowBlockActivation`), so they
@@ -5049,14 +5063,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5183,8 +5203,12 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -5804,7 +5828,25 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            hiddenStates = hiddenStates + p
+            // `BONSAI_FINAL_HEAD_BOUNDARY`, capture verify: the last residual add, the final norm
+            // and the head's quantizing rotation as the fused boundary every
+            // other layer boundary takes (one launch for the add, the norm's
+            // cast, `rms_looped` and the rotation); the head reads the
+            // activation (`cbv2ForwardWithHiddenCaptured`).
+            if captureRecurrentWindow, hiddenStates.size / max(hiddenStates.dim(-1), 1) == 16,
+                let head = dFlash2Tap.head,
+                ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+                sharedHadamardTensorRouteTakesNarrowInt8(
+                    [head], rows: hiddenStates.size / max(hiddenStates.dim(-1), 1)),
+                let boundary = Qwen35FusedBoundaryQ8.apply(
+                    hiddenStates, p, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
+                    transform: head.transform, gainSigned: false, writeNormed: false)
+            {
+                hiddenStates = boundary.h
+                dFlash2Tap.headInput = (boundary.h, boundary.activation)
+            } else {
+                hiddenStates = hiddenStates + p
+            }
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -5850,6 +5892,13 @@ enum Qwen35PromptTapJoin {
             if (j >= width) return;
             const uint src = row * width + j;
             const uint dst = (row * 5 + tap) * width + j;
+            if ((width & 3u) == 0) {
+              auto input = tap == 0 ? x0 : tap == 1 ? x1 : tap == 2 ? x2 : tap == 3 ? x3 : x4;
+              *(device vec<bfloat16_t, 4>*)(out + dst) = vec<bfloat16_t, 4>(
+                  cast_to<bfloat16_t>(input[src]), cast_to<bfloat16_t>(input[src + 1]),
+                  cast_to<bfloat16_t>(input[src + 2]), cast_to<bfloat16_t>(input[src + 3]));
+              return;
+            }
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
               if (j + i < width) {
@@ -5885,7 +5934,14 @@ enum Qwen35PromptTapJoin {
     }
 
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdict: Bool?
+    private struct Entry {
+        // Retain the owners so a reloaded model cannot reuse an old verdict.
+        let head: HadamardQuantizedLinear
+        let gain: MLXArray
+        let epsBits: UInt32
+        let passed: Bool
+    }
+    nonisolated(unsafe) private static var entry: Entry?
 
     /// Called at drafter load, never from a timed forward. Both source dtypes
     /// must pass; errors and mismatches leave the model's opt-in flag false.
@@ -7558,6 +7614,28 @@ enum Qwen35FusedHadamard {
                 outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+        // The drafter head's BF16 rows, padded to `paddedRows` in the read
+        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
+        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
+        // the zero-row concatenation.
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, groupSize, paddedRows in
+            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
+                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
+            ]
+            return Qwen35RotationQ8Blocks.launchPadded(
+                x, signs, template: template, paddedRows: paddedRows, width: width,
+                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
         }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
@@ -10149,10 +10227,18 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        let fusedHead =
+            Qwen35HeadBoundary.enabled && !model.exactTargetVerify
+            ? (lmHead as? HadamardQuantizedLinear).flatMap {
+                Qwen35HeadBoundary.verified($0, norm: model.norm) ? $0 : nil
+            } : nil
+        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (fusedHead, nil)
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
             captureRecurrentWindow: true)
+        let headInput = model.dFlash2Tap.headInput
+        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (nil, nil)
         let normalized = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
@@ -10160,7 +10246,17 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             // int8 route takes the rows and it is on (`Qwen35HeadTopTwo`).
             logits = model.exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : Qwen35HeadTopTwo.capture { lmHead(normalized) }
+                : Qwen35HeadTopTwo.capture {
+                    // `BONSAI_FINAL_HEAD_BOUNDARY`: the same route matmul on the boundary's
+                    // activation (what `lmHead(normalized)` quantizes to).
+                    if let fusedHead, let input = headInput, input.h === hidden,
+                        let routed = sharedHadamardProjectionsQuantized(
+                            input.activation, leading: Array(hidden.shape.dropLast()), [fusedHead])
+                    {
+                        return routed[0]
+                    }
+                    return lmHead(normalized)
+                }
         } else if model.exactTargetVerify, normalized.dim(1) > 1 {
             logits = qwen35A3BTimewiseProjection(normalized) {
                 model.embedTokens.asLinear($0)
@@ -10169,6 +10265,63 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             logits = model.embedTokens.asLinear(normalized)
         }
         return (logits, hidden)
+    }
+}
+
+/// `BONSAI_FINAL_HEAD_BOUNDARY`: the capture verify's final boundary feeding the head
+/// (`Qwen35TextModelInner.cbv2Forward`), checked on first use for each head,
+/// norm gain and epsilon (the load-time verify warm): every bit of `h` and of the 16-row logits against
+/// `head(norm(x + r))` on random rows. A failure keeps the composed path.
+enum Qwen35HeadBoundary {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_FINAL_HEAD_BOUNDARY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    static func verified(_ head: HadamardQuantizedLinear, norm: RMSNorm) -> Bool {
+        guard ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            norm.weight.dtype == .float32, norm.weight.shape == [Qwen35FusedBoundaryQ8.width],
+            sharedHadamardTensorRouteTakesNarrowInt8([head], rows: 16)
+        else { return false }
+        return lock.withLock {
+            if let entry, entry.head === head, entry.gain === norm.weight,
+                entry.epsBits == norm.eps.bitPattern
+            { return entry.passed }
+            var same = false
+            do {
+                try withError { error in
+                    let keys = MLXRandom.split(key: MLXRandom.key(0x6862_6f75), into: 3)
+                    let shape = [1, 16, norm.weight.dim(0)]
+                    let x = (MLXRandom.normal(shape, key: keys[0]) * 2).asType(.float16)
+                    let r = (MLXRandom.normal(shape, key: keys[1])
+                        * MLXRandom.uniform(Float(0.01) ..< Float(8), [1, 16, 1], key: keys[2]))
+                        .asType(.float16)
+                    let h = x + r
+                    let reference = head(norm(h))
+                    guard
+                        let b = Qwen35FusedBoundaryQ8.apply(
+                            x, r, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
+                            transform: head.transform, gainSigned: false, writeNormed: false),
+                        let fused = sharedHadamardProjectionsQuantized(b.activation, leading: [1, 16], [head])?
+                            .first, fused.shape == reference.shape, fused.dtype == .float32
+                    else { return }
+                    same = all(fused.view(dtype: .uint32) .== reference.view(dtype: .uint32)).item(Bool.self)
+                        && all(b.h.view(dtype: .uint16) .== h.view(dtype: .uint16)).item(Bool.self)
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            entry = Entry(head: head, gain: norm.weight, epsBits: norm.eps.bitPattern, passed: same)
+            FileHandle.standardError.write(
+                Data(("bonsai verify head boundary: "
+                    + (same ? "self-test passed (h and 16 x vocabulary logits bitwise); fused\n"
+                        : "self-test failed; composed final norm kept\n")).utf8))
+            return same
+        }
     }
 }
 

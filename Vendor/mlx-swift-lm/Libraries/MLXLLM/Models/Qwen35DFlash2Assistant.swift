@@ -114,6 +114,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -169,6 +170,19 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Memory.clearCache()
                 // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
                 DFlash2TensorMatmul.SwapTrial.run()
+                Stream().synchronize()
+                Memory.clearCache()
+                if self.speculationPlan != nil, self.drafter.prepareQueryWindows() {
+                    // Reuse the existing whole-block parity guard without
+                    // changing its row classes, front choice or active plan.
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableQueryWindows()
+                        FileHandle.standardError.write(
+                            ("dflash2 query window: whole-block check failed (\(failure)); stock kept\n")
+                                .data(using: .utf8)!)
+                    }
+                }
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
@@ -980,15 +994,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
+        // WALK1: the walk in one launch when on; ACCGLUE: the chain scans the
+        // bool comparison when on (no cast launch).
+        let (anchor, confirmed) =
+            CBv2AcceptGlue.walk(packet, depth: k) ?? CBv2AcceptGlue.chainWalk(packet, depth: k)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                anchor: anchor, confirmed: confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
