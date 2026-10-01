@@ -9,13 +9,13 @@ import MLX
 /// proposal, which already holds the draft ids as `[B, k]` in column order)
 /// instead of one copy per column: 16 launches of one element each become
 /// two. The same int32 values in the same order. Checked once, on first use,
-/// bit for bit against the per-column concatenation;
-/// `MLXFAST_VERIFY_TOKEN_STACK=0` concatenates the columns.
+/// bit for bit against the per-column concatenation (a mismatch keeps it).
+/// Default on; `MLXFAST_VERIFY_TOKEN_STACK=0` concatenates the columns.
 enum CBv2VerifyTokenStack {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_TOKEN_STACK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let verified: Bool = {
