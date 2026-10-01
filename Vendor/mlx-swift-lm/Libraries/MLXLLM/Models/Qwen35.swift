@@ -694,9 +694,22 @@ enum Qwen35GatedDeltaV3 {
           }
           float kv[DVPL];
           float vt[DVPL];
+          // Vector load of the DVPL contiguous value rows (dvbase is a multiple
+          // of DVPL). Same floats as the prior scalar vt[d] = v_[d] loop.
+          if constexpr (DVPL == 2) {
+            const float2 v2 = *(const device float2*)v_;
+            vt[0] = v2.x; vt[1] = v2.y;
+          } else if constexpr (DVPL == 4) {
+            const float4 v4 = *(const device float4*)v_;
+            vt[0] = v4.x; vt[1] = v4.y; vt[2] = v4.z; vt[3] = v4.w;
+          } else {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              vt[d] = v_[d];
+            }
+          }
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
-            vt[d] = v_[d];
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
             #pragma clang loop unroll(full)
             for (int j = 0; j < R / 4; ++j) {
@@ -747,9 +760,17 @@ enum Qwen35GatedDeltaV3 {
               }
             }
             if (lane % LPD == 0) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                y_[d] = out[d];
+              // Vector store of the DVPL contiguous output rows. Same values /
+              // order as the prior scalar y_[d] = out[d] loop; dvbase % DVPL == 0.
+              if constexpr (DVPL == 2) {
+                *(device float2*)y_ = float2(out[0], out[1]);
+              } else if constexpr (DVPL == 4) {
+                *(device float4*)y_ = float4(out[0], out[1], out[2], out[3]);
+              } else {
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  y_[d] = out[d];
+                }
               }
             }
             q_ += Hk * Dk;

@@ -1192,9 +1192,17 @@ extension Qwen35GDNReplayFused {
               }
             }
             if (lane % LPD == 0) {
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                y_[d] = out[d];
+              // Vector store of the DVPL contiguous output rows (same values as
+              // the scalar loop; dvbase is a multiple of DVPL).
+              if constexpr (DVPL == 2) {
+                *(device float2*)y_ = float2(out[0], out[1]);
+              } else if constexpr (DVPL == 4) {
+                *(device float4*)y_ = float4(out[0], out[1], out[2], out[3]);
+              } else {
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  y_[d] = out[d];
+                }
               }
             }
             y_ += Hv * Dv;
