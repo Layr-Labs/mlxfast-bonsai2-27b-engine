@@ -2421,6 +2421,7 @@ enum Qwen35GatedDeltaChunked {
             template: [
                 ("C", C), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", ns),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, ns, 1),
@@ -3965,7 +3966,8 @@ final class Qwen35GatedDeltaNet: Module {
                     ssmPre: ssmState[rowRange],
                     mask: nil,
                     rowCount: S,
-                    convStateRows: nKeep)
+                    convStateRows: nKeep,
+                    g: pre?.g[rowRange], beta: pre?.beta[rowRange])
                 // Count unique additional buffers retained by this stage.
                 // `finalConv` aliases `convInput` until full acceptance detaches
                 // its exact tail at commit. A one-row `ssmPre` aliases the
@@ -3975,6 +3977,8 @@ final class Qwen35GatedDeltaNet: Module {
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
+                if let g = tape.g { roots.append(g) }
+                if let beta = tape.beta { roots.append(beta) }
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
                 if B > 1 || inputSSM == nil {
