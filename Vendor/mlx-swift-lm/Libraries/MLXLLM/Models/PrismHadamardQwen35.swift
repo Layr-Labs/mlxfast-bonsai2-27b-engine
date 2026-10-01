@@ -51,6 +51,29 @@ enum Qwen35SmallNMatmul {
 
     static let chunk = 128
 
+    private struct Dimensions: Hashable {
+        let k: Int
+        let rows: Int
+        let n: Int
+    }
+
+    private static let dimensionsLock = NSLock()
+    nonisolated(unsafe) private static var dimensionsCache: [Dimensions: MLXArray] = [:]
+
+    /// Geometry repeats across layers and decode rounds. Reuse only these
+    /// read-only kernel arguments, never activations or projection results.
+    private static func dimensionsArray(k: Int, rows: Int, n: Int) -> MLXArray {
+        let key = Dimensions(k: k, rows: rows, n: n)
+        return dimensionsLock.withLock {
+            if let cached = dimensionsCache[key] { return cached }
+            let array = MLXArray([Int32(k), Int32(rows), Int32(n)])
+            // Bound retention for processes serving multiple model geometries.
+            // An uncached shape still uses exactly the same argument values.
+            if dimensionsCache.count < 64 { dimensionsCache[key] = array }
+            return array
+        }
+    }
+
     /// The reduce takes the qkv|z product as an unread input (`after`), so MLX
     /// encodes it after that product and the partial runs beside the product
     /// instead of alone. `DARKBLOOM_QWEN35_SPLITK_BA_OVERLAP=0` drops it.
@@ -160,7 +183,7 @@ enum Qwen35SmallNMatmul {
         let n = w.dim(0)
         let rows = x.size / k
         guard rows >= 1, rows <= 16, w.dim(1) == k, n % 32 == 0, k % chunk == 0 else { return nil }
-        let dims = MLXArray([Int32(k), Int32(rows), Int32(n)])
+        let dims = dimensionsArray(k: k, rows: rows, n: n)
         let part = partialKernel(
             [x.reshaped(rows, k), w, dims],
             grid: (n / 32 * 128, k / chunk, 1), threadGroup: (128, 1, 1),
