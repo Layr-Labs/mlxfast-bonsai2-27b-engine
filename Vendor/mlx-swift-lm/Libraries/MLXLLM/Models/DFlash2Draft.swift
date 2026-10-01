@@ -840,7 +840,8 @@ extension DFlash2Attention {
         else { return nil }
         let start = confirmed.reshaped([1])
         let rows = joined ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
-        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
+        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(
+            rows, q: qProj, k: kProj, v: vProj, confirmed: confirmed, blockRows: L)
         else { return nil }
         let queries: MLXArray
         let allKeys: MLXArray
@@ -956,9 +957,14 @@ private final class DFlash2QKVStack {
 
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
-        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
+        _ rows: MLXArray, q: Linear, k: Linear, v: Linear,
+        confirmed: MLXArray? = nil, blockRows: Int? = nil
     ) -> (y: MLXArray, qEnd: Int, kEnd: Int)? {
         guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
+        if let confirmed, blockRows == 16, rows.shape == [1, 32, weight.dim(1)],
+            let y = DFlash2PackedWeights.applyQWindow(
+                rows.reshaped(32, weight.dim(1)), weight, confirmed: confirmed, qEnd: qEnd)
+        { return (y.reshaped(1, 32, weight.dim(0)), qEnd, kEnd) }
         // The same route as `apply`, so every row matches today's block forward.
         return (DFlash2TensorMatmul.apply(rows, weight: weight) ?? matmul(rows, weight.T), qEnd, kEnd)
     }
@@ -3338,6 +3344,139 @@ enum DFlash2PackedWeights {
           }
         }
         """
+
+    // Research variant: Q rows c..<c+16, both K/V tiles unchanged.
+    // All output cells are initialized; Q cells outside the consumer window are zero.
+    private static let qWindowSource = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
+        const int K = ksz[0]; const int N = ksz[2];
+        const int nb = int(threadgroup_position_in_grid.x);
+        const int n0 = nb * COLS;
+        const bool qOnly = n0 < qsz[0];
+        const int shift = metal::clamp(int(cdev[0]), 0, 16);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        const int steps = K / KS;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            COLS, 16, KS, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
+        auto tW0 = Wt.template slice<KS, COLS>(0, n0);
+        auto tX0 = X.template slice<KS, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT0.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        const device uint4* mp = (const device uint4*)mant;
+        const device uint2* cp = (const device uint2*)code;
+        const device uint4* fp = (const device uint4*)first4;
+        dflash2_pack12_share<KT> cur, nxt, far;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+        }
+        if constexpr (AHEAD > 1) {
+          if (KS < kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+        }
+        for (int k = k0; k < k0 + kq; k += KS) {
+          const int tile = nb * steps + k / KS;
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, tile, lane);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+          } else {
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(far, mp, cp, fp, bases, tile + 2, lane); }
+          }
+          dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD > 1) { nxt = far; }
+          auto tXlo = X.template slice<KS, 16>(k, qOnly ? shift : 0);
+          op.run(lw, tXlo, cT0);
+          if (!qOnly) {
+            auto tXhi = X.template slice<KS, 16>(k, 16);
+            op.run(lw, tXhi, cT1);
+          }
+        }
+        threadgroup float red[SPLITS - 1][2 * 16 * COLS];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            red[sg - 1][(COLS / 2 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT0.is_valid_element(i)) continue;
+            float v0, v1;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];
+            } else if constexpr (SPLITS == 4) {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]
+                  + red[2][(COLS / 2 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i]; v1 = cT1[i];
+              for (int j = 0; j < SPLITS - 1; j++) {
+                v0 += red[j][i * 32 + lane]; v1 += red[j][(COLS / 2 + i) * 32 + lane];
+              }
+            }
+            auto idx = cT0.get_multidimensional_index(i);
+            const int r0 = qOnly ? shift + int(idx[0]) : int(idx[0]);
+            const int r1 = qOnly
+                ? (int(idx[0]) < shift ? int(idx[0]) : 16 + int(idx[0]))
+                : 16 + int(idx[0]);
+            out[(IndexT)r0 * N + n0 + idx[1]] = OutT(v0);
+            out[(IndexT)r1 * N + n0 + idx[1]] = qOnly ? OutT(0.0f) : OutT(v1);
+          }
+        }
+        """
+
+    private static let qWindowKernel = MLXFast.metalKernel(
+        name: "dflash2_pack12_q_window_m32",
+        inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "cdev", "qsz"],
+        outputNames: ["out"], source: qWindowSource, header: header, ensureRowContiguous: true)
+
+    private static let qWindowEnabled: Bool = {
+        // Default on; MLXFAST_DFLASH_Q_WINDOW=0 restores the full 32-row stacked projection.
+        guard let raw = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_Q_WINDOW"]?.lowercased() else { return true }
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
+    static func applyQWindow(
+        _ a: MLXArray, _ weight: MLXArray, confirmed: MLXArray, qEnd: Int
+    ) -> MLXArray? {
+        guard qWindowEnabled, weight.shape == [6144, 5120], qEnd == 4096,
+            a.shape == [32, 5120], a.dtype == .bfloat16,
+            confirmed.size == 1, confirmed.dtype == .int32,
+            qEnd > 0, qEnd < weight.dim(0), qEnd % cols == 0,
+            let c = copy(of: weight)
+        else { return nil }
+        return launchQWindow(a, c, confirmed: confirmed, qEnd: qEnd, outputDType: .bfloat16)
+    }
+
+    private static func launchQWindow(
+        _ a: MLXArray, _ c: Copy, confirmed: MLXArray, qEnd: Int, outputDType: DType,
+        tiling: DFlash2TensorMatmul.SwapTiling? = nil
+    ) -> MLXArray {
+        let n = c.source.dim(0)
+        let t = tiling ?? DFlash2TensorMatmul.swapTiling(
+            k: c.source.dim(1), n: n, rows32: true, packed: true)
+        return qWindowKernel(
+            [a] + c.arrays + [dims(c.source), confirmed.reshaped([1]), MLXArray([Int32(qEnd)])],
+            template: [("OutT", outputDType), ("SPLITS", t.splits), ("IO32", c.index32Safe ? 1 : 0)]
+                + geometry + [("AHEAD", t.ahead ?? 1)],
+            grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
+            outputShapes: [[32, n]], outputDTypes: [outputDType])[0]
+    }
 
     private static let encodeKernel = MLXFast.metalKernel(
         name: "dflash2_pack12_encode", inputNames: ["w", "ksz"],
