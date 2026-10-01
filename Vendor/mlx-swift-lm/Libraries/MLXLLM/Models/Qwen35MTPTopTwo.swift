@@ -2098,6 +2098,38 @@ enum Qwen35TensorPackedMatmul {
             outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
     }
 
+    private static func fixedKNNarrowSource(_ source: String?) -> String? {
+        let old = "const int K = ksz[0]; const int M = 16; const int N = ksz[2];"
+        guard let source, source.components(separatedBy: old).count == 2 else { return nil }
+        return source.replacingOccurrences(
+            of: old, with: "constexpr int K = 5120; const int M = 16; constexpr int N = 16384;")
+    }
+
+    private static let kernelNarrowC1FixedKN = fixedKNNarrowSource(sourceNarrowInt8ZooC1IO32).map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1io32_fixedkn",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static let kernelNarrowC1U2FixedKN = fixedKNNarrowSource(sourceNarrowInt8ZooC1U2IO32).map {
+        MLXFast.metalKernel(
+            name: "bonsai_tensor_packed_matmul_m16_i8zc1u2io32_fixedkn",
+            inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+    }
+
+    private static func fixedKNNarrowKernel(
+        _ kernel: NarrowKernel
+    ) -> MLXFast.MLXFastKernel? {
+        guard kernel.fixedKN, kernel.form != .base else { return nil }
+        switch kernel.variant {
+        case .k32pd1C1IO32: return kernelNarrowC1FixedKN
+        case .k32pd1C1U2IO32: return kernelNarrowC1U2FixedKN
+        default: return nil
+        }
+    }
+
     private static func narrowZooIO32Fits(k: Int, n: Int, m: Int) -> Bool {
         guard m == 16, k >= 512, k % 512 == 0, n > 0, n % 32 == 0 else { return false }
         let limit = Int(Int32.max)
@@ -3663,8 +3695,9 @@ enum Qwen35TensorPackedMatmul {
     struct NarrowKernel: Hashable, CustomStringConvertible {
         var variant: NarrowVariant
         var form: NarrowEpilogue
+        var fixedKN = false
         static let original = NarrowKernel(variant: .v0, form: .base)
-        var description: String { "\(variant)/\(form)" }
+        var description: String { "\(variant)/\(form)" + (fixedKN ? "/fixedKN" : "") }
     }
 
     /// The load-time choice (see `chooseNarrowKernels`): per production shape
@@ -3920,7 +3953,7 @@ enum Qwen35TensorPackedMatmul {
 
         /// A kernel's name in the logs.
         static func name(_ kernel: NarrowKernel) -> String {
-            kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
+            kernel.fixedKN || kernel.variant.family == nil ? "\(kernel)" : "\(kernel.variant)"
         }
 
         /// A set's kernel on each per-shape factor and the head.
@@ -4204,7 +4237,10 @@ enum Qwen35TensorPackedMatmul {
         _ cache: HadamardConstantLayoutCache, _ scales: MLXArray, _ biases: MLXArray,
         k: Int, n: Int, outputDType: DType
     ) -> NarrowKernel {
-        let choice = narrowByShape[[k, n]] ?? narrowDefault
+        var choice = narrowByShape[[k, n]] ?? narrowDefault
+        if choice.fixedKN, k != 5120 || n != 16384 || outputDType != .float32 {
+            choice.fixedKN = false
+        }
         if n % choice.variant.tn != 0 { return .original }
         // zoo 3a: only on the production shapes its self-test ran (not the head)
         if choice.variant.xtg != nil, !narrowXTGShapes.contains([k, n]) { return .original }
@@ -4589,7 +4625,11 @@ enum Qwen35TensorPackedMatmul {
             // Zoo 4: the derived text's kernel (its variants are offered only
             // where it built, `narrowDerivedVariants`), same templates and grid.
             let zooKernel: MLXFast.MLXFastKernel
-            if v == .k32pd1C1IO32, narrowZooIO32Fits(k: k, n: n, m: m),
+            if kernel.fixedKN, k == 5120, n == 16384, outputDType == .float32,
+                narrowZooIO32Fits(k: k, n: n, m: m),
+                let body = fixedKNNarrowKernel(kernel) {
+                zooKernel = body
+            } else if v == .k32pd1C1IO32, narrowZooIO32Fits(k: k, n: n, m: m),
                 let body = kernelNarrowInt8ZooC1IO32 {
                 zooKernel = body
             } else if v == .k32pd1C1U2IO32, narrowZooIO32Fits(k: k, n: n, m: m),
@@ -5307,11 +5347,65 @@ enum Qwen35TensorPackedMatmul {
         return choices
     }
 
+    // A fixed shape option in the existing whole-forward trial; no new timing rule.
+    private static func fixedKNTrials(_ choice: NarrowChoice) -> [(NarrowChoice, String, Int)] {
+        guard narrowTiled, NarrowInSituTrial.enabled else { return [] }
+        let stocks = zooExact32.filter {
+            !$0.fixedKN && $0.form != .base && zooExact16.contains($0)
+                && [.k32pd1C1IO32, .k32pd1C1U2IO32].contains($0.variant)
+        }.sorted { $0.description < $1.description }
+        guard !stocks.isEmpty else { return [] }
+        let ops = NarrowOperands(k: 5120, n: 16384, seed: 0x6669_7865)
+        let zeroCodes = MLXArray.zeros([16, ops.k], dtype: .int8)
+        let zeroScales = MLXArray.ones([16, ops.k / 128], dtype: .float32)
+        let zeroSums = MLXArray.zeros([16, ops.k / 128], dtype: .float32)
+        eval(zeroCodes, zeroScales, zeroSums)
+        var trial: [(NarrowChoice, String, Int)] = []
+        var passed: [String] = [], failed: [String] = []
+        for stock in stocks {
+            var fixed = stock
+            fixed.fixedKN = true
+            guard fixedKNNarrowKernel(fixed) != nil else { continue }
+            let scales = stock.form == .negativeBiasF32Scales ? ops.scalesT32 : ops.scalesT
+            let checked = try? withError { scoped -> Bool in
+                for zero in [false, true] {
+                    let codes = zero ? zeroCodes : ops.codes
+                    let ascale = zero ? zeroScales : ops.ascale
+                    let rowsum = zero ? zeroSums : ops.rowsum
+                    func run(_ kernel: NarrowKernel) -> MLXArray {
+                        launchNarrowInt8(
+                            codes, ops.tiledWeight, scales, scales, ascale, rowsum,
+                            k: ops.k, n: ops.n, outputDType: .float32, kernel: kernel, tiled: true)
+                    }
+                    let differ = (run(stock).view(dtype: .uint32) .!= run(fixed).view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try scoped.check()
+                    if differ.item(Int32.self) != 0 { return false }
+                }
+                return true
+            }
+            if checked == true {
+                zooExact32.insert(fixed)
+                var map = choice.1
+                map[[5120, 16384]] = fixed
+                trial.append(((choice.0, map), "fixedKN \(fixed)", 2))
+                passed.append("\(fixed)")
+            } else {
+                failed.append("\(fixed)")
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "bonsai tensor fixed KN: self-test passed [\(passed.joined(separator: " "))] failed [\(failed.joined(separator: " "))]\n".utf8))
+        return trial
+    }
+
     /// Installs the record's pick and sets up the in-situ trial. The operands
     /// every candidate reads (the per-projection proof, the FP32 scales) are
     /// prepared at the load-time prompt forward, before any trial round.
     private static func installNarrowChoice() {
-        let (choice, trial) = chooseNarrowKernels()
+        let (choice, stockTrial) = chooseNarrowKernels()
+        let trial = stockTrial.isEmpty ? [] : stockTrial + fixedKNTrials(choice)
         narrowDefault = choice.0
         narrowByShape = choice.1
         NarrowInSituTrial.sets = trial.map(\.0)
@@ -5406,6 +5500,9 @@ enum Qwen35TensorPackedMatmul {
                     }
                     if Qwen35HeadTopTwo.on, headTop2Applies(k: k, n: n, kernel: choice) {
                         Qwen35HeadTopTwo.captured = launchNarrowInt8Top2(
+                            codes, words, scalesT, biasesT, activation.scales,
+                            activation.scaledSums, k: k, n: n, kernel: choice, tiled: narrowTiled)
+                        Qwen35HeadTopTwo.capturedFirst = headFirstFactory(
                             codes, words, scalesT, biasesT, activation.scales,
                             activation.scaledSums, k: k, n: n, kernel: choice, tiled: narrowTiled)
                         Qwen35HeadTopTwo.announce(
@@ -6170,6 +6267,7 @@ enum Qwen35HeadTopTwo {
     /// launch then leaves its fused pair in `captured`.
     nonisolated(unsafe) static var capturing = false
     nonisolated(unsafe) static var captured: (ids: MLXArray, values: MLXArray)?
+    nonisolated(unsafe) static var capturedFirst: (() -> MLXArray?)?
     /// Rounds whose policy top two came from the fused pair (`lookup` hits).
     nonisolated(unsafe) static var hits = 0
 
@@ -6177,10 +6275,12 @@ enum Qwen35HeadTopTwo {
         weak var logits: MLXArray?
         let ids: MLXArray
         let values: MLXArray
-        init(logits: MLXArray, ids: MLXArray, values: MLXArray) {
+        let first: (() -> MLXArray?)?
+        init(logits: MLXArray, ids: MLXArray, values: MLXArray, first: (() -> MLXArray?)?) {
             self.logits = logits
             self.ids = ids
             self.values = values
+            self.first = first
         }
     }
 
@@ -6200,11 +6300,15 @@ enum Qwen35HeadTopTwo {
     static func capture(_ head: () -> MLXArray) -> MLXArray {
         guard forced != false else { return head() }
         captured = nil
+        capturedFirst = nil
         capturing = true
         let logits = head()
         capturing = false
-        last = captured.map { Entry(logits: logits, ids: $0.ids, values: $0.values) }
+        last = captured.map {
+            Entry(logits: logits, ids: $0.ids, values: $0.values, first: capturedFirst)
+        }
         captured = nil
+        capturedFirst = nil
         return logits
     }
 
@@ -6217,6 +6321,14 @@ enum Qwen35HeadTopTwo {
         hits += 1
         if rows == entry.ids.dim(0) { return (entry.ids, entry.values) }
         return (entry.ids[0 ..< rows], entry.values[0 ..< rows])
+    }
+
+    /// Build only this capture's first-ID graph; the pair graph stays lazy.
+    static func lookupFirst(_ logits: MLXArray) -> MLXArray? {
+        guard on, let entry = last, let held = entry.logits, held === logits,
+            entry.ids.dim(0) == 16, let first = entry.first
+        else { return nil }
+        return first()
     }
 
     /// The in-situ trial (as `Qwen35TensorPackedMatmul.NarrowInSituTrial`):
@@ -6538,11 +6650,11 @@ extension Qwen35TensorPackedMatmul {
     /// `qwen35MTPTopTwoRows`. Nil when the variant's fused body is missing.
     /// `tiled`: `weight` is the tiled copy (`narrowTiledWeight`), as for the
     /// stock launch; the fused body keeps the stock body's `TILED` loads.
-    static func launchNarrowInt8Top2(
+    static func launchNarrowInt8Top2Partial(
         _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
         _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel,
         tiled: Bool
-    ) -> (ids: MLXArray, values: MLXArray)? {
+    ) -> [MLXArray]? {
         let m = 16
         let inputs = [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: m, n: n)]
         let template: [(String, any KernelTemplateArg)] = [
@@ -6606,10 +6718,304 @@ extension Qwen35TensorPackedMatmul {
                     outputShapes: shapes, outputDTypes: dtypes)
             }
         }
+        return partial
+    }
+
+    static func launchNarrowInt8Top2(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel,
+        tiled: Bool
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        let m = 16
+        guard let partial = launchNarrowInt8Top2Partial(
+            codes, weight, scalesT, biasesT, ascale, rowsum,
+            k: k, n: n, kernel: kernel, tiled: tiled)
+        else { return nil }
         let merged = headTop2MergeKernel(
             partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
             outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
         return (merged[0], merged[1])
+    }
+
+    private static func mergeHeadTop2Partial(
+        _ partial: [MLXArray]
+    ) -> (ids: MLXArray, values: MLXArray) {
+        let m = partial[0].dim(0)
+        let merged = headTop2MergeKernel(
+            partial, grid: (32, m, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[m, 2], [m, 2]], outputDTypes: [.int32, .float32])
+        return (merged[0], merged[1])
+    }
+
+    private static let headFirstHeader = headTop2Header + """
+
+        struct bonsai_head_first { float first_value; uint first_id; uint count; };
+        inline bonsai_head_first bonsai_head_first_empty() {
+          return {0.0f, 0u, 0u};
+        }
+        inline void bonsai_head_first_insert(thread bonsai_head_first &s, float value, uint id) {
+          if (s.count == 0u || bonsai_head_top2_better(value, id, s.first_value, s.first_id)) {
+            s.first_value = value; s.first_id = id; s.count = 1u;
+          }
+        }
+        inline bonsai_head_first bonsai_head_first_shuffle(bonsai_head_first s, ushort mask) {
+          return {simd_shuffle_xor(s.first_value, mask), simd_shuffle_xor(s.first_id, mask),
+            simd_shuffle_xor(s.count, mask)};
+        }
+        inline void bonsai_head_first_merge_full(thread bonsai_head_first &s, bonsai_head_first o) {
+          if (bonsai_head_top2_better(o.first_value, o.first_id, s.first_value, s.first_id)) {
+            s.first_value = o.first_value; s.first_id = o.first_id;
+          }
+        }
+        inline void bonsai_head_first_merge(thread bonsai_head_first &s, bonsai_head_first o) {
+          if (o.count != 0u) bonsai_head_first_insert(s, o.first_value, o.first_id);
+        }
+
+        """
+
+    static func headFirstSource(_ text: String) -> String? {
+        guard var t = headTop2Source(text, columns: "TN") else { return nil }
+        let edits: [(String, String, Int)] = [
+            ("bonsai_head_top2 ht2[2] = {bonsai_head_top2_empty(), bonsai_head_top2_empty()};",
+                "bonsai_head_first ht2[2] = {bonsai_head_first_empty(), bonsai_head_first_empty()};", 1),
+            ("bonsai_head_top2_insert", "bonsai_head_first_insert", 4),
+            ("bonsai_head_top2_merge", "bonsai_head_first_merge", 2),
+            ("bonsai_head_top2_shuffle_xor", "bonsai_head_first_shuffle", 2),
+            ("const uint o = (uint(fm + 8 * mh) * uint(ht2blocks) + uint(ht2block)) * 2u;",
+                "const uint o = uint(fm + 8 * mh) * uint(ht2blocks) + uint(ht2block);", 1),
+            ("*(device int2*)(top_ids + o) = int2(int(ht2[mh].first_id), int(ht2[mh].second_id));",
+                "top_ids[o] = int(ht2[mh].first_id);", 1),
+            ("*(device float2*)(top_values + o) = float2(ht2[mh].first_value, ht2[mh].second_value);",
+                "top_values[o] = ht2[mh].first_value;", 1),
+        ]
+        for (old, new, count) in edits {
+            guard t.components(separatedBy: old).count == count + 1 else { return nil }
+            t = t.replacingOccurrences(of: old, with: new)
+        }
+        return t
+    }
+
+    private static func headFirstKernel(_ name: String, _ text: String?) -> MLXFast.MLXFastKernel? {
+        guard let text, let source = headFirstSource(text) else { return nil }
+        return MLXFast.metalKernel(
+            name: name, inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
+            outputNames: ["top_ids", "top_values"], source: source, header: header + headFirstHeader,
+            ensureRowContiguous: true)
+    }
+
+    private static let headFirstC1 = headFirstKernel(
+        "bonsai_tensor_packed_matmul_m16_i8zc1io32_first", sourceNarrowInt8ZooC1IO32)
+    private static let headFirstC1U2 = headFirstKernel(
+        "bonsai_tensor_packed_matmul_m16_i8zc1u2io32_first", sourceNarrowInt8ZooC1U2IO32)
+
+    private static let headFirstMergeSource = """
+        const uint lane = thread_index_in_simdgroup;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint blocks = uint(pid_shape[1]);
+        bonsai_head_first st = bonsai_head_first_empty();
+        const uint row_base = row * blocks;
+        for (uint b = lane; b < blocks; b += 32u) {
+          const uint o = row_base + b;
+          bonsai_head_first_insert(st, pval[o], uint(pid[o]));
+        }
+        for (ushort m = 16; m > 0; m >>= 1) {
+          if constexpr (FULL) {
+            bonsai_head_first_merge_full(st, bonsai_head_first_shuffle(st, m));
+          } else {
+            bonsai_head_first_merge(st, bonsai_head_first_shuffle(st, m));
+          }
+        }
+        if (lane == 0) {
+          top_ids[row] = int(st.first_id);
+          top_values[row] = st.first_value;
+        }
+        """
+    private static let headFirstMergeKernel = MLXFast.metalKernel(
+        name: "bonsai_head_first_merge", inputNames: ["pid", "pval"], outputNames: ["top_ids"],
+        source: headFirstMergeSource.replacingOccurrences(of: "top_values[row] = st.first_value;", with: ""),
+        header: headFirstHeader, ensureRowContiguous: true)
+    private static let headFirstPartitionedMergeKernel = MLXFast.metalKernel(
+        name: "bonsai_head_first_partitioned_merge", inputNames: ["pid", "pval"],
+        outputNames: ["top_ids", "top_values"],
+        source: headFirstMergeSource
+            .replacingOccurrences(of: "const uint row = threadgroup_position_in_grid.y;",
+                with: "const uint output_row = threadgroup_position_in_grid.y;\n"
+                    + "const uint row = output_row / PARTS;\nconst uint part = output_row % PARTS;")
+            .replacingOccurrences(of: "uint b = lane; b < blocks; b += 32u",
+                with: "uint b = lane + part * 32u; b < blocks; b += 32u * PARTS")
+            .replacingOccurrences(of: "top_ids[row]", with: "top_ids[output_row]")
+            .replacingOccurrences(of: "top_values[row]", with: "top_values[output_row]"),
+        header: headFirstHeader, ensureRowContiguous: true)
+
+    private static func mergeHeadFirst(_ partial: [MLXArray], parts: Int) -> MLXArray {
+        let m = partial[0].dim(0)
+        let pairs: [MLXArray]
+        if parts > 1 && partial[0].dim(1) >= parts * 32 {
+            pairs = headFirstPartitionedMergeKernel(
+                partial, template: [("PARTS", parts), ("FULL", true)],
+                grid: (32, m * parts, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[m, parts], [m, parts]], outputDTypes: [.int32, .float32])
+        } else { pairs = partial }
+        return headFirstMergeKernel(
+            pairs, template: [("FULL", pairs[0].dim(1) >= 32)],
+            grid: (32, m, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[m]], outputDTypes: [.int32])[0]
+    }
+
+    private static func headFirstSupported(_ kernel: NarrowKernel) -> Bool {
+        (kernel.variant == .k32pd1C1IO32 || kernel.variant == .k32pd1C1U2IO32)
+            && (kernel.form == .negativeBias || kernel.form == .negativeBiasF32Scales)
+    }
+
+    private static func launchHeadFirstPartial(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel, tiled: Bool
+    ) -> [MLXArray]? {
+        guard tiled, headFirstSupported(kernel), n % 32 == 0,
+            narrowZooIO32Fits(k: k, n: n, m: 16),
+            let launch = kernel.variant == .k32pd1C1IO32 ? headFirstC1 : headFirstC1U2
+        else { return nil }
+        return launch(
+            [codes, weight, scalesT, biasesT, ascale, rowsum, dimsArray(k: k, m: 16, n: n)],
+            template: [("OutT", DType.float32), ("NEG", 1),
+                ("F32S", kernel.form == .negativeBiasF32Scales ? 1 : 0),
+                ("PD", kernel.variant.pd), ("TN", kernel.variant.tn),
+                ("KH", kernel.variant.kh), ("AM", kernel.variant.am)],
+            grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[16, n / 32], [16, n / 32]], outputDTypes: [.int32, .float32])
+    }
+
+    nonisolated(unsafe) private static var headFirstVerified: Set<NarrowKernel> = []
+    nonisolated(unsafe) private static var headFirstMergeParts = 1
+
+    private static func headFirstFactory(
+        _ codes: MLXArray, _ weight: MLXArray, _ scalesT: MLXArray, _ biasesT: MLXArray,
+        _ ascale: MLXArray, _ rowsum: MLXArray, k: Int, n: Int, kernel: NarrowKernel, tiled: Bool
+    ) -> (() -> MLXArray?)? {
+        guard headTop2Applies(k: k, n: n, kernel: kernel), headFirstVerified.contains(kernel)
+        else { return nil }
+        let parts = headFirstMergeParts
+        return {
+            guard let partial = launchHeadFirstPartial(
+                codes, weight, scalesT, biasesT, ascale, rowsum,
+                k: k, n: n, kernel: kernel, tiled: tiled)
+            else { return nil }
+            return mergeHeadFirst(partial, parts: parts)
+        }
+    }
+
+    private static func prepareHeadFirst(
+        k: Int, n: Int, kernels: [NarrowKernel], cases: [() -> NarrowOperands]
+    ) {
+        headFirstVerified = []
+        headFirstMergeParts = 1
+        guard narrowTiled else { return }
+        var trialPartial: [MLXArray]?
+        defer { trialPartial = nil }
+        for kernel in kernels where headFirstSupported(kernel) {
+            var passed = true
+            var samplePartial: [MLXArray]?
+            for make in cases {
+                let o = make()
+                let s = kernel.form == .negativeBiasF32Scales ? o.scalesT32 : o.scalesT
+                do {
+                    try withError { error in
+                        guard let old = o.runTop2Partial(kernel),
+                            let first = launchHeadFirstPartial(
+                                o.codes, o.tiledWeight, s, s, o.ascale, o.rowsum,
+                                k: k, n: n, kernel: kernel, tiled: true)
+                        else { passed = false; return }
+                        var bad = (old[0][0..., 0..., 0] .!= first[0]).asType(.int32).sum()
+                            + (old[1][0..., 0..., 0].view(dtype: .uint32)
+                                .!= first[1].view(dtype: .uint32)).asType(.int32).sum()
+                        let stockFirst = mergeHeadTop2Partial(old).ids[0..., 0]
+                        for parts in [1, 2, 4, 8, 16] where old[0].dim(1) >= parts * 32 {
+                            bad = bad + (mergeHeadFirst(first, parts: parts)
+                                .!= stockFirst).asType(.int32).sum()
+                        }
+                        eval(bad)
+                        try error.check()
+                        if bad.item(Int32.self) != 0 {
+                            passed = false
+                        } else if samplePartial == nil {
+                            samplePartial = first
+                        }
+                    }
+                } catch { passed = false }
+            }
+            if passed {
+                headFirstVerified.insert(kernel)
+                if trialPartial == nil { trialPartial = samplePartial }
+            }
+            FileHandle.standardError.write(
+                ("bonsai head first-ID: \(kernel) " + (passed ? "self-test passed\n" : "FAILED; top-two kept\n"))
+                    .data(using: .utf8)!)
+        }
+        if let partial = trialPartial {
+            headFirstMergeParts = chooseHeadFirstMergeParts(partial, inherited: headFirstMergeParts)
+        }
+    }
+
+    private static func headFirstMergeChoice(
+        _ samples: [Int: [UInt64]], choices: [Int], inherited: Int
+    ) -> (parts: Int, times: [Int: Double]) {
+        func median(_ a: [UInt64]) -> Double {
+            let a = a.sorted(), middle = a.count / 2
+            return a.count % 2 == 1 ? Double(a[middle])
+                : (Double(a[middle - 1]) + Double(a[middle])) / 2
+        }
+        var times = [Int: Double]()
+        for parts in choices {
+            guard let a = samples[parts], a.count == 8 else { return (inherited, [:]) }
+            let first = median(a)
+            let kept = a.filter { Double($0) <= first * 1.5 }
+            guard kept.count >= 5 else { return (inherited, [:]) }
+            times[parts] = median(kept)
+        }
+        guard let record = times[inherited],
+            let best = choices.min(by: { times[$0]! < times[$1]! }),
+            times[best]! < record * 0.98
+        else { return (inherited, times) }
+        return (best, times)
+    }
+
+    private static func chooseHeadFirstMergeParts(_ partial: [MLXArray], inherited: Int) -> Int {
+        let choices = [1] + [2, 4, 8, 16].filter { partial[0].dim(1) >= $0 * 32 }
+        guard choices.contains(inherited) else { return inherited }
+        var samples = [Int: [UInt64]]()
+        do {
+            try withError { error in
+                for parts in choices {
+                    eval(mergeHeadFirst(partial, parts: parts))
+                    try error.check()
+                }
+                for round in 0 ..< 8 {
+                    for offset in choices.indices {
+                        let parts = choices[(round + offset) % choices.count]
+                        let before = DispatchTime.now().uptimeNanoseconds
+                        let result = mergeHeadFirst(partial, parts: parts)
+                        eval(result)
+                        let elapsed = DispatchTime.now().uptimeNanoseconds - before
+                        try error.check()
+                        samples[parts, default: []].append(elapsed)
+                    }
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(
+                ("bonsai head first-ID merge: timing failed; inherited \(inherited) kept\n")
+                    .data(using: .utf8)!)
+            return inherited
+        }
+        let selected = headFirstMergeChoice(samples, choices: choices, inherited: inherited)
+        let readings = choices.map {
+            "\($0):" + (selected.times[$0].map { String(format: "%.1f us", $0 / 1e3) } ?? "-")
+        }.joined(separator: " ")
+        FileHandle.standardError.write(
+            ("bonsai head first-ID merge partitions: \(readings); adopted \(selected.parts); "
+                + "inherited \(inherited); checks \(choices), 3 cases, 0 mismatches\n")
+                .data(using: .utf8)!)
+        return selected.parts
     }
 
     /// The capture verify's head launch: `(k, n)` and the kernel the route
@@ -6711,6 +7117,7 @@ extension Qwen35TensorPackedMatmul {
         let passed = kernels.filter { failed[$0] == nil && mismatchesByKernel[$0] == 0 }
         headTop2Shape = [k, n]
         headTop2Verified = Set(passed)
+        prepareHeadFirst(k: k, n: n, kernels: passed, cases: cases)
         Memory.clearCache()
         let total = mismatchesByKernel.values.reduce(0, +)
         log += (passed.count == kernels.count ? "self-test passed" : "self-test FAILED")
@@ -6765,6 +7172,21 @@ extension Qwen35TensorPackedMatmul.NarrowOperands {
         case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
         }
         return Qwen35TensorPackedMatmul.launchNarrowInt8Top2(
+            codes, tiled ? tiledWeight : weight, s, b, ascale, rowsum, k: k, n: n,
+            kernel: kernel, tiled: tiled)
+    }
+
+    func runTop2Partial(
+        _ kernel: Qwen35TensorPackedMatmul.NarrowKernel
+    ) -> [MLXArray]? {
+        let tiled = Qwen35TensorPackedMatmul.narrowTiled
+        let (s, b): (MLXArray, MLXArray)
+        switch kernel.form {
+        case .base: (s, b) = (scalesT, biasesT)
+        case .negativeBias: (s, b) = (scalesT, scalesT)
+        case .negativeBiasF32Scales: (s, b) = (scalesT32, scalesT32)
+        }
+        return Qwen35TensorPackedMatmul.launchNarrowInt8Top2Partial(
             codes, tiled ? tiledWeight : weight, s, b, ascale, rowsum, k: k, n: n,
             kernel: kernel, tiled: tiled)
     }

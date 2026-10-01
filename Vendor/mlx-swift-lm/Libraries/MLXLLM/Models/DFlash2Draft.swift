@@ -5669,12 +5669,17 @@ private enum DFlash2ResidencyTouch {
     /// Inputs per kernel; with the output well inside Metal's 31 buffer slots.
     static let inputs = 24
 
+    static let name = "dflash2_residency_touch"
+    static let source: String = {
+        let reads = (0 ..< inputs).map { "acc += static_cast<float>(w\($0)[0]);" }.joined(separator: "\n")
+        return "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n"
+    }()
+
     private static let kernel: MLXFast.MLXFastKernel = {
         let names = (0 ..< inputs).map { "w\($0)" }
-        let reads = names.map { "acc += static_cast<float>(\($0)[0]);" }.joined(separator: "\n")
         return MLXFast.metalKernel(
-            name: "dflash2_residency_touch", inputNames: names, outputNames: ["out"],
-            source: "float acc = 0.0f;\n" + reads + "\nout[0] = acc;\n",
+            name: name, inputNames: names, outputNames: ["out"],
+            source: source,
             ensureRowContiguous: false)
     }()
 
@@ -5684,22 +5689,36 @@ private enum DFlash2ResidencyTouch {
             outputShapes: [[1]], outputDTypes: [.float32])[0]
     }
 
-    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
-    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+    /// The launches' operands for `arrays`: per dtype (first-seen order),
+    /// `inputs` at a time, the last chunk padded with its own last array.
+    static func chunks(_ arrays: [MLXArray]) -> [[MLXArray]] {
         var order: [DType] = []
         var byType: [DType: [MLXArray]] = [:]
         for array in arrays {
             if byType[array.dtype] == nil { order.append(array.dtype) }
             byType[array.dtype, default: []].append(array)
         }
-        return order.flatMap { dtype -> [MLXArray] in
+        return order.flatMap { dtype -> [[MLXArray]] in
             let same = byType[dtype]!
             return stride(from: 0, to: same.count, by: inputs).map { start in
                 var chunk = Array(same[start ..< min(start + inputs, same.count)])
                 chunk += Array(repeating: chunk[chunk.count - 1], count: inputs - chunk.count)
-                return launch(chunk)
+                return chunk
             }
         }
+    }
+
+    /// The touches of `arrays`: per dtype (first-seen order), `inputs` at a time.
+    static func touch(_ arrays: [MLXArray]) -> [MLXArray] {
+        chunks(arrays).map { launch($0) }
+    }
+
+    /// Submits the touches of `groups` (each group's chunks, in order) on the
+    /// side queue (`CBv2SideQueue`, `MLXFAST_SEEDGAP`): the same launches the
+    /// default queue would take, committed on their own queue.
+    static func submitOnSideQueue(_ groups: [[MLXArray]]) {
+        CBv2SideQueue.submitTouches(
+            groups.flatMap { chunks($0) }, name: name, inputs: inputs, source: source)
     }
 
     private static let lock = NSLock()
@@ -5713,6 +5732,15 @@ private enum DFlash2ResidencyTouch {
         }) else { return }
         let types: [DType] = [.bfloat16, .float16, .float32, .uint32, .uint16, .uint8, .int8, .int32]
         eval(types.map { launch(Array(repeating: MLXArray.zeros([1], dtype: $0), count: inputs)) })
+        // The side queue is made here, at load, with its own first touches.
+        if CBv2SideQueue.enabled {
+            CBv2SideQueue.prepare()
+            let zeros = types.map { MLXArray.zeros([1], dtype: $0) }
+            eval(zeros)
+            CBv2SideQueue.submitTouches(
+                zeros.map { Array(repeating: $0, count: inputs) }, name: name, inputs: inputs,
+                source: source)
+        }
     }
 }
 
@@ -5933,6 +5961,10 @@ public enum DFlash2ResidencyPrefetch {
             return due
         }
         guard !due.isEmpty else { return }
+        if CBv2SideQueue.enabled {
+            DFlash2ResidencyTouch.submitOnSideQueue(due)
+            return
+        }
         asyncEval(due.flatMap { DFlash2ResidencyTouch.touch($0) })
     }
 
@@ -7185,7 +7217,7 @@ enum DFlash2QKPrework {
         name: "dflash2_qk_prework",
         inputNames: ["y", "qw", "kw", "p", "pos"],
         outputNames: ["q", "k"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework"),
         ensureRowContiguous: true)
 
     /// The kernel body, shared with `DFlash2SpeculativeFront`'s variant.
@@ -7620,7 +7652,7 @@ enum DFlash2SpeculativeFront {
 
     /// `DFlash2QKPrework.source` with the q rows at `cdev + t`; nil when its
     /// text no longer has the lines the variant rewrites.
-    private static let headsKernel: MLXFast.MLXFastKernel? = {
+    private static let headsSource: String? = {
         var source = DFlash2QKPrework.source
         let edits: [(String, String)] = [
             (
@@ -7637,9 +7669,60 @@ enum DFlash2SpeculativeFront {
             guard source.components(separatedBy: from).count == 2 else { return nil }
             source = source.replacingOccurrences(of: from, with: to)
         }
+        return source
+    }()
+
+    private static let headsKernel: MLXFast.MLXFastKernel? = {
+        guard let source = headsSource else { return nil }
         return MLXFast.metalKernel(
             name: "dflash2_qk_prework_at", inputNames: ["y", "qw", "kw", "p", "pos", "cdev"],
             outputNames: ["q", "k"], source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework_at"),
+            ensureRowContiguous: true)
+    }()
+
+    private static let headsSIMDKernel: MLXFast.MLXFastKernel? = {
+        guard var source = headsSource else { return nil }
+        let shared = """
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            """
+        let reduction = """
+            if (simd_group_id == 0) {
+              local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+              local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              acc = simd_sum(local_sums[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + p[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+        let simdReduction = """
+            acc = simd_sum(simd_lane_id == 0 ? acc : as_type<float>(0u));
+            uint inverse_bits = 0u;
+            if (simd_lane_id == 0) {
+              inverse_bits = as_type<uint>(metal::precise::rsqrt(acc / axis_size + p[0]));
+            }
+            const float inv_mean = as_type<float>(simd_broadcast(inverse_bits, ushort(0)));
+            """
+        for (from, to) in [
+            (shared, ""), (reduction, simdReduction),
+            ("constexpr int SIMD_SIZE = 32;", ""),
+            ("const uint simd_group_id = simdgroup_index_in_threadgroup;", ""),
+            ("thread_x[i] * local_inv_mean[0]", "thread_x[i] * inv_mean"),
+        ] {
+            guard source.components(separatedBy: from).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: from, with: to)
+        }
+        return MLXFast.metalKernel(
+            name: "dflash2_qk_prework_at_simd", inputNames: ["y", "qw", "kw", "p", "pos", "cdev"],
+            outputNames: ["q", "k"], source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework_at_simd"),
             ensureRowContiguous: true)
     }()
 
@@ -7648,13 +7731,14 @@ enum DFlash2SpeculativeFront {
     /// passed their self-tests and the trial.
     nonisolated(unsafe) private(set) static var rowsChosen = false
     nonisolated(unsafe) private(set) static var headsChosen = false
+    nonisolated(unsafe) private static var headsSIMDChosen = false
 
     /// Either one-launch form is in use.
     static var active: Bool { rowsChosen || headsChosen }
 
     /// Back to the composed front (the speculation self-test failed with it).
     static func deactivate() {
-        lock.withLock { (rowsChosen, headsChosen) = (false, false) }
+        lock.withLock { (rowsChosen, headsChosen, headsSIMDChosen) = (false, false, false) }
     }
     /// `[eps, log2(base), scale]` of the drafter's head geometry.
     nonisolated(unsafe) private static var parameters: MLXArray?
@@ -7710,7 +7794,8 @@ enum DFlash2SpeculativeFront {
             kNorm.eps == g.eps, qNorm.weight.dtype == y.dtype, kNorm.weight.dtype == y.dtype,
             c.size == 1, c.dtype == .int32
         else { return nil }
-        return headsLaunch(kernel, y, l, g.hq, g.hk, qNorm.weight, kNorm.weight, p, pos, c)
+        let checked = headsSIMDChosen ? (headsSIMDKernel ?? kernel) : kernel
+        return headsLaunch(checked, y, l, g.hq, g.hk, qNorm.weight, kNorm.weight, p, pos, c)
     }
 
     /// The self-tests and the trial, once, at bind.
@@ -7737,6 +7822,8 @@ enum DFlash2SpeculativeFront {
             }
             var rowsSame = true
             var headsSame = headsKernel != nil
+            var headsSIMDSame = headsSIMDKernel != nil
+            var headsSIMDInputs: [(MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)] = []
             var compared = 0
             // Inputs of the trial (the last case's).
             var trialRows: (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)?
@@ -7803,6 +7890,7 @@ enum DFlash2SpeculativeFront {
                                         .item(Bool.self)
                                 compared += r.size
                             }
+                            if headsSIMDSame { headsSIMDInputs.append((y, qw, kw, pos, cdev, fq, fk)) }
                             trialHeads = (y, qw, kw, pos, cdev)
                         }
                     }
@@ -7812,12 +7900,29 @@ enum DFlash2SpeculativeFront {
                 rowsSame = false
                 headsSame = false
             }
+            if headsSame, let kernel = headsSIMDKernel, headsSIMDInputs.count == 3 {
+                do {
+                    try withError { error in
+                        for (y, qw, kw, pos, c, rq, rk) in headsSIMDInputs {
+                            let (q, k) = headsLaunch(kernel, y, l, hq, hk, qw, kw, p, pos, c)
+                            for (f, r) in [(q, rq), (k, rk)] {
+                                headsSIMDSame = headsSIMDSame && f.shape == r.shape
+                                    && all(f.view(dtype: .uint16) .== r.view(dtype: .uint16)).item(Bool.self)
+                                compared += r.size
+                            }
+                        }
+                        try error.check()
+                    }
+                } catch { headsSIMDSame = false }
+            } else { headsSIMDSame = false }
+            headsSIMDInputs.removeAll()
             // The trial: five layers' fronts, composed against fused, at the
             // drafter's shapes (the q|k|v matmul between them is the same
             // launch either way and is left out).
             var note = ""
             var rowsWins = rowsSame
             var headsWins = headsSame
+            var headsSIMDWins = false
             if rowsSame || headsSame, let (h, dyn, kernelBase, context, base) = trialRows,
                 let (y, qw, kw, pos, cdev) = trialHeads, let kernel = headsKernel
             {
@@ -7856,13 +7961,29 @@ enum DFlash2SpeculativeFront {
                     let (q, k) = headsLaunch(kernel, y, l, hq, hk, qw, kw, p, pos, c)
                     return [q, k]
                 }
-                let t = DFlash2LaunchTrial.race([composedRows, fusedRows, composedHeads, fusedHeads])
-                if t.count == 4 {
+                var builders: [() -> [MLXArray]] = [composedRows, fusedRows, composedHeads, fusedHeads]
+                if headsSIMDSame, let simd = headsSIMDKernel {
+                    builders.append {
+                        let (q, k) = headsLaunch(simd, y, l, hq, hk, qw, kw, p, pos, c)
+                        return [q, k]
+                    }
+                }
+                var t = DFlash2LaunchTrial.race(builders)
+                if builders.count == 5, t.count != builders.count {
+                    headsSIMDSame = false
+                    builders.removeLast()
+                    t = DFlash2LaunchTrial.race(builders)
+                }
+                if t.count == builders.count {
                     rowsWins = rowsSame && t[1] <= t[0] * DFlash2LaunchTrial.tolerance
-                    headsWins = headsSame && t[3] <= t[2] * DFlash2LaunchTrial.tolerance
+                    headsSIMDWins = headsSIMDSame && t.count == 5
+                        && t[4] <= t[3] * DFlash2LaunchTrial.tolerance
+                        && t[4] <= t[2] * DFlash2LaunchTrial.tolerance
+                    headsWins = headsSame && (t[3] <= t[2] * DFlash2LaunchTrial.tolerance || headsSIMDWins)
                     note = String(
                         format: "; trial per 5 layers: rows %.1f us composed, %.1f us one launch; "
                             + "heads %.1f us composed, %.1f us one launch", t[0], t[1], t[2], t[3])
+                    if t.count == 5 { note += String(format: ", %.1f us one SIMD", t[4]) }
                 } else {
                     (rowsWins, headsWins) = (false, false)
                     note = "; trial failed"
@@ -7870,6 +7991,7 @@ enum DFlash2SpeculativeFront {
             }
             rowsChosen = rowsWins
             headsChosen = headsWins
+            headsSIMDChosen = headsWins && headsSIMDWins
             parameters = p
             geometry = (hq, hk, d, eps)
             let ms = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
@@ -7878,7 +8000,8 @@ enum DFlash2SpeculativeFront {
                     + (rowsSame && headsSame ? "passed" : "FAILED (rows \(rowsSame), heads \(headsSame))")
                     + " (\(compared) values compared bitwise)\(note); rows "
                     + (rowsWins ? "one launch" : "composed") + ", heads "
-                    + (headsWins ? "one launch" : "composed") + "; \(ms) ms\n").data(using: .utf8)!)
+                    + (headsWins ? (headsSIMDChosen ? "one launch, one SIMD" : "one launch") : "composed")
+                    + "; one-SIMD guard \(headsSIMDSame ? "passed" : "declined"); \(ms) ms\n").data(using: .utf8)!)
         }
     }
 }

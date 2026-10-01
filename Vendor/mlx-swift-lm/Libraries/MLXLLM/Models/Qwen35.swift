@@ -10372,7 +10372,14 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 }
 
-extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
+extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding, CBv2MTPPolicyFirstProviding {
+    public func cbv2MTPFirst(_ logits: MLXArray) -> MLXArray? {
+        guard logits.ndim == 3, logits.dim(0) == 1, logits.dim(1) == 16,
+            let ids = Qwen35HeadTopTwo.lookupFirst(logits)
+        else { return nil }
+        return ids.reshaped([1, 16])
+    }
+
     public func cbv2MTPTopTwo(
         _ logits: MLXArray
     ) -> (ids: MLXArray, values: MLXArray) {
@@ -10654,7 +10661,11 @@ extension Qwen35Model: DFlash2TapTarget {
     }
 }
 
-extension Qwen35Model: CBv2MTPPolicyTopTwoProviding {
+extension Qwen35Model: CBv2MTPPolicyTopTwoProviding, CBv2MTPPolicyFirstProviding {
+    public func cbv2MTPFirst(_ logits: MLXArray) -> MLXArray? {
+        languageModel.cbv2MTPFirst(logits)
+    }
+
     public func cbv2MTPTopTwo(
         _ logits: MLXArray
     ) -> (ids: MLXArray, values: MLXArray) {

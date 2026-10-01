@@ -84,6 +84,7 @@ extension EngineLoopV2 {
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
+        var policyFirst: MLXArray?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         // The fused tapped context a BLOCK drafter reads. The tap holds ONE
         // forward's rows, so it is read immediately after each target
@@ -341,13 +342,24 @@ extension EngineLoopV2 {
                 let flat =
                     batch == 1
                     ? output.logits : output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo = provider.cbv2MTPTopTwo(flat)
-                policyTopTwo = (
-                    topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                if batch == 1, width == 16, !useTargetPrefix, !mtp.usesMarginalPolicy,
+                    CBv2MTPDeadMarginSkip.enabled, logitDiagnostic == nil,
+                    (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize == nil
+                {
+                    policyFirst = (mtp.model as? any CBv2MTPPolicyFirstProviding)?
+                        .cbv2MTPFirst(flat)
+                }
+                if policyFirst == nil {
+                    let topTwo = provider.cbv2MTPTopTwo(flat)
+                    policyTopTwo = (
+                        topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
+                        topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                }
             }
             if useTargetPrefix {
                 scores = scoreColumns(output.logits, columnOffset: 0)
+            } else if let policyFirst {
+                scores = policyFirst
             } else if let policyTopTwo {
                 scores = policyTopTwo.ids[0..., 0..., 0]
             } else {
