@@ -3164,18 +3164,19 @@ enum Qwen35TensorPackedMatmul {
 
     // The plane kernel's forms for the load-time per-shape trial
     // (`PlaneFormTrial`): each simdgroup still runs the plane kernel's
-    // 32 x 32 x 128 op over its 32 rows and one 32-column tile, the right
+    // TM x 32 x 128 op over its TM rows and one 32-column tile, the right
     // operand built from its own 32 bytes of the plane copy exactly as there,
     // the same epilogue per element in ascending group order and the same
     // stores, so every output is the plane kernel's bit for bit. What changes
     // is how the activation tile a threadgroup multiplies is shared:
     // SGN simdgroups per threadgroup (the plane kernel's 2; 4 or 8 run more
-    // column tiles against the same 32 x 128 activation slice while it is in
+    // column tiles against the same TM x 128 activation slice while it is in
     // the core's cache); CT column tiles per simdgroup (2: two ops a group
     // against the same slice, the rows' constants loaded once); AT the slice
     // staged in threadgroup memory once a group by the whole threadgroup
     // (uint4 runs, double-buffered, one barrier a group) and read by every
-    // op from there; RT row tiles per simdgroup (2 or 4: the right operand
+    // op from there; TM is 16 only for the independently checked p1r16/p2r16
+    // forms, or 32 for all incumbent forms; RT row tiles per simdgroup (2 or 4: the right operand
     // extracted once a group and column tile and run against the RT 32-row
     // slices ms + 32 r, so each weight tile is loaded and extracted once per
     // 32 RT rows, not once per 32). Why RT is exact: each op's integer
@@ -3202,20 +3203,20 @@ enum Qwen35TensorPackedMatmul {
         // CM (`y`): the grid's x walks the row blocks of one column block.
         const int tgr = int(CM ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y);
         const int tgc = int(CM ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x);
-        const int ms = tgr * (32 * RT);
+        const int ms = tgr * (TM * RT);
         const int ns0 = tgc * (32 * SGN * CT) + 32 * CT * int(sg);
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(TM, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
         auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         thread uint32_t* bw = (thread uint32_t*)&bT;
-        // AT: the group's (32 RT) x 128 activation slice, rows of 128 bytes.
-        threadgroup uint4 abuf[AT ? 2 : 1][AT ? 32 * RT * 128 / 16 : 1];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> As0((threadgroup int8_t*)abuf[0], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 32>(0, ms);
+        // AT: the group's (TM RT) x 128 activation slice, rows of 128 bytes.
+        threadgroup uint4 abuf[AT ? 2 : 1][AT ? TM * RT * 128 / 16 : 1];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> As0((threadgroup int8_t*)abuf[0], dextents<int, 2>(128, TM));
+        auto tA0 = A.template slice<128, TM>(0, ms);
         typedef typename metal::conditional<AT != 0, metal::remove_addrspace_t<decltype(As0)>, metal::remove_addrspace_t<decltype(tA0)>>::type AOpT;
         auto cT = op.template get_destination_cooperative_tensor<AOpT, decltype(bT), int32_t>();
-        constexpr int CAP = 32;
+        constexpr int CAP = TM;
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
         const int mb = ms + fm;
@@ -3229,14 +3230,16 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         const int NQ = N / 4;
-        // Row tile r (rows ms + 32 r): the plane kernel's row-constant
-        // offsets at its own rows.
+        // Row tile r (rows ms + TM r): row constants are packed in
+        // 64-row groups. For TM16, bit 16 selects the second 16-row half
+        // normally loaded from tb1 by a 32-row tile.
         IndexT tb0[RT], tb1[RT];
         #pragma clang loop unroll(full)
         for (int r = 0; r < RT; r++) {
-          const int mr = ms + 32 * r;
-          tb0[r] = (IndexT)(mr / 64) * (IndexT)Kg * 64 + (IndexT)(fm * 4) + (IndexT)((mr & 32) >> 4);
-          tb1[r] = tb0[r] + 32;
+          const int mr = ms + TM * r;
+          tb0[r] = (IndexT)(mr / 64) * (IndexT)Kg * 64 + (IndexT)(fm * 4) + (IndexT)((mr & 32) >> 4)
+              + (IndexT)((mr & 16) << 1);
+          if constexpr (TM == 32) { tb1[r] = tb0[r] + 32; }
         }
         // The plane kernel's words, extracts and epilogue, per column tile t.
         uint4 wv[2];
@@ -3258,7 +3261,7 @@ enum Qwen35TensorPackedMatmul {
         };
         auto stageA = [&](int g, int buf) {
           #pragma clang loop unroll(full)
-          for (int e = int(tid); e < 32 * RT * 128 / 16; e += 32 * SGN) {
+          for (int e = int(tid); e < TM * RT * 128 / 16; e += 32 * SGN) {
             const int r = e >> 3; const int q = e & 7;
             abuf[buf][e] = *(const device uint4*)(xq + (IndexT)(ms + r) * (IndexT)K + (IndexT)g * 128 + 16 * q);
           }
@@ -3274,11 +3277,15 @@ enum Qwen35TensorPackedMatmul {
           #pragma clang loop unroll(full)
           for (int r = 0; r < RT; r++) {
             const float2 a0 = *(const device float2*)(ascale + tb0[r] + (IndexT)g * 64);
-            const float2 a1 = *(const device float2*)(ascale + tb1[r] + (IndexT)g * 64);
             const float2 r0 = *(const device float2*)(rsb + tb0[r] + (IndexT)g * 64);
-            const float2 r1 = *(const device float2*)(rsb + tb1[r] + (IndexT)g * 64);
-            as[r][0] = a0.x; as[r][1] = a0.y; as[r][2] = a1.x; as[r][3] = a1.y;
-            rb[r][0] = r0.x; rb[r][1] = r0.y; rb[r][2] = r1.x; rb[r][3] = r1.y;
+            as[r][0] = a0.x; as[r][1] = a0.y;
+            rb[r][0] = r0.x; rb[r][1] = r0.y;
+            if constexpr (TM == 32) {
+              const float2 a1 = *(const device float2*)(ascale + tb1[r] + (IndexT)g * 64);
+              const float2 r1 = *(const device float2*)(rsb + tb1[r] + (IndexT)g * 64);
+              as[r][2] = a1.x; as[r][3] = a1.y;
+              rb[r][2] = r1.x; rb[r][3] = r1.y;
+            }
           }
           #pragma clang loop unroll(full)
           for (int t = 0; t < CT; t++) {
@@ -3290,10 +3297,10 @@ enum Qwen35TensorPackedMatmul {
             #pragma clang loop unroll(full)
             for (int r = 0; r < RT; r++) {
               if (AT) {
-                tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Ag((threadgroup int8_t*)abuf[cur] + 32 * 128 * r, dextents<int, 2>(128, 32));
+                tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Ag((threadgroup int8_t*)abuf[cur] + TM * 128 * r, dextents<int, 2>(128, TM));
                 op.run(Ag, bT, cT);
               } else {
-                auto tA = A.template slice<128, 32>(g * 128, ms + 32 * r);
+                auto tA = A.template slice<128, TM>(g * 128, ms + TM * r);
                 op.run(tA, bT, cT);
               }
               if (r == 0) {
@@ -3318,7 +3325,7 @@ enum Qwen35TensorPackedMatmul {
             #pragma clang loop unroll(full)
             for (int i = 0; i < CAP; i += 4) {
               const int nh = (i >> 3) & 1;
-              const int mm = mb + 32 * r + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+              const int mm = mb + TM * r + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
               const IndexT base = (IndexT)mm * N + nb + 16 * nh;
               if constexpr (sizeof(OutT) == sizeof(float)) {
                 *(device float4*)(out + base) = float4(acc[r][t][i], acc[r][t][i + 1], acc[r][t][i + 2], acc[r][t][i + 3]);
@@ -5665,12 +5672,12 @@ extension Qwen35TensorPackedMatmul {
     /// four tiles in all, `t` with two row tiles at most: 16 KB of staged
     /// slices), `t` the activation slice staged in threadgroup memory, `f` the
     /// plane loads one tile ahead (`sourcePlaneFormsPrefetched`), `y` the
-    /// column-major traversal (e.g. `p4`, `p8t`, `p2c2`, `p2r2t`, `p2f`,
+    /// column-major traversal, `r16` a 16-row tensor op (p1/p2 only) (e.g. `p4`, `p8t`, `p2c2`, `p2r2t`, `p2f`,
     /// `p2fy`). `p2` is the plane kernel's own tiling in the
     /// forms' text (the rows' constants loaded before the op, not after it).
     /// Every form's outputs are the plane kernel's bit for bit.
     struct PlaneForm: Hashable, CustomStringConvertible {
-        let sgn: Int, ct: Int, rt: Int, at: Int, pf: Int, cm: Int, io32: Int
+        let sgn: Int, ct: Int, rt: Int, at: Int, pf: Int, cm: Int, io32: Int, tm: Int
         let name: String
 
         init?(name raw: String) {
@@ -5681,8 +5688,9 @@ extension Qwen35TensorPackedMatmul {
             let digits = rest.prefix { $0.isNumber }
             guard let sgn = Int(digits), [1, 2, 4, 8, 16].contains(sgn) else { return nil }
             rest = rest.dropFirst(digits.count)
-            var ct = 1, rt = 1, at = 0
+            var ct = 1, rt = 1, at = 0, tm = 32
             if rest.hasPrefix("c2") { ct = 2; rest = rest.dropFirst(2) }
+            if rest.hasPrefix("r16") { tm = 16; rest = rest.dropFirst(3) }
             if rest.hasPrefix("r2") { rt = 2; rest = rest.dropFirst(2) } else if rest.hasPrefix("r4") { rt = 4; rest = rest.dropFirst(2) }
             if rest.hasPrefix("t") { at = 1; rest = rest.dropFirst(1) }
             var pf = 0
@@ -5691,8 +5699,10 @@ extension Qwen35TensorPackedMatmul {
             if rest.hasPrefix("y") { cm = 1; rest = rest.dropFirst(1) }
             var io32 = 0
             if rest.hasPrefix("i32") { io32 = 1; rest = rest.dropFirst(3) }
-            guard rest.isEmpty, sgn * ct <= 16, ct * rt <= 4, at == 0 || rt <= 2 else { return nil }
-            (self.sgn, self.ct, self.rt, self.at, self.pf, self.cm, self.io32) = (sgn, ct, rt, at, pf, cm, io32)
+            guard rest.isEmpty, sgn * ct <= 16, ct * rt <= 4, at == 0 || rt <= 2,
+                tm == 32 || ([1, 2].contains(sgn) && ct == 1 && rt == 1 && at == 0 && pf == 0 && cm == 0 && io32 == 0)
+            else { return nil }
+            (self.sgn, self.ct, self.rt, self.at, self.pf, self.cm, self.io32, self.tm) = (sgn, ct, rt, at, pf, cm, io32, tm)
             self.name = name
         }
 
@@ -5701,7 +5711,7 @@ extension Qwen35TensorPackedMatmul {
         var columns: Int { 32 * sgn * ct }
         /// Rows per threadgroup; a launch needs `m` to be a multiple (the
         /// route launches the plane kernel where the adopted form does not fit).
-        var rows: Int { 32 * rt }
+        var rows: Int { tm * rt }
         func fits(k: Int, n: Int, m: Int) -> Bool {
             guard n % columns == 0, m % rows == 0, pf == 0 || kernelPlaneFormsPrefetched != nil else { return false }
             guard io32 != 0 else { return true }
@@ -5727,7 +5737,7 @@ extension Qwen35TensorPackedMatmul {
             [codes, plane, scalesT, biasesT, folded, ascale, rsb, dimsArray(k: k, m: m, n: n)],
             template: [
                 ("OutT", outputDType), ("SGN", form.sgn), ("CT", form.ct), ("RT", form.rt), ("AT", form.at),
-                ("CM", form.cm), ("IO32", form.io32),
+                ("CM", form.cm), ("IO32", form.io32), ("TM", form.tm),
             ],
             grid: form.cm != 0
                 ? (m / form.rows * 32 * form.sgn, n / form.columns, 1)
@@ -5771,14 +5781,15 @@ extension Qwen35TensorPackedMatmul {
     /// per-round time ratio to the plane kernel; the best is adopted only if,
     /// over `confirmReps` fresh rounds of it against the plane kernel alone
     /// (those rounds by themselves, not the ones that picked it), it beats
-    /// the plane kernel by more than `adoptMargin` (1%). One stderr line
-    /// per shape and a summary. The route then launches the adopted form for
+    /// the plane kernel by more than `adoptMargin` (1%; TM16 needs 2% in
+    /// both timing races). One stderr line per shape and a summary. The route then launches the adopted form for
     /// that shape (at every row count it fits), and the plane kernel
     /// elsewhere.
     ///
     /// `DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS=0` keeps the plane kernel
     /// with no trial; `..._PLANE_FORMS_FORCE=<form>` installs that form on
-    /// every shape where it passes both checks, without timing;
+    /// every shape where it passes both checks, without timing (except TM16,
+    /// whose force mode refuses installation);
     /// `..._PLANE_FORMS_LIST=p4,p8,...` replaces the candidate list.
     /// `..._PLANE_FORMS_EVIDENCE=1` (diagnostics only, for a GPU whose
     /// register-weight kernel fails its self-test, e.g. an M4): the prompt
@@ -5823,7 +5834,7 @@ extension Qwen35TensorPackedMatmul {
         /// with the column-major traversal (`y`).
         static let list: (forms: [PlaneForm], rejected: [String]) = {
             let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TENSOR_ROUTE_PLANE_FORMS_LIST"]
-                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32,p1t,p1c2,p1c2t,p2t,p2c2t,p4t,p4c2t,p8c2,p8c2t,p16,p16t,p1r2,p2r2,p4r2,p8r2,p2c2r2,p1r4,p2r4,p2r2t,p4r2t,p2f,p4f,p8f,p2tf,p2r2f,p4r2f,p2y,p4y,p8y,p2ty,p2r2y,p2fy"
+                ?? "p1,p2,p4,p8,p8t,p1i32,p2c2,p4c2,p2i32,p4i32,p8i32,p8ti32,p2c2i32,p4c2i32,p1t,p1c2,p1c2t,p2t,p2c2t,p4t,p4c2t,p8c2,p8c2t,p16,p16t,p1r2,p2r2,p4r2,p8r2,p2c2r2,p1r4,p2r4,p2r2t,p4r2t,p2f,p4f,p8f,p2tf,p2r2f,p4r2f,p2y,p4y,p8y,p2ty,p2r2y,p2fy,p1r16,p2r16"
             var forms: [PlaneForm] = []
             var rejected: [String] = []
             for name in raw.split(separator: ",") {
@@ -5841,7 +5852,7 @@ extension Qwen35TensorPackedMatmul {
         static let reps = 4
         /// A form is adopted only if its own fresh confirmation rounds (not
         /// the rounds that picked it) show it more than `adoptMargin` faster
-        /// than the plane kernel, so the pick's selection bias does not count.
+        /// than the plane kernel (2% for TM16), so selection bias does not count.
         static let confirmReps = 6
         static let adoptMargin = 0.01
         static let dropMargin = 0.05
@@ -5979,6 +5990,11 @@ extension Qwen35TensorPackedMatmul {
                         outputShapes: [[rows, key.n]], outputDTypes: [outputDType])[0]
                 }
                 let pool = (forced.map { [$0] } ?? list.forms).filter { $0.fits(k: key.k, n: key.n, m: rows) }
+                // A TM16 candidate must also match the current RT and CM
+                // forms across all 32 sixteen-row slices of the 512-row test.
+                let checkTM16 = pool.contains { $0.tm == 16 }
+                let stockRTRef = checkTM16 ? launch(PlaneForm(name: "p2r2"), sets[0]) : nil
+                let stockCMRef = checkTM16 ? launch(PlaneForm(name: "p2y"), sets[0]) : nil
                 // Bitwise: each form against the plane kernel and against staged8.
                 let planeRef = launch(nil, sets[0])
                 if let planeRef { eval(planeRef) }
@@ -5991,26 +6007,33 @@ extension Qwen35TensorPackedMatmul {
                     let vsStaged = mismatches({ launch(form, sets[0]) }, { stagedRef }, f32: key.f32)
                     let planeOK = vsPlane == 0
                     let stagedOK = vsStaged == 0
-                    if planeOK && (stagedOK || evidence) {
+                    let vsRT: Int? = form.tm == 16
+                        ? mismatches({ launch(form, sets[0]) }, { stockRTRef }, f32: key.f32) : 0
+                    let vsCM: Int? = form.tm == 16
+                        ? mismatches({ launch(form, sets[0]) }, { stockCMRef }, f32: key.f32) : 0
+                    if planeOK && (stagedOK || evidence) && vsRT == 0 && vsCM == 0 {
                         passing.append(form)
                         if !stagedOK {
                             notes.append("\(form) = plane bit for bit (\(vsStaged.map { "\($0)" } ?? "?") differ from staged8: evidence mode)")
                         }
                     } else {
-                        let what = vsPlane == nil || vsStaged == nil
+                        let what = vsPlane == nil || vsStaged == nil || vsRT == nil || vsCM == nil
                             ? "did not launch"
-                            : "\(vsPlane!) differ from the plane kernel, \(vsStaged!) from staged8"
+                            : "\(vsPlane!) differ from the plane kernel, \(vsStaged!) from staged8, \(vsRT!) from stock RT, \(vsCM!) from stock CM"
                         notes.append("\(form) FAILED (\(what))")
                     }
                 }
                 checkNanoseconds += DispatchTime.now().uptimeNanoseconds - checkStart
                 if let form = forced {
-                    let ok = passing.contains(form)
+                    // TM16 is never force-installed: it needs the separate
+                    // 2% fresh-round timing gate below, even in force mode.
+                    let ok = passing.contains(form) && form.tm != 16
                     if ok {
                         adopted[key] = form
                         installedNames.append("\(key.k)x\(key.n)=\(form)")
                     }
                     log("\(key): forced \(form), " + (ok ? "installed" : "plane kept")
+                        + (form.tm == 16 ? " (TM16 requires timed 2% adoption; force disabled)" : "")
                         + (notes.isEmpty ? "" : " [" + notes.joined(separator: "; ") + "]"))
                     continue
                 }
@@ -6060,7 +6083,7 @@ extension Qwen35TensorPackedMatmul {
                 if !notes.isEmpty { line += " | " + notes.joined(separator: " | ") }
                 var best = 1
                 for f in 2 ..< forms.count where scores[f] < scores[best] { best = f }
-                if scores[best] < -adoptMargin, let form = forms[best] {
+                if let form = forms[best], scores[best] < -(form.tm == 16 ? 0.02 : adoptMargin) {
                     for round in 0 ..< confirmReps {
                         let first = round % 2 == 0 ? 0 : best
                         let a = sample(forms[first], burst: burst)
@@ -6071,7 +6094,7 @@ extension Qwen35TensorPackedMatmul {
                     // The fresh rounds alone decide (median of their paired ratios).
                     let confirmed = median(zip(times[best].suffix(confirmReps), times[0].suffix(confirmReps))
                         .map { Double($0) / Double($1) }) - 1
-                    let adopt = confirmed < -adoptMargin
+                    let adopt = confirmed < -(form.tm == 16 ? 0.02 : adoptMargin)
                     line += " -> \(form) " + (adopt ? "confirmed" : "not confirmed")
                         + String(format: " (%+.1f%% over its %d fresh rounds)", confirmed * 100, confirmReps)
                     if adopt {
@@ -6377,7 +6400,7 @@ extension Qwen35TensorPackedMatmul {
     private static let headTop2Insert = """
         {
                       // TOP2: the four columns enter this lane's top two of the row.
-                      const uint ht2col = uint(base - (size_t)(fm + 8 * mh) * (size_t)N);
+                      const uint ht2col = uint(base - (uint)(fm + 8 * mh) * (uint)N);
                       bonsai_head_top2_insert(ht2[mh], v0, ht2col);
                       bonsai_head_top2_insert(ht2[mh], v1, ht2col + 1u);
                       bonsai_head_top2_insert(ht2[mh], v2, ht2col + 2u);
@@ -6403,11 +6426,9 @@ extension Qwen35TensorPackedMatmul {
             const int ht2block = n0 / (HT2COLS);
             #pragma clang loop unroll(full)
             for (int mh = 0; mh < 2; mh++) {
-              const size_t o = ((size_t)(fm + 8 * mh) * (size_t)ht2blocks + (size_t)ht2block) * 2;
-              top_ids[o] = int(ht2[mh].first_id);
-              top_ids[o + 1] = int(ht2[mh].second_id);
-              top_values[o] = ht2[mh].first_value;
-              top_values[o + 1] = ht2[mh].second_value;
+              const uint o = (uint(fm + 8 * mh) * uint(ht2blocks) + uint(ht2block)) * 2u;
+              *(device int2*)(top_ids + o) = int2(int(ht2[mh].first_id), int(ht2[mh].second_id));
+              *(device float2*)(top_values + o) = float2(ht2[mh].first_value, ht2[mh].second_value);
             }
           }
         }
@@ -6492,19 +6513,20 @@ extension Qwen35TensorPackedMatmul {
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
             bonsai_head_top2 st = bonsai_head_top2_empty();
-            for (uint b = lane; b < blocks; b += 32) {
-              const size_t o = (size_t(row) * size_t(blocks) + size_t(b)) * 2;
-              bonsai_head_top2_insert(st, pval[o], uint(pid[o]));
-              bonsai_head_top2_insert(st, pval[o + 1], uint(pid[o + 1]));
+            const uint row_base = (row * blocks) * 2u;
+            for (uint b = lane; b < blocks; b += 32u) {
+              const uint o = row_base + b * 2u;
+              const float2 pv = *(const device float2*)(pval + o);
+              const uint2 pi = *(const device uint2*)(pid + o);
+              bonsai_head_top2_insert(st, pv.x, pi.x);
+              bonsai_head_top2_insert(st, pv.y, pi.y);
             }
             for (ushort m = 16; m > 0; m >>= 1) {
               bonsai_head_top2_merge(st, bonsai_head_top2_shuffle_xor(st, m));
             }
             if (lane == 0) {
-              top_ids[row * 2] = int(st.first_id);
-              top_ids[row * 2 + 1] = int(st.second_id);
-              top_values[row * 2] = st.first_value;
-              top_values[row * 2 + 1] = st.second_value;
+              *(device int2*)(top_ids + row * 2) = int2(int(st.first_id), int(st.second_id));
+              *(device float2*)(top_values + row * 2) = float2(st.first_value, st.second_value);
             }
             """,
         header: headTop2Header,
