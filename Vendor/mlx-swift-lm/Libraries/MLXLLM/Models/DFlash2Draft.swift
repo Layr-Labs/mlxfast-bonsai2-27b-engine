@@ -1641,7 +1641,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(source, count: 1, "dflash2_bf16_matmul_m16"),
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_bf16_matmul_m16"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1792,7 +1792,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m32s",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(sourceSwapped32, count: 2, "dflash2_bf16_matmul_m32s"),
+        source: Qwen35IO32.narrow(sourceSwapped32, count: 1, "dflash2_bf16_matmul_m32s"),
         header: header,
         ensureRowContiguous: true)
 
@@ -1927,7 +1927,7 @@ enum DFlash2TensorMatmul {
         name: "dflash2_bf16_matmul_m16_kvar",
         inputNames: ["x", "w", "ksz"],
         outputNames: ["out"],
-        source: Qwen35IO32.narrow(variantSource, count: 3, "dflash2_bf16_matmul_m16_kvar"),
+        source: Qwen35IO32.narrow(variantSource, count: 4, "dflash2_bf16_matmul_m16_kvar"),
         header: header,
         ensureRowContiguous: true)
 
@@ -6406,7 +6406,7 @@ enum DFlash2QKPrework {
         name: "dflash2_qk_prework",
         inputNames: ["y", "qw", "kw", "p", "pos"],
         outputNames: ["q", "k"],
-        source: source,
+        source: Qwen35IO32.narrow(source, count: 2, "dflash2_qk_prework"),
         ensureRowContiguous: true)
 
     /// The kernel body, shared with `DFlash2SpeculativeFront`'s variant.
