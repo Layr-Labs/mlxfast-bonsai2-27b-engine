@@ -1817,6 +1817,27 @@ extension Qwen35GDNPrework {
         inputNames: ["qkv", "w", "S"], outputNames: ["v"],
         source: splitValueSource, ensureRowContiguous: false)
 
+    /// The value launch alone (`freshStridedRows` forms 2 and 3): the value
+    /// columns' conv and SiLU, FP32 `[B, S, HV, DV]`. The v-fold scan form's
+    /// check and trial (`Qwen35GatedDeltaChunked.prepareVFold`) compare against it.
+    static func valueLaunch(
+        qkv: MLXArray, convWeight: MLXArray, keyHeads: Int, valueHeads: Int,
+        headKDim: Int, headVDim: Int, rows: Int
+    ) -> MLXArray {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let CD = qkv.dim(2)
+        let KS = convWeight.dim(1)
+        return splitValueKernel(
+            [qkv, convWeight, MLXArray(Int32(S))],
+            template: [
+                ("InT", qkv.dtype), ("HK", keyHeads), ("HV", valueHeads), ("DK", headKDim),
+                ("DV", headVDim), ("CD", CD), ("KS", KS), ("RW", rows),
+            ],
+            grid: (128 * keyHeads, S / rows, B), threadGroup: (128, 1, 1),
+            outputShapes: [[B, S, valueHeads, headVDim]], outputDTypes: [.float32])[0]
+    }
+
     /// Every element offset below 2^31 with each input row at most 4 * CD
     /// elements apart (`qkv`, `a` and `b` are column slices of the qkv|z and
     /// b|a stacks, or of one stack of all four, each narrower; a lazy slice
@@ -4366,6 +4387,355 @@ extension Qwen35GatedDeltaChunked {
     }
 }
 
+
+// MARK: - Chunked GDN fresh scan: v from the conv input (v-fold)
+
+/// The prompt-width fresh scan reading the value columns' conv input instead
+/// of the value launch's FP32 `v` (`freshStridedRows` forms 2 and 3 launch it
+/// beside the q/k launch; it writes `[S, Hv, Dv]` FP32 that only this scan
+/// reads). Each thread forms the two `v` elements it would have loaded, for
+/// its row and its two columns, with the value launch's own arithmetic: the
+/// taps before the prompt read 0.0f (the fresh state), `acc = fma(x, w, acc)`
+/// for j = 0..KS-1 from 0.0f, then MLX's SiLU in its stable functor form,
+/// all in FP32 from `float(qkv[...])`, exactly as `conv_silu_rows` computes
+/// them. Every later operation is the record scan's text. The value launch is
+/// then never evaluated (its output has no other reader) and its store and
+/// reload of `v` go away. Two forms: the taps read where `v` was read, and the
+/// next chunk's taps loaded into registers during this chunk. Each form is
+/// checked bit for bit against the value launch followed by the scan
+/// `freshChunks` would otherwise launch (y and the final state; FP32, FP16 and
+/// BF16 conv inputs; 8 and 64 chunks), the passing forms are timed against
+/// that pair on this device (interleaved rounds, the median ratio), and the
+/// fastest is installed only when it beats the pair by `scanTrialMargin` and
+/// a confirmation run agrees. Taken only after a q/k launch that formed the
+/// chunk prep (form 3, whose value launch is a separate launch).
+/// `BONSAI_GDN_SCAN_VFOLD=0` keeps the value launch.
+extension Qwen35GatedDeltaChunked {
+    static let vfoldEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_SCAN_VFOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The installed v-fold form's kernel and checked geometry [Hk, Dk, Hv, Dv]
+    /// (set once, at model construction); nil keeps the value launch.
+    nonisolated(unsafe) static var installedVFold:
+        (kernel: MLXFast.MLXFastKernel, geometry: [Int])? = nil
+
+    private static let vfoldPrelude = """
+        // v from the conv input: the value launch's conv (taps from 0.0f before
+        // the prompt, fma(x, w, acc) for j = 0..KS-1) and MLX's SiLU, for this
+        // thread's two columns of its 8 state rows.
+        constexpr int VOFF = 2 * Hk * Dk;
+        constexpr int NK = KS - 1;
+        const int vqb = b_idx * (int)qkv_strides[0];
+        const int vqs1 = (int)qkv_strides[1];
+        const int vqs2 = (int)qkv_strides[2];
+        const int vcol0 = VOFF + hv * Dv + r0 + fn;
+        float vw0[KS], vw1[KS];
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < KS; j++) {
+          vw0[j] = w[vcol0 * (int)w_strides[0] + j * (int)w_strides[1]];
+          vw1[j] = w[(vcol0 + 1) * (int)w_strides[0] + j * (int)w_strides[1]];
+        }
+        auto vsilu = [&](float acc) -> float {
+          const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+          const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+          return acc * sig;
+        };
+        auto vconv = [&](int t, int col, thread const float* wt) -> float {
+          float acc = 0.0f;
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < KS; j++) {
+            const int r = t + j - NK;
+            const float xv = (r < 0) ? 0.0f : float(qkv[vqb + r * vqs1 + col * vqs2]);
+            acc = fma(xv, wt[j], acc);
+          }
+          return vsilu(acc);
+        };
+
+        """
+
+    private static let vfoldTapRegisters = """
+        float vx0[KS], vx1[KS];
+        auto vtaps = [&](int t) {
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < KS; j++) {
+            const int r = t + j - NK;
+            vx0[j] = (r < 0) ? 0.0f : float(qkv[vqb + r * vqs1 + vcol0 * vqs2]);
+            vx1[j] = (r < 0) ? 0.0f : float(qkv[vqb + r * vqs1 + (vcol0 + 1) * vqs2]);
+          }
+        };
+        auto vconv_regs = [&](thread const float* x, thread const float* wt) -> float {
+          float acc = 0.0f;
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < KS; j++) {
+            acc = fma(x[j], wt[j], acc);
+          }
+          return vsilu(acc);
+        };
+        vtaps(fm);
+
+        """
+
+    /// `text` (the record's fresh scan, prefetch staging or stock) reading the
+    /// conv input for `v`, its taps in registers when `registers`; nil when a
+    /// target moved.
+    private static func vfoldSource(_ text: String, registers: Bool) -> String? {
+        var text = text
+        let vRead = "const float2 vv = *(const device float2*)(v_ + row * vs + fn);"
+        var pairs: [(String, String)] = [
+            ("simdgroup_float8x8 St[DT];",
+             vfoldPrelude + (registers ? vfoldTapRegisters : "") + "simdgroup_float8x8 St[DT];"),
+            ("const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;", ""),
+            (vRead, registers
+                ? "const float2 vv = float2(vconv_regs(vx0, vw0), vconv_regs(vx1, vw1));"
+                : "const float2 vv = float2(vconv(t0 + row, vcol0, vw0), vconv(t0 + row, vcol0 + 1, vw1));"),
+        ]
+        if registers {
+            pairs.append(
+                ("// Delta = T' Z (T' lower triangular)",
+                 "if (n + 1 < NC) { vtaps((n + 1) * C + fm); }\n// Delta = T' Z (T' lower triangular)"))
+        }
+        for (target, replacement) in pairs {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: replacement)
+        }
+        // No read of the value launch's output is left.
+        guard !text.contains("(v_ + "), !text.contains("v_ = v + ") else { return nil }
+        return text
+    }
+
+    private struct VFoldForm {
+        let name: String
+        let kernel: MLXFast.MLXFastKernel
+    }
+
+    private static let vfoldForms: [VFoldForm] = {
+        let prefetch = scanPrefetchActive && scanFreshPrefetchSource != nil
+        let base = prefetch ? scanFreshPrefetchSource! : scanFreshSource
+        var forms: [VFoldForm] = []
+        for registers in [false, true] {
+            let name = "vfold" + (registers ? "-regs" : "")
+            guard let text = vfoldSource(base, registers: registers) else {
+                FileHandle.standardError.write(
+                    "qwen35: chunked GDN v-fold scan (\(name)): the scan text moved; not offered\n"
+                        .data(using: .utf8)!)
+                continue
+            }
+            let kernelName = "bonsai_gated_delta_chunk_scan_fresh_vfold"
+                + (registers ? "_regs" : "") + (prefetch ? "_pf" : "")
+            forms.append(VFoldForm(
+                name: name,
+                kernel: MLXFast.metalKernel(
+                    name: kernelName,
+                    inputNames: ["q", "k", "qkv", "w", "tp", "pm", "gf", "T"],
+                    outputNames: ["y", "state_out"],
+                    source: Qwen35IO32.narrow(text, count: 10, kernelName),
+                    ensureRowContiguous: false)))
+        }
+        return forms
+    }()
+
+    /// One v-fold launch: `freshChunks`' geometry, the conv input in place of `v`.
+    static func vfoldLaunch(
+        _ kernel: MLXFast.MLXFastKernel, q: MLXArray, k: MLXArray, qkv: MLXArray,
+        convWeight: MLXArray, prepared: [MLXArray], valueHeads Hv: Int, headVDim Dv: Int
+    ) -> (MLXArray, MLXArray) {
+        let (B, T, Hk, Dk) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3))
+        let outputs = kernel(
+            [q, k, qkv, convWeight, prepared[0], prepared[1], prepared[2], MLXArray(Int32(T))],
+            template: [
+                ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("NS", scanSimdgroups), ("KS", convWeight.dim(1)), ("InT", qkv.dtype),
+            ],
+            grid: (32, Dv / 8, B * Hv),
+            threadGroup: (32, scanSimdgroups, 1),
+            outputShapes: [[B, T, Hv, Dv], [B, Hv, Dv, Dk]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    /// Whether `freshChunks` may take the installed v-fold form for this
+    /// launch: the checked geometry, the record's conv input layout, and every
+    /// element offset below 2^31 (`Qwen35GDNPrework.narrowFits`).
+    static func vfoldApplies(
+        _ geometry: [Int], qkv: MLXArray, convWeight: MLXArray, rows T: Int
+    ) -> Bool {
+        guard let installed = installedVFold, installed.geometry == geometry,
+            qkv.ndim == 3, qkv.dim(1) == T, convWeight.ndim == 3, convWeight.dim(2) == 1,
+            convWeight.dtype == .float32,
+            [DType.float32, .float16, .bfloat16].contains(qkv.dtype)
+        else { return false }
+        let CD = qkv.dim(2)
+        return CD == 2 * geometry[0] * geometry[1] + geometry[2] * geometry[3]
+            && convWeight.dim(0) == CD
+            && Qwen35GDNPrework.narrowFits(batch: qkv.dim(0), rows: T, convDim: CD)
+    }
+
+    /// Check the v-fold forms, time the passing ones against the value launch
+    /// and the scan it feeds, install the fastest (see the type's notes).
+    /// Called by `prepareFresh` after `prepareScanForms`.
+    static func prepareVFold(hk: Int, dk: Int, hv: Int, dv: Int) {
+        guard vfoldEnabled, installedVFold == nil, chunk == 8, dk == 128, dv == 128,
+            hk > 0, hv % hk == 0, (dv / 8) % scanSimdgroups == 0,
+            Qwen35GDNPrework.narrowFits(batch: 1, rows: 520, convDim: 2 * hk * dk + hv * dv)
+        else { return }
+        let forms = vfoldForms
+        guard !forms.isEmpty else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let cd = 2 * hk * dk + hv * dv
+        let ks = 4
+        let geometry = [hk, dk, hv, dv]
+        // The scan `freshChunks` launches without a v-fold form.
+        let installedForm = installedScanForm.flatMap {
+            $0.geometry == geometry ? ($0.kernel, $0.simdgroups) : nil
+        }
+        let (scanKernel, ns) = installedForm ?? (recordFreshScanKernel, scanSimdgroups)
+        func scanPair(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ p: [MLXArray], _ T: Int)
+            -> (MLXArray, MLXArray)
+        {
+            let outputs = scanKernel(
+                [q, k, v, p[0], p[1], p[2], MLXArray(Int32(T))],
+                template: [
+                    ("C", chunk), ("Dk", dk), ("Dv", dv), ("Hk", hk), ("Hv", hv), ("NS", ns),
+                ],
+                grid: (32, dv / 8, hv), threadGroup: (32, ns, 1),
+                outputShapes: [[1, T, hv, dv], [1, hv, dv, dk]],
+                outputDTypes: [.float32, .float32])
+            return (outputs[0], outputs[1])
+        }
+        func value(_ qkv: MLXArray, _ w: MLXArray) -> MLXArray {
+            Qwen35GDNPrework.valueLaunch(
+                qkv: qkv, convWeight: w, keyHeads: hk, valueHeads: hv, headKDim: dk,
+                headVDim: dv, rows: Qwen35GDNPrework.rowTile)
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7666_6f6c), into: 10)
+        var verdict = [Bool](repeating: true, count: forms.count)
+        var timingSet: (q: MLXArray, k: MLXArray, qkv: MLXArray, w: MLXArray, p: [MLXArray])? = nil
+        do {
+            try withError { error in
+                for T in [64, 512] {
+                    func spread(_ shape: [Int], _ i: Int) -> MLXArray {
+                        MLXRandom.normal(shape, key: keys[i])
+                            * exp(MLXRandom.normal(shape, key: keys[i + 5]))
+                    }
+                    let q = spread([1, T, hk, dk], 0) * 0.1
+                    let k = spread([1, T, hk, dk], 1) * 0.1
+                    // The conv input as at prompt width: a column slice of a wider stack.
+                    let stack = spread([1, T, cd + hv * dv], 2)
+                    let w = spread([cd, ks, 1], 3) * 0.5
+                    let rowIndex = MLXArray.arange(T).reshaped(1, T, 1)
+                    let g0 = MLXRandom.uniform(0.5 ..< 1.0, [1, T, hv], key: keys[4])
+                    let g = which(
+                        (rowIndex .>= 8) .&& (rowIndex .< 16), Float(0),
+                        which((rowIndex .>= 16) .&& (rowIndex .< 24), Float(1e-39), g0))
+                    let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[9])
+                    let p = prep(q: q, k: k, g: g, beta: beta)
+                    for dtype in [DType.float32, .float16, .bfloat16] {
+                        let qkv = stack.asType(dtype)[0..., 0..., 0 ..< cd]
+                        let (yRef, sRef) = scanPair(q, k, value(qkv, w), p, T)
+                        eval([yRef, sRef] + p)
+                        try error.check()
+                        for f in forms.indices where verdict[f] {
+                            let (y, s) = vfoldLaunch(
+                                forms[f].kernel, q: q, k: k, qkv: qkv, convWeight: w,
+                                prepared: p, valueHeads: hv, headVDim: dv)
+                            let differ = (yRef.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                                .asType(.int32).sum()
+                                + (sRef.view(dtype: .uint32) .!= s.view(dtype: .uint32))
+                                .asType(.int32).sum()
+                            eval(differ)
+                            try error.check()
+                            if differ.item(Int32.self) != 0 { verdict[f] = false }
+                        }
+                        if T == 512 && dtype == .float32 { timingSet = (q, k, qkv, w, p) }
+                    }
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(
+                "qwen35 GDN v-fold scan: self-test error (\(error)); the value launch kept\n"
+                    .data(using: .utf8)!)
+            return
+        }
+        let passing = forms.indices.filter { verdict[$0] }
+        var line = "qwen35 GDN v-fold scan: bitwise vs the value launch + scan (8, 64 chunks; "
+            + "FP32/FP16/BF16): passed [" + passing.map { forms[$0].name }.joined(separator: " ")
+            + "]" + (passing.count == forms.count ? "" : " FAILED ["
+                + forms.indices.filter { !verdict[$0] }.map { forms[$0].name }
+                .joined(separator: " ") + "]")
+        func finish(_ text: String) {
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+            FileHandle.standardError.write(
+                (line + "; " + text + String(format: " (%.0f ms)\n", ms)).data(using: .utf8)!)
+        }
+        guard !passing.isEmpty, let set = timingSet else {
+            finish("the value launch kept")
+            return
+        }
+        // Arm 0: the value launch and the scan; arm 1 + f: v-fold form f. Bursts
+        // of independent launches (both arms saturate the GPU, as at prompt
+        // width), interleaved rounds, the first round discarded.
+        let arms = [-1] + passing
+        func sample(_ arm: Int, burst: Int) -> Double {
+            var outputs: [MLXArray] = []
+            for _ in 0 ..< burst {
+                let (y, s) = arm < 0
+                    ? scanPair(set.q, set.k, value(set.qkv, set.w), set.p, 512)
+                    : vfoldLaunch(
+                        forms[arm].kernel, q: set.q, k: set.k, qkv: set.qkv, convWeight: set.w,
+                        prepared: set.p, valueHeads: hv, headVDim: dv)
+                outputs += [y, s]
+            }
+            let begin = DispatchTime.now().uptimeNanoseconds
+            eval(outputs)
+            return Double(DispatchTime.now().uptimeNanoseconds - begin) / Double(burst)
+        }
+        let burst = 6
+        var times = [[Double]](repeating: [], count: arms.count)
+        for round in 0 ..< 6 {
+            for j in arms.indices {
+                let a = (j + round) % arms.count
+                let t = sample(arms[a], burst: burst)
+                if round > 0 { times[a].append(t) }
+            }
+        }
+        func median(_ x: [Double]) -> Double {
+            let s = x.sorted()
+            return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+        }
+        func score(_ a: Int) -> Double {
+            median(zip(times[a], times[0]).map { $0 / $1 }) - 1
+        }
+        line += String(format: "; value + scan %.1f us", median(times[0]) / 1e3)
+        var best = 1
+        for a in 1 ..< arms.count {
+            line += " | \(forms[arms[a]].name) " + String(format: "%+.1f%%", score(a) * 100)
+            if score(a) < score(best) { best = a }
+        }
+        guard score(best) < -scanTrialMargin else {
+            finish("the value launch kept")
+            return
+        }
+        for round in 0 ..< 6 {
+            let firstIsPair = round % 2 == 0
+            let a = sample(firstIsPair ? -1 : arms[best], burst: burst)
+            let b = sample(firstIsPair ? arms[best] : -1, burst: burst)
+            times[0].append(firstIsPair ? a : b)
+            times[best].append(firstIsPair ? b : a)
+        }
+        let confirmed = score(best)
+        if confirmed < -scanTrialMargin {
+            installedVFold = (forms[arms[best]].kernel, geometry)
+            finish("\(forms[arms[best]].name) confirmed "
+                + String(format: "%+.1f%%", confirmed * 100) + ", installed")
+        } else {
+            finish("\(forms[arms[best]].name) not confirmed "
+                + String(format: "(%+.1f%%)", confirmed * 100) + "; the value launch kept")
+        }
+    }
+}
 
 // MARK: - The prompt embedding: host ids for the stepper, built early for the seed
 
