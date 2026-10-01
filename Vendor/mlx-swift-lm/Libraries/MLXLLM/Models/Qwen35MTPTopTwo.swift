@@ -2207,7 +2207,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8z",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8Zoo,
+        source: Qwen35IO32.narrow(sourceNarrowInt8Zoo, count: 14, "bonsai_m16_i8z"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2215,7 +2215,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8x",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8Pair,
+        source: Qwen35IO32.narrow(sourceNarrowInt8Pair, count: 12, "bonsai_m16_i8x"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2223,7 +2223,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8z2",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8Zoo2,
+        source: Qwen35IO32.narrow(sourceNarrowInt8Zoo2, count: 14, "bonsai_m16_i8z2"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2231,7 +2231,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8r",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8PairR,
+        source: Qwen35IO32.narrow(sourceNarrowInt8PairR, count: 12, "bonsai_m16_i8r"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2309,11 +2309,14 @@ enum Qwen35TensorPackedMatmul {
     private static let kernelNarrowXTG: [MLXFast.MLXFastKernel?] = [
         (sourceNarrowInt8Zoo, false), (sourceNarrowInt8Zoo2, false), (sourceNarrowInt8PairR, true),
     ].enumerated().map { base in
-        narrowXTGSource(base.element.0, pair: base.element.1).map {
-            MLXFast.metalKernel(
+        narrowXTGSource(base.element.0, pair: base.element.1).map { raw in
+            let n = raw.components(separatedBy: "size_t").count - 1
+            return MLXFast.metalKernel(
                 name: "bonsai_tensor_packed_matmul_m16_i8q\(base.offset)",
                 inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-                outputNames: ["part"], source: $0, header: header, ensureRowContiguous: true)
+                outputNames: ["part"],
+                source: Qwen35IO32.narrow(raw, count: n, "bonsai_m16_i8q\(base.offset)"),
+                header: header, ensureRowContiguous: true)
         }
     }
 
@@ -2454,12 +2457,16 @@ enum Qwen35TensorPackedMatmul {
     ].map { form in
         narrowDerivedSource(
             form.2 ? sourceNarrowInt8PairR : sourceNarrowInt8Zoo, i4: form.0, cs: form.1, pair: form.2
-        ).map {
-            MLXFast.metalKernel(
+        ).map { raw in
+            let n = raw.components(separatedBy: "size_t").count - 1
+            let tag = "bonsai_m16_i8" + (form.2 ? "r_" : "z_") + (form.0 ? "i4" : "") + (form.1 ? "cs" : "")
+            return MLXFast.metalKernel(
                 name: "bonsai_tensor_packed_matmul_m16_i8" + (form.2 ? "r_" : "z_") + (form.0 ? "i4" : "")
                     + (form.1 ? "cs" : ""),
                 inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
-                outputNames: ["out"], source: $0, header: header, ensureRowContiguous: true)
+                outputNames: ["out"],
+                source: Qwen35IO32.narrow(raw, count: n, tag),
+                header: header, ensureRowContiguous: true)
         }
     }
 
@@ -2586,11 +2593,15 @@ enum Qwen35TensorPackedMatmul {
 
     private static let kernelNarrowRB: MLXFast.MLXFastKernel? = {
         let prefetched = narrowRBPrefetch ? sourceNarrowInt8RBPrefetched : nil
+        let raw = prefetched ?? sourceNarrowInt8RB
+        // 32-bit element offsets: fail-closed on the live size_t census of the
+        // chosen body (stock RB is 12; the prefetch rewrite may add taps).
+        let n = raw.components(separatedBy: "size_t").count - 1
         return MLXFast.metalKernel(
             name: prefetched != nil ? "bonsai_tensor_packed_matmul_m16_i8rbf" : "bonsai_tensor_packed_matmul_m16_i8rb",
             inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
             outputNames: ["out"],
-            source: prefetched ?? sourceNarrowInt8RB,
+            source: Qwen35IO32.narrow(raw, count: n, "bonsai_m16_i8rb"),
             header: header,
             ensureRowContiguous: true)
     }()
@@ -2654,7 +2665,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8p",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8Pipelined,
+        source: Qwen35IO32.narrow(sourceNarrowInt8Pipelined, count: 16, "bonsai_m16_i8p"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2662,7 +2673,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_i8",
         inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowInt8,
+        source: Qwen35IO32.narrow(sourceNarrowInt8, count: 14, "bonsai_m16_i8"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2670,7 +2681,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_m16_s8",
         inputNames: ["x", "w", "scalesT", "biasesT", "rowsum", "ksz"],
         outputNames: ["out"],
-        source: sourceNarrowStaged8,
+        source: Qwen35IO32.narrow(sourceNarrowStaged8, count: 7, "bonsai_m16_s8n"),
         header: header,
         ensureRowContiguous: true)
 
@@ -2920,7 +2931,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_q8_u8",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
-        source: sourceStaged8,
+        source: Qwen35IO32.narrow(sourceStaged8, count: 18, "bonsai_m16_s8"),
         header: header,
         ensureRowContiguous: true)
 
@@ -3068,7 +3079,7 @@ enum Qwen35TensorPackedMatmul {
         name: "bonsai_tensor_packed_matmul_q8_rb",
         inputNames: ["xq", "w", "scalesT", "biasesT", "uT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
-        source: sourceStaged8Reg,
+        source: Qwen35IO32.narrow(sourceStaged8Reg, count: 16, "bonsai_m16_s8reg"),
         header: header,
         ensureRowContiguous: true)
 
@@ -6469,11 +6480,14 @@ extension Qwen35TensorPackedMatmul {
         _ name: String, _ text: String, columns: String
     ) -> MLXFast.MLXFastKernel? {
         guard let source = headTop2Source(text, columns: columns) else { return nil }
+        // Narrow after the top-2 rewrite so the size_t census matches the
+        // launched text (anchors in headTop2Source do not depend on size_t).
+        let n = source.components(separatedBy: "size_t").count - 1
         return MLXFast.metalKernel(
             name: name,
             inputNames: ["x", "w", "scalesT", "biasesT", "ascale", "rowsum", "ksz"],
             outputNames: ["top_ids", "top_values"],
-            source: source,
+            source: Qwen35IO32.narrow(source, count: n, name),
             header: header + headTop2Header,
             ensureRowContiguous: true)
     }
