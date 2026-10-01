@@ -1111,7 +1111,7 @@ package enum CBv2PromptCausalAttention {
 
             float ld[N_READS];
 
-            const device float* in = scores + gid * size_t(axis_size) + lid * N_READS;
+            const device float* in = scores + gid * uint(axis_size) + lid * N_READS;
             if (lid * N_READS + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
                 ld[i] = (lid * N_READS + i <= last) ? in[i] * c_scale : c_fill;
@@ -1160,7 +1160,7 @@ package enum CBv2PromptCausalAttention {
             normalizer = 1 / simd_sum(local_normalizer[simd_lane_id]);
 
             // Normalize and write to the output
-            device float* o = out + gid * size_t(axis_size) + lid * N_READS;
+            device float* o = out + gid * uint(axis_size) + lid * N_READS;
             if (lid * N_READS + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
                 o[i] = float(ld[i] * normalizer);

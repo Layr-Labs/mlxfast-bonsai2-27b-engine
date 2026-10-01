@@ -6242,8 +6242,8 @@ enum DFlash2StridedRMSNorm {
             const uint h = gid % H;
             const uint t = (gid / H) % T;
             const uint b = gid / (H * T);
-            const device auto* xr = x + int64_t(b) * x_strides[0] + int64_t(t) * x_strides[1]
-                + int64_t(h) * x_strides[2] + lid * N_READS;
+            const device auto* xr = x + int(b) * int(x_strides[0]) + int(t) * int(x_strides[1])
+                + int(h) * int(x_strides[2]) + lid * N_READS;
             const device auto* wr = w + lid * N_READS;
 
             float acc = 0;
@@ -6276,7 +6276,7 @@ enum DFlash2StridedRMSNorm {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            device auto* o = out + size_t(gid) * axis_size + lid * N_READS;
+            device auto* o = out + uint(gid) * uint(axis_size) + lid * N_READS;
             if (lid * N_READS + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
                 o[i] = wr[i] * static_cast<OutT>(thread_x[i] * local_inv_mean[0]);
@@ -6612,14 +6612,14 @@ enum DFlash2SwiGLU {
             const uint q = thread_position_in_grid.x;
             const uint r = thread_position_in_grid.y;
             const uint N = uint(g_shape[2]);
-            const device OutT* gr = g + int64_t(r) * g_strides[1];
-            const device OutT* ur = u + int64_t(r) * u_strides[1];
-            device OutT* o = out + size_t(r) * N;
+            const device OutT* gr = g + int(r) * int(g_strides[1]);
+            const device OutT* ur = u + int(r) * int(u_strides[1]);
+            device OutT* o = out + uint(r) * N;
             for (uint i = 0; i < 4; ++i) {
               const uint c = q * 4 + i;
               if (c < N) {
-                const OutT gv = gr[int64_t(c) * g_strides[2]];
-                const OutT uv = ur[int64_t(c) * u_strides[2]];
+                const OutT gv = gr[int(c) * int(g_strides[2])];
+                const OutT uv = ur[int(c) * int(u_strides[2])];
                 const OutT sg = SigmoidMLX()(gv);
                 const OutT act = MultiplyMLX()(gv, sg);
                 o[c] = MultiplyMLX()(act, uv);
@@ -6663,8 +6663,8 @@ enum DFlash2SwiGLU {
             if (idx >= uint(g_shape[1]) * N) { return; }
             const uint r = idx / N;
             const uint c = idx - r * N;
-            const OutT gv = g[int64_t(r) * g_strides[1] + int64_t(c) * g_strides[2]];
-            const OutT uv = u[int64_t(r) * u_strides[1] + int64_t(c) * u_strides[2]];
+            const OutT gv = g[int(r) * int(g_strides[1]) + int(c) * int(g_strides[2])];
+            const OutT uv = u[int(r) * int(u_strides[1]) + int(c) * int(u_strides[2])];
             const OutT sg = SigmoidMLX()(gv);
             const OutT act = MultiplyMLX()(gv, sg);
             out[idx] = MultiplyMLX()(act, uv);

@@ -3755,6 +3755,50 @@ extension Qwen35RotationQ8Blocks {
           }
           return v;
         }
+        // The 32-bit twins: every element offset below 2^31 (a negative
+        // stride or a span at or above it picks the 64-bit path), so the
+        // 32-bit forms address the same elements.
+        template <int NDIM>
+        inline bool bonsai_q8p_fits32(
+            const constant int* shape, const constant int64_t* st) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (st[d] < 0 || st[d] >= (int64_t(1) << 31)) { return false; }
+              span += ulong(shape[d] - 1) * ulong(st[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_row32(
+            const constant int* shape, const constant int64_t* st, uint row) {
+          if (HD == 0) {
+            return row * uint(st[0]);
+          }
+          const uint L = uint(shape[1]);
+          return (row / L) * uint(st[0]) + (row % L) * uint(st[1]);
+        }
+        template <int HD>
+        inline uint bonsai_q8p_col32(const constant int64_t* st, uint c) {
+          if (HD == 0) {
+            return c * uint(st[1]);
+          }
+          return (c / uint(HD)) * uint(st[2]) + (c % uint(HD)) * uint(st[3]);
+        }
+        template <int HD, typename T>
+        inline float4 bonsai_q8p_ld4_32(
+            const device T* p, uint rowoff, const constant int64_t* st, uint c, bool vec) {
+          if (vec) {
+            return bonsai_ld4(p + int64_t(rowoff + bonsai_q8p_col32<HD>(st, c)));
+          }
+          float4 v;
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < 4; r++) {
+            v[r] = float(p[int64_t(rowoff + bonsai_q8p_col32<HD>(st, c + uint(r)))]);
+          }
+          return v;
+        }
 
         """
 
@@ -3773,8 +3817,12 @@ extension Qwen35RotationQ8Blocks {
         const uint row = blk / uint(BPR);
         const uint bcol = (blk % uint(BPR)) * uint(N);
         const uint rowbase = uint(row) * uint(W);
-        const int64_t arow = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
-        const int64_t brow = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const bool p32 = bonsai_q8p_fits32<(AHD == 0 ? 2 : 4)>(a_shape, a_strides)
+            && bonsai_q8p_fits32<(BHD == 0 ? 2 : 4)>(b_shape, b_strides);
+        const int64_t arow64 = bonsai_q8p_row<AHD>(a_shape, a_strides, row);
+        const int64_t brow64 = bonsai_q8p_row<BHD>(b_shape, b_strides, row);
+        const uint arow = uint(arow64);
+        const uint brow = uint(brow64);
         const bool AV = (AHD == 0 ? a_strides[1] : a_strides[3]) == 1;
         const bool BV = (BHD == 0 ? b_strides[1] : b_strides[3]) == 1;
         alignas(16) threadgroup float buf[N];
@@ -3791,8 +3839,12 @@ extension Qwen35RotationQ8Blocks {
             const uint rr = hr % uint(GR);
             src = (rr * uint(GKH) + h) * uint(GD) + d;
           }
-          const float4 a4 = bonsai_q8p_ld4<AHD>(a, arow, a_strides, src, AV);
-          const float4 b4 = bonsai_q8p_ld4<BHD>(b, brow, b_strides, src, BV);
+          const float4 a4 = p32
+              ? bonsai_q8p_ld4_32<AHD>(a, arow, a_strides, src, AV)
+              : bonsai_q8p_ld4<AHD>(a, arow64, a_strides, src, AV);
+          const float4 b4 = p32
+              ? bonsai_q8p_ld4_32<BHD>(b, brow, b_strides, src, BV)
+              : bonsai_q8p_ld4<BHD>(b, brow64, b_strides, src, BV);
           const float4 s4 = bonsai_ld4(signs + col);
           float inv = 0.0f;
           if (PROD == 3) {
