@@ -1417,7 +1417,7 @@ enum Qwen35TensorPackedMatmul {
         }
         """
 
-    private static let sourceNarrowInt8Pair = """
+    private static let sourceNarrowInt8Pair = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
@@ -1604,7 +1604,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 12, "qwen35_head_i8_pair")
 
     // Zoo 2: more bodies under the zoo's rule (a)-(c) above, so every one is
     // bitwise that of `sourceNarrowInt8` (self-tested at load against
@@ -1632,7 +1632,7 @@ enum Qwen35TensorPackedMatmul {
     // Both read the tiled copy only. The zoo 2 reduction keeps one `if (sg ==
     // 0)` block and one store, so the fused head top two (`headTop2Source`)
     // applies to it as to the others (its running state at `HT2 STATE`).
-    private static let sourceNarrowInt8Zoo2 = """
+    private static let sourceNarrowInt8Zoo2 = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * TN;
@@ -1857,9 +1857,9 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 14, "qwen35_head_i8_zoo2")
 
-    private static let sourceNarrowInt8PairR = """
+    private static let sourceNarrowInt8PairR = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
@@ -2062,7 +2062,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 12, "qwen35_head_i8_pairr")
 
     // One constants slot and bounded element offsets; pointer types stay wide.
     private static let sourceNarrowInt8ZooC1IO32: String? = {
@@ -2480,7 +2480,7 @@ enum Qwen35TensorPackedMatmul {
     // `original`; a mismatch drops the family). grid (N / 32 * 128, 1, 1),
     // threadgroup (128, 1, 1); inputs as `sourceNarrowInt8` with `w` the plane
     // copy. Templates: OutT, NEG, F32S (TILED unused).
-    private static let sourceNarrowInt8RB = """
+    private static let sourceNarrowInt8RB = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
@@ -2582,7 +2582,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 12, "qwen35_head_i8_rb")
 
     private static let kernelNarrowRB: MLXFast.MLXFastKernel? = {
         let prefetched = narrowRBPrefetch ? sourceNarrowInt8RBPrefetched : nil
@@ -2950,7 +2950,7 @@ enum Qwen35TensorPackedMatmul {
     // blocks: the words of those blocks stay cached across the M / 32 row
     // tiles and the activations of a row tile across its SWZ blocks. The
     // last supertile may be narrower (N / 64 need not divide by SWZ).
-    private static let sourceStaged8RegBase = """
+    private static let sourceStaged8RegBase = Qwen35IO32.narrow("""
 
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
@@ -3045,7 +3045,7 @@ enum Qwen35TensorPackedMatmul {
             *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
           }
         }
-        """
+        """, count: 16, "qwen35_head_staged8_reg")
 
     /// Column blocks per supertile of the register-weight prompt kernels'
     /// tile order (see `sourceStaged8RegBase`): the stock x-fastest order (0)
