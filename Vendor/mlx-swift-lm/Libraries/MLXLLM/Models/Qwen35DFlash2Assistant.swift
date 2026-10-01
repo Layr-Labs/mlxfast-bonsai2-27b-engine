@@ -169,7 +169,23 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Stream().synchronize()
                 Memory.clearCache()
                 // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
-                DFlash2TensorMatmul.SwapTrial.run()
+                let queryTrial: (() -> DFlash2PackedWeights.QueryWindowMap)? = self.speculationPlan == nil ? nil : {
+                    let choices = self.drafter.prepareQueryWindows()
+                    if !choices.isEmpty {
+                        // Use the existing guard with this format's query map installed.
+                        let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                        if let failure {
+                            self.drafter.disableQueryWindows()
+                            FileHandle.standardError.write(
+                                ("dflash2 query window: \(DFlash2Pack11.live ? "11-bit" : "12-bit") whole-block check failed (\(failure)); stock kept\n")
+                                    .data(using: .utf8)!)
+                            return [:]
+                        }
+                    }
+                    return choices
+                }
+                let choices = DFlash2TensorMatmul.SwapTrial.run(queryTrial: queryTrial)
+                self.drafter.useQueryWindows(choices)
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
@@ -178,6 +194,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
             }
+        } else {
+            // No deferred warm, no tiling trial: the 11-bit copies are not kept.
+            DFlash2Pack11.finish(adopting: false)
         }
         Stream().synchronize()
         Memory.clearCache()
@@ -992,7 +1011,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 anchor: anchor, confirmed: confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
-                submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
+                submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed,
+                acceptancePacket: packet)
         else { return nil }
         return Speculation(state: state, block: block, kernelTag: kernelTag)
     }
@@ -1040,9 +1060,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         // The front's one-launch forms passed their own self-tests; should the
         // whole block still differ, the composed front is proven instead of
         // losing the block before the readback.
-        var frontNote = DFlash2SpeculativeFront.active ? "; one-launch front" : ""
-        if failure != nil, DFlash2SpeculativeFront.active {
+        var frontNote = DFlash2SpeculativeFront.active || DFlash2PacketFront.active ? "; one-launch front" : ""
+        if failure != nil, DFlash2SpeculativeFront.active || DFlash2PacketFront.active {
             DFlash2SpeculativeFront.deactivate()
+            DFlash2PacketFront.deactivate()
             frontNote = "; one-launch front FAILED (\(failure!)), composed front kept"
             speculationPlan = SpeculationPlan(classes: classes, maskUnconfirmed: masked)
             (failure, compared) = speculationCheck(block: block)

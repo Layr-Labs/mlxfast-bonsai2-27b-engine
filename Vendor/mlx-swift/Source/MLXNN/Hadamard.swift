@@ -85,6 +85,18 @@ public struct SignedBlockHadamard {
     ) -> Int8Activation?
     nonisolated(unsafe) public static var fusedTransformInt8: FusedTransformInt8?
 
+    /// One FP32 row quantized into the same sixteen-row tuple as zero padding
+    /// followed by `forwardInt8`. Nil keeps that composed path.
+    nonisolated(unsafe) public static var fusedTransformInt8OneRowPadded: FusedTransformInt8?
+
+    public func forwardInt8OneRowPadded(_ x: MLXArray, preSigned: Bool) -> Int8Activation? {
+        validate(x)
+        guard x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+            let fused = Self.fusedTransformInt8OneRowPadded
+        else { return nil }
+        return fused(x, signs, blockSize, preSigned, nil, 128)
+    }
+
     /// `forward` (or `applyPreSigned` when `preSigned`) quantized per group;
     /// nil when no fused implementation provides it.
     public func forwardInt8(
@@ -312,6 +324,25 @@ public struct SignedBlockHadamard {
         _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
     ) -> MLXArray?
     nonisolated(unsafe) public static var fusedInverse: FusedInverse?
+
+
+    /// Dequantize selected rows and recover their original basis; nil declines.
+    public typealias FusedDequantizedInverse = (
+        _ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ signs: MLXArray,
+        _ blockSize: Int, _ groupSize: Int, _ bits: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedDequantizedInverse: FusedDequantizedInverse?
+
+    public func inverseDequantized(
+        _ w: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        if let biases, let fused = Self.fusedDequantizedInverse,
+            let y = fused(w, scales, biases, signs, blockSize, groupSize, bits)
+        {
+            return y
+        }
+        return inverse(dequantized(w, scales: scales, biases: biases, groupSize: groupSize, bits: bits))
+    }
 
     /// A packed embedding lookup, `inverse(dequantized(gathered rows))`, as
     /// one kernel: the tables, the flat ids, the signs, the block size, the
@@ -1369,7 +1400,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let padded = Self.tensorRouteMaximumNarrowRows
         let quantized: SignedBlockHadamard.Int8Activation?
-        if x.dtype == .bfloat16 {
+        if rows == 1, gdnLayout == nil,
+            let direct = transform.forwardInt8OneRowPadded(x, preSigned: preSigned)
+        {
+            quantized = direct
+        } else if x.dtype == .bfloat16 {
             // The drafter head's BF16 rows: the rotation reads them as they
             // are and forms the zero rows in its read (no cast, no concat).
             quantized = transform.forwardInt8(
@@ -2044,20 +2079,17 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let indices = x.flattened()
         let chain: (MLXArray) -> MLXArray = { [self] indices in
-            let rows: MLXArray
+            let rows: (MLXArray, MLXArray, MLXArray?)
             if let biases,
                 let gathered = HadamardEmbeddingGather.apply(
                     weight, scales, biases, indices, groupSize: groupSize, bits: bits)
             {
-                rows = dequantized(
-                    gathered[0], scales: gathered[1], biases: gathered[2],
-                    groupSize: groupSize, bits: bits)
+                rows = (gathered[0], gathered[1], gathered[2])
             } else {
-                rows = dequantized(
-                    weight[indices], scales: scales[indices],
-                    biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
+                rows = (weight[indices], scales[indices], biases.map { $0[indices] })
             }
-            return transform.inverse(rows)
+            return transform.inverseDequantized(
+                rows.0, scales: rows.1, biases: rows.2, groupSize: groupSize, bits: bits)
         }
         let rows =
             biases.flatMap {
@@ -2473,9 +2505,11 @@ enum FusedInputHadamardKernel {
 
             BONSAI_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
-              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-                out[row_base + col0 + index + r] = static_cast<OutT>(buf[index + r] * 0.03125f);
-              }
+              const uint out_off = row_base + col0 + index;
+              float4 bv = *(threadgroup float4*)(buf + index) * 0.03125f;
+              *(device vec<OutT, 4>*)(out + out_off) = vec<OutT, 4>(
+                  static_cast<OutT>(bv.x), static_cast<OutT>(bv.y),
+                  static_cast<OutT>(bv.z), static_cast<OutT>(bv.w));
             }
             """,
         header: """
@@ -2597,6 +2631,17 @@ extension FusedInputHadamardKernel {
               const auto zp = z + rz;
               fill([&](uint c) { return float(xp[c]); }, [&](uint c) { return float(zp[c]); },
                    [&](uint c) { return w[c]; }, [&](uint c) { return signs[c]; });
+            } else if (bonsai_offsets_fit32<4>(x_shape, x_strides)
+                && bonsai_offsets_fit32<4>(z_shape, z_strides)
+                && bonsai_offsets_fit32<1>(signs_shape, signs_strides)) {
+              const uint rx32 = bonsai_row_base32<2>(row, x_shape, x_strides);
+              const uint rz32 = bonsai_row_base32<2>(row, z_shape, z_strides);
+              const uint ss = uint(signs_strides[0]);
+              const uint ws = uint(w_strides[0]);
+              fill([&](uint c) { return float(x[rx32 + bonsai_col_off32<2, 2>(c, x_shape, x_strides)]); },
+                   [&](uint c) { return float(z[rz32 + bonsai_col_off32<2, 2>(c, z_shape, z_strides)]); },
+                   [&](uint c) { return w[c * ws]; },
+                   [&](uint c) { return signs[c * ss]; });
             } else {
               fill([&](uint c) { return float(x[rx + bonsai_col_off<2, 2>(c, x_shape, x_strides)]); },
                    [&](uint c) { return float(z[rz + bonsai_col_off<2, 2>(c, z_shape, z_strides)]); },
@@ -2637,9 +2682,11 @@ extension FusedInputHadamardKernel {
 
             BONSAI_UNROLL for (short j = 0; j < 4; j++) {
               short index = j * 4 * NT + i * 4;
-              BONSAI_UNROLL for (short r = 0; r < 4; r++) {
-                out[row_base + col0 + index + r] = static_cast<OutT>(buf[index + r] * 0.03125f);
-              }
+              const uint out_off = row_base + col0 + index;
+              float4 bv = *(threadgroup float4*)(buf + index) * 0.03125f;
+              *(device vec<OutT, 4>*)(out + out_off) = vec<OutT, 4>(
+                  static_cast<OutT>(bv.x), static_cast<OutT>(bv.y),
+                  static_cast<OutT>(bv.z), static_cast<OutT>(bv.w));
             }
             """,
         header: """
