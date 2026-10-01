@@ -168,7 +168,23 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Stream().synchronize()
                 Memory.clearCache()
                 // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
-                DFlash2TensorMatmul.SwapTrial.run()
+                let queryTrial: (() -> DFlash2PackedWeights.QueryWindowMap)? = self.speculationPlan == nil ? nil : {
+                    let choices = self.drafter.prepareQueryWindows()
+                    if !choices.isEmpty {
+                        // Use the existing guard with this format's query map installed.
+                        let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                        if let failure {
+                            self.drafter.disableQueryWindows()
+                            FileHandle.standardError.write(
+                                ("dflash2 query window: \(DFlash2Pack11.live ? "11-bit" : "12-bit") whole-block check failed (\(failure)); stock kept\n")
+                                    .data(using: .utf8)!)
+                            return [:]
+                        }
+                    }
+                    return choices
+                }
+                let choices = DFlash2TensorMatmul.SwapTrial.run(queryTrial: queryTrial)
+                self.drafter.useQueryWindows(choices)
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
