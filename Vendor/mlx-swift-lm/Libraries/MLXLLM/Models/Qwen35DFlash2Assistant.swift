@@ -143,7 +143,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// own warm does, so the served phases start from the footprint a cold
     /// load leaves.
     func warmSpeculativeShapes(serving: (any LanguageModel)? = nil) {
-        guard Self.speculativeWarmEnabled else { return }
+        guard Self.speculativeWarmEnabled else {
+            DFlash2Pack11.finish(adopting: false)
+            return
+        }
         warmTargetPrefill()
         if drafter.prepareTiledWeights(), DFlash2TensorMatmul.trialWanted {
             // The trial runs in the deferred warm; without it, no copy is read.
@@ -169,6 +172,26 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 Memory.clearCache()
                 // The drafter GEMM tiling per shape (packed or swapped kernel), before the in-situ trials time rounds.
                 DFlash2TensorMatmul.SwapTrial.run()
+                Stream().synchronize()
+                Memory.clearCache()
+                var changedProjection = false
+                if self.speculationPlan != nil {
+                    changedProjection = self.drafter.prepareActivatedGateUps()
+                    changedProjection = self.drafter.prepareQueryWindows() || changedProjection
+                }
+                if changedProjection {
+                    // Existing whole-block proposals/cache/cursor parity guard;
+                    // failure disables both projection additions without changing the plan.
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableQueryWindows()
+                        self.drafter.disableActivatedGateUps()
+                        self.drafter.disableFinalNormOnly()
+                        FileHandle.standardError.write(
+                            ("dflash2 projection fusion: whole-block check failed (\(failure)); stock kept\n")
+                                .data(using: .utf8)!)
+                    }
+                }
                 Stream().synchronize()
                 Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
@@ -1044,6 +1067,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         speculationPlan = SpeculationPlan(classes: classes, maskUnconfirmed: masked)
         drafter.prepareSpeculativeFront(blockSize: block)
         var (failure, compared) = speculationCheck(block: block)
+        if failure != nil, drafter.finalNormOnlyActive {
+            drafter.disableFinalNormOnly()
+            (failure, compared) = speculationCheck(block: block)
+            FileHandle.standardError.write(
+                "dflash2 final norm-only: whole-block failed; ordinary restored\n".data(using: .utf8)!)
+        }
         // The front's one-launch forms passed their own self-tests; should the
         // whole block still differ, the composed front is proven instead of
         // losing the block before the readback.
@@ -1084,8 +1113,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             for state in [a, b] {
                 append(prompt, to: state)
                 eval(prefetchCommittedContext(requestState: state))
-                _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
-                eval(evaluationTargets(for: state))
+                if state === a {
+                    try DFlash2PackedWeights.withoutActivatedGateUp {
+                        _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
+                        eval(evaluationTargets(for: state))
+                    }
+                } else {
+                    _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
+                    eval(evaluationTargets(for: state))
+                }
             }
             for c in 1 ... block where failure == nil {
                 let window = MLXRandom.normal([1, block, width], key: MLXRandom.key(UInt64(100 + c)))
@@ -1096,9 +1132,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     requestState: a, confirmedInputTokens: c,
                     committedDraftTokens: MLXArray.zeros([1, 0], dtype: .int32),
                     committedTargetHidden: window[0..., ..<c, 0...])
-                let expected = try proposeBlock(
-                    anchor: Int(targets[c - 1]), depth: block - 1, requestState: a,
-                    submittingLeadingLayers: 3)
+                let expected = try DFlash2PackedWeights.withoutActivatedGateUp {
+                    try proposeBlock(
+                        anchor: Int(targets[c - 1]), depth: block - 1, requestState: a,
+                        submittingLeadingLayers: 3)
+                }
                 b.lastConfirmed = c  // build this count's class
                 guard
                     let pending = speculateBlock(
