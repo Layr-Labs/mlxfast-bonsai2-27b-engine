@@ -2353,7 +2353,7 @@ enum Qwen35GatedDeltaChunked {
     /// stock path.
     static func runFresh(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil
+        prepared: [MLXArray]? = nil, valueSource: (qkv: MLXArray, weights: MLXArray)? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
         let B = k.dim(0)
@@ -2368,7 +2368,8 @@ enum Qwen35GatedDeltaChunked {
             freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
         else { return nil }
         return freshChunks(
-            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared)
+            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared,
+            valueSource: valueSource)
     }
 
     /// The prep launch alone (`chunks`' first launch): T', P and the decay
@@ -2390,7 +2391,7 @@ enum Qwen35GatedDeltaChunked {
     /// launch, the same scan launch geometry, no state input.
     private static func freshChunks(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil
+        prepared: [MLXArray]? = nil, valueSource: (qkv: MLXArray, weights: MLXArray)? = nil
     ) -> (MLXArray, MLXArray) {
         let B = k.dim(0)
         let T = k.dim(1)
@@ -2416,6 +2417,10 @@ enum Qwen35GatedDeltaChunked {
                 ? ($0.kernel, $0.simdgroups) : nil
         }
         let (scan, ns) = form ?? (recordFreshScanKernel, scanSimdgroups)
+        if let valueSource, let fused = Qwen35GDNFreshValueScan.run(
+            q: q, k: k, v: v, prepared: prepared, rowCount: rowCount,
+            stateShape: stateShape, source: valueSource, simdgroups: ns)
+        { return (fused[0], fused[1]) }
         let outputs = scan(
             [q, k, v, prepared[0], prepared[1], prepared[2], rowCount],
             template: [
@@ -3397,7 +3402,8 @@ final class Qwen35GatedDeltaNet: Module {
         // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
         if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
             q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape,
-            prepared: pre.prepared)
+            prepared: pre.prepared,
+            valueSource: S == 512 && pre.prepared != nil ? (qkv, conv1d.weight) : nil)
         {
             return (out, pre.tail, newSsmState)
         }

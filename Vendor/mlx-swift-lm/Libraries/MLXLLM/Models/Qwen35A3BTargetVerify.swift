@@ -1973,6 +1973,20 @@ extension Qwen35GDNPrework {
         return all
     }
 
+
+    /// The final V tile and checked form. No lazy array metadata is read.
+    static func freshValuePair(_ dtype: DType) -> (geometry: [Int], rows: Int)? {
+        rowTileLock.withLock {
+            guard preparedShape == [16, 128, 48, 128, 4] else { return nil }
+            let geometry = RowTileGeometry(hk: 16, hv: 48, cd: 10240, ks: 4, dtype: "\(dtype)")
+            guard rowTiledEnabled, freshStridedReads, rowTileVerdicts[geometry] ?? false,
+                min(rowFormVerdicts[geometry] ?? 0, rowForms - 1) == 3,
+                512 % rowTileChoice == 0
+            else { return nil }
+            return ([16, 128, 48, 128], rowTileChoice)
+        }
+    }
+
     /// The prompt qkv dtype last seen by `rowTileVerified`.
     nonisolated(unsafe) static var lastPromptDType: DType?
 
@@ -4288,7 +4302,7 @@ extension Qwen35GatedDeltaChunked {
     /// geometry [Hk, Dk, Hv, Dv] (set once, at model construction, before any
     /// forward); nil keeps the record's launch.
     nonisolated(unsafe) static var installedScanForm:
-        (kernel: MLXFast.MLXFastKernel, simdgroups: Int, geometry: [Int])? = nil
+        (kernel: MLXFast.MLXFastKernel, simdgroups: Int, geometry: [Int], name: String)? = nil
 
     /// Relative gain a form needs over the record's launch to be installed.
     private static let scanTrialMargin = 0.02
@@ -4355,6 +4369,21 @@ extension Qwen35GatedDeltaChunked {
             outputNames: ["y", "state_out"],
             source: Qwen35IO32.narrow(text, count: 8, "bonsai_gated_delta_chunk_scan_fresh_kt"))
     }()
+
+
+    /// The final checked scan text, before its existing I32 conversion.
+    static func freshValueScanBody() -> (body: String, name: String, ns: Int)? {
+        let pf = scanPrefetchActive && scanFreshPrefetchSource != nil
+        let body = pf ? scanFreshPrefetchSource! : scanFreshSource
+        if let form = installedScanForm {
+            guard form.geometry == [16, 128, 48, 128] else { return nil }
+            if form.name.hasPrefix("kt/") {
+                return ktSource(body, prefetch: pf).map { ($0, form.name, form.simdgroups) }
+            }
+            return (body, form.name, form.simdgroups)
+        }
+        return (body, "record/\(scanSimdgroups)", scanSimdgroups)
+    }
 
     private struct ScanForm {
         let name: String
@@ -4471,7 +4500,7 @@ extension Qwen35GatedDeltaChunked {
         }
         if let forced = scanFormForced {
             if let f = passing.first(where: { forms[$0].name == forced }), f != 0 {
-                installedScanForm = (forms[f].kernel, forms[f].simdgroups, [hk, dk, hv, dv])
+                installedScanForm = (forms[f].kernel, forms[f].simdgroups, [hk, dk, hv, dv], forms[f].name)
                 finish("forced \(forced), installed")
             } else {
                 finish("forced \(forced) not available; the record's launch kept")
@@ -4537,7 +4566,7 @@ extension Qwen35GatedDeltaChunked {
         }
         let confirmed = score(best)
         if confirmed < -scanTrialMargin {
-            installedScanForm = (forms[best].kernel, forms[best].simdgroups, [hk, dk, hv, dv])
+            installedScanForm = (forms[best].kernel, forms[best].simdgroups, [hk, dk, hv, dv], forms[best].name)
             finish("\(forms[best].name) confirmed " + String(format: "%+.1f%%", confirmed * 100)
                 + ", installed")
         } else {
@@ -4978,6 +5007,8 @@ enum Qwen35ExactFormTrial {
     /// when it beats 4 by more than `rowsMargin` in the race and in a
     /// confirmation race. One stderr line.
     static func runPromptRows() {
+        let valueDType = Qwen35GDNPrework.lastPromptDType
+        defer { Qwen35GDNFreshValueScan.prepare(dtype: valueDType) }
         guard promptRowsWanted, Qwen35GDNPrework.rowTiledEnabled,
             Qwen35GDNPrework.rowTileForced == nil,
             Qwen35GDNPrework.rowTileChoice == Qwen35GDNPrework.rowTile
@@ -5019,6 +5050,230 @@ enum Qwen35ExactFormTrial {
         }
         Qwen35GDNPrework.rowTileChoice = tiles[best]
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
+    }
+}
+
+
+// MARK: - Fresh prompt V convolution inside the selected scan
+
+/// Optional fresh512 form3 only. The old V graph remains the decline path.
+enum Qwen35GDNFreshValueScan {
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_GDN_FRESH_VALUE_SCAN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    private struct Choice {
+        let kernel: MLXFast.MLXFastKernel
+        let dtype: DType
+        let name: String
+        let ns: Int
+        let rows: Int
+        let prefetch: Bool
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var done = false
+    nonisolated(unsafe) private static var choice: Choice?
+
+    /// The old scan with only its V read replaced. No new array or barrier.
+    static func source(_ parent: String) -> String? {
+        var text = parent
+        let read = "const float2 vv = *(const device float2*)(v_ + row * vs + fn);"
+        let prefix = "const short fn = (qid & 2) * 2 + (lane % 2) * 2;"
+        guard text.components(separatedBy: read).count == 2,
+            text.components(separatedBy: prefix).count == 2 else { return nil }
+        let oldPointer = "const device float* v_ = v + ((size_t)b_idx * T_ + t0) * vs + hv * Dv + r0;"
+        let ktPointer = "const device float* v_ = vb0 + t0 * vs;"
+        let ktBase = "const device float* vb0 = v + ((size_t)b_idx * T_) * vs + hv * Dv + r0;"
+        let kt = text.components(separatedBy: ktPointer).count == 2
+        for target in kt ? [ktPointer, ktBase] : [oldPointer] {
+            guard text.components(separatedBy: target).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: target, with: "")
+        }
+        let tapPrefix = """
+            \(prefix)
+            const int64_t vc = int64_t(2 * Hk * Dk + hv * Dv + r0 + fn);
+            const int64_t qb = int64_t(b_idx) * qkv_strides[0];
+            const int64_t qr = qkv_strides[1];
+            const int64_t qc = qkv_strides[2];
+            const int64_t w0 = vc * w_strides[0];
+            const int64_t w1 = (vc + 1) * w_strides[0];
+            const float wx0 = w[w0], wx1 = w[w0 + w_strides[1]];
+            const float wx2 = w[w0 + 2 * w_strides[1]], wx3 = w[w0 + 3 * w_strides[1]];
+            const float wy0 = w[w1], wy1 = w[w1 + w_strides[1]];
+            const float wy2 = w[w1 + 2 * w_strides[1]], wy3 = w[w1 + 3 * w_strides[1]];
+            auto conv_silu = [&](int t, int64_t col, float a, float b, float c, float d) __attribute__((always_inline)) -> float {
+              float acc = 0.0f;
+              auto input = [&](int r) __attribute__((always_inline)) -> float {
+                return r < 0 ? 0.0f : float(qkv[qb + int64_t(r) * qr + col * qc]);
+              };
+              acc = fma(input(t - 3), a, acc);
+              acc = fma(input(t - 2), b, acc);
+              acc = fma(input(t - 1), c, acc);
+              acc = fma(input(t), d, acc);
+              const float sy = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = (acc < 0.0f) ? sy : 1.0f - sy;
+              return acc * sig;
+            };
+            """
+        text = text.replacingOccurrences(of: prefix, with: tapPrefix)
+        text = text.replacingOccurrences(of: read, with: """
+            const float2 vv = float2(
+                conv_silu(t0 + row, vc, wx0, wx1, wx2, wx3),
+                conv_silu(t0 + row, vc + 1, wy0, wy1, wy2, wy3));
+            """)
+        guard text.range(of: "\\bv_\\b|\\bvb0\\b|\\bstate_in\\b", options: .regularExpression) == nil,
+            text.components(separatedBy: "size_t").count - 1 == (kt ? 7 : 10)
+        else { return nil }
+        return Qwen35IO32.narrow(text, count: kt ? 7 : 10, "qwen35_gdn_fresh_value_scan")
+    }
+
+    private static func launch(
+        _ selected: Choice, q: MLXArray, k: MLXArray, qkv: MLXArray, weights: MLXArray,
+        prepared: [MLXArray], rowCount: MLXArray, stateShape: [Int]
+    ) -> [MLXArray] {
+        selected.kernel(
+            [q, k, qkv, weights, prepared[0], prepared[1], prepared[2], rowCount],
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 48),
+                       ("NS", selected.ns)],
+            grid: (32, 16, 48), threadGroup: (32, selected.ns, 1),
+            outputShapes: [[1, 512, 48, 128], stateShape], outputDTypes: [.float32, .float32])
+    }
+
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray], rowCount: MLXArray,
+        stateShape: [Int], source: (qkv: MLXArray, weights: MLXArray), simdgroups: Int
+    ) -> [MLXArray]? {
+        guard let selected = lock.withLock({ choice }), simdgroups == selected.ns,
+            selected.prefetch == Qwen35GatedDeltaChunked.scanPrefetchActive,
+            selected.name == (Qwen35GatedDeltaChunked.installedScanForm?.name
+                ?? "record/\(Qwen35GatedDeltaChunked.scanSimdgroups)"),
+            q.shape == [1, 512, 16, 128], k.shape == q.shape,
+            v.shape == [1, 512, 48, 128], stateShape == [1, 48, 128, 128],
+            source.qkv.shape == [1, 512, 10240], source.qkv.dtype == selected.dtype,
+            source.weights.shape == [10240, 4, 1], source.weights.dtype == .float32,
+            prepared.count == 3, Qwen35GDNPrework.rowTileChoice == selected.rows
+        else { return nil }
+        return launch(selected, q: q, k: k, qkv: source.qkv, weights: source.weights,
+            prepared: prepared, rowCount: rowCount, stateShape: stateShape)
+    }
+
+    /// Check and race after the old scan and V tile choices are final.
+    static func prepare(dtype: DType?) {
+        guard enabled, let dtype, [DType.float32, .float16, .bfloat16].contains(dtype),
+            let pair = Qwen35GDNPrework.freshValuePair(dtype),
+            let body = Qwen35GatedDeltaChunked.freshValueScanBody(),
+            [2, 4, 8, 16].contains(body.ns), let text = source(body.body)
+        else { return }
+        guard lock.withLock({ () -> Bool in
+            if done { return false }; done = true; return true
+        }) else { return }
+        let selected = Choice(
+            kernel: MLXFast.metalKernel(name: "qwen35_gdn_fresh_value_scan",
+                inputNames: ["q", "k", "qkv", "w", "tp", "pm", "gf", "T"],
+                outputNames: ["y", "state_out"], source: text, ensureRowContiguous: false),
+            dtype: dtype, name: body.name, ns: body.ns, rows: pair.rows,
+            prefetch: Qwen35GatedDeltaChunked.scanPrefetchActive)
+        var adopted = false
+        var line = "qwen35 fresh prompt V scan: \(dtype), \(body.name), V rows\(pair.rows)"
+        defer {
+            Stream().synchronize()
+            if adopted { lock.withLock { choice = selected } }
+            FileHandle.standardError.write((line + (adopted ? "; installed\n" : "; stock kept\n"))
+                .data(using: .utf8)!)
+        }
+        do {
+            try withError { error in
+                let keys = MLXRandom.split(key: MLXRandom.key(0x7663_7363), into: 8)
+                let width = 16384
+                let rowCount = MLXArray(Int32(512))
+                let s = [1, 48, 128, 128]
+                let ba = MLXRandom.normal([1, 512, 96], key: keys[2]) * 2
+                let b = ba[.ellipsis, ..<48], a = ba[.ellipsis, 48...]
+                let weights = MLXRandom.normal([10240, 4, 1], key: keys[3]) * 0.5
+                let decay = Qwen35GDNDerived().decay(MLXRandom.normal([48], key: keys[4]) * 0.5)
+                let dtb = MLXRandom.normal([48], key: keys[5])
+                let scales = (q: MLXArray.ones([128]), k: MLXArray.ones([128]))
+                func build(_ fused: Bool, _ qkv: MLXArray, _ w: MLXArray) -> [MLXArray]? {
+                    let pre = Qwen35GDNPrework.freshStridedRows(
+                        qkv: qkv, convWeight: w, a: a, b: b, decay: decay, dtb: dtb,
+                        normScales: scales, keyHeads: 16, valueHeads: 48,
+                        headKDim: 128, headVDim: 128, rows: pair.rows, form: 3)
+                    guard let p = pre.prepared else { return nil }
+                    if fused {
+                        return launch(selected, q: pre.q, k: pre.k, qkv: qkv, weights: w,
+                            prepared: p, rowCount: rowCount, stateShape: s)
+                    }
+                    return Qwen35GatedDeltaChunked.runFresh(
+                        q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta,
+                        stateShape: s, prepared: p).map { [$0.0, $0.1] }
+                }
+                var timingQKV: MLXArray?
+                for seed in 0 ..< 4 {
+                    let stack = (MLXRandom.normal([1, 512, width], key: keys[seed])
+                        * exp(MLXRandom.normal([1, 512, width], key: keys[seed + 3]))).asType(dtype)
+                    var qkv = stack[.ellipsis, ..<10240]
+                    var w = weights
+                    if seed == 1 {
+                        let rows = MLXArray.arange(512).reshaped(1, 512, 1)
+                        qkv = which(rows .< 4, Float(0), which(rows .< 8, Float(1e-39), qkv)).asType(dtype)
+                    }
+                    if seed >= 2 {
+                        let bits: [UInt32] = [0, 0x80000000, 1, 0x007fffff, 0x00800000, 0x7f800000,
+                            0xff800000, 0x7fc00001, 0x7f800001, 0x3f800000, 0xbf800000, 0x00800001,
+                            0x80000001, 0x7fc12345, 0xffc12345, 0x3e800000]
+                        if seed == 2 {
+                            let special = MLXArray((0 ..< 10240).map { bits[$0 % bits.count] })
+                                .view(dtype: .float32).reshaped(1, 1, 10240).asType(dtype)
+                            qkv = which(MLXArray.arange(10240).reshaped(1, 1, 10240) .>= 4096,
+                                special, qkv)
+                        } else {
+                            let special = MLXArray((0 ..< 10240 * 4).map { bits[$0 % bits.count] })
+                                .view(dtype: .float32).reshaped(10240, 4, 1)
+                            w = which(MLXArray.arange(10240).reshaped(10240, 1, 1) .>= 4096,
+                                special, w)
+                        }
+                    }
+                    guard let old = build(false, qkv, w), let new = build(true, qkv, w) else { return }
+                    var differ = MLXArray(Int32(0))
+                    for (x, y) in zip(old, new) {
+                        differ = differ + (x.view(dtype: .uint32) .!= y.view(dtype: .uint32))
+                            .asType(.int32).sum()
+                    }
+                    eval(differ)
+                    try error.check()
+                    guard differ.item(Int32.self) == 0 else { line += "; check\(seed) failed"; return }
+                    if seed == 0 { timingQKV = qkv; eval(qkv) }
+                }
+                guard let qkv = timingQKV else { return }
+                eval([qkv, weights, ba, decay, dtb, scales.q, scales.k])
+                try error.check()
+                func sample(_ fused: Bool) throws -> Double? {
+                    guard let outputs = build(fused, qkv, weights) else { return nil }
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    eval(outputs)
+                    try error.check()
+                    return Double(DispatchTime.now().uptimeNanoseconds - start)
+                }
+                func race(_ rounds: Int, discard: Bool) throws -> Double? {
+                    var ratios: [Double] = []
+                    for round in 0 ..< rounds {
+                        let first = round % 2 == 1
+                        guard let a = try sample(first), let b = try sample(!first) else { return nil }
+                        if !discard || round > 0 { ratios.append(first ? a / b : b / a) }
+                    }
+                    let sorted = ratios.sorted()
+                    return sorted.count % 2 == 1 ? sorted[sorted.count / 2]
+                        : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
+                }
+                guard let gain = try race(7, discard: true), gain < 0.98,
+                    let confirmed = try race(6, discard: false), confirmed < 0.98 else {
+                    line += "; no confirmed 2% gain"; return
+                }
+                line += String(format: "; checks4 passed, confirmed %+.2f%%", (confirmed - 1) * 100)
+                adopted = true
+            }
+        } catch { line += "; check/trial error (\(error))" }
     }
 }
 
