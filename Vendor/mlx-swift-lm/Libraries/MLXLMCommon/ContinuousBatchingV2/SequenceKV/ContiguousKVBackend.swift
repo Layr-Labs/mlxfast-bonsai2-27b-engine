@@ -6,6 +6,7 @@
 // Metal kernel; the scheduler and models never see the difference.
 
 import Foundation
+import Cmlx
 import MLX
 
 /// Configuration for `CBv2ContiguousKVBackend`.
@@ -378,5 +379,98 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                     * (entry.keys.dtype.size + entry.values.dtype.size)
             }
         }
+    }
+}
+
+/// A second GPU command queue for submissions no result ever reads
+/// (`MLXFAST_SEEDGAP`, default on; `MLXFAST_SEEDGAP=0` restores the original).
+///
+/// The seed's residency touches (`DFlash2ResidencyPrefetch`) bind the drafter's
+/// weights and the window's arrays behind the prompt forward's early
+/// submissions. On the prompt's own queue every touch command buffer sits
+/// between two prompt command buffers, so the prompt (and the seed token's
+/// readback behind it) can wait for a residency restore that nothing in the
+/// seed reads. Here the same touches, in the same groups, at the same layer
+/// points, inside the same `free_decode_begin`, are committed on their own
+/// queue instead. They read element 0 of arrays that are already evaluated and
+/// write a scalar no one reads, so no value of any result can change.
+///
+/// The queue is created once per process by `prepare()`, at load (the touch
+/// prewarm), with the same process-global registration the default GPU stream
+/// uses (`mlx_thread_unsafe_gpu_stream_new`), so the engine thread can submit
+/// to it whichever thread created it.
+public enum CBv2SideQueue {
+    public static let enabled: Bool = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["MLXFAST_SEEDGAP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var stream: mlx_stream?
+    nonisolated(unsafe) private static var kernels: [String: mlx_fast_metal_kernel] = [:]
+
+    /// Creates the side queue (once). Idempotent; call at load.
+    public static func prepare() {
+        guard enabled else { return }
+        _ = sideStream()
+    }
+
+    private static func sideStream() -> mlx_stream {
+        lock.withLock {
+            if let stream { return stream }
+            let created = mlx_thread_unsafe_gpu_stream_new()
+            stream = created
+            return created
+        }
+    }
+
+    private static func kernel(name: String, inputs: Int, source: String) -> mlx_fast_metal_kernel {
+        lock.withLock {
+            let key = "\(name)/\(inputs)"
+            if let cached = kernels[key] { return cached }
+            let inputNames = mlx_vector_string_new()
+            defer { mlx_vector_string_free(inputNames) }
+            for i in 0 ..< inputs { mlx_vector_string_append_value(inputNames, "w\(i)") }
+            let outputNames = mlx_vector_string_new()
+            defer { mlx_vector_string_free(outputNames) }
+            mlx_vector_string_append_value(outputNames, "out")
+            let made = mlx_fast_metal_kernel_new(name, inputNames, outputNames, source, "", false, false)
+            kernels[key] = made
+            return made
+        }
+    }
+
+    /// One single-thread launch per chunk (each chunk exactly `inputs` arrays),
+    /// all committed together on the side queue. The scalar outputs are dropped,
+    /// exactly as the default-queue touches drop theirs.
+    public static func submitTouches(
+        _ chunks: [[MLXArray]], name: String, inputs: Int, source: String
+    ) {
+        guard !chunks.isEmpty else { return }
+        let stream = sideStream()
+        let kernel = kernel(name: name, inputs: inputs, source: source)
+        let outputs = mlx_vector_array_new()
+        defer { mlx_vector_array_free(outputs) }
+        for chunk in chunks {
+            precondition(chunk.count == inputs, "CBv2SideQueue: a touch chunk must hold \(inputs) arrays")
+            let config = mlx_fast_metal_kernel_config_new()
+            defer { mlx_fast_metal_kernel_config_free(config) }
+            mlx_fast_metal_kernel_config_set_grid(config, 1, 1, 1)
+            mlx_fast_metal_kernel_config_set_thread_group(config, 1, 1, 1)
+            let shape: [Int32] = [1]
+            mlx_fast_metal_kernel_config_add_output_arg(config, shape, 1, MLX_FLOAT32)
+            let ins = mlx_vector_array_new()
+            defer { mlx_vector_array_free(ins) }
+            for array in chunk { mlx_vector_array_append_value(ins, array.ctx) }
+            var result = mlx_vector_array_new()
+            defer { mlx_vector_array_free(result) }
+            mlx_fast_metal_kernel_apply(&result, kernel, ins, config, stream)
+            for i in 0 ..< mlx_vector_array_size(result) {
+                var out = mlx_array_new()
+                mlx_vector_array_get(&out, result, i)
+                mlx_vector_array_append_value(outputs, out)
+                mlx_array_free(out)
+            }
+        }
+        mlx_async_eval(outputs)
     }
 }

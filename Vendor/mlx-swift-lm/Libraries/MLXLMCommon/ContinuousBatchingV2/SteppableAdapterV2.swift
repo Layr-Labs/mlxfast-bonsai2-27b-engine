@@ -401,6 +401,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyFirstProviding {
+    public func cbv2MTPFirst(_ logits: MLXArray) -> MLXArray? {
+        (model as? any CBv2MTPPolicyFirstProviding)?.cbv2MTPFirst(logits)
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter:
     CBv2MTPPolicyTopTwoCapabilityProviding
 {
