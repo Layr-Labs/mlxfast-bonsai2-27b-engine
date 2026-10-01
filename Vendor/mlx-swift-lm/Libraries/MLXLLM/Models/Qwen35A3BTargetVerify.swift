@@ -2661,6 +2661,15 @@ enum Qwen35RotationQ8Blocks {
     private struct Form: Hashable {
         let width: Int, presigned: Bool, gr: Int, gkh: Int, gd: Int
         let perm: Bool, mperm: Bool, signed: Bool, dtype: String, tpb: Int
+        /// A prompt-width form (`runPromptTrial`), self-tested at its own
+        /// row count.
+        var prompt = false
+
+        func with(tpb: Int) -> Form {
+            Form(
+                width: width, presigned: presigned, gr: gr, gkh: gkh, gd: gd, perm: perm,
+                mperm: mperm, signed: signed, dtype: dtype, tpb: tpb, prompt: prompt)
+        }
     }
 
     private static let lock = NSLock()
@@ -2668,13 +2677,15 @@ enum Qwen35RotationQ8Blocks {
 
     /// The stock kernel's outputs for `x` from this kernel, or nil (off, not
     /// a verify-width launch, or a form that failed its self-test). `stock`
-    /// runs the stock kernel with the same template (for the self-test).
+    /// runs the stock kernel with the same template (for the self-test). At
+    /// prompt width only a form the prompt trial installed (`promptThreads`).
     static func launch(
         _ x: MLXArray, _ signs: MLXArray, template: [(String, any KernelTemplateArg)],
         rows: Int, width: Int, groupShape: [Int], codesDType: DType,
-        stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+        stock: @escaping ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
     ) -> SignedBlockHadamard.Int8Activation? {
-        guard enabled, rows > 0, rows < BonsaiPromptWidth.minimumRows, width > 0,
+        let prompt = rows >= BonsaiPromptWidth.minimumRows
+        guard enabled, rows > 0, !prompt || promptTrialWanted, width > 0,
             width % 1024 == 0, rows <= Int(Int32.max) / width
         else { return nil }
         func value(_ name: String) -> Int? {
@@ -2688,6 +2699,37 @@ enum Qwen35RotationQ8Blocks {
             let signed = value("SIGNED"), value("QSIM") == 0
         else { return nil }
         let blocks = rows * (width / 1024)
+        if prompt {
+            let base = Form(
+                width: width, presigned: presigned != 0, gr: gr, gkh: gkh, gd: gd,
+                perm: perm != 0, mperm: mperm != 0, signed: signed != 0, dtype: "\(x.dtype)",
+                tpb: 0, prompt: true)
+            guard
+                let tpb = promptThreads(for: base, record: {
+                    PromptCase(
+                        label: "plain \(width) \(x.dtype)",
+                        check: { tpb in
+                            verified(
+                                base.with(tpb: tpb), x: x, signs: signs, template: template,
+                                tmpl: template + [("TPB", tpb)], rows: rows, width: width,
+                                groupShape: groupShape, codesDType: codesDType, stock: stock)
+                        },
+                        launch: { tpb in
+                            tpb == 0
+                                ? stock([x, signs], template)
+                                : run(
+                                    x, signs, tmpl: template + [("TPB", tpb)], rows: rows,
+                                    width: width, tpb: tpb, groupShape: groupShape,
+                                    codesDType: codesDType)
+                        })
+                }),
+                lock.withLock({ verdicts[base.with(tpb: tpb)] }) == true
+            else { return nil }
+            let outs = run(x, signs, tmpl: template + [("TPB", tpb)], rows: rows, width: width,
+                tpb: tpb, groupShape: groupShape, codesDType: codesDType)
+            return SignedBlockHadamard.Int8Activation(
+                codes: outs[0], scales: outs[1], scaledSums: outs[2])
+        }
         let tpb = threads(blocks: blocks)
         let form = Form(
             width: width, presigned: presigned != 0, gr: gr, gkh: gkh, gd: gd, perm: perm != 0,
@@ -3926,6 +3968,15 @@ extension Qwen35RotationQ8Blocks {
     private struct ProducerForm: Hashable {
         let width: Int, prod: Int, gr: Int, gkh: Int, gd: Int, ahd: Int, bhd: Int
         let perm: Int, mperm: Int, signed: Int, adtype: String, bdtype: String, tpb: Int
+        /// A SwiGLU / attention-gate form at prompt width (`runPromptTrial`).
+        var prompt = false
+
+        func with(tpb: Int) -> ProducerForm {
+            ProducerForm(
+                width: width, prod: prod, gr: gr, gkh: gkh, gd: gd, ahd: ahd, bhd: bhd,
+                perm: perm, mperm: mperm, signed: signed, adtype: adtype, bdtype: bdtype, tpb: tpb,
+                prompt: prompt)
+        }
     }
 
     private static let producerLock = NSLock()
@@ -3934,12 +3985,14 @@ extension Qwen35RotationQ8Blocks {
     /// The stock producer kernel's outputs for these operands from this
     /// kernel, or nil (off, not a verify-width launch, or a form that failed
     /// or cannot take its self-test). `stock` launches the stock producer
-    /// kernel with the same template on given operands.
+    /// kernel with the same template on given operands. At prompt width the
+    /// gated norm, and a SwiGLU / attention-gate form only where the prompt
+    /// trial installed it (`promptThreads`).
     static func launchProducer(
         a: MLXArray, b: MLXArray, w: MLXArray, eps: MLXArray, signs: MLXArray,
         template: [(String, any KernelTemplateArg)], rows: Int, width: Int,
         outShape: [Int], groupShape: [Int], codesDType: DType,
-        stock: ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
+        stock: @escaping ([MLXArray], [(String, any KernelTemplateArg)]) -> [MLXArray]
     ) -> SignedBlockHadamard.Int8Activation? {
         guard producerEnabled, rows > 0, width > 0, width % 1024 == 0,
             rows <= Int(Int32.max) / width, !producerVerifying
@@ -3954,9 +4007,45 @@ extension Qwen35RotationQ8Blocks {
             let gd = value("GD"), let ahd = value("AHD"), let bhd = value("BHD"),
             let perm = value("PERM"), let mperm = value("MPERM"), let signed = value("SIGNED")
         else { return nil }
-        guard rows < BonsaiPromptWidth.minimumRows || (prod == 3 && producerPromptGatedNorm)
-        else { return nil }
+        let prompt = rows >= BonsaiPromptWidth.minimumRows
         let blocks = rows * (width / 1024)
+        if prompt, prod != 3 {
+            guard promptTrialWanted, producerPromptGatedNorm, prod == 1 || prod == 2,
+                gr == 1 || gd % 4 == 0
+            else { return nil }
+            let base = ProducerForm(
+                width: width, prod: prod, gr: gr, gkh: gkh, gd: gd, ahd: ahd, bhd: bhd, perm: perm,
+                mperm: mperm, signed: signed, adtype: "\(a.dtype)", bdtype: "\(b.dtype)", tpb: 0,
+                prompt: true)
+            func runPrompt(_ tpb: Int, _ inputs: [MLXArray]) -> [MLXArray] {
+                producerKernel(
+                    inputs, template: template + [("TPB", tpb)],
+                    grid: (tpb * blocks, 1, 1), threadGroup: (tpb, 1, 1),
+                    outputShapes: [outShape, groupShape, groupShape],
+                    outputDTypes: [codesDType, .float32, .float32])
+            }
+            guard
+                let tpb = promptThreads(for: base, record: {
+                    PromptCase(
+                        label: "prod \(prod) \(width) \(a.dtype)/\(b.dtype)",
+                        check: { tpb in
+                            producerVerified(
+                                base.with(tpb: tpb), a: a, b: b, w: w, eps: eps, signs: signs,
+                                template: template, run: { runPrompt(tpb, $0) }, stock: stock)
+                        },
+                        launch: { tpb in
+                            tpb == 0
+                                ? stock([a, b, w, eps, signs], template)
+                                : runPrompt(tpb, [a, b, w, eps, signs])
+                        })
+                }),
+                producerLock.withLock({ producerVerdicts[base.with(tpb: tpb)] }) == true
+            else { return nil }
+            let outs = runPrompt(tpb, [a, b, w, eps, signs])
+            return SignedBlockHadamard.Int8Activation(
+                codes: outs[0], scales: outs[1], scaledSums: outs[2])
+        }
+        guard !prompt || producerPromptGatedNorm else { return nil }
         // The gated norm holds one head per simdgroup: always 256 threads.
         let tpb = prod == 3 ? 256 : threads(blocks: blocks)
         guard (1 ... 3).contains(prod), gr == 1 || gd % 4 == 0,
@@ -4058,6 +4147,130 @@ extension Qwen35RotationQ8Blocks {
     }
 }
 
+// MARK: - Per-block rotations at prompt width: a load-time trial
+
+/// The plain quantizing rotation and its SwiGLU / attention-gate producer
+/// forms at prompt width (at least `BonsaiPromptWidth.minimumRows` rows) with
+/// 128 or 256 threads per 1024-block instead of the stock kernels' 64 (the
+/// gated norm already takes 256 there). The per-block kernels compute every
+/// element of a block from the same operand element, signs and head remap,
+/// through the same butterfly levels in the same order and the same
+/// quantization expressions; the row only selects which block is read and
+/// written (32-bit offsets, taken below 2^31 elements), so their outputs are
+/// the stock kernels', bit for bit, at any row count.
+///
+/// Which is fastest at prompt width was measured only on the M4 (the SwiGLU
+/// form read 19% slower there), so the ranked device decides: the forms the
+/// load's prompt warm launches (`recordPromptForms`, the scored seed width)
+/// are recorded with that call's operands; after the load, outside any timed
+/// window, each is self-tested bit for bit against the stock kernel at 128
+/// and 256 threads at the recorded row count (which also builds both
+/// pipelines), the passing ones are raced against the stock launch on the
+/// recorded operands, and the fastest is installed for that form only when it
+/// beats the stock launch by `Qwen35ExactFormTrial.rowsMargin` in the race and
+/// in a confirmation race. A prompt-width form that was not installed (or not
+/// seen at load) keeps the stock kernel: nothing is self-tested or built at
+/// its first use. Off unless `Qwen35ExactFormTrial.promptRotationWanted`
+/// (`BONSAI_EXACT_TRIALS=0` or `BONSAI_TRIAL_PROMPT_ROTATION_TPB=0` keep the
+/// stock kernels at prompt width); a forced verify-width form
+/// (`BONSAI_ROTATION_Q8_TPB=128`, `BONSAI_ROTATION_Q8_TPB_SMALL=128`) skips it,
+/// and `BONSAI_ROTATION_Q8P_BLOCKS_PROMPT=0` keeps the stock producer.
+extension Qwen35RotationQ8Blocks {
+    static let promptTrialWanted = Qwen35ExactFormTrial.promptRotationWanted
+        && wideThreads == 256 && smallThreadsForced == nil
+
+    private struct PromptCase {
+        let label: String
+        /// The form's bitwise self-test with `tpb` threads (it builds the pipeline).
+        let check: (Int) -> Bool
+        /// One launch on the recorded operands: `tpb` threads, 0 the stock kernel.
+        let launch: (Int) -> [MLXArray]
+    }
+
+    private static let promptLock = NSLock()
+    nonisolated(unsafe) private static var promptRecording = false
+    nonisolated(unsafe) private static var promptCases: [(form: AnyHashable, item: PromptCase)] = []
+    /// Threads per block the trial installed, per prompt-width form (`tpb` 0).
+    nonisolated(unsafe) private static var promptChoice: [AnyHashable: Int] = [:]
+
+    /// Records the prompt-width forms launched while on (the load's prompt
+    /// warm), with their operands, for `runPromptTrial`.
+    static func recordPromptForms(_ on: Bool) {
+        promptLock.withLock { promptRecording = on && promptTrialWanted }
+    }
+
+    /// The installed threads per block for a prompt-width form, or nil (the
+    /// stock kernel); while recording, a form's first launch is recorded.
+    private static func promptThreads(for form: AnyHashable, record: () -> PromptCase) -> Int? {
+        promptLock.withLock { () -> Int? in
+            if let tpb = promptChoice[form] { return tpb }
+            if promptRecording, promptCases.count < 16, !promptCases.contains(where: { $0.form == form }) {
+                promptCases.append((form, record()))
+            }
+            return nil
+        }
+    }
+
+    /// The trial (see above): one stderr line; the recorded operands are
+    /// released.
+    static func runPromptTrial(margin: Double) {
+        guard promptTrialWanted else { return }
+        let cases = promptLock.withLock { () -> [(form: AnyHashable, item: PromptCase)] in
+            promptRecording = false
+            defer { promptCases = [] }
+            return promptCases
+        }
+        let start = DispatchTime.now().uptimeNanoseconds
+        var parts: [String] = []
+        defer {
+            let line = "bonsai exact forms trial (prompt rotation threads): "
+                + (parts.isEmpty ? "no prompt-width form seen at load" : parts.joined(separator: " | "))
+                + String(format: " (%.0f ms)\n", Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
+        for (form, item) in cases {
+            var arms = [0]
+            var notes: [String] = []
+            for tpb in [128, 256] {
+                let passed = item.check(tpb)
+                notes.append("\(tpb) " + (passed ? "passed" : "FAILED"))
+                if passed { arms.append(tpb) }
+            }
+            var part = item.label + ": bitwise " + notes.joined(separator: ", ")
+            defer { parts.append(part) }
+            guard arms.count > 1 else {
+                part += "; stock kept"
+                continue
+            }
+            let first = DFlash2LaunchTrial.race(
+                arms.map { tpb in { item.launch(tpb) } }, copies: 8, samples: 11)
+            guard first.count == arms.count else {
+                part += "; race failed, stock kept"
+                continue
+            }
+            part += "; race us:" + zip(arms, first).map {
+                " \($0 == 0 ? "stock" : "\($0)") " + String(format: "%.1f", $1)
+            }.joined()
+            var best = 0
+            for i in arms.indices.dropFirst() where first[i] < first[best] { best = i }
+            guard best > 0, first[best] < first[0] * (1 - margin) else {
+                part += "; stock kept"
+                continue
+            }
+            let again = DFlash2LaunchTrial.race(
+                [{ item.launch(0) }, { item.launch(arms[best]) }], copies: 8, samples: 11)
+            guard again.count == 2, again[1] < again[0] * (1 - margin) else {
+                part += "; \(arms[best]) not confirmed" + (again.count == 2
+                    ? String(format: " (%.1f vs %.1f)", again[1], again[0]) : "") + ", stock kept"
+                continue
+            }
+            promptLock.withLock { promptChoice[form] = arms[best] }
+            part += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0])
+                + "\(arms[best]) installed"
+        }
+    }
+}
+
 // MARK: - Chunked GDN fresh scan: exact forms and a load-time trial
 
 /// Exact forms of the prompt-width fresh scan (`freshChunks`' kernel), and a
@@ -4154,7 +4367,9 @@ extension Qwen35GatedDeltaChunked {
             guard text.components(separatedBy: target).count == 2 else { return nil }
             text = text.replacingOccurrences(of: target, with: replacement)
         }
-        return text
+        guard text.components(separatedBy: "size_t").count == 9 else { return nil }
+        return "using ScanIndexT = metal::conditional_t<IO32 != 0, uint, size_t>;\n"
+            + text.replacingOccurrences(of: "size_t", with: "ScanIndexT")
     }
 
     private static let ktKernel: MLXFast.MLXFastKernel? = {
@@ -4181,6 +4396,14 @@ extension Qwen35GatedDeltaChunked {
         let simdgroups: Int
     }
 
+    static func scanOffsetsFitIO32(batch: Int, rows: Int, hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
+        let limit = Int(Int32.max)
+        let rowWidth = max(hk * dk, hv * dv, hv * chunk)
+        return Qwen35IO32.enabled && batch > 0 && rows > 0
+            && rows <= limit / rowWidth && batch <= limit / (rows * rowWidth)
+            && batch <= limit / (hv * dv * dk)
+    }
+
     private static func scanFormLaunch(
         _ form: ScanForm, q: MLXArray, k: MLXArray, v: MLXArray, prepared: [MLXArray],
         stateShape: [Int]
@@ -4191,6 +4414,7 @@ extension Qwen35GatedDeltaChunked {
             template: [
                 ("C", chunk), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
                 ("NS", form.simdgroups),
+                ("IO32", scanOffsetsFitIO32(batch: B, rows: T, hk: Hk, dk: Dk, hv: Hv, dv: Dv) ? 1 : 0),
             ],
             grid: (32, Dv / 8, B * Hv),
             threadGroup: (32, form.simdgroups, 1),
@@ -4471,6 +4695,13 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// - `rowkernel`: the verify boundary on the per-row kernel instead of
 ///   `Qwen35BoundaryBlocks` (80 threadgroups of 256); offered only when the
 ///   16-row self-test passed through both.
+/// - `unfold`: the verify block's attention GEMMs as `kvHeads * repeats`
+///   broadcast batches of 16 rows instead of `kvHeads` folded batches
+///   (`CBv2PromptCausalAttention.verifyFoldRepeats`, fixed from the M4 Max):
+///   three times the threadgroups at 64-row tiles. Offered only when
+///   `checkVerifyUnfold` found the probabilities and the output of both forms
+///   equal bit for bit at every key count the verify warm covered, which also
+///   builds the unfolded pipelines before any timed round.
 /// Round 0 and each arm's first round warm up; then the arms rotate for
 /// `roundsPerArm` rounds each, rounds above 1.5x their arm's median dropped,
 /// and an alternative is kept only when its median round beats the record's
@@ -4482,13 +4713,21 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// at the real prompt shape. (Whole prompt forwards are too coarse for it:
 /// 2.36 s each on the M4 Max, arms within 0.02 %.)
 ///
+/// Prompt (`runPromptRotation`): the plain quantizing rotation and its SwiGLU
+/// / attention-gate producer forms with 128 or 256 threads per 1024-block
+/// instead of the stock 64, per form the load's prompt warm launched: checked
+/// bit for bit at that row count, raced on that call's operands, installed on
+/// two wins by `rowsMargin` (`Qwen35RotationQ8Blocks.runPromptTrial`).
+///
 /// `BONSAI_EXACT_TRIALS=0` keeps every record form (no trial, no extra
 /// self-test). Per item (default on): `BONSAI_TRIAL_GDN_DVPL`,
 /// `BONSAI_TRIAL_ROTATION_TPB`, `BONSAI_TRIAL_BOUNDARY`,
-/// `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced form skips its item:
-/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
-/// `BONSAI_ROTATION_Q8_TPB_SMALL=128`, `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
-/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
+/// `BONSAI_TRIAL_VERIFY_UNFOLD`, `BONSAI_TRIAL_PROMPT_ROWS`,
+/// `BONSAI_TRIAL_PROMPT_ROTATION_TPB` `=0`. A forced form skips its item:
+/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128` and
+/// `BONSAI_ROTATION_Q8_TPB_SMALL=128` (both rotation items),
+/// `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
+/// `BONSAI_VERIFY_FOLD_REPEATS` (either way), `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
 enum Qwen35ExactFormTrial {
     private static func on(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
@@ -4500,7 +4739,9 @@ enum Qwen35ExactFormTrial {
     static let dvplWanted = enabled && on("BONSAI_TRIAL_GDN_DVPL")
     static let rotationWanted = enabled && on("BONSAI_TRIAL_ROTATION_TPB")
     static let boundaryWanted = enabled && on("BONSAI_TRIAL_BOUNDARY")
+    static let unfoldWanted = enabled && on("BONSAI_TRIAL_VERIFY_UNFOLD")
     static let promptRowsWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROWS")
+    static let promptRotationWanted = enabled && on("BONSAI_TRIAL_PROMPT_ROTATION_TPB")
 
     /// Whether the fused boundary's 16-row self-test also checks the per-row kernel.
     static var boundaryOffered: Bool { boundaryWanted && Qwen35BoundaryBlocks.enabled }
@@ -4577,6 +4818,22 @@ enum Qwen35ExactFormTrial {
                     Qwen35BoundaryBlocks.stock = $0
                 })
             }
+        }
+        if unfoldWanted, CBv2PromptCausalAttention.verifyFoldRepeats,
+            !CBv2PromptCausalAttention.verifyFoldRepeatsForced
+        {
+            if let check = CBv2PromptCausalAttention.checkVerifyUnfold() {
+                checks.append(
+                    "unfold " + (check.passed ? "passed" : "FAILED") + " (\(check.detail))")
+                if check.passed {
+                    list.append(Arm(name: "unfold", knob: "fold") {
+                        CBv2PromptCausalAttention.verifyFoldRepeats = !$0
+                    })
+                }
+            } else {
+                checks.append("unfold not offered (no verify block warm)")
+            }
+            Memory.clearCache()
         }
         guard list.count > 1 else {
             if !checks.isEmpty || enabled {
@@ -4838,5 +5095,12 @@ enum Qwen35ExactFormTrial {
         }
         Qwen35GDNPrework.rowTileChoice = tiles[best]
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
+    }
+
+    /// The prompt-width rotations' threads per block
+    /// (`Qwen35RotationQ8Blocks.runPromptTrial`). One stderr line.
+    static func runPromptRotation() {
+        guard promptRotationWanted else { return }
+        Qwen35RotationQ8Blocks.runPromptTrial(margin: rowsMargin)
     }
 }

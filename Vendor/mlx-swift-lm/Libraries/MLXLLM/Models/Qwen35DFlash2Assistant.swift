@@ -144,7 +144,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// load leaves.
     func warmSpeculativeShapes(serving: (any LanguageModel)? = nil) {
         guard Self.speculativeWarmEnabled else { return }
+        // The prompt-width rotation forms this warm launches are the prompt
+        // rotation trial's (`runExactFormTrials`, deferred below).
+        Qwen35RotationQ8Blocks.recordPromptForms(serving != nil)
         warmTargetPrefill()
+        Qwen35RotationQ8Blocks.recordPromptForms(false)
         if drafter.prepareTiledWeights(), DFlash2TensorMatmul.trialWanted {
             // The trial runs in the deferred warm; without it, no copy is read.
             DFlash2KernelTrial.armed = serving != nil && Self.engineRoundWarmEnabled
@@ -263,9 +267,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
 
     /// The exact kernel forms' trials (`Qwen35ExactFormTrial`), after the
     /// record's own: the verify rounds' (one engine request, cancelled once
-    /// every arm has its rounds) and the prompt prework tiles' (a real-shape
-    /// launch race); each logs one stderr line, and the buffer cache is
-    /// drained after each. `BONSAI_EXACT_TRIALS=0` skips both.
+    /// every arm has its rounds), the prompt prework tiles' and the prompt
+    /// rotations' threads per block (real-shape launch races); each logs one
+    /// stderr line, and the buffer cache is drained after each.
+    /// `BONSAI_EXACT_TRIALS=0` skips all three.
     private func runExactFormTrials(serving: any LanguageModel) {
         typealias Trial = Qwen35ExactFormTrial
         guard Trial.enabled else { return }
@@ -277,6 +282,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             Memory.clearCache()
         }
         Trial.runPromptRows()
+        Stream().synchronize()
+        Memory.clearCache()
+        Trial.runPromptRotation()
         Stream().synchronize()
         Memory.clearCache()
     }
