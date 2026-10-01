@@ -110,10 +110,15 @@ enum Qwen35TensorPackedMatmul {
           }
         }
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          } else {
+            *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
+          }
         }
         """
 
