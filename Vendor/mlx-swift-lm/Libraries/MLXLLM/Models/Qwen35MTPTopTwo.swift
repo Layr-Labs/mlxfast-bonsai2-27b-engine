@@ -109,11 +109,22 @@ enum Qwen35TensorPackedMatmul {
             acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
           }
         }
+        // v0..v3 are the same four accumulator columns the scalar loop wrote one at
+        // a time: c = i & 3 steps 0..3 across the group, while mm (bits 2 and 4 of i)
+        // and nh (bit 3) are constant inside it, so the four addresses are contiguous.
+        // nb = n0 + 16 * (sg & 1) + fn is a multiple of 4 (n0 = tgid.x * 64 and fn is
+        // a multiple of 4) and N is a multiple of 64 (the grid is (N / 64 * 128, ..)),
+        // so the group base is 4-aligned for float4 and half4.
         #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          const int c = i & 3; const int nh = (i >> 3) & 1;
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
           const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          out[(size_t)mm * N + nb + c + 32 * nh] = OutT(acc[i]);
+          const size_t base = (size_t)mm * N + nb + 32 * nh;
+          if constexpr (sizeof(OutT) == sizeof(float)) {
+            *(device float4*)(out + base) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          } else {
+            *(device half4*)(out + base) = half4(half(acc[i]), half(acc[i + 1]), half(acc[i + 2]), half(acc[i + 3]));
+          }
         }
         """
 

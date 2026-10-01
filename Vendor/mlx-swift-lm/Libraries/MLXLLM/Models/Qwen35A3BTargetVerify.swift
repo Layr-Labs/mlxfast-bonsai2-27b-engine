@@ -2574,17 +2574,21 @@ enum Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = uint(index + r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
@@ -3513,17 +3517,21 @@ enum Qwen35BoundaryBlocks {
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = lane * 4 + uint(r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { codes[base + uint(g) * 128 + kp] = int8_t(q); } else { codes[base + uint(g) * 128 + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint ml = row & 63u;
@@ -3851,17 +3859,21 @@ extension Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            const uint kk = uint(index + r);
-            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
-            if (PERM) {
-              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
-            } else {
-              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
-            }
+            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
           }
-          if (!PERM) {
-            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
+          if (PERM) {
+            uint word = as_type<uint>(packed);
+            uint other = simd_shuffle_xor(word, 1);
+            word = (lane & 1u)
+                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
+                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
+            other = simd_shuffle_xor(word, 2);
+            word = (lane & 2u)
+                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
+                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
+            packed = as_type<uchar4>(word);
           }
+          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
