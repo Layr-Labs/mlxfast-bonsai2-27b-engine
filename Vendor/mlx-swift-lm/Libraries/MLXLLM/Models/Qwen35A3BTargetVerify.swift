@@ -645,20 +645,8 @@ enum Qwen35GDNReplayFused {
         let useStaged =
             (staged ?? stagedActive) && T >= stagedRows / 2 && T <= stagedRows
             && P <= stagedRows
-        var inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
+        let inputs = [q, k, v, g, beta, MLXArray(Int32(T))] + previous
             + [MLXArray([aRows, bRows]), MLXArray(Int32(keep))]
-        // Reuse this tape's verify gates when their layout fits the staged read.
-        var storedGates = false
-        if useStaged, let pg = tape.g, let pb = tape.beta,
-            pg.dtype == .float32, pb.dtype == .float32,
-            pg.shape == [1, P, Hv], pb.shape == [1, P, Hv],
-            pg.strides == [P * Hv, Hv, 1], pb.strides == [P * Hv, Hv, 1]
-        {
-            inputs[9] = pg
-            inputs[10] = pb
-            inputs[13] = MLXArray([Int32(Hv), Int32(Hv)])
-            storedGates = true
-        }
         let template: [(String, any KernelTemplateArg)] = [
             ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
             ("DVPL", dvpl),
@@ -666,10 +654,7 @@ enum Qwen35GDNReplayFused {
         if useStaged {
             // The committed state, and (`storeFinal`) the window's final state.
             let out = stagedKernel(
-                inputs, template: template + [
-                    ("SC", true), ("SF", storeFinal), ("GATES_STORED", storedGates),
-                    ("REPLAY_NEEDED", keep > 0),
-                ],
+                inputs, template: template + [("SC", true), ("SF", storeFinal)],
                 grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
                 outputShapes: [[1, T, Hv, Dv], ps.shape, storeFinal ? ps.shape : [1]],
                 outputDTypes: [.float32, .float32, .float32])
@@ -727,7 +712,6 @@ enum Qwen35GDNReplayFused {
             template: [
                 ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("OUTPUT_NEEDED", true),
                 ("DVPL", dvpl), ("SC", false), ("SF", storeFinal),
-                ("GATES_STORED", false), ("REPLAY_NEEDED", false),
             ],
             grid: (128, Dv / (16 * dvpl), Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1, T, Hv, Dv], [1], storeFinal ? state.shape : [1]],
@@ -864,15 +848,11 @@ enum Qwen35GDNReplayFused {
                     let window = [
                         rows(11, Hk, Dk, 0.09), rows(12, Hk, Dk, 0.09), nextV, gates[0], gates[1],
                     ]
-                    let previousGates = Qwen35FusedElementwise.gatedDeltaGates(
-                        [pair[0..., 0..., Hv...], pair[0..., 0..., ..<Hv], aLog, dtBias])
                     let tape = ArraysCache.PrefixReplayTape(
                         convInput: convInput, q: rows(13, Hk, Dk, 0.09), k: rows(14, Hk, Dk, 0.09),
                         v: v, a: pair[0..., 0..., Hv...], b: pair[0..., 0..., ..<Hv],
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK,
-                        g: previousGates[0], beta: previousGates[1])
-                    eval(window + previousGates
-                        + [ssmPre, convInput, tape.q, tape.k, v, tape.a, tape.b, aLog, dtBias])
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
+                    eval(window + [ssmPre, convInput, tape.q, tape.k, v, tape.a, tape.b, aLog, dtBias])
                     operands.append(
                         Qwen35GDNReplayBatch.Operand(tape: tape, aLog: aLog, dtBias: dtBias))
                     windows.append(window)
@@ -1024,8 +1004,7 @@ extension Qwen35GDNReplayFused {
         }
 
         // Phase 1: the previous tape's KP rows, the batched replay's step.
-        // A zero-row replay has no previous staging or recurrence.
-        if (REPLAY_NEEDED) {
+        {
           const int a_rs = ab_rows[0];
           const int b_rs = ab_rows[1];
           const float g_nexp = -metal::precise::exp(alog[hv_idx]);
@@ -1040,14 +1019,9 @@ extension Qwen35GDNReplayFused {
             tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
           }
           if (tid < uint(KP)) {
-            if (GATES_STORED) {
-              tgate[tid] = pa[hv_idx + tid * a_rs];
-              tgate[16 + tid] = pb[hv_idx + tid * b_rs];
-            } else {
-              const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
-              tgate[tid] = metal::precise::exp(g_nexp * g_sp);
-              tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
-            }
+            const float g_sp = qwen35_replay_logaddexp(pa[hv_idx + tid * a_rs] + g_dtb, 0.0f);
+            tgate[tid] = metal::precise::exp(g_nexp * g_sp);
+            tgate[16 + tid] = qwen35_replay_sigmoid(pb[hv_idx + tid * b_rs]);
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           for (int t = 0; t < KP; ++t) {
@@ -1106,7 +1080,7 @@ extension Qwen35GDNReplayFused {
 
         // Phase 2: this verify's T rows, the output-only scan's step.
         {
-          if (REPLAY_NEEDED) threadgroup_barrier(mem_flags::mem_threadgroup);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
           const device float4* k4src = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
           const device float4* q4src = (const device float4*)(q + (b_idx * T * Hk + hk_idx) * Dk);
           for (uint e = tid; e < uint(T) * 32u; e += NT) {
@@ -1399,8 +1373,7 @@ enum Qwen35GDNFullAcceptStore {
                     else { throw SelfTestFailure.message("no plain scan") }
                     let tape = ArraysCache.PrefixReplayTape(
                         convInput: convInput, q: pre.q, k: pre.k, v: pre.v, a: a, b: b,
-                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK,
-                        g: pre.g, beta: pre.beta)
+                        ssmPre: ssmPre, mask: nil, rowCount: S, convStateRows: NK)
                     guard layer.canReplayPrefix(tape: tape, committedRows: S, fullWindow: true)
                     else { throw SelfTestFailure.message("tape rejected") }
                     let replayed = layer.replayedPrefixState(
@@ -1469,7 +1442,7 @@ extension Qwen35GDNPrework {
     static let rowTileForced: Int? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_GDN_PREWORK_ROW_TILE"]
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        return value.flatMap { [2, 8, 16].contains($0) ? $0 : nil }
+        return value.flatMap { [2, 8, 16, 32].contains($0) ? $0 : nil }
     }()
     private struct RowTileAlternative: Hashable {
         let geometry: RowTileGeometry, rows: Int
@@ -2274,7 +2247,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -2601,21 +2574,17 @@ enum Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            const uint kk = uint(index + r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
           }
-          if (PERM) {
-            uint word = as_type<uint>(packed);
-            uint other = simd_shuffle_xor(word, 1);
-            word = (lane & 1u)
-                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
-                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
-            other = simd_shuffle_xor(word, 2);
-            word = (lane & 2u)
-                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
-                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
-            packed = as_type<uchar4>(word);
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
-          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
@@ -3544,21 +3513,17 @@ enum Qwen35BoundaryBlocks {
           BONSAI_UNROLL for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            const uint kk = lane * 4 + uint(r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (PERM) {
+              if (SIGNED) { codes[base + uint(g) * 128 + kp] = int8_t(q); } else { codes[base + uint(g) * 128 + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
           }
-          if (PERM) {
-            uint word = as_type<uint>(packed);
-            uint other = simd_shuffle_xor(word, 1);
-            word = (lane & 1u)
-                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
-                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
-            other = simd_shuffle_xor(word, 2);
-            word = (lane & 2u)
-                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
-                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
-            packed = as_type<uchar4>(word);
+          if (!PERM) {
+            *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
           }
-          *(device uchar4*)(codes + base + uint(g) * 128 + lane * 4) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint ml = row & 63u;
@@ -3886,21 +3851,17 @@ extension Qwen35RotationQ8Blocks {
           for (short r = 0; r < 4; r++) {
             const float q = rint(v[r] * iqs);
             part += q;
-            packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            const uint kk = uint(index + r);
+            const uint kp = PERM ? ((kk & ~15u) | (4u * (kk & 3u) + ((kk >> 2) & 3u))) : kk;
+            if (PERM) {
+              if (SIGNED) { out[rowbase + bcol + kp] = int8_t(q); } else { out[rowbase + bcol + kp] = uint8_t(int(q) + 128); }
+            } else {
+              packed[r] = SIGNED ? as_type<uchar>(int8_t(q)) : uint8_t(int(q) + 128);
+            }
           }
-          if (PERM) {
-            uint word = as_type<uint>(packed);
-            uint other = simd_shuffle_xor(word, 1);
-            word = (lane & 1u)
-                ? ((word & 0xff00ff00u) | ((other & 0xff00ff00u) >> 8))
-                : ((word & 0x00ff00ffu) | ((other & 0x00ff00ffu) << 8));
-            other = simd_shuffle_xor(word, 2);
-            word = (lane & 2u)
-                ? ((word & 0xffff0000u) | ((other & 0xffff0000u) >> 16))
-                : ((word & 0x0000ffffu) | ((other & 0x0000ffffu) << 16));
-            packed = as_type<uchar4>(word);
+          if (!PERM) {
+            *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           }
-          *(device uchar4*)(out + rowbase + bcol + uint(index)) = packed;
           part = simd_sum(part);
           if (lane == 0) {
             const uint g = uint(bcol / 128) + uint(gi);
@@ -4455,13 +4416,14 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 ///
 /// Verify rounds (`runVerify` hooks, in the deferred boot warm after the
 /// record's trials, one engine request as `Qwen35NarrowProducerTrial`):
-/// - `dvpl4`: the GDN recurrence with four dv rows per lane (template `DVPL`,
-///   `Qwen35GatedDeltaV3.rowsPerLane`) instead of two, for the verify scan,
-///   the fused replay and the state stores. Rows never mix; checked here:
-///   `run` / `runOutputOnly` / `runFreshState` at 2 and 4 rows per lane on
-///   the same operands (1, 3 and 16 rows) bit for bit, then the derived
-///   kernels' own self-tests (state skip, fused replay, full-accept store)
-///   at 4 rows per lane, which must reach the verdicts they reached at 2.
+/// - `dvpl4`, `dvpl1`: the GDN recurrence with four or one dv rows per lane
+///   (template `DVPL`, `Qwen35GatedDeltaV3.rowsPerLane`) instead of two, for
+///   the verify scan, the fused replay and the state stores. Rows never mix;
+///   checked here: `run` / `runOutputOnly` / `runFreshState` at 2, 4 and 1
+///   rows per lane on the same operands (1, 3 and 16 rows) bit for bit, then
+///   the derived kernels' own self-tests (state skip, fused replay,
+///   full-accept store) at 4 and at 1 rows per lane, which must reach the
+///   verdicts they reached at 2.
 /// - `tpb128`, `wide128`: the per-block quantizing rotations
 ///   (`Qwen35RotationQ8Blocks`, plain and SwiGLU / attention-gate producer)
 ///   with 128 threads per 1024-block instead of 256, at most 128 blocks
@@ -4476,7 +4438,7 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// and an alternative is kept only when its median round beats the record's
 /// by more than `adoptMargin`.
 ///
-/// Prompt (`runPromptRows`): the GDN prompt prework with 8 or 2 rows per
+/// Prompt (`runPromptRows`): the GDN prompt prework with 8, 2, 16 or 32 rows per
 /// threadgroup instead of 4 (`checkRowTile`: every launch form the record's
 /// tile passed, bit for bit against the stock launch, three dtypes), raced
 /// at the real prompt shape. (Whole prompt forwards are too coarse for it:
@@ -4486,9 +4448,9 @@ extension Qwen35Model: CBv2PromptEmbeddingPrefetching {
 /// self-test). Per item (default on): `BONSAI_TRIAL_GDN_DVPL`,
 /// `BONSAI_TRIAL_ROTATION_TPB`, `BONSAI_TRIAL_BOUNDARY`,
 /// `BONSAI_TRIAL_PROMPT_ROWS` `=0`. A forced form skips its item:
-/// `BONSAI_GDN_V3_DVPL=2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
+/// `BONSAI_GDN_V3_DVPL=1|2|4`, `BONSAI_ROTATION_Q8_TPB=128`,
 /// `BONSAI_ROTATION_Q8_TPB_SMALL=128`, `BONSAI_BOUNDARY_Q8_BLOCKS=0`,
-/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16`.
+/// `BONSAI_GDN_PREWORK_ROW_TILE=2|8|16|32`.
 enum Qwen35ExactFormTrial {
     private static func on(_ name: String) -> Bool {
         let value = ProcessInfo.processInfo.environment[name]?
@@ -4554,8 +4516,13 @@ enum Qwen35ExactFormTrial {
                 list.append(Arm(name: "dvpl4", knob: "dvpl") {
                     Qwen35GatedDeltaV3.rowsPerLane = $0 ? 4 : 2
                 })
+                // One dv row per lane (DVPL=1): the same rows-never-mix
+                // kernel, checked at 1 inside `dvplCheck`; its own candidate
+                // on the same knob.
+                list.append(Arm(name: "dvpl1", knob: "dvpl") {
+                    Qwen35GatedDeltaV3.rowsPerLane = $0 ? 1 : 2
+                })
             }
-        }
         if rotationWanted, Qwen35RotationQ8Blocks.enabled {
             if Qwen35RotationQ8Blocks.smallThreadsForced == nil {
                 list.append(Arm(name: "tpb128", knob: "small") {
@@ -4719,7 +4686,7 @@ enum Qwen35ExactFormTrial {
                     let beta = MLXRandom.uniform(0.0 ..< 1.0, [1, T, hv], key: keys[4])
                     let state = spread([1, hv, dv, dk], 5)
                     var outs: [[MLXArray]] = []
-                    for rows in [2, 4] {
+                    for rows in [2, 4, 1] {
                         Qwen35GatedDeltaV3.rowsPerLane = rows
                         var o: [MLXArray] = []
                         if let r = Qwen35GatedDeltaV3.run(
@@ -4741,14 +4708,16 @@ enum Qwen35ExactFormTrial {
                         outs.append(o)
                     }
                     Qwen35GatedDeltaV3.rowsPerLane = 2
-                    guard outs[0].count == 5, outs[1].count == 5 else {
+                    guard outs.allSatisfy({ $0.count == 5 }) else {
                         throw SelfTestFailure.message("a launch declined")
                     }
                     var differ: [MLXArray] = []
-                    for (a, b) in zip(outs[0], outs[1]) {
-                        differ.append(
-                            (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
-                        values += a.size
+                    for candidate in outs.dropFirst() {
+                        for (a, b) in zip(outs[0], candidate) {
+                            differ.append(
+                                (a.view(dtype: .uint32) .!= b.view(dtype: .uint32)).asType(.int32).sum())
+                            values += a.size
+                        }
                     }
                     let count = stacked(differ).sum()
                     eval(count)
@@ -4761,21 +4730,26 @@ enum Qwen35ExactFormTrial {
             return (false, "\(error)")
         }
         guard mismatches == 0 else { return (false, "\(values) values, \(mismatches) mismatches") }
-        // The derived kernels at 4 rows per lane (each against the stock
-        // kernel at 4, now equal to it at 2 bit for bit).
-        Qwen35GatedDeltaV3.rowsPerLane = 4
-        Qwen35GDNVerifyStateSkip.prepare(layer: layer)
-        Qwen35GDNReplayFused.prepare(layer: layer)
-        Qwen35GDNFullAcceptStore.prepare(layer: layer)
-        let after = (
-            Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer),
-            Qwen35GDNFullAcceptStore.verdict(layer: layer))
-        Qwen35GatedDeltaV3.rowsPerLane = 2
-        let stagedSame = Qwen35GDNReplayFused.stagedLive == stagedBefore
-        if !stagedSame { Qwen35GDNReplayFused.stagedLive = stagedBefore }
+        // The derived kernels at 4 and at 1 rows per lane (each against the
+        // stock kernel at that layout, now equal to it at 2 bit for bit).
+        var derivedSame = true
+        var stagedSame = true
+        for rows in [4, 1] {
+            Qwen35GatedDeltaV3.rowsPerLane = rows
+            Qwen35GDNVerifyStateSkip.prepare(layer: layer)
+            Qwen35GDNReplayFused.prepare(layer: layer)
+            Qwen35GDNFullAcceptStore.prepare(layer: layer)
+            let after = (
+                Qwen35GDNVerifyStateSkip.applies(to: layer), Qwen35GDNReplayFused.applies(to: layer),
+                Qwen35GDNFullAcceptStore.verdict(layer: layer))
+            Qwen35GatedDeltaV3.rowsPerLane = 2
+            let staged = Qwen35GDNReplayFused.stagedLive == stagedBefore
+            if !staged { Qwen35GDNReplayFused.stagedLive = stagedBefore }
+            derivedSame = derivedSame && after.0 == before.0 && after.1 == before.1
+                && after.2 == before.2
+            stagedSame = stagedSame && staged
+        }
         Memory.clearCache()
-        let derivedSame = after.0 == before.0 && after.1 == before.1 && after.2 == before.2
-            && stagedSame
         return (
             derivedSame,
             "\(values) values bitwise, 0 mismatches; derived kernels "
@@ -4790,7 +4764,7 @@ enum Qwen35ExactFormTrial {
 
     static let rowsMargin = 0.02
 
-    /// The prompt prework's rows per threadgroup: 8 and 2 are checked bit for
+    /// The prompt prework's rows per threadgroup: 8, 2 and 16 are checked bit for
     /// bit (`checkRowTile`), then raced against 4 at the real prompt shape
     /// (512 rows, the model's geometry and prompt qkv dtype;
     /// `Qwen35GDNPrework.raceRowTiles`), and the fastest is installed only
@@ -4804,7 +4778,7 @@ enum Qwen35ExactFormTrial {
         let start = DispatchTime.now().uptimeNanoseconds
         var tiles = [Qwen35GDNPrework.rowTile]
         var notes: [String] = []
-        for rows in [8, 2] {
+        for rows in [8, 2, 16, 32] {
             let passed = Qwen35GDNPrework.checkRowTile(rows)
             notes.append("\(rows) rows " + (passed ? "passed" : "FAILED"))
             if passed { tiles.append(rows) }
