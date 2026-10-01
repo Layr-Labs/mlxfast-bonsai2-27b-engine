@@ -114,6 +114,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -143,7 +144,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
     /// own warm does, so the served phases start from the footprint a cold
     /// load leaves.
     func warmSpeculativeShapes(serving: (any LanguageModel)? = nil) {
-        guard Self.speculativeWarmEnabled else { return }
+        guard Self.speculativeWarmEnabled else {
+            DFlash2Pack11.finish(adopting: false)
+            return
+        }
         warmTargetPrefill()
         if drafter.prepareTiledWeights(), DFlash2TensorMatmul.trialWanted {
             // The trial runs in the deferred warm; without it, no copy is read.
@@ -171,12 +175,33 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                 DFlash2TensorMatmul.SwapTrial.run()
                 Stream().synchronize()
                 Memory.clearCache()
+                var changedProjection = false
+                if self.speculationPlan != nil {
+                    changedProjection = self.drafter.prepareActivatedGateUps()
+                    changedProjection = self.drafter.prepareQueryWindows() || changedProjection
+                }
+                if changedProjection {
+                    // Existing whole-block proposals/cache/cursor parity guard;
+                    // failure disables both projection additions without changing the plan.
+                    let (failure, _) = self.speculationCheck(block: Self.warmBlockSize)
+                    if let failure {
+                        self.drafter.disableQueryWindows()
+                        self.drafter.disableActivatedGateUps()
+                        FileHandle.standardError.write(
+                            ("dflash2 projection fusion: whole-block check failed (\(failure)); stock kept\n")
+                                .data(using: .utf8)!)
+                    }
+                }
+                Stream().synchronize()
+                Memory.clearCache()
                 self.runNarrowInSituTrial(serving: serving)
                 self.runNarrowProducerTrial(serving: serving)
                 self.runHeadTopTwoTrial(serving: serving)
                 self.runKernelTrial(serving: serving)
                 self.runExactFormTrials(serving: serving)
             }
+        } else {
+            DFlash2Pack11.finish(adopting: false)
         }
         Stream().synchronize()
         Memory.clearCache()
@@ -980,15 +1005,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             state.cacheSeeded, state.pending.isEmpty, !state.contextPrefetched,
             packet.ndim == 1, packet.dim(0) >= 2 * k + 1, packet.dtype == .int32
         else { return nil }
-        let targets = packet[k ..< (2 * k + 1)]
-        let accepted = cumprod((packet[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
-            .sum().asType(.int32)
+        // WALK1: the walk in one launch when on; ACCGLUE: the chain scans the
+        // bool comparison when on (no cast launch).
+        let (anchor, confirmed) =
+            CBv2AcceptGlue.walk(packet, depth: k) ?? CBv2AcceptGlue.chainWalk(packet, depth: k)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: targets.take(accepted.reshaped([1]), axis: 0),
-                confirmed: accepted + MLXArray(Int32(1)), verifyContext: verifyContext,
+                anchor: anchor, confirmed: confirmed, verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
@@ -1076,8 +1101,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
             for state in [a, b] {
                 append(prompt, to: state)
                 eval(prefetchCommittedContext(requestState: state))
-                _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
-                eval(evaluationTargets(for: state))
+                if state === a {
+                    try DFlash2PackedWeights.withoutActivatedGateUp {
+                        _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
+                        eval(evaluationTargets(for: state))
+                    }
+                } else {
+                    _ = try proposeBlock(anchor: 4242, depth: block - 1, requestState: state)
+                    eval(evaluationTargets(for: state))
+                }
             }
             for c in 1 ... block where failure == nil {
                 let window = MLXRandom.normal([1, block, width], key: MLXRandom.key(UInt64(100 + c)))
@@ -1088,9 +1120,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
                     requestState: a, confirmedInputTokens: c,
                     committedDraftTokens: MLXArray.zeros([1, 0], dtype: .int32),
                     committedTargetHidden: window[0..., ..<c, 0...])
-                let expected = try proposeBlock(
-                    anchor: Int(targets[c - 1]), depth: block - 1, requestState: a,
-                    submittingLeadingLayers: 3)
+                let expected = try DFlash2PackedWeights.withoutActivatedGateUp {
+                    try proposeBlock(
+                        anchor: Int(targets[c - 1]), depth: block - 1, requestState: a,
+                        submittingLeadingLayers: 3)
+                }
                 b.lastConfirmed = c  // build this count's class
                 guard
                     let pending = speculateBlock(

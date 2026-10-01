@@ -9,13 +9,13 @@ import MLX
 /// proposal, which already holds the draft ids as `[B, k]` in column order)
 /// instead of one copy per column: 16 launches of one element each become
 /// two. The same int32 values in the same order. Checked once, on first use,
-/// bit for bit against the per-column concatenation;
-/// `MLXFAST_VERIFY_TOKEN_STACK=0` concatenates the columns.
+/// bit for bit against the per-column concatenation (a mismatch keeps it).
+/// Default on; `MLXFAST_VERIFY_TOKEN_STACK=0` concatenates the columns.
 enum CBv2VerifyTokenStack {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_VERIFY_TOKEN_STACK"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
     private static let verified: Bool = {
@@ -35,7 +35,8 @@ enum CBv2VerifyTokenStack {
 
     /// `[seed | block]`, or nil (the caller concatenates `columns`).
     static func tokens(seed: MLXArray, block: MLXArray?, columns: [MLXArray]) -> MLXArray? {
-        guard enabled, let block, block.ndim == 2, seed.ndim == 2, seed.dim(1) == 1,
+        guard enabled, let block, block.ndim == 2, seed.ndim == 2,
+            seed.dim(0) == 1, seed.dim(1) == 1, block.dim(1) == 15, seed.dtype == .int32,
             block.dim(0) == seed.dim(0), columns.count == block.dim(1) + 1,
             block.dtype == seed.dtype, verified
         else { return nil }
