@@ -1018,8 +1018,13 @@ extension Qwen35GDNReplayFused {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            const uint base = (n * Dv + dvbase + d) * Dk + dk0 + i;
+            const float4 x = *(const device float4*)(ps + base);
+            state[d][i] = x.x;
+            state[d][i + 1] = x.y;
+            state[d][i + 2] = x.z;
+            state[d][i + 3] = x.w;
           }
         }
 
@@ -2274,7 +2279,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -4790,6 +4795,9 @@ enum Qwen35ExactFormTrial {
 
     static let rowsMargin = 0.02
 
+    /// Whether the prompt prework race also offers 16 rows per threadgroup.
+    static let promptRows16Wanted = on("BONSAI_TRIAL_PROMPT_ROWS16")
+
     /// The prompt prework's rows per threadgroup: 8 and 2 are checked bit for
     /// bit (`checkRowTile`), then raced against 4 at the real prompt shape
     /// (512 rows, the model's geometry and prompt qkv dtype;
@@ -4804,7 +4812,9 @@ enum Qwen35ExactFormTrial {
         let start = DispatchTime.now().uptimeNanoseconds
         var tiles = [Qwen35GDNPrework.rowTile]
         var notes: [String] = []
-        for rows in [8, 2] {
+        // 16 is the tile `BONSAI_GDN_PREWORK_ROW_TILE` already accepts and
+        // checks, never raced; `BONSAI_TRIAL_PROMPT_ROWS16=0` keeps 8 and 2 only.
+        for rows in [8, 2] + (Self.promptRows16Wanted ? [16] : []) {
             let passed = Qwen35GDNPrework.checkRowTile(rows)
             notes.append("\(rows) rows " + (passed ? "passed" : "FAILED"))
             if passed { tiles.append(rows) }
