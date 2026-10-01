@@ -6374,7 +6374,7 @@ extension Qwen35TensorPackedMatmul {
 
     /// The four summed values enter this lane's running top two of the row
     /// instead of being stored; the column is `base` less the row offset.
-    private static let headTop2Insert = """
+    private static let headTop2Insert = Qwen35IO32.narrow("""
         {
                       // TOP2: the four columns enter this lane's top two of the row.
                       const uint ht2col = uint(base - (size_t)(fm + 8 * mh) * (size_t)N);
@@ -6383,14 +6383,14 @@ extension Qwen35TensorPackedMatmul {
                       bonsai_head_top2_insert(ht2[mh], v2, ht2col + 2u);
                       bonsai_head_top2_insert(ht2[mh], v3, ht2col + 3u);
                     }
-        """
+        """, count: 2, "bonsai_head_top2_insert")
 
     /// After the reduction: the four lanes holding one row pair's columns
     /// (lanes differing in bits 0 and 3 of the fragment layout) merge their
     /// states, and one of them stores the block's top two of rows `fm` and
     /// `fm + 8` at `[row, block, 0 ..< 2]`. `HT2COLS` is the kernel's columns
     /// per threadgroup.
-    private static let headTop2Tail = """
+    private static let headTop2Tail = Qwen35IO32.narrow("""
 
         if (sg == 0) {
           #pragma clang loop unroll(full)
@@ -6412,7 +6412,7 @@ extension Qwen35TensorPackedMatmul {
           }
         }
 
-        """
+        """, count: 4, "bonsai_head_top2_tail")
 
     /// `text` (one of the int8 verify kernel bodies) with its logit stores
     /// replaced by the running top two (`headTop2Insert`) and the block's
@@ -6487,7 +6487,7 @@ extension Qwen35TensorPackedMatmul {
         name: "bonsai_head_top2_merge",
         inputNames: ["pid", "pval"],
         outputNames: ["top_ids", "top_values"],
-        source: """
+        source: Qwen35IO32.narrow("""
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             const uint blocks = uint(pid_shape[1]);
@@ -6506,7 +6506,7 @@ extension Qwen35TensorPackedMatmul {
               top_values[row * 2] = st.first_value;
               top_values[row * 2 + 1] = st.second_value;
             }
-            """,
+            """, count: 4, "bonsai_head_top2_merge"),
         header: headTop2Header,
         ensureRowContiguous: true)
 
