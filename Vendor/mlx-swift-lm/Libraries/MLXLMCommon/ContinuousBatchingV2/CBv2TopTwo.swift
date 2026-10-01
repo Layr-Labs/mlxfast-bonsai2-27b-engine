@@ -78,6 +78,21 @@ private let cbv2TopTwoHeader = """
             state.count = 2;
         }
     }
+
+    inline void darkbloom_qwen35_mtp_top2_merge_full(
+        thread darkbloom_qwen35_mtp_top2_state &state, darkbloom_qwen35_mtp_top2_state other) {
+      if (darkbloom_qwen35_mtp_top2_better(other.first_value, other.first_id, state.first_value, state.first_id)) {
+        bool second = darkbloom_qwen35_mtp_top2_better(other.second_value, other.second_id, state.first_value, state.first_id);
+        state.second_value = second ? other.second_value : state.first_value;
+        state.second_id = second ? other.second_id : state.first_id;
+        state.first_value = other.first_value;
+        state.first_id = other.first_id;
+      } else {
+        bool second = darkbloom_qwen35_mtp_top2_better(other.first_value, other.first_id, state.second_value, state.second_id);
+        state.second_value = second ? other.first_value : state.second_value;
+        state.second_id = second ? other.first_id : state.second_id;
+      }
+    }
 """
 
 /// The tree loop of the branch-free stage one and of stage two with its
@@ -187,10 +202,7 @@ private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
             if (lane < stride) {
                 darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
                 darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
-                darkbloom_qwen35_mtp_top2_insert(
-                    merged, other.first_value, other.first_id);
-                darkbloom_qwen35_mtp_top2_insert(
-                    merged, other.second_value, other.second_id);
+                darkbloom_qwen35_mtp_top2_merge_full(merged, other);
                 scratch[lane] = merged;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -266,13 +278,17 @@ private let cbv2TopTwoPartialFastKernel = MLXFast.metalKernel(
             if (lane < stride) {
                 darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
                 darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
-                if (other.count > 0) {
-                    darkbloom_qwen35_mtp_top2_insert(
-                        merged, other.first_value, other.first_id);
-                }
-                if (other.count > 1) {
-                    darkbloom_qwen35_mtp_top2_insert(
-                        merged, other.second_value, other.second_id);
+                if constexpr (FULL) {
+                    darkbloom_qwen35_mtp_top2_merge_full(merged, other);
+                } else {
+                    if (other.count > 0) {
+                        darkbloom_qwen35_mtp_top2_insert(
+                            merged, other.first_value, other.first_id);
+                    }
+                    if (other.count > 1) {
+                        darkbloom_qwen35_mtp_top2_insert(
+                            merged, other.second_value, other.second_id);
+                    }
                 }
                 scratch[lane] = merged;
             }
@@ -312,7 +328,7 @@ private enum CBv2TopTwoFast {
     static func partials(_ logits: MLXArray, fast: Bool) -> [MLXArray] {
         let rows = logits.dim(1)
         return (fast ? cbv2TopTwoPartialFastKernel : cbv2TopTwoPartialKernel)(
-            [logits],
+            [logits], template: [("FULL", logits.dim(2) >= 16_384)],
             grid: (rows * 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[rows, 32, 2], [rows, 32, 2]],
