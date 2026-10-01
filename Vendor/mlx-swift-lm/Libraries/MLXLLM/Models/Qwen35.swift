@@ -418,6 +418,17 @@ enum Qwen35IO32 {
     }
 }
 
+/// Exact dead-work removals in the timed prompt forwards (default on;
+/// `MLXFAST_DW1=0` restores the record's launches): the prompt int8 kernels'
+/// guarded 32-bit twins and the final layer's last-row gate.
+enum MLXFastDW1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DW1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+}
+
 /// Elementwise chains of the Bonsai 2 forward that MLX `compile` fuses into
 /// one kernel each. Every function here is pure elementwise arithmetic in the
 /// same order as the ops it replaces; fusion changes the dispatch count, not
@@ -674,8 +685,14 @@ enum Qwen35GatedDeltaV3 {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            // Same 16 floats as the scalar i-loop; dk0 is a multiple of R=16 so
+            // each quartet is 16-byte aligned. Matches the float4 state_out store.
+            const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));
+            state[d][i] = s4.x;
+            state[d][i + 1] = s4.y;
+            state[d][i + 2] = s4.z;
+            state[d][i + 3] = s4.w;
           }
         }
         float kr[R];
@@ -900,12 +917,22 @@ enum Qwen35GatedDeltaV3 {
     /// then never materialized. The same values (+0.0f) enter the same
     /// arithmetic. Derived from `source` so the stock kernel stays as it is.
     private static let freshSource: String = {
-        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        // Float4 initial load: replace the unique device load with four zeros.
+        // The i-loop already steps by 4 (same as the float4 state_out store).
+        let load =
+            "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));"
+        let zero =
+            "state[d][i] = 0.0f; state[d][i + 1] = 0.0f; state[d][i + 2] = 0.0f; state[d][i + 3] = 0.0f;"
         precondition(
             source.components(separatedBy: load).count == 2,
             "Qwen35 GDN v3: the fresh-state source no longer matches the stock kernel")
-        let text = source.replacingOccurrences(of: load, with: "state[d][i] = 0.0f;")
+        var text = source.replacingOccurrences(of: load, with: zero)
+        text = text.replacingOccurrences(of: "state[d][i] = s4.x;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 1] = s4.y;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 2] = s4.z;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 3] = s4.w;", with: "")
         precondition(!text.contains("state_in"))
+        precondition(!text.contains("s4"))
         return text
     }()
 
@@ -1085,8 +1112,8 @@ enum Qwen35GDNReplayBatch {
             ("device float* y_ = y;", ""),
             ("y[0] = 0.f;", "(void)0;"),
             (
-                "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];",
-                "state[d][i] = s_[(hv_idx * Dv + dvbase + d) * Dk + dk0 + i];"
+                "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));",
+                "const float4 s4 = *((const device float4*)(s_ + (hv_idx * Dv + dvbase + d) * Dk + dk0 + i));"
             ),
             (
                 "const float gt = g_[0];",
@@ -2353,7 +2380,7 @@ enum Qwen35GatedDeltaChunked {
     /// stock path.
     static func runFresh(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil, convInput: (qkv: MLXArray, weight: MLXArray)? = nil
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
         let B = k.dim(0)
@@ -2368,8 +2395,7 @@ enum Qwen35GatedDeltaChunked {
             freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
         else { return nil }
         return freshChunks(
-            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared,
-            convInput: convInput)
+            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared)
     }
 
     /// The prep launch alone (`chunks`' first launch): T', P and the decay
@@ -2391,7 +2417,7 @@ enum Qwen35GatedDeltaChunked {
     /// launch, the same scan launch geometry, no state input.
     private static func freshChunks(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil, convInput: (qkv: MLXArray, weight: MLXArray)? = nil
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray) {
         let B = k.dim(0)
         let T = k.dim(1)
@@ -2409,15 +2435,6 @@ enum Qwen35GatedDeltaChunked {
             threadGroup: (32, 1, 1),
             outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
             outputDTypes: [.float32, .float32, .float32])
-        // The installed v-fold form (`prepareVFold`): v from the conv input, so
-        // the value launch that produced `v` is never evaluated.
-        if let convInput, let vfold = installedVFold,
-            vfoldApplies([Hk, Dk, Hv, Dv], qkv: convInput.qkv, convWeight: convInput.weight, rows: T)
-        {
-            return vfoldLaunch(
-                vfold.kernel, q: q, k: k, qkv: convInput.qkv, convWeight: convInput.weight,
-                prepared: prepared, valueHeads: Hv, headVDim: Dv)
-        }
         // The installed exact form (`prepareScanForms`) for the geometry it was
         // checked on (its 32-bit offsets need T * max(Hk * Dk, Hv * Dv) < 2^31),
         // else the record's launch.
@@ -2477,10 +2494,7 @@ enum Qwen35GatedDeltaChunked {
                 "qwen35: chunked GDN fresh-state scan disagrees with the stock scan on this device; using the stock scan\n"
                     .data(using: .utf8)!)
         }
-        if recorded && verdict {
-            prepareScanForms(hk: hk, dk: dk, hv: hv, dv: dv)
-            prepareVFold(hk: hk, dk: dk, hv: hv, dv: dv)
-        }
+        if recorded && verdict { prepareScanForms(hk: hk, dk: dk, hv: hv, dv: dv) }
     }
 
     private static func freshSelfCheck(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
@@ -3406,8 +3420,7 @@ final class Qwen35GatedDeltaNet: Module {
         // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
         if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
             q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape,
-            prepared: pre.prepared,
-            convInput: pre.prepared != nil ? (qkv, conv1d.weight) : nil)
+            prepared: pre.prepared)
         {
             return (out, pre.tail, newSsmState)
         }
@@ -4456,7 +4469,11 @@ final class Qwen35Attention: Module {
                 scale: scale, sinks: nil)
                 .transposed(0, 2, 1, 3)
                 .reshaped(B, 1, -1)
-            attendedGate = gate[0..., (qL - 1)..., 0...]
+            // `MLXFastDW1`: the last row's gate half reshaped alone (the same
+            // elements), not every row's reshaped into a copy and sliced.
+            attendedGate = MLXFastDW1.enabled
+                ? qSplit[1][0..., (qL - 1)..., 0..., 0...].reshaped(B, 1, -1)
+                : gate[0..., (qL - 1)..., 0...]
         } else {
             // Prompt width on the tensor route: the o_proj rotation reads the
             // attention's query blocks in place (`rowBlockActivation`), so they
@@ -5063,14 +5080,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5197,8 +5220,12 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -5639,7 +5666,8 @@ public class Qwen35TextModelInner: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        lastRowOnly: Bool = false
+        lastRowOnly: Bool = false,
+        finalAdd: ((MLXArray, MLXArray) -> MLXArray?)? = nil
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -5818,7 +5846,8 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            hiddenStates = hiddenStates + p
+            // A verify window's last add may also form its final norm (`finalAdd`).
+            hiddenStates = (verifyPending ? finalAdd?(hiddenStates, p) : nil) ?? (hiddenStates + p)
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -6704,6 +6733,8 @@ enum Qwen35AttentionPrework {
 /// kernel's for that row. Derived from the stock source by checked
 /// replacements; checked bit for bit against the stock kernel's rows at
 /// `prepare` (a mismatch or an MLX error keeps the full q|gate projection).
+/// 32-bit offsets (`Qwen35IO32`): every output index is below B x HQ x Lk x D
+/// < 2^29 (B = 1 on the prompt path, Lk < 65536 checked at launch).
 extension Qwen35AttentionPrework {
     nonisolated(unsafe) private static var lastRowsVerdicts: [Geometry: Bool] = [:]
 
@@ -6741,7 +6772,7 @@ extension Qwen35AttentionPrework {
             name: "bonsai_attn_prework_lastq",
             inputNames: ["q", "k", "wq", "wk", "offs", "epsq", "epsk", "axis", "lbase", "scale"],
             outputNames: ["qo", "ko"],
-            source: $0,
+            source: Qwen35IO32.narrow($0, count: 7, "bonsai_attn_prework_lastq"),
             ensureRowContiguous: false)
     }
 
@@ -7140,7 +7171,7 @@ enum Qwen35FusedHadamard {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
-    private static let header = """
+    static let header = """
         // MLX `Sigmoid` (unary_ops.h), verbatim.
         METAL_FUNC float bonsai_sigmoid(float x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -7172,7 +7203,7 @@ enum Qwen35FusedHadamard {
     // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
     // 1024-wide block. Template: InT, OutT, W (row width), BPR (blocks per
     // row), PRESIGNED, GR (GDN repeats, 1 = identity), GKH, GD.
-    private static let source = """
+    static let source = """
         constexpr short N = 1024;
         constexpr short NT = 64;
         const uint blk = threadgroup_position_in_grid.x;
@@ -7489,6 +7520,7 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
+        Qwen35EmbeddingRows.install()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7572,6 +7604,28 @@ enum Qwen35FusedHadamard {
                 outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+        // The drafter head's BF16 rows, padded to `paddedRows` in the read
+        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
+        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
+        // the zero-row concatenation.
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, groupSize, paddedRows in
+            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
+                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
+            ]
+            return Qwen35RotationQ8Blocks.launchPadded(
+                x, signs, template: template, paddedRows: paddedRows, width: width,
+                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
         }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
@@ -10163,11 +10217,31 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        // The last residual add, its FP32 promotion and the final norm in one
+        // launch (`Qwen35FinalNormGlue`), or the add and the head's quantized
+        // input (`Qwen35HeadInputGlue`); the forward returns the kernel's sum.
+        var glued: MLXArray? = nil
+        var headInput: Qwen35HeadInputGlue.Input? = nil
+        let norm = model.norm
+        let head = model.exactTargetVerify ? nil : lmHead
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
+            captureRecurrentWindow: true,
+            finalAdd: Qwen35FinalNormGlue.enabled || Qwen35HeadInputGlue.enabled
+                ? { h, p in
+                    if let input = Qwen35HeadInputGlue.apply(h, p, norm, head) {
+                        headInput = input
+                        return input.sum
+                    }
+                    guard let out = Qwen35FinalNormGlue.apply(h, p, norm) else { return nil }
+                    glued = out.normed
+                    return out.sum
+                } : nil)
+        if let headInput {
+            return (Qwen35HeadTopTwo.capture { headInput.logits { model.norm(hidden) } }, hidden)
+        }
+        let normalized = glued ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             // The head's fused top two rides beside the lazy logits where the
