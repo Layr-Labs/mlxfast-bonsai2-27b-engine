@@ -2274,7 +2274,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
@@ -2781,6 +2781,187 @@ enum Qwen35RotationQ8Blocks {
                 + "\(form.presigned ? 1 : 0), heads \(form.gr)): self-test "
                 + (passed ? "passed" : "FAILED") + ": \(values) values, \(mismatches) mismatches"
                 + detail + (passed ? "\n" : "; stock kernel kept\n")).data(using: .utf8)!)
+        return passed
+    }
+}
+
+// MARK: - The drafter head's BF16 rows, padded in the read
+
+/// The drafter's shared-head read (`HadamardQuantizedLinear.drafterHeadInt8`)
+/// hands the verify route's int8 head its BF16 rows (15 at depth 15). The
+/// record widens them to FP32 (a copy kernel, 154 KB read and 307 KB written)
+/// and pads them with an FP32 zero row to the 16 rows the narrow body reads
+/// (`concatenated`: two more copy kernels, 328 KB read and written), then
+/// rotates and quantizes the 16 FP32 rows here. This form reads the BF16 rows
+/// where they are and forms the zero rows in its read: the per-block launch's
+/// own text with one change, a row at or past the input's row count loads
+/// 0.0f instead of an element. Everything after the load (the signs, the
+/// butterflies, the group absmax, the codes, scales and scaled sums) is the
+/// same text. Exact: BF16 to FP32 is exact, so every real row loads the value
+/// the copy wrote, and every pad row loads the +0.0f the zero row held, then
+/// takes the same arithmetic. One pipeline serves 1 to 16 rows (the row count
+/// is read from the input's shape, not compiled in).
+///
+/// At first use, per thread count, a self-test runs this launch against the
+/// record's chain itself (the FP32 cast, the zero-row concatenation and
+/// `SignedBlockHadamard.fusedTransformInt8`) on synthetic BF16 rows at the
+/// real width with the real signs: 16, 15, 8 and 1 rows; random rows of a
+/// wide scale spread with outlier channels, an all-zero group, an all-zero
+/// row and a negated row; every BF16 bit pattern (NaN and infinities
+/// included); every finite pattern. Codes, scales and scaled sums are compared
+/// as unsigned integers, pad rows included. A mismatch or an MLX error keeps
+/// the record's chain. `BONSAI_HEAD_ROT_BF16=0` keeps it too.
+extension Qwen35RotationQ8Blocks {
+    private static let paddedSource: String? = {
+        let load = "float v = float(inp[rowbase + src]);"
+        let bounded = "float v = 0.0f;\n          if (row < uint(inp_shape[0])) { v = float(inp[rowbase + src]); }"
+        let text = source.replacingOccurrences(of: load, with: bounded)
+        return text == source ? nil : text
+    }()
+
+    private static let paddedKernel: MLXFast.MLXFastKernel? = paddedSource.map {
+        MLXFast.metalKernel(
+            name: "bonsai_signed_hadamard_1024_q8_blocks_padrows",
+            inputNames: ["inp", "signs"],
+            outputNames: ["out", "qscale", "qsum"],
+            source: $0,
+            header: header,
+            ensureRowContiguous: true)
+    }
+
+    private static let paddedLock = NSLock()
+    nonisolated(unsafe) private static var paddedVerdicts: [String: Bool] = [:]
+
+    /// `x` (`[rows, width]`, BF16, `rows <= paddedRows`) rotated and quantized
+    /// as `paddedRows` rows, the rows past `rows` as zero rows: the outputs of
+    /// `SignedBlockHadamard.fusedTransformInt8` over `x` widened to FP32 and
+    /// concatenated with zero rows. Nil when off or not verified (the caller
+    /// then takes that chain).
+    static func launchPadded(
+        _ x: MLXArray, _ signs: MLXArray, template: [(String, any KernelTemplateArg)],
+        paddedRows: Int, width: Int, codesDType: DType, preSigned: Bool
+    ) -> SignedBlockHadamard.Int8Activation? {
+        guard enabled, let kernel = paddedKernel, x.ndim == 2, x.dtype == .bfloat16,
+            x.dim(1) == width, x.dim(0) >= 1, x.dim(0) <= paddedRows,
+            paddedRows < BonsaiPromptWidth.minimumRows, width % 1024 == 0,
+            paddedRows <= Int(Int32.max) / width
+        else { return nil }
+        let tpb = threads(blocks: paddedRows * (width / 1024))
+        guard paddedVerified(
+            tpb: tpb, kernel: kernel, signs: signs, template: template, paddedRows: paddedRows,
+            width: width, codesDType: codesDType, preSigned: preSigned)
+        else { return nil }
+        return runPadded(
+            kernel, x, signs, tmpl: template + [("TPB", tpb)], paddedRows: paddedRows,
+            width: width, tpb: tpb, codesDType: codesDType)
+    }
+
+    private static func runPadded(
+        _ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ signs: MLXArray,
+        tmpl: [(String, any KernelTemplateArg)], paddedRows: Int, width: Int, tpb: Int,
+        codesDType: DType
+    ) -> SignedBlockHadamard.Int8Activation {
+        let groupShape = [paddedRows, width / 128]
+        let outs = kernel(
+            [x, signs], template: tmpl,
+            grid: (tpb * paddedRows * (width / 1024), 1, 1), threadGroup: (tpb, 1, 1),
+            outputShapes: [[paddedRows, width], groupShape, groupShape],
+            outputDTypes: [codesDType, .float32, .float32])
+        return SignedBlockHadamard.Int8Activation(codes: outs[0], scales: outs[1], scaledSums: outs[2])
+    }
+
+    /// Once per process, for both thread counts (the load-time trial may
+    /// switch them): this launch against the record's chain, bit for bit.
+    private static func paddedVerified(
+        tpb: Int, kernel: MLXFast.MLXFastKernel, signs: MLXArray,
+        template: [(String, any KernelTemplateArg)], paddedRows: Int, width: Int,
+        codesDType: DType, preSigned: Bool
+    ) -> Bool {
+        paddedLock.lock()
+        defer { paddedLock.unlock() }
+        let form = { (t: Int) in "\(width) \(paddedRows) \(preSigned) \(codesDType) \(t)" }
+        if let verdict = paddedVerdicts[form(tpb)] { return verdict }
+        var values = 0
+        var mismatches: [Int: Int] = [128: 0, 256: 0]
+        var detail = ""
+        do {
+            try withError { error in
+                guard let chain = SignedBlockHadamard.fusedTransformInt8 else {
+                    throw SelfTestFailure.message("no FP32 chain")
+                }
+                let finite: (UInt16) -> UInt16 = { ($0 & 0x7F80) == 0x7F80 ? $0 & 0xFF7F : $0 }
+                for rows in [paddedRows, paddedRows - 1, 8, 1] where rows >= 1 && rows <= paddedRows {
+                    let count = rows * width
+                    let key = MLXRandom.key(UInt64(60 + rows))
+                    let parts = MLXRandom.split(key: key, into: 2)
+                    let scale = MLXRandom.uniform(Float(0.001) ..< Float(60), [rows, 1], key: parts[0])
+                    let outlier = MLXArray((0 ..< width).map { $0 % 331 == 17 ? Float(90) : Float(1) })
+                    var v = MLXRandom.normal([rows, width], key: parts[1]) * scale * outlier
+                    let cols = MLXArray(0 ..< width).reshaped(1, width)
+                    let rowIds = MLXArray(0 ..< rows).reshaped(rows, 1)
+                    let zeroGroup = (cols .>= MLXArray(Int32(256))) .&& (cols .< MLXArray(Int32(384)))
+                    v = which(zeroGroup .&& (rowIds .== MLXArray(Int32(0))), MLXArray(Float(0)), v)
+                    if rows > 2 { v = which(rowIds .== MLXArray(Int32(1)), MLXArray(Float(0)), v) }
+                    if rows > 1 { v = which(rowIds .== MLXArray(Int32(rows - 1)), -v[0 ..< 1], v) }
+                    let patterns = (0 ..< count).map { UInt16(truncatingIfNeeded: $0 &* 40503) }
+                    let operands = [
+                        v.asType(.bfloat16),
+                        MLXArray(patterns, [rows, width]).view(dtype: .bfloat16),
+                        MLXArray(patterns.map(finite), [rows, width]).view(dtype: .bfloat16),
+                    ]
+                    for operand in operands {
+                        let wide = operand.asType(.float32)
+                        let padded =
+                            rows < paddedRows
+                            ? concatenated(
+                                [wide, MLXArray.zeros([paddedRows - rows, width], dtype: .float32)],
+                                axis: 0)
+                            : wide
+                        guard let a = chain(padded, signs, 1024, preSigned, nil, 128) else {
+                            throw SelfTestFailure.message("FP32 chain declined")
+                        }
+                        for t in [128, 256] {
+                            let b = runPadded(
+                                kernel, operand, signs, tmpl: template + [("TPB", t)],
+                                paddedRows: paddedRows, width: width, tpb: t,
+                                codesDType: codesDType)
+                            var differ: [MLXArray] = []
+                            for (p, q) in zip(
+                                [a.codes, a.scales, a.scaledSums], [b.codes, b.scales, b.scaledSums])
+                            {
+                                guard p.shape == q.shape, p.dtype == q.dtype else {
+                                    throw SelfTestFailure.message("shape or dtype mismatch")
+                                }
+                                let bits: DType = p.dtype == .float32 ? .uint32 : .uint8
+                                differ.append(
+                                    (p.view(dtype: bits) .!= q.view(dtype: bits)).asType(.int32).sum())
+                                values += p.size
+                            }
+                            let n = stacked(differ).sum()
+                            eval(n)
+                            try error.check()
+                            mismatches[t, default: 0] += Int(n.item(Int32.self))
+                        }
+                    }
+                }
+            }
+        } catch {
+            detail = " (\(error))"
+            mismatches[128, default: 0] += 1
+            mismatches[256, default: 0] += 1
+        }
+        for (t, m) in mismatches { paddedVerdicts[form(t)] = m == 0 }
+        let passed = paddedVerdicts[form(tpb)] ?? false
+        FileHandle.standardError.write(
+            ("bonsai head rotation from BF16 rows (\(width) wide, padded to \(paddedRows) in the read, "
+                + "presigned \(preSigned ? 1 : 0)): self-test "
+                + (passed ? "passed" : "FAILED")
+                + " against the FP32 cast-and-pad chain (rows \(paddedRows)/\(paddedRows - 1)/8/1, "
+                + "random, every BF16 pattern, every finite pattern; 128 and 256 threads): "
+                + "\(values) values bitwise, mismatches 128: \(mismatches[128] ?? 0), "
+                + "256: \(mismatches[256] ?? 0)" + detail
+                + (passed ? "; \(tpb) threads in use\n" : "; FP32 cast-and-pad chain kept\n"))
+                .data(using: .utf8)!)
         return passed
     }
 }
@@ -4840,3 +5021,185 @@ enum Qwen35ExactFormTrial {
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
     }
 }
+
+// MARK: - Layer 0's input norm on the FP16 embedding
+
+/// `RMSNorm` (FP32 weight) of FP16 rows in one launch. MLX's `rms_norm`
+/// promotes FP16 rows to the weight's FP32 with an `astype` node, a copy
+/// launch that writes the rows as FP32 (5 MB read and 10 MB written at 512
+/// rows), and `rms_looped` then reads that copy. On the tensor route this
+/// runs once per forward, at layer 0's input norm on the FP16 embedding
+/// (every later input norm is inside the fused boundary): in each prompt
+/// forward and in each verify window. This kernel is
+/// `rms_looped` (1024 lanes x 4 reads, two passes at W = 5120) reading the
+/// FP16 rows and widening each element at its read, as the fused boundary
+/// reads its FP16 sum (`Qwen35FusedBoundaryQ8`): the same FP32 values summed
+/// in the same order, the same `simd_sum` and threadgroup reduction,
+/// `precise::rsqrt(t / axis_size + eps)` and `w * (x * inv)`, so every output
+/// has the chain's bits and dtype, with one launch and 20 MB of traffic less.
+///
+/// Before first use a self-test compares it with the norm's own call (the
+/// chain, cast included) on FP16 rows with the production weight and eps at
+/// 1, 16, 128 and 512 rows (per-row scales from 0.05 to 30, outlier channels
+/// 100x larger, an all-zero row from 16 rows up: `rsqrt(eps)`), bit for bit;
+/// a mismatch or an MLX error keeps the chain. The kernel is per row, so it
+/// takes any row count: a prompt's, a verify window's, a serial step's.
+/// `BONSAI_HALF_INPUT_NORM=0` keeps the chain.
+enum Qwen35HalfInputNorm {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_HALF_INPUT_NORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The width `rms_looped` covers in two passes of 1024 lanes x 4.
+    private static let width = 5120
+    /// `rms_looped`'s threadgroup: its pipeline's maximum, 1024.
+    private static let lanes = 1024
+    nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(width))
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// `norm(x)` for FP16 rows, or nil for the chain.
+    static func apply(_ x: MLXArray, _ norm: RMSNorm) -> MLXArray? {
+        guard enabled, ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            x.dtype == .float16, x.ndim >= 2, x.dim(-1) == width, x.size > 0,
+            norm.weight.dtype == .float32, norm.weight.shape == [width],
+            verified(norm)
+        else { return nil }
+        return launch(x, norm)
+    }
+
+    private static func launch(_ x: MLXArray, _ norm: RMSNorm) -> MLXArray {
+        kernel(
+            [x, norm.weight, MLXArray(norm.eps), axisSize], template: [("W", width)],
+            grid: (lanes * (x.size / width), 1, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.float32])[0]
+    }
+
+    private static func verified(_ norm: RMSNorm) -> Bool {
+        lock.withLock {
+            if let verdict { return verdict }
+            let (passed, summary) = selfTest(norm)
+            verdict = passed
+            FileHandle.standardError.write(
+                ("bonsai half-input norm: " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).data(using: .utf8)!)
+            return passed
+        }
+    }
+
+    private static func selfTest(_ norm: RMSNorm) -> (Bool, String) {
+        var values = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                let outlier = MLXArray(
+                    (0 ..< width).map { $0 % 509 == 7 ? Float(100) : Float(1) })
+                for (rows, seed) in [(1, 63), (16, 64), (128, 61), (512, 62)] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows >= 16 ? rows / 3 : -1)))
+                        .reshaped(1, rows, 1)
+                    let x = which(
+                        zeroRow, Float(0),
+                        MLXRandom.normal([1, rows, width], key: MLXRandom.key(UInt64(seed + 100)))
+                            * scale * outlier
+                    ).asType(.float16)
+                    let chain = norm(x)
+                    let fused = launch(x, norm)
+                    guard chain.dtype == fused.dtype, chain.shape == fused.shape else {
+                        failure = "output \(fused.dtype) \(fused.shape) vs \(chain.dtype) \(chain.shape)"
+                        return
+                    }
+                    let differ = (chain.view(dtype: .uint32) .!= fused.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    values += chain.size
+                    mismatches += Int(differ.item(Int32.self))
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && values > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(values) values compared bitwise, "
+                + "\(mismatches) mismatches")
+    }
+
+    // grid (1024 * rows, 1, 1), threadgroup (1024, 1, 1): one threadgroup per
+    // row. Inputs: x half [rows, W], w float [W], eps, axis_size. Output: out
+    // float [rows, W].
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_rmsnorm_half_input",
+        inputNames: ["x", "w", "eps", "axis_size"],
+        outputNames: ["out"],
+        source: """
+            constexpr uint NR = 4;
+            constexpr uint LS = 1024;
+            constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+            static_assert(W % 4 == 0 && W > 4096 && W <= 8192, "rms_looped width, two passes");
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(row) * size_t(W);
+
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            // rms_looped's sum of squares of the promoted row: pass p covers
+            // elements p * 4096 + 4 * lid + i, each widened at its read.
+            float hv[NP * NR];
+            float acc = 0;
+            BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint e0 = p * LS * NR + lid * NR;
+              if (e0 + NR <= uint(W)) {
+                const half4 xs = *(const device half4*)(x + base + e0);
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  hv[p * NR + i] = float(xs[i]);
+                  acc += hv[p * NR + i] * hv[p * NR + i];
+                }
+              }
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) {
+              local_sums[lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              local_sums[sg] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float t = simd_sum(local_sums[lane]);
+              if (lane == 0) {
+                local_inv[0] = metal::precise::rsqrt(t / axis_size + eps);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv[0];
+
+            // rms_looped's output `w * (x * inv)`.
+            BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint e0 = p * LS * NR + lid * NR;
+              if (e0 + NR <= uint(W)) {
+                float4 o;
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  o[i] = w[e0 + i] * (hv[p * NR + i] * inv);
+                }
+                *(device float4*)(out + base + e0) = o;
+              }
+            }
+            """,
+        header: "#define BONSAI_UNROLL _Pragma(\"clang loop unroll(full)\")\n",
+        ensureRowContiguous: true)
+}
+
+// A second box reading of terrapinelf's 0dcf4367 tree (2026-10-01T07:12Z); no code change.
