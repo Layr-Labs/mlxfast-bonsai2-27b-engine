@@ -85,6 +85,18 @@ public struct SignedBlockHadamard {
     ) -> Int8Activation?
     nonisolated(unsafe) public static var fusedTransformInt8: FusedTransformInt8?
 
+    /// One FP32 row quantized into the same sixteen-row tuple as zero padding
+    /// followed by `forwardInt8`. Nil keeps that composed path.
+    nonisolated(unsafe) public static var fusedTransformInt8Padded: FusedTransformInt8?
+
+    public func forwardInt8Padded(_ x: MLXArray, preSigned: Bool) -> Int8Activation? {
+        validate(x)
+        guard x.dtype == .float32, x.ndim == 2, x.dim(0) == 1,
+            let fused = Self.fusedTransformInt8Padded
+        else { return nil }
+        return fused(x, signs, blockSize, preSigned, nil, 128)
+    }
+
     /// `forward` (or `applyPreSigned` when `preSigned`) quantized per group;
     /// nil when no fused implementation provides it.
     public func forwardInt8(
@@ -291,6 +303,41 @@ public struct SignedBlockHadamard {
         _ x: MLXArray, _ signs: MLXArray, _ blockSize: Int
     ) -> MLXArray?
     nonisolated(unsafe) public static var fusedInverse: FusedInverse?
+
+
+    /// Dequantize selected rows and recover their original basis; nil declines.
+    public typealias FusedDequantizedInverse = (
+        _ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ signs: MLXArray,
+        _ blockSize: Int, _ groupSize: Int, _ bits: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedDequantizedInverse: FusedDequantizedInverse?
+
+
+    /// Read selected packed table rows and recover their original basis; nil declines.
+    public typealias FusedSelectedDequantizedInverse = (
+        _ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ signs: MLXArray, _ blockSize: Int, _ groupSize: Int, _ bits: Int
+    ) -> MLXArray?
+    nonisolated(unsafe) public static var fusedSelectedDequantizedInverse:
+        FusedSelectedDequantizedInverse?
+
+    fileprivate func inverseSelected(
+        _ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ group: Int, _ bits: Int
+    ) -> MLXArray? {
+        HadamardEmbeddingGather.inverse(w, scales, biases, ids, self, signs, group, bits)
+    }
+
+    public func inverseDequantized(
+        _ w: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        if let biases, let fused = Self.fusedDequantizedInverse,
+            let y = fused(w, scales, biases, signs, blockSize, groupSize, bits)
+        {
+            return y
+        }
+        return inverse(dequantized(w, scales: scales, biases: biases, groupSize: groupSize, bits: bits))
+    }
 
     private func validate(_ x: MLXArray) {
         precondition(x.ndim > 0 && x.dim(-1) == width, "Hadamard input width mismatch")
@@ -1318,15 +1365,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let applies = Self.tensorPackedMatmulNarrowApplies, applies(rows, n, k)
         else { return nil }
         let padded = Self.tensorRouteMaximumNarrowRows
-        let input =
-            rows < padded
-            ? concatenated(
-                [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
-            : x
-        guard
-            let activation = transform.forwardInt8(
+        let activation: SignedBlockHadamard.Int8Activation
+        if rows == 1, gdnLayout == nil,
+            let direct = transform.forwardInt8Padded(x, preSigned: preSigned)
+        {
+            activation = direct
+        } else {
+            let input =
+                rows < padded
+                ? concatenated(
+                    [x, Self.cachedNarrowZeros(rows: padded - rows, cols: k, dtype: x.dtype)], axis: 0)
+                : x
+            guard let composed = transform.forwardInt8(
                 input, gdnLayout: gdnLayout, preSigned: preSigned, groupSize: 128)
-        else { return nil }
+            else { return nil }
+            activation = composed
+        }
         if siblings.count == 1 {
             guard let y = matmul(
                 activation, weight, scales, biases!, groupSize, outputDType, matrixRoute.layoutCache)
@@ -1962,10 +2016,23 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let indices = x.flattened()
-        let rows = dequantized(
-            weight[indices], scales: scales[indices],
-            biases: biases.map { $0[indices] }, groupSize: groupSize, bits: bits)
-        return transform.inverse(rows).reshaped(x.shape + [transform.width])
+        if let biases,
+            let y = transform.inverseSelected(
+                weight, scales, biases, indices, groupSize, bits)
+        {
+            return y.reshaped(x.shape + [transform.width])
+        }
+        let rows: (MLXArray, MLXArray, MLXArray?)
+        if let biases,
+            let gathered = HadamardEmbeddingGather.apply(weight, scales, biases, indices)
+        {
+            rows = (gathered[0], gathered[1], gathered[2])
+        } else {
+            rows = (weight[indices], scales[indices], biases.map { $0[indices] })
+        }
+        return transform.inverseDequantized(
+            rows.0, scales: rows.1, biases: rows.2, groupSize: groupSize, bits: bits)
+            .reshaped(x.shape + [transform.width])
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {
@@ -1973,6 +2040,217 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
             transform(x), weight, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
     }
+}
+
+/// Copy the three packed row tables together. Other layouts keep the gathers.
+enum HadamardEmbeddingGather {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_FUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let lock = NSLock()
+    private struct DirectVerdict {
+        let signs: MLXArray
+        let width: Int
+        let block: Int
+        let group: Int
+        let bits: Int
+        let passed: Bool
+    }
+    private struct Entry {
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        let passed: Bool
+        var direct: DirectVerdict?
+    }
+    nonisolated(unsafe) private static var entry: Entry?
+
+    static func apply(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray
+    ) -> [MLXArray]? {
+        guard admitted(codes, scales, biases, ids) else { return nil }
+        return launch(codes, scales, biases, ids)
+    }
+
+    private static func admitted(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray
+    ) -> Bool {
+        guard enabled, ids.ndim == 1, ids.size > 0, ids.size <= Int(Int32.max),
+            ids.dtype == .int32 || ids.dtype == .uint32,
+            codes.ndim == 2, scales.ndim == 2, biases.ndim == 2,
+            codes.dtype == .uint32, scales.dtype == .float16, biases.dtype == .float16,
+            biases.shape == scales.shape, codes.dim(0) == scales.dim(0),
+            codes.dim(0) > 0, codes.dim(0) <= Int(Int32.max),
+            codes.dim(1) > 0, scales.dim(1) > 0,
+            max(codes.dim(1), scales.dim(1)) <= Int(Int32.max),
+            max(codes.dim(1), scales.dim(1)) <= Int.max / ids.size / 4,
+            packed(codes), packed(scales), packed(biases), verified(codes, scales, biases)
+        else { return false }
+        return true
+    }
+
+    static func inverse(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray,
+        _ transform: SignedBlockHadamard, _ signs: MLXArray, _ group: Int, _ bits: Int
+    ) -> MLXArray? {
+        guard let fused = SignedBlockHadamard.fusedSelectedDequantizedInverse,
+            admitted(codes, scales, biases, ids),
+            let candidate = fused(
+                codes, scales, biases, ids, signs, transform.blockSize, group, bits)
+        else { return nil }
+        let passed: Bool? = lock.withLock {
+            guard var current = entry, current.codes === codes, current.scales === scales,
+                current.biases === biases, current.passed
+            else { return nil }
+            if let verdict = current.direct, verdict.signs === signs,
+                verdict.width == transform.width, verdict.block == transform.blockSize,
+                verdict.group == group, verdict.bits == bits
+            {
+                return verdict.passed
+            }
+            var same = MLXArray(true)
+            var available = true
+            var passed = false
+            do {
+                try withError { error in
+                    let vocab = codes.dim(0)
+                    for dtype in [DType.int32, .uint32] {
+                        for n in [1, 16] {
+                            var values = (0 ..< n).map { Int32(($0 * 7919) % vocab) }
+                            if n == 16 {
+                                values[0] = 0
+                                values[1] = Int32(vocab - 1)
+                                values[2] = Int32(vocab / 2)
+                                values[3] = Int32(vocab - 1)
+                                if dtype == .int32 {
+                                    values[n - 2] = -1
+                                    values[n - 1] = -Int32(vocab)
+                                }
+                            }
+                            let testIDs = MLXArray(values).asType(dtype)
+                            guard let direct = fused(
+                                codes, scales, biases, testIDs, signs,
+                                transform.blockSize, group, bits)
+                            else { available = false; return }
+                            let rows = launch(codes, scales, biases, testIDs)
+                            let stock = transform.inverseDequantized(
+                                rows[0], scales: rows[1], biases: rows[2],
+                                groupSize: group, bits: bits)
+                            guard direct.shape == stock.shape, direct.dtype == stock.dtype else { return }
+                            same = same .&& all(direct.view(dtype: .uint16) .== stock.view(dtype: .uint16))
+                        }
+                    }
+                    eval(same)
+                    try error.check()
+                    passed = same.item(Bool.self)
+                }
+            } catch {
+                passed = false
+            }
+            guard available else { return nil }
+            current.direct = DirectVerdict(
+                signs: signs, width: transform.width, block: transform.blockSize,
+                group: group, bits: bits, passed: passed)
+            entry = current
+            FileHandle.standardError.write(
+                Data(("bonsai selected-table inverse: "
+                    + (passed ? "raw byte self-test passed; direct rows\n"
+                        : "self-test failed; row gather kept\n")).utf8))
+            return passed
+        }
+        return passed == true ? candidate : nil
+    }
+
+    // Buffer metadata only. This call does not evaluate or wait for an input.
+    private static func packed(_ array: MLXArray) -> Bool {
+        guard let info = try? array.evaluatedBufferInfo(), info.isRowContiguous,
+            info.dataElements >= array.size, info.dataOffset % array.dtype.size == 0,
+            info.dataOffset <= info.allocatedBytes,
+            array.nbytes <= info.allocatedBytes - info.dataOffset
+        else { return false }
+        return true
+    }
+
+    private static func launch(
+        _ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray, _ ids: MLXArray
+    ) -> [MLXArray] {
+        let (n, wc, gc) = (ids.dim(0), codes.dim(1), scales.dim(1))
+        return kernel(
+            [codes, scales, biases, ids],
+            template: [("WC", wc), ("GC", gc), ("V", codes.dim(0))],
+            grid: (max(wc, gc), n, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[n, wc], [n, gc], [n, gc]],
+            outputDTypes: [.uint32, .float16, .float16])
+    }
+
+    private static func verified(_ codes: MLXArray, _ scales: MLXArray, _ biases: MLXArray) -> Bool {
+        lock.withLock {
+            if let entry, entry.codes === codes, entry.scales === scales, entry.biases === biases {
+                return entry.passed
+            }
+            var passed = false
+            do {
+                try withError { error in
+                    var differ = MLXArray(Int32(0))
+                    let vocab = codes.dim(0)
+                    for dtype in [DType.int32, .uint32] {
+                        for n in [1, 16, 17, 512] {
+                            var values = (0 ..< n).map { Int32(($0 * 7919) % vocab) }
+                            if n >= 16 {
+                                values[0] = 0
+                                values[1] = Int32(vocab - 1)
+                                values[2] = Int32(vocab / 2)
+                                values[3] = Int32(vocab - 1)
+                                if dtype == .int32 {
+                                    values[n - 2] = -1
+                                    values[n - 1] = -Int32(vocab)
+                                }
+                            }
+                            let ids = MLXArray(values).asType(dtype)
+                            let fused = launch(codes, scales, biases, ids)
+                            let stock = [codes[ids], scales[ids], biases[ids]]
+                            for (a, b) in zip(stock, fused) {
+                                guard a.shape == b.shape, a.dtype == b.dtype else { return }
+                                differ = differ
+                                    + (a.view(dtype: .uint8) .!= b.view(dtype: .uint8)).asType(.int32).sum()
+                            }
+                        }
+                    }
+                    eval(differ)
+                    try error.check()
+                    passed = differ.item(Int32.self) == 0
+                }
+            } catch {
+                passed = false
+            }
+            entry = Entry(codes: codes, scales: scales, biases: biases, passed: passed, direct: nil)
+            FileHandle.standardError.write(
+                Data(("bonsai embedding row gather: "
+                    + (passed ? "raw byte self-test passed; one launch\n"
+                        : "self-test failed; gathers kept\n")).utf8))
+            return passed
+        }
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_embedding_row_gather",
+        inputNames: ["codes", "scale_table", "bias_table", "ids"],
+        outputNames: ["code_rows", "scale_rows", "bias_rows"],
+        source: """
+            const uint x = thread_position_in_grid.x;
+            const uint r = thread_position_in_grid.y;
+            long i = long(ids[r]);
+            if (i < 0) i += long(V);
+            const ulong src = ulong(i);
+            if (x < uint(WC)) code_rows[ulong(r) * WC + x] = codes[src * WC + x];
+            if (x < uint(GC)) {
+                scale_rows[ulong(r) * GC + x] = scale_table[src * GC + x];
+                bias_rows[ulong(r) * GC + x] = bias_table[src * GC + x];
+            }
+            """, ensureRowContiguous: true)
 }
 
 /// The row count from which a forward counts as prompt width: the timed
@@ -2039,6 +2317,44 @@ public enum HadamardStridedInputs {
           }
           return strides[LEAD + 1] == 1
               && (shape[LEAD] == 1 || strides[LEAD] == int64_t(shape[LEAD + 1]));
+        }
+        // Every element offset of an NDIM-dimensional view below 2^31: each
+        // dimension of extent above 1 has a stride in [0, 2^31) (an extent-1
+        // dimension's index is 0), and the largest offset, the sum of
+        // (extent - 1) * stride, is below 2^31. Then every row base, column
+        // offset and their sum (each a partial sum of that one) is below 2^31,
+        // and the 32-bit forms below equal the 64-bit ones.
+        template <int NDIM>
+        METAL_FUNC bool bonsai_offsets_fit32(constant const int* shape, constant const int64_t* strides) {
+          ulong span = 0;
+          for (int d = 0; d < NDIM; d++) {
+            if (shape[d] > 1) {
+              if (strides[d] < 0 || strides[d] >= (int64_t(1) << 31)) {
+                return false;
+              }
+              span += ulong(shape[d] - 1) * ulong(strides[d]);
+            }
+          }
+          return span < (1ul << 31);
+        }
+        template <int LEAD>
+        METAL_FUNC uint bonsai_row_base32(
+            uint row, constant const int* shape, constant const int64_t* strides) {
+          if (LEAD == 1) {
+            return row * uint(strides[0]);
+          }
+          const uint n1 = uint(shape[1]);
+          return (row < n1) ? row * uint(strides[1])
+                            : (row / n1) * uint(strides[0]) + (row % n1) * uint(strides[1]);
+        }
+        template <int LEAD, int TRAIL>
+        METAL_FUNC uint bonsai_col_off32(
+            uint c, constant const int* shape, constant const int64_t* strides) {
+          if (TRAIL == 1) {
+            return c * uint(strides[LEAD]);
+          }
+          const uint n = uint(shape[LEAD + 1]);
+          return (c / n) * uint(strides[LEAD]) + (c % n) * uint(strides[LEAD + 1]);
         }
 
         """
@@ -2154,6 +2470,16 @@ enum FusedInputHadamardKernel {
               fill([&](uint p) { return static_cast<float>(ap[p]); },
                    [&](uint p) { return static_cast<float>(bp[p]); },
                    [&](uint p) { return signs[p]; });
+            } else if (bonsai_offsets_fit32<LEAD + TRAIL>(a_shape, a_strides)
+                && bonsai_offsets_fit32<LEAD + TRAIL>(b_shape, b_strides)
+                && bonsai_offsets_fit32<1>(signs_shape, signs_strides)) {
+              // The same elements through 32-bit offsets (every offset below 2^31).
+              const uint ra32 = bonsai_row_base32<LEAD>(row, a_shape, a_strides);
+              const uint rb32 = bonsai_row_base32<LEAD>(row, b_shape, b_strides);
+              const uint ss = uint(signs_strides[0]);
+              fill([&](uint p) { return static_cast<float>(a[ra32 + bonsai_col_off32<LEAD, TRAIL>(p, a_shape, a_strides)]); },
+                   [&](uint p) { return static_cast<float>(b[rb32 + bonsai_col_off32<LEAD, TRAIL>(p, b_shape, b_strides)]); },
+                   [&](uint p) { return signs[p * ss]; });
             } else {
               fill([&](uint p) { return static_cast<float>(a[ra + bonsai_col_off<LEAD, TRAIL>(p, a_shape, a_strides)]); },
                    [&](uint p) { return static_cast<float>(b[rb + bonsai_col_off<LEAD, TRAIL>(p, b_shape, b_strides)]); },
