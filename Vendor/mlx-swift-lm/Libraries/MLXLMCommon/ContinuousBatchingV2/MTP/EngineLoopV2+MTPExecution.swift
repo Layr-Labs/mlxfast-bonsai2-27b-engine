@@ -518,6 +518,7 @@ extension EngineLoopV2 {
         }
         if let verify {
             asyncEvalTargets.append(verify.acceptancePacket)
+            if let drafts = verify.packetDrafts { asyncEvalTargets.append(drafts) }
             asyncEvalTargets.append(verify.lastHidden)
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
@@ -838,7 +839,11 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        let acceptancePacket = concatenated(packetParts, axis: 0)
+        // ACCGLUE: one launch writes both parts (`CBv2AcceptGlue.packet`).
+        let acceptancePacket =
+            CBv2AcceptGlue.packet(packetParts) ?? concatenated(packetParts, axis: 0)
+        // i34-9's `CBv2DW2` packet split is off on this tree (ACCGLUE writes the packet), so the drafts stay in it.
+        let packetDrafts: MLXArray? = nil
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
@@ -856,6 +861,7 @@ extension EngineLoopV2 {
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.packetDrafts = packetDrafts
         return result
     }
 
