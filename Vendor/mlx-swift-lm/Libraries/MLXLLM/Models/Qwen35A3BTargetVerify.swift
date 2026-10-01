@@ -1011,15 +1011,20 @@ extension Qwen35GDNReplayFused {
         const uint dvbase = row0 + rbase;
         threadgroup float4 tk[16 * 32];
         threadgroup float4 tq[16 * 32];
-        threadgroup float tv[16 * DVPT];
+        alignas(16) threadgroup float tv[16 * DVPT];
         threadgroup float tgate[32];
 
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
+          const device float4* ps4 = (const device float4*)(ps + (n * Dv + dvbase + d) * Dk + dk0);
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R / 4; ++i) {
+            const float4 s4 = ps4[i];
+            state[d][i * 4] = s4.x;
+            state[d][i * 4 + 1] = s4.y;
+            state[d][i * 4 + 2] = s4.z;
+            state[d][i * 4 + 3] = s4.w;
           }
         }
 
@@ -1035,9 +1040,9 @@ extension Qwen35GDNReplayFused {
             const uint t = e >> 5, f = e & 31u;
             tk[t * 32u + qwen35_staged_slot(f >> 2, f & 3u)] = k4src[t * uint(Hk * Dk / 4) + f];
           }
-          for (uint e = tid; e < uint(KP) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = pv[(t * Hv + hv_idx) * Dv + row0 + r];
+          for (uint e = tid; e < uint(KP) * uint(DVPT / 4); e += NT) {
+            const uint t = e / uint(DVPT / 4), r = e % uint(DVPT / 4);
+            ((threadgroup float4*)tv)[e] = ((const device float4*)(pv + (t * Hv + hv_idx) * Dv + row0))[r];
           }
           if (tid < uint(KP)) {
             if (GATES_STORED) {
@@ -1115,9 +1120,9 @@ extension Qwen35GDNReplayFused {
             tk[slot] = k4src[t * uint(Hk * Dk / 4) + f];
             tq[slot] = q4src[t * uint(Hk * Dk / 4) + f];
           }
-          for (uint e = tid; e < uint(T) * uint(DVPT); e += NT) {
-            const uint t = e / uint(DVPT), r = e % uint(DVPT);
-            tv[e] = v[((b_idx * T + t) * Hv + hv_idx) * Dv + row0 + r];
+          for (uint e = tid; e < uint(T) * uint(DVPT / 4); e += NT) {
+            const uint t = e / uint(DVPT / 4), r = e % uint(DVPT / 4);
+            ((threadgroup float4*)tv)[e] = ((const device float4*)(v + ((b_idx * T + t) * Hv + hv_idx) * Dv + row0))[r];
           }
           if (tid < uint(T)) {
             tgate[tid] = g[(b_idx * T + tid) * Hv + hv_idx];
@@ -1460,7 +1465,7 @@ extension Qwen35GDNPrework {
     /// Rows per threadgroup of `freshStridedRowsKernel`: one fixed value, not
     /// chosen per chip or at run time. A chunk whose row count it does not
     /// divide takes `freshStridedKernel`.
-    static let rowTile = 4
+    static let rowTile = 8
 
     /// The tile the prompt prework takes when it divides the chunk and passed
     /// its check (`checkRowTile`); else `rowTile`. Set by the load-time trial
