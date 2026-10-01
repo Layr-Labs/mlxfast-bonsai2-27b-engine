@@ -4801,3 +4801,183 @@ enum Qwen35ExactFormTrial {
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
     }
 }
+
+// MARK: - Layer 0's input norm on the FP16 embedding
+
+/// `RMSNorm` (FP32 weight) of FP16 rows in one launch. MLX's `rms_norm`
+/// promotes FP16 rows to the weight's FP32 with an `astype` node, a copy
+/// launch that writes the rows as FP32 (5 MB read and 10 MB written at 512
+/// rows), and `rms_looped` then reads that copy. On the tensor route this
+/// runs once per forward, at layer 0's input norm on the FP16 embedding
+/// (every later input norm is inside the fused boundary): in each prompt
+/// forward and in each verify window. This kernel is
+/// `rms_looped` (1024 lanes x 4 reads, two passes at W = 5120) reading the
+/// FP16 rows and widening each element at its read, as the fused boundary
+/// reads its FP16 sum (`Qwen35FusedBoundaryQ8`): the same FP32 values summed
+/// in the same order, the same `simd_sum` and threadgroup reduction,
+/// `precise::rsqrt(t / axis_size + eps)` and `w * (x * inv)`, so every output
+/// has the chain's bits and dtype, with one launch and 20 MB of traffic less.
+///
+/// Before first use a self-test compares it with the norm's own call (the
+/// chain, cast included) on FP16 rows with the production weight and eps at
+/// 1, 16, 128 and 512 rows (per-row scales from 0.05 to 30, outlier channels
+/// 100x larger, an all-zero row from 16 rows up: `rsqrt(eps)`), bit for bit;
+/// a mismatch or an MLX error keeps the chain. The kernel is per row, so it
+/// takes any row count: a prompt's, a verify window's, a serial step's.
+/// `BONSAI_HALF_INPUT_NORM=0` keeps the chain.
+enum Qwen35HalfInputNorm {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["BONSAI_HALF_INPUT_NORM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The width `rms_looped` covers in two passes of 1024 lanes x 4.
+    private static let width = 5120
+    /// `rms_looped`'s threadgroup: its pipeline's maximum, 1024.
+    private static let lanes = 1024
+    nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(width))
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// `norm(x)` for FP16 rows, or nil for the chain.
+    static func apply(_ x: MLXArray, _ norm: RMSNorm) -> MLXArray? {
+        guard enabled, ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
+            x.dtype == .float16, x.ndim >= 2, x.dim(-1) == width, x.size > 0,
+            norm.weight.dtype == .float32, norm.weight.shape == [width],
+            verified(norm)
+        else { return nil }
+        return launch(x, norm)
+    }
+
+    private static func launch(_ x: MLXArray, _ norm: RMSNorm) -> MLXArray {
+        kernel(
+            [x, norm.weight, MLXArray(norm.eps), axisSize], template: [("W", width)],
+            grid: (lanes * (x.size / width), 1, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.float32])[0]
+    }
+
+    private static func verified(_ norm: RMSNorm) -> Bool {
+        lock.withLock {
+            if let verdict { return verdict }
+            let (passed, summary) = selfTest(norm)
+            verdict = passed
+            FileHandle.standardError.write(
+                ("bonsai half-input norm: " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).data(using: .utf8)!)
+            return passed
+        }
+    }
+
+    private static func selfTest(_ norm: RMSNorm) -> (Bool, String) {
+        var values = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                let outlier = MLXArray(
+                    (0 ..< width).map { $0 % 509 == 7 ? Float(100) : Float(1) })
+                for (rows, seed) in [(1, 63), (16, 64), (128, 61), (512, 62)] {
+                    let scale = MLXRandom.uniform(
+                        Float(0.05) ..< Float(30), [1, rows, 1], key: MLXRandom.key(UInt64(seed)))
+                    let zeroRow = (MLXArray(0 ..< rows) .== MLXArray(Int32(rows >= 16 ? rows / 3 : -1)))
+                        .reshaped(1, rows, 1)
+                    let x = which(
+                        zeroRow, Float(0),
+                        MLXRandom.normal([1, rows, width], key: MLXRandom.key(UInt64(seed + 100)))
+                            * scale * outlier
+                    ).asType(.float16)
+                    let chain = norm(x)
+                    let fused = launch(x, norm)
+                    guard chain.dtype == fused.dtype, chain.shape == fused.shape else {
+                        failure = "output \(fused.dtype) \(fused.shape) vs \(chain.dtype) \(chain.shape)"
+                        return
+                    }
+                    let differ = (chain.view(dtype: .uint32) .!= fused.view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    values += chain.size
+                    mismatches += Int(differ.item(Int32.self))
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && values > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(values) values compared bitwise, "
+                + "\(mismatches) mismatches")
+    }
+
+    // grid (1024 * rows, 1, 1), threadgroup (1024, 1, 1): one threadgroup per
+    // row. Inputs: x half [rows, W], w float [W], eps, axis_size. Output: out
+    // float [rows, W].
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_rmsnorm_half_input",
+        inputNames: ["x", "w", "eps", "axis_size"],
+        outputNames: ["out"],
+        source: """
+            constexpr uint NR = 4;
+            constexpr uint LS = 1024;
+            constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+            static_assert(W % 4 == 0 && W > 4096 && W <= 8192, "rms_looped width, two passes");
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(row) * size_t(W);
+
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            // rms_looped's sum of squares of the promoted row: pass p covers
+            // elements p * 4096 + 4 * lid + i, each widened at its read.
+            float hv[NP * NR];
+            float acc = 0;
+            BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint e0 = p * LS * NR + lid * NR;
+              if (e0 + NR <= uint(W)) {
+                const half4 xs = *(const device half4*)(x + base + e0);
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  hv[p * NR + i] = float(xs[i]);
+                  acc += hv[p * NR + i] * hv[p * NR + i];
+                }
+              }
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) {
+              local_sums[lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              local_sums[sg] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float t = simd_sum(local_sums[lane]);
+              if (lane == 0) {
+                local_inv[0] = metal::precise::rsqrt(t / axis_size + eps);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv[0];
+
+            // rms_looped's output `w * (x * inv)`.
+            BONSAI_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint e0 = p * LS * NR + lid * NR;
+              if (e0 + NR <= uint(W)) {
+                float4 o;
+                BONSAI_UNROLL for (uint i = 0; i < NR; i++) {
+                  o[i] = w[e0 + i] * (hv[p * NR + i] * inv);
+                }
+                *(device float4*)(out + base + e0) = o;
+              }
+            }
+            """,
+        header: "#define BONSAI_UNROLL _Pragma(\"clang loop unroll(full)\")\n",
+        ensureRowContiguous: true)
+}

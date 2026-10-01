@@ -5046,14 +5046,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5180,8 +5186,12 @@ final class Qwen35DecoderLayer: Module {
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {

@@ -801,13 +801,21 @@ extension DFlash2Attention {
         let (projectedK, projectedV) =
             qkv.applyContext(context, q: qProj, k: kProj, v: vProj)
             ?? (kProj(context), vProj(context))
+        let kRows = projectedK.reshaped(B, contextLength, kvHeads, -1)
+        let vRows = projectedV.reshaped(B, contextLength, kvHeads, -1)
+        // A fresh cache: the norm, rope and first append in one launch.
+        if DFlash2AbsorbKV.enabled,
+            let capacity = block.firstAppendCapacity(contextRows: contextLength),
+            let (keys, values) = DFlash2AbsorbKV.apply(
+                kRows, vRows, kNorm: kNorm, offset: cache.offset, capacity: capacity),
+            block.installFirst(keys: keys, values: values, contextRows: contextLength)
+        {
+            return true
+        }
         let keys = rope(
-            DFlash2StridedRMSNorm.apply(
-                kNorm, projectedK.reshaped(B, contextLength, kvHeads, -1))
-                .transposed(0, 2, 1, 3),
+            DFlash2StridedRMSNorm.apply(kNorm, kRows).transposed(0, 2, 1, 3),
             offset: cache.offset)
-        let values = projectedV.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
+        let values = vRows.transposed(0, 2, 1, 3)
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 
@@ -2177,19 +2185,27 @@ enum DFlash2TensorMatmul {
     struct SwapTiling: Hashable, CustomStringConvertible {
         var kt: Int, splits: Int, ahead: Int?
         var description: String { "t\(kt)s\(splits)" + (ahead.map { "a\($0)" } ?? "") }
-        func fits(k: Int) -> Bool { k % splits == 0 && (k / splits) % kt == 0 }
+        /// The split's slabs are whole K steps, and the packed kernel's fold
+        /// buffer (`red`: splits - 1 slabs of 16 x cols floats per 16 rows)
+        /// fits 32 KB of threadgroup memory (split 16: 15 or 30 KB at the
+        /// default 16 columns).
+        func fits(_ shape: SwapShape) -> Bool {
+            shape.k % splits == 0 && (shape.k / splits) % kt == 0
+                && (ahead == nil || (splits - 1) * (shape.rows32 ? 2 : 1) * DFlash2PackedWeights.cols * 64 <= 32768)
+        }
 
         init(kt: Int, splits: Int, ahead: Int? = nil) { (self.kt, self.splits, self.ahead) = (kt, splits, ahead) }
 
         /// `t<KT>s<S>` for the swapped kernel (KT 64, 128 or 256) or
         /// `t<tile>s<S>a<A>` for the packed one (A 0, 1 or 2), `standard`'s
-        /// kernel only; S 2, 4, 8, or 0 for `standard`'s split.
+        /// kernel only; S 2, 4, 8 (the packed kernel also 16), or 0 for
+        /// `standard`'s split.
         init?(name: String, standard: SwapTiling) {
             let v = name.split(whereSeparator: { "tsa".contains($0) }).compactMap { Int($0) }
             let packed = standard.ahead != nil
             guard v.count == (packed ? 3 : 2), name == "t\(v[0])s\(v[1])" + (packed ? "a\(v[2])" : ""),
                 (packed ? [DFlash2PackedWeights.ks] : [64, 128, 256]).contains(v[0]),
-                [0, 2, 4, 8].contains(v[1]), !packed || (0 ... 2).contains(v[2])
+                (packed ? [0, 2, 4, 8, 16] : [0, 2, 4, 8]).contains(v[1]), !packed || (0 ... 2).contains(v[2])
             else { return nil }
             self.init(kt: v[0], splits: v[1] == 0 ? standard.splits : v[1], ahead: packed ? v[2] : nil)
         }
@@ -2226,8 +2242,9 @@ enum DFlash2TensorMatmul {
     /// The block-width kernels' tiling per drafter projection shape, chosen
     /// at the deferred load warm, on the kernel the record runs there: the
     /// packed 12-bit kernel when `DFlash2PackedWeights` is on (splits 2, 4,
-    /// 8 by look-ahead 0, 1, 2), else the swapped BF16 kernel (K steps 64,
-    /// 128, 256 by splits 2, 4, 8). Each candidate runs on every weight of its
+    /// 8 by look-ahead 0, 1, 2, and split 16 by look-ahead 0 and 1), else
+    /// the swapped BF16 kernel (K steps 64, 128, 256 by splits 2, 4, 8).
+    /// Each candidate runs on every weight of its
     /// shape against the standard (BF16 outputs): bitwise (`=`) or close (`~`:
     /// every value within one BF16 ulp of its row's largest magnitude), else
     /// dropped. A sample is one evaluation of a chain of launches over the
@@ -2267,11 +2284,14 @@ enum DFlash2TensorMatmul {
             return sequence.map { $0.0 }.filter { seen.insert($0).inserted }
         }
 
+        /// DSG2's (splits 2, 4, 8 by look-ahead 0, 1, 2 on the packed kernel,
+        /// by K step on the swapped one), then on the packed kernel split 16
+        /// by look-ahead 0 and 1, where its fold buffer fits (`fits`).
         private static var list: [String] {
             listed ?? [2, 4, 8].flatMap { s in
                 packed
                     ? (0 ... 2).map { "t\(DFlash2PackedWeights.ks)s\(s)a\($0)" } : [64, 128, 256].map { "t\($0)s\(s)" }
-            }
+            } + (packed ? (0 ... 1).map { "t\(DFlash2PackedWeights.ks)s16a\($0)" } : [])
         }
 
         private static func log(_ line: String) {
@@ -2303,7 +2323,7 @@ enum DFlash2TensorMatmul {
             let lines = forced.split(separator: ",").map { entry -> String in
                 let parts = entry.split(separator: "=").map(String.init)
                 guard parts.count == 2, let shape = shapes.first(where: { "\($0)" == parts[0] }),
-                    let t = SwapTiling(name: parts[1], standard: shape.standard(packed: packed)), t.fits(k: shape.k)
+                    let t = SwapTiling(name: parts[1], standard: shape.standard(packed: packed)), t.fits(shape)
                 else { return "\(entry) ignored (not a shape and fitting tiling)" }
                 guard let c = check(t, shape), c.within else { return "\(shape)=\(t) FAILED its check" }
                 swapTilings[shape] = t
@@ -2385,7 +2405,7 @@ enum DFlash2TensorMatmul {
                 let std = shape.standard(packed: packed)
                 var (opts, tags) = ([std], ["="])
                 for name in list {
-                    guard let t = SwapTiling(name: name, standard: std), t.fits(k: shape.k), !opts.contains(t)
+                    guard let t = SwapTiling(name: name, standard: std), t.fits(shape), !opts.contains(t)
                     else { continue }
                     guard let c = check(t, shape) else { errors += 1; continue }
                     guard c.within else { far += 1; continue }
@@ -5251,6 +5271,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         DFlash2QKPrework.prepare(
             rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
             kvHeads: config.kvHeads, headDim: config.headDim, eps: config.rmsNormEps)
+        if let slidingWindow = config.slidingWindow {
+            DFlash2AbsorbKV.prepare(
+                rope: rope, base: config.ropeTheta, dtype: dtype, heads: config.attentionHeads,
+                kvHeads: config.kvHeads, headDim: config.headDim,
+                kNorms: layers.map { $0.selfAttn.kNorm }, cacheSize: slidingWindow - 1)
+        }
         DFlash2AttentionPipeline.verify(
             dtype: dtype, heads: config.attentionHeads, kvHeads: config.kvHeads, headDim: config.headDim)
         DFlash2TopK.prepareThreshold(vocabularySize: Qwen35TextModel.drafterVocabularyRows > 0
@@ -6563,6 +6589,203 @@ enum DFlash2QKPrework {
                     + (same
                         ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
                         : "self-test failed; norms and ropes kept\n")).data(using: .utf8)!)
+        }
+    }
+}
+
+// MARK: - Context keys and values in one launch
+
+/// The absorbed context's k head norm, its rope and the first append of the
+/// keys and values into a fresh cache (four launches per layer: MLX's
+/// `RMSNorm` first copies the strided k view) as ONE launch that writes the
+/// cache's two `[1, kvHeads, capacity, D]` buffers. Each simdgroup takes one
+/// k head row through `DFlash2StridedRMSNorm`'s body (MLX's `rms_single_row`:
+/// reads, FP32 sum, `simd_sum`s, `precise::rsqrt`, both roundings), then
+/// MLX's `rope` body on the rounded row as `DFlash2QKPrework` runs it (the
+/// other half of each pair from lane `^ 16`, one rounding), and copies the
+/// same v head row; rows past the context stay unwritten, as the first
+/// append leaves them. Self-tested at bind, bit for bit, against the chain it
+/// replaces (`kNorm` of every layer, the drafter's rope, a fresh cache's
+/// `updateBlock`) at 512, 513 and 7 context rows (the k|v-only product and
+/// the full q|k|v stack), rope offsets 0, 37 and 4077, rows from 1e-3 to 3e3
+/// and a zero row; a mismatch or an MLX error keeps the chain.
+/// `MLXFAST_DFLASH_ABSORB_FUSED=0` keeps it.
+enum DFlash2AbsorbKV {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_DFLASH_ABSORB_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_absorb_kv",
+        inputNames: ["k", "v", "w", "p", "pos"],
+        outputNames: ["ko", "vo"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint axis_size = uint(D);
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+
+            const uint H = uint(k_shape[2]);
+            const uint t = gid / H;
+            const uint h = gid % H;
+            const int64_t kr = int64_t(t) * k_strides[1] + int64_t(h) * k_strides[2];
+            const int64_t vr = int64_t(t) * v_strides[1] + int64_t(h) * v_strides[2];
+            const device auto* wr = w + lid * N_READS;
+
+            float acc = 0;
+            float thread_x[N_READS];
+            for (int i = 0; i < N_READS; i++) {
+              thread_x[i] = k[kr + int64_t(lid * N_READS + i) * k_strides[3]];
+              acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+              local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+              local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              acc = simd_sum(local_sums[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + p[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const bool lo = lid < 16;
+            float Lp = p[2] * static_cast<float>(t + uint(pos[0]));
+            const size_t o = (size_t(h) * uint(pos[1]) + t) * D + lid * N_READS;
+            for (int i = 0; i < N_READS; i++) {
+              const T nv = wr[i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+              const float xv = static_cast<float>(nv);
+              const float other = simd_shuffle_xor(xv, ushort(16));
+              float d = static_cast<float>((lid & 15) * N_READS + i) / static_cast<float>(D / 2);
+              float inv_freq = metal::exp2(-d * p[1]);
+              float theta = Lp * inv_freq;
+              float costheta = metal::fast::cos(theta);
+              float sintheta = metal::fast::sin(theta);
+              float x1 = lo ? xv : other;
+              float x2 = lo ? other : xv;
+              float rx1 = x1 * costheta - x2 * sintheta;
+              float rx2 = x1 * sintheta + x2 * costheta;
+              ko[o + i] = static_cast<T>(lo ? rx1 : rx2);
+              vo[o + i] = v[vr + int64_t(lid * N_READS + i) * v_strides[3]];
+            }
+            """,
+        ensureRowContiguous: false)
+
+    private static let lock = NSLock()
+    /// `[eps, log2(base), scale]` per self-tested geometry.
+    nonisolated(unsafe) private static var ready: [String: MLXArray] = [:]
+
+    private static func launch(
+        _ k: MLXArray, _ v: MLXArray, _ weight: MLXArray, _ p: MLXArray, offset: Int, capacity: Int
+    ) -> (MLXArray, MLXArray) {
+        let (n, h, d) = (k.dim(1), k.dim(2), k.dim(3))
+        let out = kernel(
+            [k, v, weight, p, MLXArray([Int32(offset), Int32(capacity)])],
+            template: [("T", k.dtype), ("D", d)],
+            grid: (32 * n * h, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, h, capacity, d], [1, h, capacity, d]],
+            outputDTypes: [k.dtype, k.dtype])
+        return (out[0], out[1])
+    }
+
+    /// The two `[1, H, capacity, D]` buffers a fresh cache's first append
+    /// leaves for the k and v head rows `k`, `v` (`[1, n, H, D]` views) after
+    /// the k norm and the rope at `offset`, or nil when the launch does not
+    /// apply.
+    static func apply(
+        _ k: MLXArray, _ v: MLXArray, kNorm: RMSNorm, offset: Int, capacity: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, k.ndim == 4, k.shape == v.shape, k.dim(0) == 1, k.dim(1) >= 1,
+            k.dim(3) == 128, v.dtype == k.dtype, kNorm.weight.shape == [k.dim(3)],
+            kNorm.weight.dtype == k.dtype, offset >= 0, capacity >= k.dim(1),
+            offset + k.dim(1) < Int(Int32.max), k.dim(2) * capacity * k.dim(3) < Int(Int32.max),
+            let p = lock.withLock({ ready["\(k.dtype) \(k.dim(2)) \(kNorm.eps)"] })
+        else { return nil }
+        return launch(k, v, kNorm.weight, p, offset: offset, capacity: capacity)
+    }
+
+    /// The self-test for the drafter's geometry, rope and k norms, at bind.
+    static func prepare(
+        rope: RoPELayer, base: Float, dtype: DType, heads hq: Int, kvHeads hk: Int,
+        headDim d: Int, kNorms: [RMSNorm], cacheSize: Int
+    ) {
+        guard enabled, d == 128, hk > 0, cacheSize >= 513, let eps = kNorms.first?.eps,
+            kNorms.allSatisfy({ $0.eps == eps && $0.weight.shape == [d] && $0.weight.dtype == dtype }),
+            [DType.bfloat16, .float16].contains(dtype)
+        else { return }
+        lock.withLock {
+            let key = "\(dtype) \(hk) \(eps)"
+            guard ready[key] == nil else { return }
+            let p = MLXArray([eps, log2(base), 1])
+            let w = hk * d
+            var same = true
+            var compared = 0
+            do {
+                try withError { error in
+                    // (rows, rope offset, k column in the product): above 256
+                    // rows the k|v-only product, at or below the full stack.
+                    let cases = [(512, 0, 0), (513, 0, 0), (7, 0, hq * d), (512, 37, 0), (7, 4077, hq * d)]
+                    for (index, (n, off, k0)) in cases.enumerated() {
+                        let heads = (k0 + 2 * w) / d
+                        let row = MLXArray(0 ..< n * heads).reshaped(n, heads, 1)
+                        // Head rows from 1e-3 to 3e3 and a zero k row.
+                        let scale = exp(MLXRandom.uniform(
+                            Float(-7) ..< Float(8), [n, heads, 1], key: MLXRandom.key(UInt64(91 + index))))
+                            * (row .!= MLXArray(Int32((n - 1) * heads + k0 / d + 1))).asType(.float32)
+                        let y = (MLXRandom.normal(
+                            [n, heads, d], key: MLXRandom.key(UInt64(191 + index))) * scale)
+                            .asType(dtype).reshaped(1, n, heads * d)
+                        let kRows = y[0..., 0..., k0 ..< (k0 + w)].reshaped(1, n, hk, d)
+                        let vRows = y[0..., 0..., (k0 + w)...].reshaped(1, n, hk, d)
+                        let kNorm = kNorms[index % kNorms.count]
+                        let live = DFlash2BlockKVCache(maxSize: cacheSize, keep: 0)
+                        let fused = DFlash2BlockKVCache(maxSize: cacheSize, keep: 0)
+                        guard
+                            let (lk, lv) = live.updateBlock(
+                                keys: rope(
+                                    DFlash2StridedRMSNorm.apply(kNorm, kRows).transposed(0, 2, 1, 3),
+                                    offset: off),
+                                values: vRows.transposed(0, 2, 1, 3), contextRows: n),
+                            let capacity = fused.firstAppendCapacity(contextRows: n)
+                        else {
+                            same = false
+                            break
+                        }
+                        let (fk, fv) = launch(kRows, vRows, kNorm.weight, p, offset: off, capacity: capacity)
+                        same = same && fused.installFirst(keys: fk, values: fv, contextRows: n)
+                            && fused.offset == live.offset && fused.inPlaceRows == live.inPlaceRows
+                            && fused.inPlaceCapacity == live.inPlaceCapacity
+                        for (f, l) in [(fk, lk), (fv, lv)] {
+                            same = same && l.shape == [1, hk, n, d]
+                                && all(f[.ellipsis, ..<n, 0...].view(dtype: .uint16) .== l.view(dtype: .uint16))
+                                    .item(Bool.self)
+                            compared += l.size
+                        }
+                    }
+                    try error.check()
+                }
+            } catch {
+                same = false
+            }
+            if same { ready[key] = p }
+            FileHandle.standardError.write(
+                ("dflash2 absorbed context K/V install (\(key)): "
+                    + (same
+                        ? "self-test passed: \(compared) values compared bitwise, 0 mismatches; one launch\n"
+                        : "self-test failed; norm, rope and first append kept\n")).data(using: .utf8)!)
         }
     }
 }
