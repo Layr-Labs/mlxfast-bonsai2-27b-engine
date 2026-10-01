@@ -107,7 +107,8 @@ enum Qwen35SmallNMatmul {
         """
 
     // One thread per output: the KS chunk partials loaded together (unrolled),
-    // then added in chunk order.
+    // then added in chunk order. Offsets below part.size ((K / 128) x 16 x N):
+    // 32-bit through `Qwen35IO32`, as the partial that writes them.
     private static let reduceSource = """
         const int M = dims[1]; const int N = dims[2];
         const uint i = thread_position_in_grid.x;
@@ -127,7 +128,8 @@ enum Qwen35SmallNMatmul {
         ensureRowContiguous: true)
     private static let reduceKernel = MLXFast.metalKernel(
         name: "qwen35_splitk_reduce", inputNames: ["part", "dims", "dep"], outputNames: ["out"],
-        source: reduceSource, ensureRowContiguous: false)
+        source: Qwen35IO32.narrow(reduceSource, count: 1, "qwen35_splitk_reduce"),
+        ensureRowContiguous: false)
 
     static func apply(_ x: MLXArray, _ w: MLXArray, after: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.dtype == .float32, w.dtype == .float32, w.ndim == 2 else { return nil }
