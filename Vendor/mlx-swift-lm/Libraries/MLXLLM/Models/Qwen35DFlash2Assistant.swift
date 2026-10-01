@@ -114,6 +114,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -987,21 +988,33 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let targets = drafts == nil ? packet[k ..< (2 * k + 1)] : packet
         let draftIDs = drafts ?? packet[0 ..< k]
         let walk = CBv2DW2.enabled ? DFlash2AcceptWalk.launch(drafts: draftIDs, targets: targets, k: k) : nil
-        let accepted = walk != nil ? nil
+        // WALK1 / ACCWALK: where the record's walk (`CBv2DW2`) is off, the
+        // joined packet's walk in one launch; ACCGLUE: the chain scans the
+        // bool comparison when on (no cast launch).
+        let glued = walk == nil && drafts == nil
+            ? (CBv2AcceptGlue.walk(packet, depth: k) ?? CBv2AcceptGlue.chainWalk(packet, depth: k))
+            : nil
+        let accepted = walk != nil || glued != nil ? nil
             : cumprod((draftIDs[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
                 .sum().asType(.int32)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: walk?.anchor ?? targets.take(accepted!.reshaped([1]), axis: 0),
-                confirmed: walk?.confirmed ?? (accepted! + MLXArray(Int32(1))),
+                anchor: walk?.anchor ?? glued?.anchor ?? targets.take(accepted!.reshaped([1]), axis: 0),
+                confirmed: walk?.confirmed ?? glued?.confirmed ?? (accepted! + MLXArray(Int32(1))),
                 verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,
                 submitLead: plan.single, maskUnconfirmed: plan.maskUnconfirmed)
         else { return nil }
         return Speculation(state: state, block: block, kernelTag: kernelTag)
+    }
+
+    /// TAPJOIN: the record's masked plan reads the whole window, from the
+    /// taps where `DFlash2TapRows` takes the join.
+    public func defersVerifyContext(_ verifyContext: MLXArray) -> Bool {
+        speculationPlan?.maskUnconfirmed == true && DFlash2TapRows.takes(verifyContext)
     }
 
     public func adoptSpeculativeBlock(

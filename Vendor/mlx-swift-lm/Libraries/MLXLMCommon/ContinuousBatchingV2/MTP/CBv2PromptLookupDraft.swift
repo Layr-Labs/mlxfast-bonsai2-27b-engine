@@ -376,6 +376,266 @@ enum CBv2PromptLookupDraft {
         }
         """
 
+    static let roundFuseEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ROUND_FUSE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let spliceFlagLock = NSLock()
+    nonisolated(unsafe) private static var spliceFlagVerdict: Bool?
+
+    /// Runs the flag's self-test now (bind time), then the one-launch score
+    /// and pick's (`splicePickFused`); the verdicts are kept.
+    static func prepareSpliceFlag() {
+        _ = spliceFlagFused()
+        _ = splicePickFused()
+    }
+
+    private static func spliceFlagFused() -> Bool {
+        guard roundFuseEnabled else { return false }
+        return spliceFlagLock.withLock {
+            if let verdict = spliceFlagVerdict { return verdict }
+            let (passed, summary) = spliceFlagSelfTest()
+            spliceFlagVerdict = passed
+            FileHandle.standardError.write(
+                Data(("dflash2 prompt splice flag: " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).utf8))
+            return passed
+        }
+    }
+
+    /// The pick and its flag against `splicePick` and `ranked.max() .>=
+    /// minimum` on random ranked scores (0, below the bar, at it, above it;
+    /// all zero; anchored bars below the minimum), every id and flag compared.
+    private static func spliceFlagSelfTest() -> (Bool, String) {
+        var cases = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                for seed in 0 ..< 48 {
+                    let n = [1, 3, 17, 255, 497, 1201][seed % 6]
+                    let d = [1, 2, 15, 16][(seed / 6) % 4]
+                    let minimum = [5, 1, 3, 6][seed % 4]
+                    let anchored = seed % 3 == 1 && minimum > 2 ? minimum - 2 : 0
+                    func key(_ salt: Int) -> MLXArray { MLXRandom.key(UInt64(0x51ce + seed * 8 + salt)) }
+                    var ranked = MLXRandom.randInt(
+                        Int32(0) ..< Int32(minimum + 4), [n * d], key: key(0))
+                    ranked = which(
+                        MLXRandom.randInt(Int32(0) ..< Int32(4), [n * d], key: key(1)) .== 0,
+                        ranked, MLXArray(Int32(0)))
+                    if seed % 8 == 3 { ranked = MLX.minimum(ranked, MLXArray(Int32(minimum - 1))) }
+                    if seed % 8 == 5 { ranked = MLX.zeros(like: ranked) }
+                    let block = MLXRandom.randInt(Int32(0) ..< Int32(50), [d], key: key(2))
+                    let prompt = MLXRandom.randInt(Int32(0) ..< Int32(50), [n + d], key: key(3))
+                    let dims = MLXArray([Int32(n), Int32(d), Int32(minimum), Int32(anchored)])
+                    let inputs = [ranked, block, prompt, dims]
+                    let chain = splicePick(
+                        inputs, grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, d]], outputDTypes: [.int32])[0]
+                    let chainFlag = ranked.max() .>= MLXArray(Int32(minimum))
+                    let fused = splicePickFlag(
+                        inputs, grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, d], [1]], outputDTypes: [.int32, .bool])
+                    let flag = fused[1].reshaped([])
+                    guard flag.dtype == chainFlag.dtype, flag.shape == chainFlag.shape else {
+                        failure = "flag \(flag.dtype) \(flag.shape) vs \(chainFlag.dtype) \(chainFlag.shape)"
+                        return
+                    }
+                    let differ = (chain .!= fused[0]).asType(.int32).sum()
+                        + (chainFlag .!= flag).asType(.int32)
+                    eval(differ)
+                    try error.check()
+                    mismatches += Int(differ.item(Int32.self))
+                    cases += 1
+                }
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && cases > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(cases) picks and flags compared with "
+                + "the pick and ranked.max() >= minimum, \(mismatches) mismatches")
+    }
+
+    /// SPLICEPICK: `spliceScore` and `splicePickFlag` in one launch. The
+    /// pick's threadgroup already visits every alignment, in its own order
+    /// (`i = tid, tid + 256, ...`); where it read `ranked[i]`, this kernel
+    /// computes that score with `spliceScore`'s statements at `x = i` (its
+    /// `j = x / n` and `c = x % n` carried from step to step: the same
+    /// integers, without a division per step). The arithmetic is integer, so
+    /// the same values meet the same reduction in the same order: the same
+    /// ids and the same flag, and `ranked` is never written. Taken where the
+    /// pick and its flag are one launch (`spliceFlagFused`) and this kernel's
+    /// own self-test passed (`splicePickFused`); `MLXFAST_SPLICE_PICK_FUSED=0`
+    /// keeps both launches.
+    static let splicePickEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_SPLICE_PICK_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let spliceScorePick = MLXFast.metalKernel(
+        name: "cbv2_prompt_splice_score_pick",
+        inputNames: ["block", "prompt", "runs", "dims"], outputNames: ["out", "found"],
+        source: """
+
+        uint tid = thread_position_in_threadgroup.x;
+        int n = dims[0], d = dims[1], minimum = dims[2], anchored = dims[3];
+        int floor_ = anchored > 0 && anchored < minimum ? anchored : minimum;
+        int bs = 0, bi = 0;
+        // i = j*n + c (spliceScore's j = x/n, c = x%n), stepped by 256 with
+        // no division per step.
+        const int q = 256/n, r = 256 - q*n;
+        int j = int(tid)/n, c = int(tid) - j*n;
+        for (int i = int(tid); i < n*d; i += 256) {
+         // spliceScore's score at x = i.
+         int a = 0;
+         while (j+a < d && block[j+a] == prompt[c+1+a]) ++a;
+         int t = a + (j == 0 ? runs[c] : 0);
+         bool eligible = t >= minimum || (anchored > 0 && j == 0 && runs[c] >= 1 && t >= anchored);
+         int s = a > 0 && eligible ? t : 0;
+         if (s > bs || (s == bs && i < bi)) { bs=s; bi=i; }
+         c += r; j += q;
+         if (c >= n) { c -= n; ++j; }
+        }
+        threadgroup int scores[256];
+        threadgroup int indices[256];
+        scores[tid]=bs; indices[tid]=bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride=128; stride>0; stride>>=1) {
+         if (tid < stride) {
+          int s=scores[tid+stride], i=indices[tid+stride];
+          if (s > scores[tid] || (s == scores[tid] && i < indices[tid])) {
+           scores[tid]=s; indices[tid]=i;
+          }
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid < uint(d)) {
+         int j=indices[0]/n, c=indices[0]%n;
+         out[tid] = scores[0] >= floor_ && int(tid) >= j ? prompt[c+1+int(tid)-j] : block[tid];
+        }
+        if (tid == 0) found[0] = scores[0] >= minimum;
+        """, ensureRowContiguous: true)
+
+    private static let splicePickLock = NSLock()
+    nonisolated(unsafe) private static var splicePickVerdict: Bool?
+
+    /// Whether the score and the pick run as one launch (self-tested once,
+    /// at bind, through `prepareSpliceFlag`).
+    private static func splicePickFused() -> Bool {
+        guard splicePickEnabled, spliceFlagFused() else { return false }
+        return splicePickLock.withLock {
+            if let verdict = splicePickVerdict { return verdict }
+            let (passed, summary) = splicePickSelfTest()
+            splicePickVerdict = passed
+            FileHandle.standardError.write(
+                Data(("dflash2 prompt splice score and pick (SPLICEPICK): " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).utf8))
+            return passed
+        }
+    }
+
+    /// `(ids, flag)` from the one launch, as `splice` takes them.
+    private static func scorePick(
+        _ block: MLXArray, _ promptIDs: MLXArray, _ runs: MLXArray, _ dims: MLXArray, depth: Int
+    ) -> (ids: MLXArray, found: MLXArray) {
+        let picked = spliceScorePick(
+            [block, promptIDs, runs, dims], grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, depth], [1]], outputDTypes: [.int32, .bool])
+        return (picked[0], picked[1].reshaped([]))
+    }
+
+    /// The one launch against the live chain (`spliceScore`, then
+    /// `splicePickFlag`, as `splice` launches them) on blocks and prompts
+    /// with planted spans: a small alphabet (many alignments and ties) and a
+    /// large one (rare matches), spans copied from the block into the prompt
+    /// at the first and last alignments and at random ones, with and without
+    /// the block's head, committed runs of 0 to 64, minimums 1 to 7 with and
+    /// without the anchored bar, 1 to 2,049 alignments and depths 1 to 16;
+    /// every id and the flag compared.
+    private static func splicePickSelfTest() -> (Bool, String) {
+        var cases = 0
+        var fired = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                var state: UInt64 = 0x5911_CE91_C4A7_D00D
+                func next(_ bound: Int) -> Int {
+                    state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                    return Int((state >> 33) % UInt64(bound))
+                }
+                var differ = MLXArray(Int32(0))
+                var flags: [MLXArray] = []
+                for (k, n) in [1, 3, 17, 255, 256, 257, 497, 1201, 2049].enumerated() {
+                    for d in [1, 2, 15, 16] {
+                        for alphabet in [3, 50_000] {
+                            let minimum = [7, 6, 5, 1, 3][(k + d + alphabet) % 5]
+                            let anchored = [5, 0, minimum - 2][(k + d) % 3]
+                            let block = (0 ..< d).map { _ in Int32(next(alphabet)) }
+                            var prompt = (0 ..< (n + d)).map { _ in Int32(next(alphabet)) }
+                            // Spans from the block at alignments c (prompt c + 1 ...),
+                            // from block position j: the first and last
+                            // alignments and two random ones.
+                            for c in [0, n - 1, next(n), next(n)] {
+                                let j = next(d)
+                                let length = 1 + next(d - j)
+                                for t in 0 ..< length where c + 1 + t < n + d {
+                                    prompt[c + 1 + t] = block[j + t]
+                                }
+                            }
+                            let runs = (0 ..< n).map { _ in Int32(next(3) == 0 ? next(65) : 0) }
+                            let dims = MLXArray([Int32(n), Int32(d), Int32(minimum), Int32(max(anchored, 0))])
+                            let blockIDs = MLXArray(block)
+                            let promptIDs = MLXArray(prompt)
+                            let runIDs = MLXArray(runs)
+                            let ranked = spliceScore(
+                                [blockIDs, promptIDs, runIDs, dims],
+                                grid: (n * d, 1, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [[n * d]], outputDTypes: [.int32])[0]
+                            let chain = splicePickFlag(
+                                [ranked, blockIDs, promptIDs, dims],
+                                grid: (256, 1, 1), threadGroup: (256, 1, 1),
+                                outputShapes: [[1, d], [1]], outputDTypes: [.int32, .bool])
+                            let fused = scorePick(blockIDs, promptIDs, runIDs, dims, depth: d)
+                            let chainFlag = chain[1].reshaped([])
+                            guard fused.ids.dtype == chain[0].dtype, fused.ids.shape == chain[0].shape,
+                                fused.found.dtype == chainFlag.dtype, fused.found.shape == chainFlag.shape
+                            else {
+                                failure = "outputs \(fused.ids.shape) \(fused.found.shape) vs "
+                                    + "\(chain[0].shape) \(chainFlag.shape)"
+                                return
+                            }
+                            differ = differ + (chain[0] .!= fused.ids).asType(.int32).sum()
+                                + (chainFlag .!= fused.found).asType(.int32)
+                            flags.append(chainFlag)
+                            cases += 1
+                        }
+                    }
+                }
+                let firedCount = stacked(flags).asType(.int32).sum()
+                eval(differ, firedCount)
+                try error.check()
+                mismatches = Int(differ.item(Int32.self))
+                fired = Int(firedCount.item(Int32.self))
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && cases > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(cases) splices (\(fired) found a span) compared "
+                + "with the score and the pick, every id and flag, \(mismatches) mismatches")
+    }
+
     /// The drafter's block, continued along the prompt span it is quoting.
     ///
     /// The host lookup above needs 16 committed tokens that run along one
@@ -428,11 +688,18 @@ enum CBv2PromptLookupDraft {
             let promptIDs = MLXArray(history[0 ..< prompt].map { Int32($0) })
             let anchored = spliceAnchorMinimum > 0 && spliceAnchorMinimum < minimum ? spliceAnchorMinimum : 0
             let dims = MLXArray([Int32(candidates), Int32(depth), Int32(minimum), Int32(anchored)])
+            if splicePickFused() {
+                let picked = scorePick(block, promptIDs, MLXArray(runs), dims, depth: depth)
+                lastSpliceFound = picked.found
+                return picked.ids.asType(drafted.dtype)
+            }
             let ranked = spliceScore(
                 [block, promptIDs, MLXArray(runs), dims],
                 grid: (candidates * depth, 1, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[candidates * depth]], outputDTypes: [.int32])[0]
-            if CBv2DW2.enabled {
+            // The record's `CBv2DW2` flag, or ROUNDFUSE's (`spliceFlagFused`,
+            // `MLXFAST_ROUND_FUSE=0` keeps the chain): the same kernel.
+            if CBv2DW2.enabled || spliceFlagFused() {
                 let picked = splicePickFlag(
                     [ranked, block, promptIDs, dims],
                     grid: (256, 1, 1), threadGroup: (256, 1, 1),

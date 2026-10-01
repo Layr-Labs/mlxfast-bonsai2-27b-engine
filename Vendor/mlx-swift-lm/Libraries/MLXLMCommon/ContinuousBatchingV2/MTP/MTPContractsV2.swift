@@ -545,6 +545,16 @@ public protocol CBv2MTPBlockSpeculation: CBv2MTPBlockDrafter {
         _ block: any CBv2MTPSpeculativeBlock, confirmed: Int,
         requestState: any CBv2MTPRequestState
     ) -> MLXArray?
+
+    /// Whether the next block built from `verifyContext` reads the target's
+    /// taps behind it instead of the join itself (TAPJOIN). The verify then
+    /// leaves the join lazy: the taps are its own layer outputs, and a later
+    /// reader (the absorb of a block that is not adopted) evaluates the join.
+    func defersVerifyContext(_ verifyContext: MLXArray) -> Bool
+}
+
+extension CBv2MTPBlockSpeculation {
+    public func defersVerifyContext(_ verifyContext: MLXArray) -> Bool { false }
 }
 
 // MARK: - Config
