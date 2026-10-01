@@ -1056,11 +1056,27 @@ package enum CBv2PromptCausalAttention {
     /// row between tiles and batches does not change its value; the scores
     /// keep the `[..., repeats, L, kL]` row order the softmax indexes by.
     /// `BONSAI_VERIFY_FOLD_REPEATS=0` restores the broadcast batches.
-    static let verifyFoldRepeats: Bool = {
+    ///
+    /// The fold was timed on the M4 Max only; the load-time trial
+    /// (`Qwen35ExactFormTrial`, arm `unfold`) may turn it off on this device
+    /// after `checkVerifyUnfold` found both forms equal bit for bit. Setting
+    /// `BONSAI_VERIFY_FOLD_REPEATS` either way forces the form (no arm).
+    package nonisolated(unsafe) static var verifyFoldRepeats =
+        !["0", "false", "no", "off"].contains(verifyFoldRepeatsSetting ?? "")
+
+    package static var verifyFoldRepeatsForced: Bool { verifyFoldRepeatsSetting != nil }
+
+    private static let verifyFoldRepeatsSetting: String? = {
         let value = ProcessInfo.processInfo.environment["BONSAI_VERIFY_FOLD_REPEATS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return value?.isEmpty == false ? value : nil
     }()
+
+    /// The geometry and key counts `warmVerifyBlock` last warmed, for
+    /// `checkVerifyUnfold` (which must build the unfolded form's pipelines at
+    /// the same alignment classes).
+    nonisolated(unsafe) private static var warmedVerify:
+        (heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int])?
 
     /// `scores` [..., L, kL] row-contiguous FP32; four consecutive columns
     /// per thread (kL % 4 == 0, so they share a row).
@@ -1189,6 +1205,7 @@ package enum CBv2PromptCausalAttention {
         heads: Int, kvHeads: Int, headDim: Int, rows: Int, scale: Float, keyLengths: [Int]
     ) -> [MLXArray] {
         guard verifyEnabled, heads > 0, kvHeads > 0, headDim > 0, rows > 0 else { return [] }
+        warmedVerify = (heads, kvHeads, headDim, rows, scale, keyLengths)
         var outputs: [MLXArray] = []
         for keyLength in keyLengths where keyLength >= rows {
             let queries = MLXArray.zeros([1, heads, rows, headDim], dtype: .float32)
@@ -1204,10 +1221,80 @@ package enum CBv2PromptCausalAttention {
         return outputs
     }
 
+    /// The folded verify block against the unfolded one (`verifyFoldRepeats`
+    /// on and off), bit for bit: the probabilities and the output, on seeded
+    /// random operands (keys and values as views into a longer buffer, as a
+    /// cache hands them), at the geometry and every key count
+    /// `warmVerifyBlock` warmed, so it also builds the unfolded GEMM
+    /// pipelines of every alignment class the warm covered. Any mismatch or
+    /// declined launch fails it. Nil when there is nothing to check (no warm,
+    /// one query head per KV head).
+    package static func checkVerifyUnfold() -> (passed: Bool, detail: String)? {
+        guard verifyEnabled, let g = warmedVerify, g.kvHeads > 0, g.heads % g.kvHeads == 0,
+            g.heads / g.kvHeads > 1
+        else { return nil }
+        let lengths = g.keyLengths.filter { $0 >= g.rows }
+        guard !lengths.isEmpty else { return nil }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5546_4c44), into: 3 * lengths.count)
+        var values = 0
+        var mismatches = 0
+        var declined = 0
+        do {
+            try withError { error in
+                for (i, kL) in lengths.enumerated() {
+                    let q = MLXRandom.normal([1, g.heads, g.rows, g.headDim], key: keys[3 * i])
+                    let stored = [1, g.kvHeads, kL + 64, g.headDim]
+                    let k = MLXRandom.normal(stored, key: keys[3 * i + 1])[0..., 0..., ..<kL, 0...]
+                    let v = MLXRandom.normal(stored, key: keys[3 * i + 2])[0..., 0..., ..<kL, 0...]
+                    eval(q, k, v)
+                    guard
+                        let folded = compose(
+                            queries: q, keys: k, values: v, scale: g.scale, promptRows: g.rows,
+                            verify: true, fold: true),
+                        let unfolded = compose(
+                            queries: q, keys: k, values: v, scale: g.scale, promptRows: g.rows,
+                            verify: true, fold: false)
+                    else {
+                        declined += 1
+                        continue
+                    }
+                    let differ =
+                        (folded.probabilities.flattened().view(dtype: .uint32)
+                            .!= unfolded.probabilities.flattened().view(dtype: .uint32))
+                        .asType(.int32).sum()
+                        + (folded.out.flattened().view(dtype: .uint32)
+                            .!= unfolded.out.flattened().view(dtype: .uint32))
+                        .asType(.int32).sum()
+                    eval(differ)
+                    try error.check()
+                    values += folded.probabilities.size + folded.out.size
+                    mismatches += Int(differ.item(Int32.self))
+                }
+            }
+        } catch {
+            return (false, "\(error)")
+        }
+        let detail =
+            "\(lengths.count) key counts, \(values) values bitwise, \(mismatches) mismatches"
+            + (declined > 0 ? ", \(declined) declined" : "")
+        return (mismatches == 0 && declined == 0 && values > 0, detail)
+    }
+
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
         verify: Bool = false
     ) -> MLXArray? {
+        compose(
+            queries: queries, keys: keys, values: values, scale: scale, promptRows: promptRows,
+            verify: verify, fold: verifyFoldRepeats)?.out
+    }
+
+    /// `attend`'s composition with the verify fold chosen by `fold`; also
+    /// returns the probabilities (for `checkVerifyUnfold`).
+    private static func compose(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, promptRows: Int,
+        verify: Bool, fold: Bool
+    ) -> (probabilities: MLXArray, out: MLXArray)? {
         guard verify ? verifyEnabled : (enabled && promptRows >= BonsaiPromptWidth.minimumRows),
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
@@ -1229,7 +1316,7 @@ package enum CBv2PromptCausalAttention {
         var q = queries
         var k = keys
         var v = values
-        if repeats > 1, verify, verifyFoldRepeats {
+        if repeats > 1, verify, fold {
             // One kvHeads-batched GEMM over repeats * L rows per KV head (see
             // `verifyFoldRepeats`): the same buffer in the same row order, so
             // the scores, the softmax rows and the output keep their layout.
@@ -1266,6 +1353,6 @@ package enum CBv2PromptCausalAttention {
         if repeats > 1 {
             out = out.reshaped([B, H, L, out.dim(-1)])
         }
-        return out
+        return (probabilities, out)
     }
 }
