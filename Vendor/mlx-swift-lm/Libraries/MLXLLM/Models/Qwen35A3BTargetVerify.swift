@@ -1017,9 +1017,14 @@ extension Qwen35GDNReplayFused {
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
+          const device float4* ps4 = (const device float4*)(ps + (n * Dv + dvbase + d) * Dk + dk0);
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = ps[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R / 4; ++i) {
+            const float4 s4 = ps4[i];
+            state[d][i * 4] = s4.x;
+            state[d][i * 4 + 1] = s4.y;
+            state[d][i * 4 + 2] = s4.z;
+            state[d][i * 4 + 3] = s4.w;
           }
         }
 
@@ -2274,7 +2279,7 @@ extension Qwen35GDNPrework {
         name: "qwen35_gdn_prework_verify_lf",
         inputNames: ["qkv", "cs", "w", "a", "b", "decay", "dtb", "wq", "wk", "S"],
         outputNames: ["q", "k", "v", "g", "beta", "ci"],
-        source: verifyLoadsFirstSource,
+        source: Qwen35IO32.narrow(verifyLoadsFirstSource, count: 32, "qwen35_gdn_prework_verify_lf"),
         ensureRowContiguous: false)
 
     private struct LoadsFirstGeometry: Hashable {
