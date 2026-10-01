@@ -674,8 +674,14 @@ enum Qwen35GatedDeltaV3 {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            // Same 16 floats as the scalar i-loop; dk0 is a multiple of R=16 so
+            // each quartet is 16-byte aligned. Matches the float4 state_out store.
+            const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));
+            state[d][i] = s4.x;
+            state[d][i + 1] = s4.y;
+            state[d][i + 2] = s4.z;
+            state[d][i + 3] = s4.w;
           }
         }
         float kr[R];
@@ -900,12 +906,22 @@ enum Qwen35GatedDeltaV3 {
     /// then never materialized. The same values (+0.0f) enter the same
     /// arithmetic. Derived from `source` so the stock kernel stays as it is.
     private static let freshSource: String = {
-        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        // Float4 initial load: replace the unique device load with four zeros.
+        // The i-loop already steps by 4 (same as the float4 state_out store).
+        let load =
+            "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));"
+        let zero =
+            "state[d][i] = 0.0f; state[d][i + 1] = 0.0f; state[d][i + 2] = 0.0f; state[d][i + 3] = 0.0f;"
         precondition(
             source.components(separatedBy: load).count == 2,
             "Qwen35 GDN v3: the fresh-state source no longer matches the stock kernel")
-        let text = source.replacingOccurrences(of: load, with: "state[d][i] = 0.0f;")
+        var text = source.replacingOccurrences(of: load, with: zero)
+        text = text.replacingOccurrences(of: "state[d][i] = s4.x;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 1] = s4.y;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 2] = s4.z;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 3] = s4.w;", with: "")
         precondition(!text.contains("state_in"))
+        precondition(!text.contains("s4"))
         return text
     }()
 
@@ -1085,8 +1101,8 @@ enum Qwen35GDNReplayBatch {
             ("device float* y_ = y;", ""),
             ("y[0] = 0.f;", "(void)0;"),
             (
-                "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];",
-                "state[d][i] = s_[(hv_idx * Dv + dvbase + d) * Dk + dk0 + i];"
+                "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));",
+                "const float4 s4 = *((const device float4*)(s_ + (hv_idx * Dv + dvbase + d) * Dk + dk0 + i));"
             ),
             (
                 "const float gt = g_[0];",
