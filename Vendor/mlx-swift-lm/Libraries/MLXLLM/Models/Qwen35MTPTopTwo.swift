@@ -810,7 +810,7 @@ enum Qwen35TensorPackedMatmul {
     // activation's per-group scale and scaled sum. Template `NEG` takes the
     // offset as `-scale` (proven per constant pair; no offset load) and `F32S`
     // reads FP32-widened scales; see `NarrowEpilogue`. Both are exact.
-    private static let sourceNarrowInt8 = """
+    private static let sourceNarrowInt8 = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
@@ -932,7 +932,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 14, "qwen35_head_narrow_i8")
 
     // The verify int8 kernel software-pipelined through registers (K2, K3):
     // the same threadgroup (four simdgroups splitting K into contiguous
@@ -956,7 +956,7 @@ enum Qwen35TensorPackedMatmul {
     // - TN (32 or 64): 32-column halves per threadgroup (two ops per step).
     // Templates: OutT, NEG, F32S (as `sourceNarrowInt8`), PD, TN, KH.
     // grid (N / TN * 128, 1, 1), threadgroup (128, 1, 1).
-    private static let sourceNarrowInt8Pipelined = """
+    private static let sourceNarrowInt8Pipelined = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * TN;
@@ -1165,7 +1165,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 16, "qwen35_head_narrow_i8_pipelined")
 
     // Tiled zoo (`DARKBLOOM_BONSAI_TENSOR_ROUTE_TZOO`, on the tiled layout of
     // Subflatus3 bb781255): more verify int8 bodies that keep every output's
@@ -1192,7 +1192,7 @@ enum Qwen35TensorPackedMatmul {
     //   (8 / 16 KB staging + 8 KB exchange). Templates: OutT, NEG, F32S, PD
     //   (1 or 2), KH. grid (N / 32 * 256), (256).
     // Both read the tiled copy only.
-    private static let sourceNarrowInt8Zoo = """
+    private static let sourceNarrowInt8Zoo = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * TN;
@@ -1415,7 +1415,7 @@ enum Qwen35TensorPackedMatmul {
             }
           }
         }
-        """
+        """, count: 14, "qwen35_head_narrow_i8_zoo")
 
     private static let sourceNarrowInt8Pair = """
         const int K = ksz[0]; const int M = 16; const int N = ksz[2];
@@ -2789,7 +2789,7 @@ enum Qwen35TensorPackedMatmul {
     // inside each 16-block (position p holds code 4 * (p % 4) + p / 4), which
     // the quantizing rotation writes its codes in (`PERM`), so the integer
     // dot product is unchanged. Same inputs as `source`.
-    private static let sourceStaged8 = """
+    private static let sourceStaged8 = Qwen35IO32.narrow("""
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
         const int n0 = int(threadgroup_position_in_grid.x) * 64;
@@ -2914,7 +2914,7 @@ enum Qwen35TensorPackedMatmul {
             *(device half4*)(out + base) = half4(half(v0), half(v1), half(v2), half(v3));
           }
         }
-        """
+        """, count: 18, "qwen35_head_staged8")
 
     private static let kernelStaged8 = MLXFast.metalKernel(
         name: "bonsai_tensor_packed_matmul_q8_u8",

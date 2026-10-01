@@ -2353,7 +2353,7 @@ enum Qwen35GatedDeltaChunked {
     /// stock path.
     static func runFresh(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil, convInput: (qkv: MLXArray, weight: MLXArray)? = nil
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, freshEnabled, q.ndim == 4, k.ndim == 4, v.ndim == 4 else { return nil }
         let B = k.dim(0)
@@ -2368,8 +2368,7 @@ enum Qwen35GatedDeltaChunked {
             freshVerified(hk: k.dim(2), dk: k.dim(3), hv: v.dim(2), dv: v.dim(3))
         else { return nil }
         return freshChunks(
-            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared,
-            convInput: convInput)
+            q: q, k: k, v: v, g: g, beta: beta, stateShape: stateShape, prepared: prepared)
     }
 
     /// The prep launch alone (`chunks`' first launch): T', P and the decay
@@ -2391,7 +2390,7 @@ enum Qwen35GatedDeltaChunked {
     /// launch, the same scan launch geometry, no state input.
     private static func freshChunks(
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateShape: [Int],
-        prepared: [MLXArray]? = nil, convInput: (qkv: MLXArray, weight: MLXArray)? = nil
+        prepared: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray) {
         let B = k.dim(0)
         let T = k.dim(1)
@@ -2409,15 +2408,6 @@ enum Qwen35GatedDeltaChunked {
             threadGroup: (32, 1, 1),
             outputShapes: [[B, Hv, NC, C, C], [B, Hv, NC, C, C], [B, Hv, NC, 2, C]],
             outputDTypes: [.float32, .float32, .float32])
-        // The installed v-fold form (`prepareVFold`): v from the conv input, so
-        // the value launch that produced `v` is never evaluated.
-        if let convInput, let vfold = installedVFold,
-            vfoldApplies([Hk, Dk, Hv, Dv], qkv: convInput.qkv, convWeight: convInput.weight, rows: T)
-        {
-            return vfoldLaunch(
-                vfold.kernel, q: q, k: k, qkv: convInput.qkv, convWeight: convInput.weight,
-                prepared: prepared, valueHeads: Hv, headVDim: Dv)
-        }
         // The installed exact form (`prepareScanForms`) for the geometry it was
         // checked on (its 32-bit offsets need T * max(Hk * Dk, Hv * Dv) < 2^31),
         // else the record's launch.
@@ -2477,10 +2467,7 @@ enum Qwen35GatedDeltaChunked {
                 "qwen35: chunked GDN fresh-state scan disagrees with the stock scan on this device; using the stock scan\n"
                     .data(using: .utf8)!)
         }
-        if recorded && verdict {
-            prepareScanForms(hk: hk, dk: dk, hv: hv, dv: dv)
-            prepareVFold(hk: hk, dk: dk, hv: hv, dv: dv)
-        }
+        if recorded && verdict { prepareScanForms(hk: hk, dk: dk, hv: hv, dv: dv) }
     }
 
     private static func freshSelfCheck(hk: Int, dk: Int, hv: Int, dv: Int) -> Bool {
@@ -3406,8 +3393,7 @@ final class Qwen35GatedDeltaNet: Module {
         // (`BONSAI_GDN_CHUNKED_FRESH=0` keeps the stock call below).
         if let (out, newSsmState) = Qwen35GatedDeltaChunked.runFresh(
             q: pre.q, k: pre.k, v: pre.v, g: pre.g, beta: pre.beta, stateShape: stateShape,
-            prepared: pre.prepared,
-            convInput: pre.prepared != nil ? (qkv, conv1d.weight) : nil)
+            prepared: pre.prepared)
         {
             return (out, pre.tail, newSsmState)
         }
