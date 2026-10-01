@@ -296,8 +296,146 @@ private let cbv2TopTwoPartialFastKernel = MLXFast.metalKernel(
     header: cbv2TopTwoHeader,
     ensureRowContiguous: false
 )
+/// Stage one with four-wide loads (`MLXFAST_TOP2_VEC=0` keeps the scalar
+/// stage one). When the last axis is contiguous each thread reads one float4
+/// per stripe step instead of four scalar loads, and the in-loop offsets are
+/// 32-bit: `index < vocab` makes `index` a `uint` already and the row offset
+/// is formed once in 64 bits outside the loop. A thread scans the indices
+/// `group * 1024 + lane * 4 + {0..3}`, then strides of 32 * 1024 — every
+/// element enters exactly once, still in ascending id order per thread, so
+/// each partial, the merge and the row's top two are the scalar kernel's
+/// bit for bit (self-tested with it at first use, including a strided view
+/// where the scalar loop runs instead). A stripe tail shorter than four
+/// elements falls back to scalar reads inside the same loop.
+private let cbv2TopTwoPartialVecKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_partial_vec",
+    inputNames: ["logits"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: cbv2TopTwoTreeTail("vectorized stage one", """
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint row = group_index / 32;
+        uint group = group_index % 32;
+        uint vocab = uint(logits_shape[2]);
+        darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+        bool numbers = false;
 
-/// `MLXFAST_TOP2_FASTPATH`, and the fast stage one's first-use verdict.
+        const ulong rowoff = ulong(row) * ulong(logits_strides[1]);
+        if (logits_strides[2] == 1) {
+            const device float* rowp = (const device float*)(logits + rowoff);
+            uint index = group * 1024 + lane * 4;
+            for (; index + 3 < vocab; index += 32 * 1024) {
+                float4 v = *(const device float4*)(rowp + index);
+                for (uint e = 0; e < 4; e++) {
+                    float value = v[e];
+                    uint i = index + e;
+                    if (numbers) {
+                        bool above_first = value > local.first_value;
+                        bool above_second = value > local.second_value;
+                        float second_value = above_first
+                            ? local.first_value
+                            : (above_second ? value : local.second_value);
+                        uint second_id = above_first
+                            ? local.first_id
+                            : (above_second ? i : local.second_id);
+                        local.first_value = above_first ? value : local.first_value;
+                        local.first_id = above_first ? i : local.first_id;
+                        local.second_value = second_value;
+                        local.second_id = second_id;
+                    } else {
+                        darkbloom_qwen35_mtp_top2_insert(local, value, i);
+                        numbers = local.count == 2 && !isnan(local.second_value);
+                    }
+                }
+            }
+            // Tail: the same per-lane stripe, partial float4 runs scalar.
+            for (; index < vocab; index += 32 * 1024) {
+                const uint last = min(index + 3, vocab - 1);
+                for (uint i = index; i <= last; i++) {
+                    float value = rowp[i];
+                    if (numbers) {
+                        bool above_first = value > local.first_value;
+                        bool above_second = value > local.second_value;
+                        float second_value = above_first
+                            ? local.first_value
+                            : (above_second ? value : local.second_value);
+                        uint second_id = above_first
+                            ? local.first_id
+                            : (above_second ? i : local.second_id);
+                        local.first_value = above_first ? value : local.first_value;
+                        local.first_id = above_first ? i : local.first_id;
+                        local.second_value = second_value;
+                        local.second_id = second_id;
+                    } else {
+                        darkbloom_qwen35_mtp_top2_insert(local, value, i);
+                        numbers = local.count == 2 && !isnan(local.second_value);
+                    }
+                }
+            }
+        } else {
+            for (uint index = group * 256 + lane;
+                 index < vocab;
+                 index += 32 * 256) {
+                ulong offset = rowoff + ulong(index) * ulong(logits_strides[2]);
+                float value = float(logits[offset]);
+                if (numbers) {
+                    bool above_first = value > local.first_value;
+                    bool above_second = value > local.second_value;
+                    float second_value = above_first
+                        ? local.first_value : (above_second ? value : local.second_value);
+                    uint second_id = above_first
+                        ? local.first_id : (above_second ? index : local.second_id);
+                    local.first_value = above_first ? value : local.first_value;
+                    local.first_id = above_first ? index : local.first_id;
+                    local.second_value = second_value;
+                    local.second_id = second_id;
+                } else {
+                    darkbloom_qwen35_mtp_top2_insert(local, value, index);
+                    numbers = local.count == 2 && !isnan(local.second_value);
+                }
+            }
+        }
+
+        threadgroup darkbloom_qwen35_mtp_top2_state scratch[256];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
+                darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
+                if (other.count > 0) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint base = (row * 32 + group) * 2;
+            uint sentinel_id = vocab + group * 2;
+            float sentinel_value = as_type<float>(0x7fc00000u);
+            partial_ids[base] = scratch[0].count > 0
+                ? int(scratch[0].first_id) : int(sentinel_id);
+            partial_ids[base + 1] = scratch[0].count > 1
+                ? int(scratch[0].second_id) : int(sentinel_id + 1);
+            partial_values[base] = scratch[0].count > 0
+                ? scratch[0].first_value : sentinel_value;
+            partial_values[base + 1] = scratch[0].count > 1
+                ? scratch[0].second_value : sentinel_value;
+        }
+    """),
+    header: cbv2TopTwoHeader,
+    ensureRowContiguous: false
+)
+
+/// `MLXFAST_TOP2_FASTPATH` / `MLXFAST_TOP2_VEC`, and the first-use verdicts.
 private enum CBv2TopTwoFast {
     static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_TOP2_FASTPATH"]?
@@ -307,11 +445,22 @@ private enum CBv2TopTwoFast {
 
     static let lock = NSLock()
     nonisolated(unsafe) static var verdict: Bool?
+    nonisolated(unsafe) static var vecVerdict: Bool?
     nonisolated(unsafe) static var testing = false
 
-    static func partials(_ logits: MLXArray, fast: Bool) -> [MLXArray] {
+    static let vecEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_TOP2_VEC"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Stage one: vectorized when its verdict holds, else the branch-free or
+    /// stock twin per `fast`.
+    static func partials(_ logits: MLXArray, vec: Bool, fast: Bool) -> [MLXArray] {
+        let kernel = vec ? cbv2TopTwoPartialVecKernel
+            : fast ? cbv2TopTwoPartialFastKernel : cbv2TopTwoPartialKernel
         let rows = logits.dim(1)
-        return (fast ? cbv2TopTwoPartialFastKernel : cbv2TopTwoPartialKernel)(
+        return kernel(
             [logits],
             grid: (rows * 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
@@ -320,8 +469,10 @@ private enum CBv2TopTwoFast {
         )
     }
 
-    /// Stock vs fast stage one on synthetic rows: every partial id and value,
-    /// bit for bit.
+    /// Stock vs the branch-free and the four-wide stage one on synthetic
+    /// rows: every partial id and value, bit for bit. The vectorized kernel's
+    /// strided-view path runs its own scalar loop, covered by the strided
+    /// case below.
     static func verified() -> Bool {
         if testing { return true }
         if let verdict = lock.withLock({ verdict }) { return verdict }
@@ -330,6 +481,7 @@ private enum CBv2TopTwoFast {
         var passed = true
         var values = 0
         var mismatches = 0
+        var vecMismatches = 0
         let rows = 16
         let vocab = 248_320
         let keys = MLXRandom.split(key: MLXRandom.key(0x7432_6670), into: 4)
@@ -357,25 +509,35 @@ private enum CBv2TopTwoFast {
         cases.append(wide[0..., 0..., .stride(by: 2)])
         for logits in cases {
             eval(logits)
-            let stock = partials(logits, fast: false)
-            let fast = partials(logits, fast: true)
+            let stock = partials(logits, vec: false, fast: false)
+            let fast = partials(logits, vec: false, fast: true)
+            let vec = partials(logits, vec: true, fast: false)
             let differ = (stock[0] .!= fast[0]).asType(.int32).sum()
                 + (stock[1].view(dtype: .uint32) .!= fast[1].view(dtype: .uint32))
                 .asType(.int32).sum()
-            eval(differ)
+            let vecDiffer = (stock[0] .!= vec[0]).asType(.int32).sum()
+                + (stock[1].view(dtype: .uint32) .!= vec[1].view(dtype: .uint32))
+                .asType(.int32).sum()
+            eval(differ, vecDiffer)
             values += stock[0].size + stock[1].size
             let count = Int(differ.item(Int32.self))
+            let vecCount = Int(vecDiffer.item(Int32.self))
             mismatches += count
+            vecMismatches += vecCount
             if count != 0 { passed = false }
         }
-        lock.withLock { verdict = passed }
+        let vecPassed = vecMismatches == 0
+        lock.withLock { verdict = passed; vecVerdict = vecPassed }
         FileHandle.standardError.write(
-            ("cbv2 top-2 branch-free stage one: self-test " + (passed ? "passed" : "FAILED")
-                + " (\(cases.count) cases of \(rows) x \(vocab), \(values) partial values, "
-                + "\(mismatches) mismatches)" + (passed ? "\n" : "; stock stage one kept\n"))
+            ("cbv2 top-2 stage one: self-test " + (passed ? "passed" : "FAILED")
+                + (vecPassed ? " (vec passed" : " (vec FAILED")
+                + ", \(cases.count) cases of \(rows) x \(vocab), \(values) partial values, "
+                + "\(mismatches) + \(vecMismatches) mismatches)"
+                + (passed ? "\n" : "; stock stage one kept\n"))
                 .data(using: .utf8)!)
         return passed
     }
+
 }
 
 /// Exact top-2 token ids and logit values for every row of `[1, rows, vocab]`.
@@ -389,9 +551,12 @@ package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXAr
     let vocabularySize = logits.dim(2)
     precondition(rows > 0 && vocabularySize >= 2)
 
-    // The branch-free stage one: the same partials bit for bit.
-    let partials = CBv2TopTwoFast.partials(
-        logits, fast: CBv2TopTwoFast.enabled && CBv2TopTwoFast.verified())
+    // The branch-free stage one, or its four-wide-load twin: the same
+    // partials bit for bit.
+    let ok = CBv2TopTwoFast.enabled && CBv2TopTwoFast.verified()
+    let vec = CBv2TopTwoFast.vecEnabled
+        && CBv2TopTwoFast.lock.withLock { CBv2TopTwoFast.vecVerdict ?? false }
+    let partials = CBv2TopTwoFast.partials(logits, vec: vec, fast: ok && !vec)
     let outputs = cbv2TopTwoFinalizeKernel(
         partials,
         grid: (rows * 32, 1, 1),
