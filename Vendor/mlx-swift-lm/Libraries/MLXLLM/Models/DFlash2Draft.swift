@@ -811,6 +811,12 @@ extension DFlash2Attention {
         return block.updateBlock(keys: keys, values: values, contextRows: contextLength) != nil
     }
 
+    func prepareQueryWindow() -> Bool {
+        qkv.prepareQueryWindow(q: qProj, k: kProj, v: vProj)
+    }
+
+    func disableQueryWindow() { qkv.disableQueryWindow() }
+
     /// The stacked q|k|v weight the 32-row tensor kernel reads, if any.
     func stackedQKVWeight() -> MLXArray? { qkv.stackWeight(q: qProj, k: kProj, v: vProj) }
 
@@ -840,7 +846,8 @@ extension DFlash2Attention {
         else { return nil }
         let start = confirmed.reshaped([1])
         let rows = joined ?? dynamicSliceUpdate(base, update: x, start: start, axes: [1])
-        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(rows, q: qProj, k: kProj, v: vProj)
+        guard case let (y, qEnd, kEnd)? = qkv.applyStacked(
+            rows, q: qProj, k: kProj, v: vProj, confirmed: confirmed)
         else { return nil }
         let queries: MLXArray
         let allKeys: MLXArray
@@ -890,11 +897,13 @@ private final class DFlash2QKVStack {
     private var weight: MLXArray?
     private var qEnd = 0
     private var kEnd = 0
+    private var queryWindowChoice: DFlash2PackedWeights.QueryWindowChoice?
 
     func clear() {
         weight = nil
         qEnd = 0
         kEnd = 0
+        queryWindowChoice = nil
     }
 
     /// The stacked weight once built (nil before its first use).
@@ -954,11 +963,26 @@ private final class DFlash2QKVStack {
     /// The stacked weight (built on first use), or nil when the stack does not apply.
     func stackWeight(q: Linear, k: Linear, v: Linear) -> MLXArray? { stacked(q: q, k: k, v: v) }
 
+    func prepareQueryWindow(q: Linear, k: Linear, v: Linear) -> Bool {
+        queryWindowChoice = nil
+        guard let w = stacked(q: q, k: k, v: v) else { return false }
+        queryWindowChoice = DFlash2PackedWeights.prepareQueryWindow(weight: w, qColumns: qEnd)
+        return queryWindowChoice != nil
+    }
+
+    func disableQueryWindow() { queryWindowChoice = nil }
+
     /// `apply`'s matmul, unsliced, with its q and k column ends.
     func applyStacked(
-        _ rows: MLXArray, q: Linear, k: Linear, v: Linear
+        _ rows: MLXArray, q: Linear, k: Linear, v: Linear, confirmed: MLXArray? = nil
     ) -> (y: MLXArray, qEnd: Int, kEnd: Int)? {
         guard rows.ndim == 3, let weight = stacked(q: q, k: k, v: v) else { return nil }
+        if let confirmed, let choice = queryWindowChoice,
+            let y = DFlash2PackedWeights.applyQueryWindow(
+                rows, weight: weight, confirmed: confirmed, choice: choice)
+        {
+            return (y, qEnd, kEnd)
+        }
         // The same route as `apply`, so every row matches today's block forward.
         return (DFlash2TensorMatmul.apply(rows, weight: weight) ?? matmul(rows, weight.T), qEnd, kEnd)
     }
@@ -1940,6 +1964,10 @@ enum DFlash2TensorMatmul {
             dims[[k, n]] = array
             return array
         }
+    }
+
+    static var packed32Available: Bool {
+        enabled && rows32Enabled && Qwen35TensorPackedMatmul.tensorOperandsAvailable
     }
 
     /// `apply` for context rows that enter the cache ahead of their block:
@@ -3338,6 +3366,222 @@ enum DFlash2PackedWeights {
           }
         }
         """
+
+    /// Speculative Q only: preserve all 32 K/V rows, calculate the 16 Q rows
+    /// the device confirmed count selects. The normal m32 source stays intact.
+    private static let queryWindowSource = """
+        using IndexT = metal::conditional_t<IO32 != 0, uint, size_t>;
+        const int K = ksz[0]; const int N = ksz[2];
+        const int nb = int(threadgroup_position_in_grid.x);
+        const int n0 = nb * COLS;
+        // Uniform per threadgroup: Q needs only the block's 16 query rows.
+        static_assert(QCOLS % COLS == 0, "Q/KV boundary must be a whole tile");
+        const bool query = n0 < QCOLS;
+        const int firstRow = query ? clamp(int(confirmed[0]), 0, 16) : 0;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int kq = K / SPLITS;
+        const int k0 = int(sg) * kq;
+        const int steps = K / KS;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            COLS, 16, KS, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> Wt((device bfloat*)x, dextents<int, 2>(K, N));
+        tensor<device bfloat, dextents<int, 2>, tensor_inline> X((device bfloat*)x, dextents<int, 2>(K, 32));
+        auto tW0 = Wt.template slice<KS, COLS>(0, n0);
+        auto tX0 = X.template slice<KS, 16>(0, 0);
+        auto cT0 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto cT1 = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tW0)>, metal::remove_addrspace_t<decltype(tX0)>, float>();
+        auto lw = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+        const uint16_t cap = cT0.get_capacity();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT0.get_capacity(); i++) { cT0[i] = 0.0f; cT1[i] = 0.0f; }
+        const device uint4* mp = (const device uint4*)mant;
+        const device uint2* cp = (const device uint2*)code;
+        const device uint4* fp = (const device uint4*)first4;
+        dflash2_pack12_share<KT> cur, nxt, far;
+        if constexpr (AHEAD > 0) {
+          dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, nb * steps + k0 / KS, lane);
+        }
+        if constexpr (AHEAD > 1) {
+          if (KS < kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, nb * steps + k0 / KS + 1, lane); }
+        }
+        for (int k = k0; k < k0 + kq; k += KS) {
+          const int tile = nb * steps + k / KS;
+          if constexpr (AHEAD == 0) {
+            dflash2_pack12_read<KT, IndexT>(cur, mp, cp, fp, bases, tile, lane);
+          } else if constexpr (AHEAD == 1) {
+            if (k + KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(nxt, mp, cp, fp, bases, tile + 1, lane); }
+          } else {
+            if (k + 2 * KS < k0 + kq) { dflash2_pack12_read<KT, IndexT>(far, mp, cp, fp, bases, tile + 2, lane); }
+          }
+          dflash2_pack12_decode<KT>(lw, cur, offsets, escapes, tile, lane);
+          if constexpr (AHEAD > 0) { cur = nxt; }
+          if constexpr (AHEAD > 1) { nxt = far; }
+          auto tXlo = X.template slice<KS, 16>(k, firstRow);
+          op.run(lw, tXlo, cT0);
+          if (!query) {
+            auto tXhi = X.template slice<KS, 16>(k, 16);
+            op.run(lw, tXhi, cT1);
+          }
+        }
+        threadgroup float red[SPLITS - 1][2 * 16 * COLS];
+        if (sg > 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            red[sg - 1][i * 32 + lane] = cT0[i];
+            if (!query) red[sg - 1][(COLS / 2 + i) * 32 + lane] = cT1[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          for (uint16_t i = 0; i < cap; i++) {
+            if (!cT0.is_valid_element(i)) continue;
+            float v0, v1 = 0.0f;
+            if constexpr (SPLITS == 2) {
+              v0 = cT0[i] + red[0][i * 32 + lane];
+              if (!query) v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane];
+            } else if constexpr (SPLITS == 4) {
+              v0 = cT0[i] + red[0][i * 32 + lane] + red[1][i * 32 + lane] + red[2][i * 32 + lane];
+              if (!query) v1 = cT1[i] + red[0][(COLS / 2 + i) * 32 + lane] + red[1][(COLS / 2 + i) * 32 + lane]
+                  + red[2][(COLS / 2 + i) * 32 + lane];
+            } else {
+              v0 = cT0[i]; if (!query) v1 = cT1[i];
+              for (int j = 0; j < SPLITS - 1; j++) {
+                v0 += red[j][i * 32 + lane]; if (!query) v1 += red[j][(COLS / 2 + i) * 32 + lane];
+              }
+            }
+            auto idx = cT0.get_multidimensional_index(i);
+            if (query) {
+              // Exactly one store per output: real Q rows and an unused complement.
+              const int r = int(idx[0]);
+              const int unused = r < firstRow ? r : r + 16;
+              out[(IndexT)(firstRow + r) * N + n0 + idx[1]] = OutT(v0);
+              out[(IndexT)unused * N + n0 + idx[1]] = OutT(0.0f);
+            } else {
+              out[(IndexT)idx[0] * N + n0 + idx[1]] = OutT(v0);
+              out[(IndexT)(16 + idx[0]) * N + n0 + idx[1]] = OutT(v1);
+            }
+          }
+        }
+        """
+
+    private static let queryWindowKernel = MLXFast.metalKernel(
+        name: "dflash2_pack12_query_window_m32",
+        inputNames: ["x", "mant", "code", "first4", "bases", "offsets", "escapes", "ksz", "confirmed"],
+        outputNames: ["out"], source: queryWindowSource, header: header, ensureRowContiguous: true)
+
+    static let queryWindowEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["BONSAI_DFLASH_QUERY_WINDOW"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    struct QueryWindowChoice {
+        let source: MLXArray
+        let qColumns: Int
+        let tiling: DFlash2TensorMatmul.SwapTiling
+    }
+
+    private static func queryWindowLaunch(
+        _ a: MLXArray, _ c: Copy, confirmed: MLXArray, qColumns: Int,
+        tiling t: DFlash2TensorMatmul.SwapTiling
+    ) -> MLXArray {
+        let n = c.source.dim(0)
+        return queryWindowKernel(
+            [a] + c.arrays + [dims(c.source), confirmed.reshaped([1])],
+            template: [("OutT", DType.bfloat16), ("SPLITS", t.splits),
+                ("IO32", c.index32Safe ? 1 : 0), ("QCOLS", qColumns)]
+                + geometry + [("AHEAD", t.ahead ?? 1)],
+            grid: (n / cols * t.splits * 32, 1, 1), threadGroup: (t.splits * 32, 1, 1),
+            outputShapes: [[32, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func applyQueryWindow(
+        _ x: MLXArray, weight: MLXArray, confirmed: MLXArray, choice: QueryWindowChoice
+    ) -> MLXArray? {
+        guard queryWindowEnabled, DFlash2TensorMatmul.packed32Available,
+            choice.source === weight, x.dtype == .bfloat16, weight.dtype == .bfloat16,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) == 32, x.dim(2) == weight.dim(1),
+            confirmed.size == 1, confirmed.dtype == .int32, let c = copy(of: weight),
+            DFlash2TensorMatmul.swapTiling(k: weight.dim(1), n: weight.dim(0), rows32: true, packed: true)
+                == choice.tiling
+        else { return nil }
+        return queryWindowLaunch(x.reshaped(32, -1), c, confirmed: confirmed,
+            qColumns: choice.qColumns, tiling: choice.tiling).reshaped(1, 32, weight.dim(0))
+    }
+
+    /// Remote startup safeguard on each actual stacked weight, after its
+    /// tiling is settled. Nothing here uses a prompt, expected token or tape.
+    /// Compare the consumed Q and all K/V bits for every confirmed count.
+    /// Retain the original launch on errors, any mismatch or a timing tie.
+    static func prepareQueryWindow(weight: MLXArray, qColumns q: Int) -> QueryWindowChoice? {
+        guard queryWindowEnabled, DFlash2TensorMatmul.packed32Available,
+            weight.ndim == 2, weight.dtype == .bfloat16, q > 0, q < weight.dim(0),
+            q % cols == 0, weight.dim(0) % 32 == 0, weight.dim(1) % 1024 == 0,
+            let c = copy(of: weight)
+        else { return nil }
+        let (k, n) = (weight.dim(1), weight.dim(0))
+        let t = DFlash2TensorMatmul.swapTiling(k: k, n: n, rows32: true, packed: true)
+        guard [2, 4, 8].contains(t.splits), t.fits(k: k), (0 ... 2).contains(t.ahead ?? 1)
+        else { return nil }
+        var same = true
+        let warm = MLXRandom.normal([32, k], key: MLXRandom.key(0x715eed)).asType(.bfloat16)
+        do {
+            try withError { error in
+                for pattern in 0 ..< 3 {
+                    let a: MLXArray
+                    if pattern == 0 {
+                        a = warm
+                    } else if pattern == 1 {
+                        a = (MLXRandom.normal([32, k], key: MLXRandom.key(0x716eed)) * 8)
+                            .asType(.bfloat16)
+                    } else {
+                        let zeroRows = MLXArray(0 ..< Int32(32)).reshaped(32, 1) % 2
+                        a = broadcast(
+                            MLX.where(zeroRows .== 0, MLXArray(Float(-0.0)), MLXArray(Float(0.0))),
+                            to: [32, k]).asType(.bfloat16)
+                    }
+                    let stock = launch(a, c, rows: 32, outputDType: .bfloat16, tiling: t)
+                    eval(a, stock)
+                    for count in 1 ... 16 {
+                        let fast = queryWindowLaunch(a, c, confirmed: MLXArray([Int32(count)]),
+                            qColumns: q, tiling: t)
+                        let sq = stock[count ..< (count + 16), ..<q].view(dtype: .uint16)
+                        let fq = fast[count ..< (count + 16), ..<q].view(dtype: .uint16)
+                        same = same && all(sq .== fq).item(Bool.self)
+                            && all(stock[0..., q...].view(dtype: .uint16)
+                                .== fast[0..., q...].view(dtype: .uint16)).item(Bool.self)
+                        if !same { return }
+                    }
+                }
+                try error.check()
+            }
+        } catch { same = false }
+        guard same else {
+            FileHandle.standardError.write("dflash2 query window: bit check failed; stock kept\n".data(using: .utf8)!)
+            return nil
+        }
+        eval(warm)
+        let counts = [1, 8, 16].map { MLXArray([Int32($0)]) }
+        let builders: [() -> [MLXArray]] = [
+            { counts.map { _ in launch(warm, c, rows: 32, outputDType: .bfloat16, tiling: t) } },
+            { counts.map { queryWindowLaunch(warm, c, confirmed: $0, qColumns: q, tiling: t) } },
+        ]
+        let times = DFlash2LaunchTrial.race(builders, copies: 8, samples: 11)
+        guard times.count == 2, times.allSatisfy({ $0.isFinite && $0 > 0 }), times[1] < times[0] * 0.98
+        else { return nil }
+        // Reverse order in an independent confirmation, so fixed-order bias
+        // or one transient startup fluctuation cannot select this kernel.
+        let confirm = DFlash2LaunchTrial.race(Array(builders.reversed()), copies: 8, samples: 11)
+        guard confirm.count == 2, confirm.allSatisfy({ $0.isFinite && $0 > 0 }), confirm[0] < confirm[1] * 0.98
+        else { return nil }
+        FileHandle.standardError.write(
+            ("dflash2 query window: consumed bits passed for all 16 counts; 32->16 Q rows adopted\n")
+                .data(using: .utf8)!)
+        return QueryWindowChoice(source: weight, qColumns: q, tiling: t)
+    }
 
     private static let encodeKernel = MLXFast.metalKernel(
         name: "dflash2_pack12_encode", inputNames: ["w", "ksz"],
@@ -5299,6 +5543,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // The tiling trial's weights, on the kernel the two self-tests left on.
         DFlash2TensorMatmul.SwapTrial.note(blockWeights, rows32: qkvWeights)
         return DFlash2TensorMatmul.prepareTiled(layerWeights)
+    }
+
+    /// After the deferred tiling trial, before any served request. Each
+    /// attention chooses independently; ordinary proposing remains unchanged.
+    func prepareQueryWindows() -> Bool {
+        var chosen = false
+        for layer in layers { chosen = layer.selfAttn.prepareQueryWindow() || chosen }
+        return chosen
+    }
+
+    func disableQueryWindows() {
+        for layer in layers { layer.selfAttn.disableQueryWindow() }
     }
 
     /// Every array a block forward reads that this drafter owns, in forward
