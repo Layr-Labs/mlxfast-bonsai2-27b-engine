@@ -1703,6 +1703,251 @@ enum DFlash2ResidualNorm {
         ensureRowContiguous: true)
 }
 
+// MARK: - The anchor row join and the first norm in one launch
+
+/// ANCHORNORM: `(join, norm(join))` for the speculative block's embedding
+/// in one launch. Each block starts with the join of the FP16 anchor row,
+/// cast to BF16, and the 15 BF16 mask rows (`DFlash2Concat.anchorJoin`, one
+/// launch), and layer 0's `input_layernorm` (BF16 weight, MLX's
+/// `rms_looped`) reads the joined block straight back: two launches in every
+/// round. This kernel takes `DFlash2ResidualNorm`'s form, one threadgroup
+/// per row with `rms_looped`'s 1024 lanes (four reads per lane, two passes
+/// at 5120). Each lane forms the elements it reads as the join's launch does
+/// (row 0: `static_cast<bfloat16_t>` of the FP16 anchor element; rows 1...:
+/// the mask elements copied), stores them as the block and keeps the stored
+/// BF16 values. The norm is `rms_looped`'s text over them, as RESNORM's:
+/// the same FP32 sum of the widened values in the same order, `simd_sum`
+/// and threadgroup reduction, `precise::rsqrt(t / axis_size + eps)` and
+/// `w * T(x * inv)`. Both outputs have the chain's bits.
+///
+/// Taken only where the join is one launch today: the anchor join's own
+/// self-test passed on this shape at bind (`DFlash2RoundFuse2.anchorReady`;
+/// the join's form is fixed there), and only for the speculative block
+/// (`proposeSpeculative`), whose layer 0 then reads this norm. At bind a
+/// self-test runs the live chain (`DFlash2Concat.anchorJoin`, then layer
+/// 0's norm module with its production weight and eps) and this kernel on
+/// the production mask block and on random BF16 rows (row scales e^-7 to
+/// e^8, a zero row), with every finite FP16 bit pattern as an anchor
+/// element, random anchor rows and an all-zero anchor row (`rsqrt(eps)`),
+/// and compares every bit of both outputs; a mismatch or an MLX error keeps
+/// the chain. `MLXFAST_ANCHOR_NORM_FUSED=0` keeps the chain.
+enum DFlash2AnchorNorm {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_ANCHOR_NORM_FUSED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let width = 5120
+    private static let rows = 16
+    private static let lanes = 1024
+    nonisolated(unsafe) private static let axisSize = MLXArray(UInt32(width))
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var verdict: Bool?
+
+    /// `(anchorJoin(anchor, masks), norm(that))`, or nil for the chain.
+    static func apply(_ anchor: MLXArray, _ masks: MLXArray, norm: RMSNorm)
+        -> (joined: MLXArray, normed: MLXArray)?
+    {
+        guard enabled, DFlash2RoundFuse2.anchorReady, lock.withLock({ verdict }) == true,
+            qualifies(anchor, masks, norm)
+        else { return nil }
+        return launch(anchor, masks, norm)
+    }
+
+    /// Runs the self-test now (bind, after `DFlash2RoundFuse2.prepare`).
+    static func prepare(norm: RMSNorm, maskRow: MLXArray) {
+        guard enabled else { return }
+        lock.withLock {
+            guard verdict == nil else { return }
+            let (passed, summary) = selfTest(norm: norm, maskRow: maskRow)
+            verdict = passed
+            FileHandle.standardError.write(
+                ("dflash2 anchor join and first norm (ANCHORNORM): " + summary
+                    + (passed ? "; one launch\n" : "; chain kept\n")).data(using: .utf8)!)
+        }
+    }
+
+    private static func qualifies(_ anchor: MLXArray, _ masks: MLXArray, _ norm: RMSNorm) -> Bool {
+        ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self)
+            && anchor.dtype == .float16 && anchor.shape == [1, 1, width]
+            && masks.dtype == .bfloat16 && masks.shape == [1, rows - 1, width]
+            && norm.weight.shape == [width] && norm.weight.dtype == .bfloat16
+    }
+
+    private static func launch(_ anchor: MLXArray, _ masks: MLXArray, _ norm: RMSNorm)
+        -> (joined: MLXArray, normed: MLXArray)
+    {
+        let out = kernel(
+            [anchor, masks, norm.weight, MLXArray(norm.eps), axisSize],
+            template: [("T", DType.bfloat16), ("W", width), ("L", rows)],
+            grid: (lanes * rows, 1, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [[1, rows, width], [1, rows, width]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        return (out[0], out[1])
+    }
+
+    private static func selfTest(norm: RMSNorm, maskRow: MLXArray) -> (Bool, String) {
+        guard DFlash2RoundFuse2.anchorReady else { return (false, "the join is not one launch here") }
+        var values = 0
+        var mismatches = 0
+        var failure: String? = nil
+        do {
+            try withError { error in
+                let masks = rows - 1
+                let block = contiguous(broadcast(maskRow.reshaped([1, 1, -1]), to: [1, masks, width]))
+                // Mask row 4 (block row 5) is zero.
+                let row = MLXArray(0 ..< masks).reshaped(1, masks, 1)
+                let random = which(
+                    row .== MLXArray(Int32(4)), Float(0),
+                    MLXRandom.normal([1, masks, width], key: MLXRandom.key(81))
+                        * exp(MLXRandom.uniform(Float(-7) ..< Float(8), [1, masks, 1], key: MLXRandom.key(82)))
+                ).asType(.bfloat16)
+                // Every finite FP16 bit pattern (exponent field below 31) as an anchor element.
+                let finite = (0 ..< 65536).filter { ($0 >> 10) & 31 != 31 }.map { UInt16($0) }
+                let patternRows = (finite.count + width - 1) / width
+                let patterns = (0 ..< patternRows * width).map { finite[$0 % finite.count] }
+                var anchors = (0 ..< patternRows).map {
+                    MLXArray(Array(patterns[($0 * width) ..< (($0 + 1) * width)]), [1, 1, width])
+                        .view(dtype: .float16)
+                }
+                for (k, scale) in [Float(-7), -3, 0, 3, 8].enumerated() {
+                    anchors.append(
+                        (MLXRandom.normal([1, 1, width], key: MLXRandom.key(UInt64(83 + k))) * exp(scale))
+                            .asType(.float16))
+                }
+                anchors.append(MLXArray.zeros([1, 1, width], dtype: .float16))
+                var differ = MLXArray(Int32(0))
+                for anchor in anchors {
+                    for rest in [block, random] {
+                        guard qualifies(anchor, rest, norm),
+                            let joined = DFlash2Concat.anchorJoin(anchor, rest)
+                        else {
+                            failure = "the join or the norm does not take the launch"
+                            return
+                        }
+                        let normed = norm(joined)
+                        let fused = launch(anchor, rest, norm)
+                        guard joined.dtype == fused.joined.dtype, joined.shape == fused.joined.shape,
+                            normed.dtype == fused.normed.dtype, normed.shape == fused.normed.shape
+                        else {
+                            failure = "outputs \(fused.joined.shape) \(fused.normed.shape) vs \(joined.shape) \(normed.shape)"
+                            return
+                        }
+                        differ = differ
+                            + (joined.view(dtype: .uint16) .!= fused.joined.view(dtype: .uint16))
+                            .asType(.int32).sum()
+                            + (normed.view(dtype: .uint16) .!= fused.normed.view(dtype: .uint16))
+                            .asType(.int32).sum()
+                        values += joined.size + normed.size
+                    }
+                }
+                eval(differ)
+                try error.check()
+                mismatches = Int(differ.item(Int32.self))
+            }
+        } catch {
+            failure = "\(error)"
+        }
+        if let failure { return (false, "self-test error: \(failure)") }
+        let passed = mismatches == 0 && values > 0
+        return (
+            passed,
+            "self-test \(passed ? "passed" : "FAILED"): \(values) values compared bitwise (BF16 blocks "
+                + "and norms; every finite FP16 bit pattern as an anchor element), \(mismatches) mismatches")
+    }
+
+    // grid (1024 * L, 1, 1), threadgroup (1024, 1, 1): one threadgroup per
+    // row of the batch-1 block. Inputs: anchor half [1, 1, W], masks T
+    // [1, L - 1, W], w T [W], eps, axis_size. Outputs: out T [1, L, W] (the
+    // joined block), normed T [1, L, W].
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_anchor_join_norm",
+        inputNames: ["anchor", "masks", "w", "eps", "axis_size"],
+        outputNames: ["out", "normed"],
+        source: """
+            constexpr uint NR = 4;
+            constexpr uint LS = 1024;
+            constexpr uint NP = (uint(W) + LS * NR - 1) / (LS * NR);
+            static_assert(W % 4 == 0 && W > 4096 && W <= 8192, "rms_looped width, two passes");
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint ro = row * uint(W);
+
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            // The join's elements for the ones rms_looped's lane reads (pass
+            // p: p * 4096 + 4 * lid + i): row 0 the FP16 anchor cast as the
+            // join's launch casts it, rows 1... the mask rows; stored, and the
+            // stored values kept as T.
+            T xv[NP * NR];
+            DFLASH2_AN_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint c = p * LS * NR + lid * NR;
+              if (c + NR <= uint(W)) {
+                if (row == 0) {
+                  DFLASH2_AN_UNROLL for (uint i = 0; i < NR; i++) {
+                    const T v = static_cast<bfloat16_t>(anchor[c + i]);
+                    out[c + i] = v;
+                    xv[p * NR + i] = v;
+                  }
+                } else {
+                  const device T* m = masks + (row - 1u) * uint(W) + c;
+                  DFLASH2_AN_UNROLL for (uint i = 0; i < NR; i++) {
+                    const T v = m[i];
+                    out[ro + c + i] = v;
+                    xv[p * NR + i] = v;
+                  }
+                }
+              }
+            }
+
+            // rms_looped's sum of squares of the stored row, widened at its read.
+            float acc = 0;
+            DFLASH2_AN_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint c = p * LS * NR + lid * NR;
+              if (c + NR <= uint(W)) {
+                DFLASH2_AN_UNROLL for (uint i = 0; i < NR; i++) {
+                  const float xi = xv[p * NR + i];
+                  acc += xi * xi;
+                }
+              }
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) {
+              local_sums[lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              local_sums[sg] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float t = simd_sum(local_sums[lane]);
+              if (lane == 0) {
+                local_inv[0] = metal::precise::rsqrt(t / axis_size + eps);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv[0];
+
+            // rms_looped's output `w * T(x * inv)`.
+            DFLASH2_AN_UNROLL for (uint p = 0; p < NP; p++) {
+              const uint c = p * LS * NR + lid * NR;
+              if (c + NR <= uint(W)) {
+                DFLASH2_AN_UNROLL for (uint i = 0; i < NR; i++) {
+                  normed[ro + c + i] = w[c + i] * static_cast<T>(xv[p * NR + i] * inv);
+                }
+              }
+            }
+            """,
+        header: "#define DFLASH2_AN_UNROLL _Pragma(\"clang loop unroll(full)\")\n",
+        ensureRowContiguous: true)
+}
+
 // MARK: - The decoder layer
 
 /// The gate and up projections' weights stacked along the output axis: the
@@ -5843,6 +6088,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         pairs += zip(layers, layers.dropFirst()).map { ($0.mlpConv, $1.inputLayerNorm, 0) }
         if let last = layers.last { pairs.append((last.mlpConv, norm, 1)) }
         DFlash2ResidualNorm.prepare(pairs)
+        if let first = layers.first {
+            DFlash2AnchorNorm.prepare(norm: first.inputLayerNorm, maskRow: maskEmbedding)
+        }
     }
 
     /// `DFlash2SpeculativeFront`'s self-tests and trial for blocks of
@@ -6029,6 +6277,14 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     /// `[anchor; masks]` embedded (the anchor `[B, 1]`, host or device ids).
     func blockEmbedding(anchorIDs: MLXArray, maskColumns cols: Int) throws -> MLXArray {
+        try blockEmbedding(anchorIDs: anchorIDs, maskColumns: cols, norm: nil).joined
+    }
+
+    /// `blockEmbedding`, and with `norm` the block's `norm` from the join's
+    /// own launch where `DFlash2AnchorNorm` applies (`normed` nil otherwise).
+    func blockEmbedding(anchorIDs: MLXArray, maskColumns cols: Int, norm: RMSNorm?) throws
+        -> (joined: MLXArray, normed: MLXArray?)
+    {
         guard let target, let maskEmbedding = maskTokenEmbedding else {
             throw DFlash2Error.notBound
         }
@@ -6054,12 +6310,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 cachedMaskEmbeddingBlock = (cols: cols, array: repeatedMasks)
             }
         }
+        if let norm, batch == 1, dtype == .bfloat16,
+            let both = DFlash2AnchorNorm.apply(anchorRow, repeatedMasks, norm: norm)
+        {
+            return (both.joined, both.normed)
+        }
         if batch == 1, dtype == .bfloat16, DFlash2RoundFuse2.anchorReady,
             let joined = DFlash2Concat.anchorJoin(anchorRow, repeatedMasks)
         {
-            return joined
+            return (joined, nil)
         }
-        return DFlash2Concat.concatenate([anchorRow.asType(dtype), repeatedMasks], axis: 1)
+        return (DFlash2Concat.concatenate([anchorRow.asType(dtype), repeatedMasks], axis: 1), nil)
     }
 
     /// `hiddenNorm(fc(rows))`. `BONSAI_DRAFT_CONTEXT_PAD16=1` (validation aid)
@@ -6193,8 +6454,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let caches = cache.map { $0 as! DFlash2BlockKVCache }
         let n = 2 * blockSize
-        var h = try blockEmbedding(anchorIDs: anchor.reshaped([1, 1]), maskColumns: blockSize - 1)
-            .asType(dtype)
+        // ANCHORNORM: layer 0's input norm from the join's launch where it
+        // applies (no scale between the two).
+        let embedded = try blockEmbedding(
+            anchorIDs: anchor.reshaped([1, 1]), maskColumns: blockSize - 1,
+            norm: config.dflash.inputEmbeddingScale == 1 ? layers.first?.inputLayerNorm : nil)
+        var h = embedded.joined.asType(dtype)
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
@@ -6229,8 +6494,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             ? min(max(leadingLayers, 0), layers.count) : 0
         var stage: MLXArray?
         // Each layer's output norm (the next input norm; the final norm of
-        // rows 1...) from its last tap's launch where `DFlash2ResidualNorm` applies.
-        var normed: MLXArray?
+        // rows 1...) from its last tap's launch where `DFlash2ResidualNorm` applies;
+        // layer 0's from the join's where `DFlash2AnchorNorm` does.
+        var normed: MLXArray? = embedded.normed
         for (index, layer) in layers.enumerated() {
             let next = index + 1 < layers.count ? (layers[index + 1].inputLayerNorm, 0) : (norm, 1)
             guard
