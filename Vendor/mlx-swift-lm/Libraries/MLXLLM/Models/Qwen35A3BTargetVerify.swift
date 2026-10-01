@@ -4840,3 +4840,5 @@ enum Qwen35ExactFormTrial {
         line += String(format: "; confirmed %.1f vs %.1f; ", again[1], again[0]) + "\(tiles[best]) installed"
     }
 }
+
+// Re-read of the record's tree (2026-10-01T04:12Z).
