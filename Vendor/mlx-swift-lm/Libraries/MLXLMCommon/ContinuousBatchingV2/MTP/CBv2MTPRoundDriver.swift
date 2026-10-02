@@ -131,10 +131,6 @@ final class CBv2MTPRoundInFlight {
         let blockContext: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
-        /// `CBv2DW2`, block drafter, no shortlist: the packet's leading
-        /// `[B * k]` draft ids, kept as their own (already evaluated) array;
-        /// `acceptancePacket` then holds the target ids alone.
-        var packetDrafts: MLXArray? = nil
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

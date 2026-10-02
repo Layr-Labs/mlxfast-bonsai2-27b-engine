@@ -3605,6 +3605,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let tokens = step.sampledTokens {
             host = tokens.asArray(Int32.self)
             CBv2CoreInstrumentation.recordHostSync()
+            // The seed-gap side queue's touches (issued by a prompt forward)
+            // are all committed before any token of this step is emitted, so
+            // nothing of theirs outlives `free_decode_begin`. One lock when
+            // the queue is idle, which it is unless a commit outlasted the
+            // prompt's GPU work (`CBv2SideQueue.settle`, bounded).
+            CBv2SideQueue.settle()
         } else if !step.evalTargets.isEmpty {
             eval(step.evalTargets)
             CBv2CoreInstrumentation.recordHostSync()

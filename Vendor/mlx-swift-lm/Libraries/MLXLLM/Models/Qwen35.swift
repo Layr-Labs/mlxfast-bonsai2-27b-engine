@@ -685,8 +685,14 @@ enum Qwen35GatedDeltaV3 {
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int i = 0; i < R; i += 4) {
+            // Same 16 floats as the scalar i-loop; dk0 is a multiple of R=16 so
+            // each quartet is 16-byte aligned. Matches the float4 state_out store.
+            const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));
+            state[d][i] = s4.x;
+            state[d][i + 1] = s4.y;
+            state[d][i + 2] = s4.z;
+            state[d][i + 3] = s4.w;
           }
         }
         float kr[R];
@@ -911,12 +917,22 @@ enum Qwen35GatedDeltaV3 {
     /// then never materialized. The same values (+0.0f) enter the same
     /// arithmetic. Derived from `source` so the stock kernel stays as it is.
     private static let freshSource: String = {
-        let load = "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];"
+        // Float4 initial load: replace the unique device load with four zeros.
+        // The i-loop already steps by 4 (same as the float4 state_out store).
+        let load =
+            "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));"
+        let zero =
+            "state[d][i] = 0.0f; state[d][i + 1] = 0.0f; state[d][i + 2] = 0.0f; state[d][i + 3] = 0.0f;"
         precondition(
             source.components(separatedBy: load).count == 2,
             "Qwen35 GDN v3: the fresh-state source no longer matches the stock kernel")
-        let text = source.replacingOccurrences(of: load, with: "state[d][i] = 0.0f;")
+        var text = source.replacingOccurrences(of: load, with: zero)
+        text = text.replacingOccurrences(of: "state[d][i] = s4.x;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 1] = s4.y;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 2] = s4.z;", with: "")
+        text = text.replacingOccurrences(of: "state[d][i + 3] = s4.w;", with: "")
         precondition(!text.contains("state_in"))
+        precondition(!text.contains("s4"))
         return text
     }()
 
@@ -1096,8 +1112,8 @@ enum Qwen35GDNReplayBatch {
             ("device float* y_ = y;", ""),
             ("y[0] = 0.f;", "(void)0;"),
             (
-                "state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];",
-                "state[d][i] = s_[(hv_idx * Dv + dvbase + d) * Dk + dk0 + i];"
+                "const float4 s4 = *((const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0 + i));",
+                "const float4 s4 = *((const device float4*)(s_ + (hv_idx * Dv + dvbase + d) * Dk + dk0 + i));"
             ),
             (
                 "const float gt = g_[0];",
@@ -2920,6 +2936,9 @@ final class Qwen35GatedDeltaNet: Module {
             let packed = outProj as? HadamardQuantizedLinear, packed.gdnLayout == nil,
             packed.transform.width == numVHeads * headVDim
         {
+            // A full verify window: the gated norm formed in out_proj's
+            // quantizing rotation (`Qwen35GDNNormFold`), the same values.
+            if let y = Qwen35GDNNormFold.apply(self, packed, out, gate: gate) { return y }
             // At verify width on the int8 route: the norm and the gated tail
             // in one launch (`Qwen35GatedNormTail`), the same values.
             if HadamardQuantizedLinear.tensorRouteTakesNarrowRows(B * S),
@@ -2999,6 +3018,7 @@ final class Qwen35GatedDeltaNet: Module {
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim, ks: convKernelSize,
             hidden: hiddenSize)
         Qwen35GDNFullAcceptStore.prepare(layer: self)
+        Qwen35GDNNormFold.register(self)
         Qwen35GatedDeltaChunked.prepareFresh(
             hk: numKHeads, dk: headKDim, hv: numVHeads, dv: headVDim)
     }
@@ -4515,6 +4535,13 @@ final class Qwen35Attention: Module {
             {
                 return y
             }
+            // A full verify window on the int8 route: the gate formed in
+            // o_proj's quantizing rotation (`Qwen35ProducerFold`), the same values.
+            if !exactTargetVerify,
+                let y = Qwen35ProducerFold.sigmoidGate(oProj, attended, qSplit[1])
+            {
+                return y
+            }
             // The int8 verify route (neither form above takes it): the gate and
             // the projection's signs in one elementwise launch that reads the
             // head-transposed output and the gate half of each q|gate head
@@ -4829,6 +4856,7 @@ extension Qwen3NextMLP {
             {
                 return y
             }
+            if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return y }
             let signed = Qwen35FusedElementwise.swigluSigned(
                 shared[0], shared[1], down.transform.signVector)
             return down.forwardPreSigned(signed, widenOutput: false)
@@ -4862,6 +4890,7 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return y
         }
+        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return y }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return down.forwardPreSigned(signed, widenOutput: false)
@@ -4902,6 +4931,7 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return (boundary.h, y)
         }
+        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return (boundary.h, y) }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
@@ -4944,6 +4974,7 @@ extension Qwen3NextMLP {
         if let y = down.applyAfterSwiGLU(gate: shared[0], up: shared[1], widenOutput: false) {
             return (boundary.h, y)
         }
+        if let y = Qwen35ProducerFold.swiglu(down, shared[0], shared[1]) { return (boundary.h, y) }
         let signed = Qwen35FusedElementwise.swigluSigned(
             shared[0], shared[1], down.transform.signVector)
         return (boundary.h, down.forwardPreSigned(signed, widenOutput: false))
@@ -5013,6 +5044,7 @@ final class Qwen35DecoderLayer: Module {
         )
 
         super.init()
+        Qwen35ProducerFold.register(self)
     }
 
     func callAsFunction(
@@ -5078,14 +5110,20 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
             if captureRecurrentWindow {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2ForwardCaptured(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState,
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                     exactTargetVerify: exactTargetVerify)
             } else {
+                // Layer 0 norms the FP16 embedding in one launch
+                // (`Qwen35HalfInputNorm`).
                 r = linearAttn!.cbv2Forward(
-                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState)
+                    (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(x, inputLayerNorm) : nil)
+                        ?? inputLayerNorm(x),
+                    modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
             }
         } else {
             guard let attentionCache else {
@@ -5207,13 +5245,21 @@ final class Qwen35DecoderLayer: Module {
                 boundary = fusedInputBoundary(x, pending)
                 input = boundary?.h ?? (x + pending)
             }
+        } else if captureRecurrentWindow, modelLayerIndex == 0, isLinear {
+            // Layer 0's norm of the FP16 embedding and its quantized rotation
+            // in one launch (`Qwen35Layer0InputGlue`).
+            boundary = Qwen35Layer0InputGlue.apply(x, inputLayerNorm, inputRotationSiblings)
         }
         let quantized = boundary?.activation
         let rotated = verifyBoundary?.rotated
         // The GDN's b|a read the kernel's norm output; with a quantized input
         // the attention reads only the norm's shape (the node is not evaluated
-        // unless a projection falls back to it).
-        let layerInput = boundary?.normed ?? verifyBoundary?.normed ?? inputLayerNorm(input)
+        // unless a projection falls back to it). Layer 0 norms the FP16
+        // embedding in one launch (`Qwen35HalfInputNorm`).
+        let layerInput =
+            boundary?.normed ?? verifyBoundary?.normed
+            ?? (modelLayerIndex == 0 ? Qwen35HalfInputNorm.apply(input, inputLayerNorm) : nil)
+            ?? inputLayerNorm(input)
         if lastRowOnly, !isLinear, input.dim(1) > 1, positionIds == nil,
             let attentionCache, attentionCache is any CBv2LastQueryPrefillLayerCache
         {
@@ -5654,7 +5700,8 @@ public class Qwen35TextModelInner: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        lastRowOnly: Bool = false
+        lastRowOnly: Bool = false,
+        finalAdd: ((MLXArray, MLXArray) -> MLXArray?)? = nil
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -5833,24 +5880,8 @@ public class Qwen35TextModelInner: Module {
             Qwen35PromptEmbeddingHostGather.touch(embedTokens)
         }
         if let p = pending {
-            // `CBv2DW2`, capture verify: the last residual add, the final norm
-            // and the head's quantizing rotation as the fused boundary every
-            // other layer boundary takes (one launch for the add, the norm's
-            // cast, `rms_looped` and the rotation); the head reads the
-            // activation (`cbv2ForwardWithHiddenCaptured`).
-            if captureRecurrentWindow, let head = dFlash2Tap.head,
-                ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self),
-                sharedHadamardTensorRouteTakesNarrowInt8(
-                    [head], rows: hiddenStates.size / max(hiddenStates.dim(-1), 1)),
-                let boundary = Qwen35FusedBoundaryQ8.apply(
-                    hiddenStates, p, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
-                    transform: head.transform, gainSigned: false, writeNormed: false)
-            {
-                hiddenStates = boundary.h
-                dFlash2Tap.headInput = (boundary.h, boundary.activation)
-            } else {
-                hiddenStates = hiddenStates + p
-            }
+            // A verify window's last add may also form its final norm (`finalAdd`).
+            hiddenStates = (verifyPending ? finalAdd?(hiddenStates, p) : nil) ?? (hiddenStates + p)
         }
         if let slot = pendingTapSlot {
             tapped[slot] = hiddenStates
@@ -5859,13 +5890,10 @@ public class Qwen35TextModelInner: Module {
             dFlash2Tap.tappedHidden = nil
         } else {
             let parts = tapped.map { $0! }
-            // Only the prompt observation changes dtype (and, with `CBv2DW2`,
-            // the verify window's: every reader of it casts it to the
-            // drafter's BF16 first, so the join stores that cast and the
-            // speculative block's own cast pass is gone). Target residuals
-            // and context submission boundaries stay put.
+            // Only the prompt observation changes dtype. Target residuals,
+            // verify observations and context submission boundaries stay put.
             dFlash2Tap.tappedHidden =
-                (dFlash2PromptTapBF16 && (promptForward || (CBv2DW2.enabled && captureRecurrentWindow))
+                (dFlash2PromptTapBF16 && promptForward
                     ? Qwen35PromptTapJoin.join(parts) : nil)
                 ?? DFlash2Concat.concatenate(parts, axis: -1)
         }
@@ -7177,7 +7205,7 @@ enum Qwen35FusedHadamard {
         return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
-    private static let header = """
+    static let header = """
         // MLX `Sigmoid` (unary_ops.h), verbatim.
         METAL_FUNC float bonsai_sigmoid(float x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -7209,7 +7237,7 @@ enum Qwen35FusedHadamard {
     // grid: (64 * blocks, 1, 1), threadgroup (64, 1, 1); one threadgroup per
     // 1024-wide block. Template: InT, OutT, W (row width), BPR (blocks per
     // row), PRESIGNED, GR (GDN repeats, 1 = identity), GKH, GD.
-    private static let source = """
+    static let source = """
         constexpr short N = 1024;
         constexpr short NT = 64;
         const uint blk = threadgroup_position_in_grid.x;
@@ -7526,6 +7554,7 @@ enum Qwen35FusedHadamard {
         guard enabled, !installed else { return }
         installed = true
         installInverse()
+        Qwen35EmbeddingRows.install()
         SignedBlockHadamard.fusedTransform = { x, signs, blockSize, preSigned, gdnLayout, outputDType in
             guard blockSize == 1024, x.ndim >= 1,
                 [DType.float32, .float16, .bfloat16].contains(x.dtype),
@@ -7609,6 +7638,28 @@ enum Qwen35FusedHadamard {
                 outputDTypes: [Qwen35TensorPackedMatmul.codesDType, .float32, .float32])
             return SignedBlockHadamard.Int8Activation(
                 codes: outputs[0], scales: outputs[1], scaledSums: outputs[2])
+        }
+        // The drafter head's BF16 rows, padded to `paddedRows` in the read
+        // (`Qwen35RotationQ8Blocks.launchPadded`): the template above with
+        // the BF16 input, at the padded row count. Nil keeps the FP32 cast and
+        // the zero-row concatenation.
+        SignedBlockHadamard.fusedTransformInt8Padded = {
+            x, signs, blockSize, preSigned, groupSize, paddedRows in
+            guard groupSize == 128, blockSize == 1024, x.ndim == 2, x.dtype == .bfloat16,
+                signs.dtype == .float32
+            else { return nil }
+            let width = x.dim(1)
+            guard width % 1024 == 0, signs.size == width else { return nil }
+            let template: [(String, any KernelTemplateArg)] = [
+                ("InT", x.dtype), ("OutT", Qwen35TensorPackedMatmul.codesDType), ("W", width),
+                ("BPR", width / 1024), ("SIGNED", Qwen35TensorPackedMatmul.signedCodes ? 1 : 0),
+                ("PRESIGNED", preSigned ? 1 : 0), ("GR", 1), ("GKH", 1), ("GD", 1),
+                ("QSIM", 0), ("PERM", Qwen35TensorPackedMatmul.support == .staged8 ? 1 : 0),
+                ("MPERM", Qwen35TensorPackedMatmul.rowTiledConstants && paddedRows % 64 == 0 ? 1 : 0),
+            ]
+            return Qwen35RotationQ8Blocks.launchPadded(
+                x, signs, template: template, paddedRows: paddedRows, width: width,
+                codesDType: Qwen35TensorPackedMatmul.codesDType, preSigned: preSigned)
         }
         SignedBlockHadamard.fusedTransformWithGroupSums = {
             x, signs, blockSize, preSigned, gdnLayout, outputDType, groupSize in
@@ -10200,36 +10251,38 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
-        let fusedHead =
-            CBv2DW2.enabled && !model.exactTargetVerify
-            ? (lmHead as? HadamardQuantizedLinear).flatMap {
-                Qwen35HeadBoundary.verified($0, norm: model.norm) ? $0 : nil
-            } : nil
-        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (fusedHead, nil)
+        // The last residual add, its FP32 promotion and the final norm in one
+        // launch (`Qwen35FinalNormGlue`), or the add and the head's quantized
+        // input (`Qwen35HeadInputGlue`); the forward returns the kernel's sum.
+        var glued: MLXArray? = nil
+        var headInput: Qwen35HeadInputGlue.Input? = nil
+        let norm = model.norm
+        let head = model.exactTargetVerify ? nil : lmHead
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let headInput = model.dFlash2Tap.headInput
-        (model.dFlash2Tap.head, model.dFlash2Tap.headInput) = (nil, nil)
-        let normalized = model.norm(hidden)
+            captureRecurrentWindow: true,
+            finalAdd: Qwen35FinalNormGlue.enabled || Qwen35HeadInputGlue.enabled
+                ? { h, p in
+                    if let input = Qwen35HeadInputGlue.apply(h, p, norm, head) {
+                        headInput = input
+                        return input.sum
+                    }
+                    guard let out = Qwen35FinalNormGlue.apply(h, p, norm) else { return nil }
+                    glued = out.normed
+                    return out.sum
+                } : nil)
+        if let headInput {
+            return (Qwen35HeadTopTwo.capture { headInput.logits { model.norm(hidden) } }, hidden)
+        }
+        let normalized = glued ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             // The head's fused top two rides beside the lazy logits where the
             // int8 route takes the rows and it is on (`Qwen35HeadTopTwo`).
             logits = model.exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : Qwen35HeadTopTwo.capture {
-                    // `CBv2DW2`: the same route matmul on the boundary's
-                    // activation (what `lmHead(normalized)` quantizes to).
-                    if let fusedHead, let input = headInput, input.h === hidden,
-                        let routed = sharedHadamardProjectionsQuantized(
-                            input.activation, leading: Array(hidden.shape.dropLast()), [fusedHead])
-                    {
-                        return routed[0]
-                    }
-                    return lmHead(normalized)
-                }
+                : Qwen35HeadTopTwo.capture { lmHead(normalized) }
         } else if model.exactTargetVerify, normalized.dim(1) > 1 {
             logits = qwen35A3BTimewiseProjection(normalized) {
                 model.embedTokens.asLinear($0)
@@ -10238,53 +10291,6 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             logits = model.embedTokens.asLinear(normalized)
         }
         return (logits, hidden)
-    }
-}
-
-/// `CBv2DW2`: the capture verify's final boundary feeding the head
-/// (`Qwen35TextModelInner.cbv2Forward`), proven once on first use (the
-/// load-time verify warm): every bit of `h` and of the 16-row logits against
-/// `head(norm(x + r))` on random rows. A failure keeps the composed path.
-enum Qwen35HeadBoundary {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdict: Bool?
-
-    static func verified(_ head: HadamardQuantizedLinear, norm: RMSNorm) -> Bool {
-        guard sharedHadamardTensorRouteTakesNarrowInt8([head], rows: 16) else { return false }
-        return lock.withLock {
-            if let verdict { return verdict }
-            var same = false
-            do {
-                try withError { error in
-                    let keys = MLXRandom.split(key: MLXRandom.key(0x6862_6f75), into: 3)
-                    let shape = [1, 16, norm.weight.dim(0)]
-                    let x = (MLXRandom.normal(shape, key: keys[0]) * 2).asType(.float16)
-                    let r = (MLXRandom.normal(shape, key: keys[1])
-                        * MLXRandom.uniform(Float(0.01) ..< Float(8), [1, 16, 1], key: keys[2]))
-                        .asType(.float16)
-                    let h = x + r
-                    let reference = head(norm(h))
-                    guard
-                        let b = Qwen35FusedBoundaryQ8.apply(
-                            x, r, gain: norm.weight, unsignedGain: norm.weight, eps: norm.eps,
-                            transform: head.transform, gainSigned: false, writeNormed: false),
-                        let fused = sharedHadamardProjectionsQuantized(b.activation, leading: [1, 16], [head])?
-                            .first, fused.shape == reference.shape, fused.dtype == .float32
-                    else { return }
-                    same = all(fused.view(dtype: .uint32) .== reference.view(dtype: .uint32)).item(Bool.self)
-                        && all(b.h.view(dtype: .uint16) .== h.view(dtype: .uint16)).item(Bool.self)
-                    try error.check()
-                }
-            } catch {
-                same = false
-            }
-            verdict = same
-            FileHandle.standardError.write(
-                Data(("bonsai verify head boundary: "
-                    + (same ? "self-test passed (h and 16 x vocabulary logits bitwise); fused\n"
-                        : "self-test failed; composed final norm kept\n")).utf8))
-            return same
-        }
     }
 }
 
