@@ -114,6 +114,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         text.model.dFlash2PromptTapBF16 =
             drafter.dtype == .bfloat16 && Qwen35PromptTapJoin.prepare()
         let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        CBv2AcceptGlue.prepare()
         assistant.establishSpeculation()
         assistant.warmSpeculativeShapes(serving: target)
         return assistant
@@ -987,15 +988,23 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockLeadingSubmission, CBv2MT
         let targets = drafts == nil ? packet[k ..< (2 * k + 1)] : packet
         let draftIDs = drafts ?? packet[0 ..< k]
         let walk = CBv2DW2.enabled ? DFlash2AcceptWalk.launch(drafts: draftIDs, targets: targets, k: k) : nil
-        let accepted = walk != nil ? nil
+        // ACCGLUE/WALK1: when the packet still carries `[drafts | targets]`,
+        // one launch counts the leading matches and writes the anchor (the
+        // cast-free chain when only the packet glue proved itself).
+        let glued: (anchor: MLXArray, confirmed: MLXArray)? =
+            walk == nil && drafts == nil
+            ? (CBv2AcceptGlue.walk(packet, depth: k)
+                ?? CBv2AcceptGlue.chainWalk(packet, depth: k))
+            : nil
+        let accepted = walk != nil || glued != nil ? nil
             : cumprod((draftIDs[0 ..< k] .== targets[0 ..< k]).asType(.int32), axis: 0)
                 .sum().asType(.int32)
         // The block is the next round's: built with that round's kernel.
         let kernelTag = DFlash2KernelTrial.aheadOfRound()
         guard
             let block = try? drafter.proposeSpeculative(
-                anchor: walk?.anchor ?? targets.take(accepted!.reshaped([1]), axis: 0),
-                confirmed: walk?.confirmed ?? (accepted! + MLXArray(Int32(1))),
+                anchor: walk?.anchor ?? glued?.anchor ?? targets.take(accepted!.reshaped([1]), axis: 0),
+                confirmed: walk?.confirmed ?? glued?.confirmed ?? (accepted! + MLXArray(Int32(1))),
                 verifyContext: verifyContext,
                 contextRows: plan.classes[state.lastConfirmed ?? (k + 1)],
                 cache: state.caches, blockSize: k + 1, leadingLayers: leadingLayersBeforeReadback,

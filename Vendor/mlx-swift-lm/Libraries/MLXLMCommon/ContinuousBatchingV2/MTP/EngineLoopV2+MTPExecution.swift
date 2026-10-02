@@ -846,7 +846,8 @@ extension EngineLoopV2 {
             CBv2DW2.enabled && blockDraftIDs != nil && target.shortlist == nil
             ? packetParts[0] : nil
         let acceptancePacket =
-            packetDrafts != nil ? packetParts[1] : concatenated(packetParts, axis: 0)
+            packetDrafts != nil ? packetParts[1]
+            : CBv2AcceptGlue.packet(packetParts) ?? concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
