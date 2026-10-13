@@ -566,6 +566,10 @@ public struct EngineBuild: Sendable {
     /// `.paged`; a contiguous build has no pages to describe.
     public var pagedPool: PagedPoolPlan
     public var environment: [String: String]
+    /// Exact-prefix recurrent checkpoint cache for hybrid models (the
+    /// engine's `hybridPrefixCache`). Separate from `prefixCache`, which is
+    /// KV-only and cannot restore recurrent layers. nil keeps it off.
+    public var hybridPrefixCache: CBv2HybridPrefixCacheConfig? = nil
 
     public init(
         kvBackend: KVBackendKind,
@@ -1040,7 +1044,8 @@ public enum RunnerEngineAssembly {
         }
 
         var schedulerConfig = build.schedulerConfig
-        schedulerConfig.enablePrefixCache = build.prefixCache != nil
+        schedulerConfig.enablePrefixCache =
+            build.prefixCache != nil || build.hybridPrefixCache != nil
 
         // A BLOCK drafter reads the TARGET's hidden state at named layers, so
         // the target has to keep those layers on every forward. Arm that tap
@@ -1061,6 +1066,7 @@ public enum RunnerEngineAssembly {
             schedulerConfig: schedulerConfig,
             loopConfig: build.loopConfig,
             prefixCache: build.prefixCache,
+            hybridPrefixCache: build.hybridPrefixCache,
             mtpDrafter: build.decoder == .serial ? nil : mtpDrafter,
             mtpConfig: build.decoder == .serial
                 ? CBv2MTPConfig(enabled: false) : build.mtpConfig)
