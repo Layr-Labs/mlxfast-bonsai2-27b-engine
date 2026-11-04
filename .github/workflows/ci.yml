@@ -92,10 +92,10 @@ jobs:
         # below is 1.7.12 -- the same one the retired digest resolved to, so
         # this is a mechanism change and not a version change.
         #
-        # 1.7.7 and older do not know the macos-26 runner label and reject the
-        # swift job's runs-on, hence the floor on the version. Bump the version
-        # and the checksum together; the checksum is the matching line from
-        # that release's actionlint_<version>_checksums.txt.
+        # 1.7.12 does not know GitHub's xcode-27 runner label, which the swift
+        # job uses, so .github/actionlint.yaml declares it. Bump the version and
+        # the checksum together; the checksum is the matching line from that
+        # release's actionlint_<version>_checksums.txt.
         env:
           ACTIONLINT_VERSION: 1.7.12
           # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
@@ -302,7 +302,7 @@ jobs:
 
   swift:
     name: swift build + test (hosted macOS, no GPU)
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 120
     env:
       # Explicit, not incidental: the GPU-dependent tests are OFF on this
@@ -317,6 +317,47 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Select Xcode 27.2
+        # The ranked boxes build with Xcode 27.2, release build 27B52 (macOS
+        # SDK 27.2, Apple Swift 6.4.2). This job selects the same release, so
+        # a green run says that the code compiles with the box compiler. The
+        # xcode-27 image carries more than one Xcode, and its default is not
+        # always 27.2, so the step always selects one. It uses, in this order:
+        # an installed Xcode that reports 27.2 (27B52); another 27.2 build, for
+        # example a release candidate, with a warning that names it. It fails
+        # when no installed Xcode reports 27.2.
+        run: |
+          set -euo pipefail
+          want_version="27.2"
+          want_build="27B52"
+          exact=""
+          other=""
+          for app in /Applications/Xcode*.app; do
+            [ -x "${app}/Contents/Developer/usr/bin/xcodebuild" ] || continue
+            version=""
+            build=""
+            read -r version build < <(DEVELOPER_DIR="${app}/Contents/Developer" xcodebuild -version 2>/dev/null \
+              | awk 'NR == 1 { v = $2 } /^Build version/ { b = $3 } END { print v, b }') || true
+            echo "  ${app}: Xcode ${version:-unknown} (${build:-unknown})"
+            if [ "${version}" = "${want_version}" ] && [ "${build}" = "${want_build}" ] && [ -z "${exact}" ]; then
+              exact="${app}"
+            elif [ "${version}" = "${want_version}" ] && [ -z "${other}" ]; then
+              other="${app}"
+            fi
+          done
+          if [ -n "${exact}" ]; then
+            selected="${exact}"
+          elif [ -n "${other}" ]; then
+            selected="${other}"
+            echo "::warning title=Xcode ${want_build} not installed::No installed Xcode reports Xcode ${want_version} (${want_build}); this job uses ${selected}"
+          else
+            echo "::error::No installed Xcode reports Xcode ${want_version}" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "${selected}/Contents/Developer"
+          xcodebuild -version
+          echo "macOS SDK $(xcrun --sdk macosx --show-sdk-version)"
 
       - name: Toolchain preflight
         run: |
@@ -501,7 +542,11 @@ jobs:
           # --force-resolved-versions on every invocation: the dependency graph
           # is frozen and a bare build can silently rewrite Package.resolved.
           # The tee is what the warning gate reads; keep the pipefail.
-          swift build --build-tests --force-resolved-versions 2>&1 | tee swift-build.log
+          # --build-system native: the default backend of Swift 6.4 (Swift Build) prints
+          # no "Compiling" lines, which tools/ci-swift-warning-gate.sh needs, and it
+          # compiles the vendored .metal sources itself. tools/build-mlx-metallib.sh
+          # builds the metallib. Ruled 2026-11-04.
+          swift build --build-system native --build-tests --force-resolved-versions 2>&1 | tee swift-build.log
 
       - name: First-party warnings are errors
         run: tools/ci-swift-warning-gate.sh swift-build.log
@@ -531,7 +576,7 @@ jobs:
 
       - name: Unit tests (no Metal runtime, no checkpoint)
         # --no-parallel is load-bearing, not a preference: parallel `swift
-        # test` on the macos-26 image wedges before completing a single test
+        # test` on the macos-26 image wedged before completing a single test
         # (every task "started" within ~100ms, none ever finishes -- the
         # actions/runner-images#13143 signature), while the identical tree and
         # toolchain run the parallel suite green in under a second on real
@@ -544,7 +589,7 @@ jobs:
         # vendored-MLX cold build. The serial gated suite itself finishes in
         # low single-digit minutes.
         timeout-minutes: 20
-        run: swift test --force-resolved-versions --no-parallel
+        run: swift test --build-system native --force-resolved-versions --no-parallel
 
       - name: Declare what this run did NOT cover
         if: always()

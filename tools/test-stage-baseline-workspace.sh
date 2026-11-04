@@ -55,8 +55,8 @@ else
   # The documented build: both swift builds, the metallib, the stager, the
   # tree's own transform.
   for needle in \
-    "swift build -c release --force-resolved-versions --product mlxfast-swift" \
-    "swift build -c release --force-resolved-versions --scratch-path .build-worker --product bench-worker" \
+    "swift build --build-system native -c release --force-resolved-versions --product mlxfast-swift" \
+    "swift build --build-system native -c release --force-resolved-versions --scratch-path .build-worker --product bench-worker" \
     "tools/build-mlx-metallib.sh" \
     "tools/stage-bench-worker.sh" \
     "mlxfast-swift transform --reference"

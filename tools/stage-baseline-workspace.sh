@@ -170,8 +170,12 @@ git_target checkout --quiet --detach "${REFERENCE_COMMIT}"
 # 2. The documented build: the trusted CLI, then the worker under its OWN
 #    scratch root (.build-worker), so a participant-code compile can never write
 #    into the trusted CLI's .build tree. These are setup.sh's own two lines.
-run env -C "${TARGET}" swift build -c release --force-resolved-versions --product mlxfast-swift
-run env -C "${TARGET}" swift build -c release --force-resolved-versions --scratch-path .build-worker --product bench-worker
+# --build-system native: the default backend of Swift 6.4 (Swift Build) prints
+# no "Compiling" lines, which tools/ci-swift-warning-gate.sh needs, and it
+# compiles the vendored .metal sources itself. tools/build-mlx-metallib.sh
+# builds the metallib. Ruled 2026-11-04.
+run env -C "${TARGET}" swift build --build-system native -c release --force-resolved-versions --product mlxfast-swift
+run env -C "${TARGET}" swift build --build-system native -c release --force-resolved-versions --scratch-path .build-worker --product bench-worker
 
 # 3. The Metal library, published next to the worker where Cmlx searches for it.
 if [[ "${PRESTAGED_METALLIB}" == "1" ]]; then

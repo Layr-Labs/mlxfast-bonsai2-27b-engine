@@ -1396,7 +1396,7 @@ trusted_scope_roster_size() { trusted_scope_roster | grep -c .; }
 # filesystem arm DISABLED, printing the relation word or "None".
 #
 # WHY THIS EXISTS, and why the injection-based cases below cannot replace it.
-# This suite runs in the macos-26 job, on APFS, which is case-INSENSITIVE and
+# This suite runs in the hosted macOS job, on APFS, which is case-INSENSITIVE and
 # resolves doubled separators. _prefixes() dropped empty segments even BEFORE
 # _normalize() existed, so on this filesystem the samefile arm caught
 # 'Sources//MLXFastCore' and 'sources//mlxfastcore' all along -- reverting

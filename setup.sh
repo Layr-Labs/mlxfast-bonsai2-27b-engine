@@ -2982,13 +2982,17 @@ build_swift_harness() {
     swift package resolve --force-resolved-versions --scratch-path .build-worker || return 1
     swiftpm_sandbox_flags=(--disable-sandbox --skip-update --manifest-cache local)
   fi
+  # --build-system native: the default backend of Swift 6.4 (Swift Build) prints
+  # no "Compiling" lines, which tools/ci-swift-warning-gate.sh needs, and it
+  # compiles the vendored .metal sources itself. tools/build-mlx-metallib.sh
+  # builds the metallib. Ruled 2026-11-04.
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
     tools/sandboxed-build.sh --write "${PWD}/.build" -- \
-    swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
+    swift build --build-system native -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
     --product mlxfast-swift || return 1
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
     tools/sandboxed-build.sh --write "${PWD}/.build-worker" -- \
-    swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
+    swift build --build-system native -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
     --scratch-path .build-worker --product bench-worker || return 1
   if [[ ! -x "${SWIFT_BIN}" ]]; then
     echo "${SETUP_LOG_LABEL}: trusted Swift CLI missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2

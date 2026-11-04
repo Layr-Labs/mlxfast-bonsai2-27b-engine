@@ -71,7 +71,7 @@ STAGED_METALLIB_FINGERPRINT="${STAGED_METALLIB}.fingerprint"
 
 if [[ ! -x "${BENCH_WORKER_BIN}" ]]; then
   echo "stage-bench-worker.sh: scored engine missing or not executable: ${BENCH_WORKER_BIN}" >&2
-  echo "stage-bench-worker.sh: build it first (setup.sh, or swift build -c ${BUILD_CONFIGURATION} --scratch-path .build-worker --product bench-worker)" >&2
+  echo "stage-bench-worker.sh: build it first (setup.sh, or swift build --build-system native -c ${BUILD_CONFIGURATION} --scratch-path .build-worker --product bench-worker)" >&2
   exit 1
 fi
 
