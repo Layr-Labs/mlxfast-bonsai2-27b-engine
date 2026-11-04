@@ -69,9 +69,9 @@ run on. Those tests exercise the transform, not a Gemma model.
   limit with `MLXFAST_REFERENCE_MIN_FREE_GIB`. The DFlash 2 drafter asks for
   8 GiB of free space of its own. Change that limit with
   `MLXFAST_DFLASH_DRAFTER_MIN_FREE_GIB`.
-- macOS 14 or later. `Package.swift` sets that platform floor. CI builds on a
-  `macos-26` runner, and the Metal toolchain policy in `setup.sh` treats
-  macOS 26 as its own case.
+- macOS 14 or later. `Package.swift` sets that platform floor. CI builds with
+  Xcode 27.2 (build 27B52) on a GitHub `xcode-27` runner, and the Metal
+  toolchain policy in `setup.sh` treats macOS 26 as its own case.
 - Swift 6, through Xcode or through the Xcode Command Line Tools.
   `Package.swift` declares `swift-tools-version: 6.3`.
 - The Xcode Metal Toolchain. `./setup.sh` tries to download it. The Command
@@ -929,8 +929,8 @@ where the benchmarker resolves them.
 
 `.github/workflows/ci.yml` runs on every pull request and on every push to
 `main`. It runs repository hygiene checks on `ubuntu-latest`. It runs
-`swift build --build-tests` and `swift test` on a hosted `macos-26` runner. It
-treats first-party warnings as errors.
+`swift build --build-tests` and `swift test` on a hosted `xcode-27` runner
+with Xcode 27.2 (build 27B52). It treats first-party warnings as errors.
 
 CI is advisory. No status check is required. A red run blocks neither a merge
 nor a dispatch. `docs/ci-coverage.md` holds the detail.

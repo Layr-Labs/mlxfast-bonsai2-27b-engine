@@ -9,3 +9,6 @@
 self-hosted-runner:
   labels:
     - bonsai2-27b-mlx-v1
+    # GitHub-hosted, not self-hosted: the image of the swift job in ci.yml
+    # (Xcode 27). actionlint 1.7.12 does not know this label.
+    - xcode-27

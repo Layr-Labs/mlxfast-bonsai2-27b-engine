@@ -41,13 +41,13 @@ templating, wire fixtures, and request validation.
 | `lint` | `ubuntu-latest` | `tools/ci-box-only-inventory.sh --check` — the inventory below matches the sources |
 | `lint` | `ubuntu-latest` | `tools/test-benchmark-facade-env.sh` — the real `tools/benchmark.sh`, driven with a stub `benchd`, exports `MLXFAST_QWEN_MTP_TRACK_ID` equal to `benchmark.json`'s `trackId` in every mode, and refuses when the manifest carries none |
 | `lint` | `ubuntu-latest` | `tools/test-new-track.sh` — the real `tools/new-track.sh` stamps a seeded copy of this tree into a new track against a stub Hugging Face tree API on `127.0.0.1`: the manifest, the contract fixture, the checkpoint file list, the runner label, the fork revision and the benchd channel all name the new track, the result still passes the manifest linter, and a dirty tree, a malformed track id and a checkpoint file with no published sha256 are refused |
-| `swift` | `macos-26` | toolchain preflight: a full Xcode is selected, Swift >= 6.3 |
-| `swift` | `macos-26` | `tools/test-submission-security.sh` — the submission-restriction HARD GATE, every hostile-archive assertion in the suite (the declared floor is 236). It sits in the `swift` job because it compiles the real byte-budget enforcer with `swiftc`. Nothing in it is box-dependent, so no assertion is gated off. See [What "hard gate" does and does not mean](#what-hard-gate-does-and-does-not-mean) |
-| `swift` | `macos-26` | the suite's **non-vacuity floor**, restated workflow-side against its printed trailer — the run reds if the suite stopped short, reported any failure, or ran fewer assertions than `CI_MIN_ASSERTIONS`, and reds again if that number has drifted from the suite's own `EXPECTED_MIN_ASSERTIONS` |
-| `swift` | `macos-26` | `swift build --build-tests --force-resolved-versions` — `MLXFastCore`/`Transform`/`Model`/`Harness`, both executables, and the test bundle |
-| `swift` | `macos-26` | `tools/ci-swift-warning-gate.sh` — a warning in `Sources/` or `Tests/` fails the run |
-| `swift` | `macos-26` | `git diff --exit-code -- Package.swift Package.resolved` — the frozen dependency graph was not re-resolved |
-| `swift` | `macos-26` | `swift test --force-resolved-versions --no-parallel` with `MLXFAST_RUN_MLX_RUNTIME_TESTS=0` (serial on purpose: parallel `swift test` wedges on this runner image -- see the step comment in `ci.yml`) |
+| `swift` | `xcode-27` | toolchain preflight: Xcode 27.2 (build 27B52) is selected, or another 27.2 build with a warning; a full Xcode, Swift >= 6.3 |
+| `swift` | `xcode-27` | `tools/test-submission-security.sh` — the submission-restriction HARD GATE, every hostile-archive assertion in the suite (the declared floor is 236). It sits in the `swift` job because it compiles the real byte-budget enforcer with `swiftc`. Nothing in it is box-dependent, so no assertion is gated off. See [What "hard gate" does and does not mean](#what-hard-gate-does-and-does-not-mean) |
+| `swift` | `xcode-27` | the suite's **non-vacuity floor**, restated workflow-side against its printed trailer — the run reds if the suite stopped short, reported any failure, or ran fewer assertions than `CI_MIN_ASSERTIONS`, and reds again if that number has drifted from the suite's own `EXPECTED_MIN_ASSERTIONS` |
+| `swift` | `xcode-27` | `swift build --build-tests --force-resolved-versions` — `MLXFastCore`/`Transform`/`Model`/`Harness`, both executables, and the test bundle |
+| `swift` | `xcode-27` | `tools/ci-swift-warning-gate.sh` — a warning in `Sources/` or `Tests/` fails the run |
+| `swift` | `xcode-27` | `git diff --exit-code -- Package.swift Package.resolved` — the frozen dependency graph was not re-resolved |
+| `swift` | `xcode-27` | `swift test --force-resolved-versions --no-parallel` with `MLXFAST_RUN_MLX_RUNTIME_TESTS=0` (serial on purpose: parallel `swift test` wedges on this runner image -- see the step comment in `ci.yml`) |
 
 ### What "hard gate" does and does not mean
 
