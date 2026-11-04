@@ -44,10 +44,10 @@ templating, wire fixtures, and request validation.
 | `swift` | `xcode-27` | toolchain preflight: Xcode 27.2 (build 27B52) is selected, or another 27.2 build with a warning; a full Xcode, Swift >= 6.3 |
 | `swift` | `xcode-27` | `tools/test-submission-security.sh` — the submission-restriction HARD GATE, every hostile-archive assertion in the suite (the declared floor is 236). It sits in the `swift` job because it compiles the real byte-budget enforcer with `swiftc`. Nothing in it is box-dependent, so no assertion is gated off. See [What "hard gate" does and does not mean](#what-hard-gate-does-and-does-not-mean) |
 | `swift` | `xcode-27` | the suite's **non-vacuity floor**, restated workflow-side against its printed trailer — the run reds if the suite stopped short, reported any failure, or ran fewer assertions than `CI_MIN_ASSERTIONS`, and reds again if that number has drifted from the suite's own `EXPECTED_MIN_ASSERTIONS` |
-| `swift` | `xcode-27` | `swift build --build-tests --force-resolved-versions` — `MLXFastCore`/`Transform`/`Model`/`Harness`, both executables, and the test bundle |
+| `swift` | `xcode-27` | `swift build --build-system native --build-tests --force-resolved-versions` — `MLXFastCore`/`Transform`/`Model`/`Harness`, both executables, and the test bundle |
 | `swift` | `xcode-27` | `tools/ci-swift-warning-gate.sh` — a warning in `Sources/` or `Tests/` fails the run |
 | `swift` | `xcode-27` | `git diff --exit-code -- Package.swift Package.resolved` — the frozen dependency graph was not re-resolved |
-| `swift` | `xcode-27` | `swift test --force-resolved-versions --no-parallel` with `MLXFAST_RUN_MLX_RUNTIME_TESTS=0` (serial on purpose: parallel `swift test` wedges on this runner image -- see the step comment in `ci.yml`) |
+| `swift` | `xcode-27` | `swift test --build-system native --force-resolved-versions --no-parallel` with `MLXFAST_RUN_MLX_RUNTIME_TESTS=0` (serial on purpose: parallel `swift test` wedges on this runner image -- see the step comment in `ci.yml`) |
 
 ### What "hard gate" does and does not mean
 
@@ -122,7 +122,7 @@ neither. An MLX evaluation without a published metallib ABORTS the process
 rather than failing the test, which is why the runtime class is gated at all.
 The gate variable is one switch for both classes; set it to `1`:
 
-    MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --force-resolved-versions
+    MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --build-system native --force-resolved-versions
 
 THE INVENTORY IS EMPTY, and that is the correct state after the Darkbloom
 CBv2 re-base. Every GPU-resident and checkpoint-resident test in this tree
@@ -157,7 +157,7 @@ that a returning gated test is inventoried rather than running unseen.
 | --- | --- | --- |
 | ~~The two `benchd/scripts/benchmark.sh` command targets in `benchmark.json`~~ | **No longer applicable.** benchd stopped being a source dependency; every `benchmark.json` command target now lives in this repository (`./setup.sh`, `./tools/fetch-benchd.sh`, `./tools/bonsai2-27b-measure-and-score.sh`), so CI verifies all three and the linter downgrades nothing | CI, fully verified |
 | `tools/build-mlx-metallib.sh` (the AOT `mlx.metallib`) | needs the Metal toolchain component and produces a GPU artifact CI cannot exercise | box, via `./setup.sh` |
-| `swift build -c release` into the two production scratch roots (`.build`, `.build-worker`) | the scored binary layout; CI proves the code compiles, not that the release layout is staged | box, before a benchd pass |
+| `swift build --build-system native -c release` into the two production scratch roots (`.build`, `.build-worker`) | the scored binary layout; CI proves the code compiles, not that the release layout is staged | box, before a benchd pass |
 | Correctness gates, token fidelity, the timed paired measurement, scoring | measurement authority is benchd's, on the ranked M5 box, behind a thermal gate | the ranked pipeline; nothing in this repository times or scores anything |
 | Hidden-golden fidelity | hidden material, R2-provisioned, sha256+bytes pinned | ranked box only |
 

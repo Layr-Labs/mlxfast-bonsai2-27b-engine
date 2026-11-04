@@ -898,13 +898,13 @@ RoPE, RMSNorm, the SDPA vector kernel, and `arg_reduce` load ahead of time from
 them. Tune the `_nax` twin as well as the plain one.
 
 ```bash
-swift build -c release --force-resolved-versions
+swift build --build-system native -c release --force-resolved-versions
 ```
 
 This command builds the trusted CLI into `.build/release`.
 
 ```bash
-swift build -c release --force-resolved-versions --scratch-path .build-worker \
+swift build --build-system native -c release --force-resolved-versions --scratch-path .build-worker \
   --product bench-worker
 ```
 
@@ -929,7 +929,7 @@ where the benchmarker resolves them.
 
 `.github/workflows/ci.yml` runs on every pull request and on every push to
 `main`. It runs repository hygiene checks on `ubuntu-latest`. It runs
-`swift build --build-tests` and `swift test` on a hosted `xcode-27` runner
+`swift build --build-system native --build-tests` and `swift test` on a hosted `xcode-27` runner
 with Xcode 27.2 (build 27B52). It treats first-party warnings as errors.
 
 CI is advisory. No status check is required. A red run blocks neither a merge
